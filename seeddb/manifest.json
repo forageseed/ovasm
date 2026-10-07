@@ -1,0 +1,1875 @@
+{
+  "name": "OVASM SeedDB",
+  "version": "v20261007",
+  "format_version": 1,
+  "scope": "representative land-plant whole organelle genome recruitment seeds",
+  "excluded_unverifiable_source": "Coffea arabica annotation record 163884508445366 has no versioned nucleotide accession",
+  "excluded_benchmark_species": [
+    "Oryza sativa",
+    "Salvia miltiorrhiza"
+  ],
+  "databases": {
+    "mitochondrion": {
+      "file": "landplants.mitochondrion.fasta",
+      "reference_count": 16,
+      "sequence_count": 16,
+      "total_bases": 7002460,
+      "references": [
+        {
+          "accession": "NC_015099.1",
+          "organism": "Beta vulgaris subsp. maritima",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "Caryophyllales",
+            "Amaranthaceae",
+            "Betoideae",
+            "Beta"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_015099.1",
+          "genome_length_bp": 364950,
+          "seeds": [
+            {
+              "id": "NC_015099.1",
+              "start_1based": 1,
+              "end_1based": 364950,
+              "strand": 1,
+              "length_bp": 364950
+            }
+          ]
+        },
+        {
+          "accession": "NC_008285.1",
+          "organism": "Brassica napus",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Brassicales",
+            "Brassicaceae",
+            "Brassiceae",
+            "Brassica"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008285.1",
+          "genome_length_bp": 221853,
+          "seeds": [
+            {
+              "id": "NC_008285.1",
+              "start_1based": 1,
+              "end_1based": 221853,
+              "strand": 1,
+              "length_bp": 221853
+            }
+          ]
+        },
+        {
+          "accession": "NC_010303.1",
+          "organism": "Cycas taitungensis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Cycadidae",
+            "Cycadales",
+            "Cycadaceae",
+            "Cycas"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_010303.1",
+          "genome_length_bp": 414903,
+          "seeds": [
+            {
+              "id": "NC_010303.1",
+              "start_1based": 1,
+              "end_1based": 414903,
+              "strand": 1,
+              "length_bp": 414903
+            }
+          ]
+        },
+        {
+          "accession": "NC_027976.1",
+          "organism": "Ginkgo biloba",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Ginkgoidae",
+            "Ginkgoales",
+            "Ginkgoaceae",
+            "Ginkgo"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_027976.1",
+          "genome_length_bp": 346544,
+          "seeds": [
+            {
+              "id": "NC_027976.1",
+              "start_1based": 1,
+              "end_1based": 346544,
+              "strand": 1,
+              "length_bp": 346544
+            }
+          ]
+        },
+        {
+          "accession": "NC_020455.1",
+          "organism": "Glycine max",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Fabales",
+            "Fabaceae",
+            "Papilionoideae",
+            "50 kb inversion clade",
+            "NPAAA clade",
+            "indigoferoid/millettioid clade",
+            "Phaseoleae",
+            "Glycine",
+            "Glycine subgen. Soja"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_020455.1",
+          "genome_length_bp": 402558,
+          "seeds": [
+            {
+              "id": "NC_020455.1",
+              "start_1based": 1,
+              "end_1based": 402558,
+              "strand": 1,
+              "length_bp": 402558
+            }
+          ]
+        },
+        {
+          "accession": "NC_023337.1",
+          "organism": "Helianthus annuus",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "campanulids",
+            "Asterales",
+            "Asteraceae",
+            "Asteroideae",
+            "Heliantheae alliance",
+            "Heliantheae",
+            "Helianthus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_023337.1",
+          "genome_length_bp": 300945,
+          "seeds": [
+            {
+              "id": "NC_023337.1",
+              "start_1based": 1,
+              "end_1based": 300945,
+              "strand": 1,
+              "length_bp": 300945
+            }
+          ]
+        },
+        {
+          "accession": "NC_021152.1",
+          "organism": "Liriodendron tulipifera",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Magnoliidae",
+            "Magnoliales",
+            "Magnoliaceae",
+            "Liriodendron"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_021152.1",
+          "genome_length_bp": 553721,
+          "seeds": [
+            {
+              "id": "NC_021152.1",
+              "start_1based": 1,
+              "end_1based": 553721,
+              "strand": 1,
+              "length_bp": 553721
+            }
+          ]
+        },
+        {
+          "accession": "NC_037508.1",
+          "organism": "Marchantia polymorpha subsp. ruderalis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Marchantiophyta",
+            "Marchantiopsida",
+            "Marchantiidae",
+            "Marchantiales",
+            "Marchantiaceae",
+            "Marchantia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_037508.1",
+          "genome_length_bp": 186196,
+          "seeds": [
+            {
+              "id": "NC_037508.1",
+              "start_1based": 1,
+              "end_1based": 186196,
+              "strand": 1,
+              "length_bp": 186196
+            }
+          ]
+        },
+        {
+          "accession": "NC_006581.1",
+          "organism": "Nicotiana tabacum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "lamiids",
+            "Solanales",
+            "Solanaceae",
+            "Nicotianoideae",
+            "Nicotianeae",
+            "Nicotiana"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006581.1",
+          "genome_length_bp": 430597,
+          "seeds": [
+            {
+              "id": "NC_006581.1",
+              "start_1based": 1,
+              "end_1based": 430597,
+              "strand": 1,
+              "length_bp": 430597
+            }
+          ]
+        },
+        {
+          "accession": "NC_037468.1",
+          "organism": "Nymphaea colorata",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Nymphaeales",
+            "Nymphaeaceae",
+            "Nymphaea"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_037468.1",
+          "genome_length_bp": 617195,
+          "seeds": [
+            {
+              "id": "NC_037468.1",
+              "start_1based": 1,
+              "end_1based": 617195,
+              "strand": 1,
+              "length_bp": 617195
+            }
+          ]
+        },
+        {
+          "accession": "NC_007945.1",
+          "organism": "Physcomitrium patens",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Bryophyta",
+            "Bryophytina",
+            "Bryopsida",
+            "Funariidae",
+            "Funariales",
+            "Funariaceae",
+            "Physcomitrium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007945.1",
+          "genome_length_bp": 105340,
+          "seeds": [
+            {
+              "id": "NC_007945.1",
+              "start_1based": 1,
+              "end_1based": 105340,
+              "strand": 1,
+              "length_bp": 105340
+            }
+          ]
+        },
+        {
+          "accession": "NC_028096.1",
+          "organism": "Populus tremula",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Malpighiales",
+            "Salicaceae",
+            "Saliceae",
+            "Populus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_028096.1",
+          "genome_length_bp": 783442,
+          "seeds": [
+            {
+              "id": "NC_028096.1",
+              "start_1based": 1,
+              "end_1based": 783442,
+              "strand": 1,
+              "length_bp": 783442
+            }
+          ]
+        },
+        {
+          "accession": "NC_036024.1",
+          "organism": "Triticum aestivum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "BOP clade",
+            "Pooideae",
+            "Triticodae",
+            "Triticeae",
+            "Triticinae",
+            "Triticum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_036024.1",
+          "genome_length_bp": 452526,
+          "seeds": [
+            {
+              "id": "NC_036024.1",
+              "start_1based": 1,
+              "end_1based": 452526,
+              "strand": 1,
+              "length_bp": 452526
+            }
+          ]
+        },
+        {
+          "accession": "NC_012119.1",
+          "organism": "Vitis vinifera",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "Vitales",
+            "Vitaceae",
+            "Viteae",
+            "Vitis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_012119.1",
+          "genome_length_bp": 773279,
+          "seeds": [
+            {
+              "id": "NC_012119.1",
+              "start_1based": 1,
+              "end_1based": 773279,
+              "strand": 1,
+              "length_bp": 773279
+            }
+          ]
+        },
+        {
+          "accession": "NC_008332.1",
+          "organism": "Zea mays subsp. parviglumis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "PACMAD clade",
+            "Panicoideae",
+            "Andropogonodae",
+            "Andropogoneae",
+            "Tripsacinae",
+            "Zea"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008332.1",
+          "genome_length_bp": 680603,
+          "seeds": [
+            {
+              "id": "NC_008332.1",
+              "start_1based": 1,
+              "end_1based": 680603,
+              "strand": 1,
+              "length_bp": 680603
+            }
+          ]
+        },
+        {
+          "accession": "NC_037304.1",
+          "organism": "Arabidopsis thaliana",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Brassicales",
+            "Brassicaceae",
+            "Camelineae",
+            "Arabidopsis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_037304.1",
+          "genome_length_bp": 367808,
+          "seeds": [
+            {
+              "id": "NC_037304.1",
+              "start_1based": 1,
+              "end_1based": 367808,
+              "strand": 1,
+              "length_bp": 367808
+            }
+          ]
+        }
+      ]
+    },
+    "plastid": {
+      "file": "landplants.plastid.fasta",
+      "reference_count": 44,
+      "sequence_count": 44,
+      "total_bases": 6406208,
+      "references": [
+        {
+          "accession": "NC_012818.1",
+          "organism": "Alsophila spinulosa",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Polypodiidae",
+            "Cyatheales",
+            "Cyatheaceae",
+            "Alsophila"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_012818.1",
+          "genome_length_bp": 156661,
+          "seeds": [
+            {
+              "id": "NC_012818.1",
+              "start_1based": 1,
+              "end_1based": 156661,
+              "strand": 1,
+              "length_bp": 156661
+            }
+          ]
+        },
+        {
+          "accession": "NC_005086.1",
+          "organism": "Amborella trichopoda",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Amborellales",
+            "Amborellaceae",
+            "Amborella"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_005086.1",
+          "genome_length_bp": 162686,
+          "seeds": [
+            {
+              "id": "NC_005086.1",
+              "start_1based": 1,
+              "end_1based": 162686,
+              "strand": 1,
+              "length_bp": 162686
+            }
+          ]
+        },
+        {
+          "accession": "NC_008829.1",
+          "organism": "Angiopteris evecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Marattiidae",
+            "Marattiales",
+            "Marattiaceae",
+            "Angiopteris"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008829.1",
+          "genome_length_bp": 153901,
+          "seeds": [
+            {
+              "id": "NC_008829.1",
+              "start_1based": 1,
+              "end_1based": 153901,
+              "strand": 1,
+              "length_bp": 153901
+            }
+          ]
+        },
+        {
+          "accession": "NC_014575.1",
+          "organism": "Cedrus deodara",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Pinopsida",
+            "Pinidae",
+            "Conifers I",
+            "Pinales",
+            "Pinaceae",
+            "Cedrus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014575.1",
+          "genome_length_bp": 119299,
+          "seeds": [
+            {
+              "id": "NC_014575.1",
+              "start_1based": 1,
+              "end_1based": 119299,
+              "strand": 1,
+              "length_bp": 119299
+            }
+          ]
+        },
+        {
+          "accession": "NC_008334.1",
+          "organism": "Citrus sinensis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Sapindales",
+            "Rutaceae",
+            "Aurantioideae",
+            "Citrus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008334.1",
+          "genome_length_bp": 160129,
+          "seeds": [
+            {
+              "id": "NC_008334.1",
+              "start_1based": 1,
+              "end_1based": 160129,
+              "strand": 1,
+              "length_bp": 160129
+            }
+          ]
+        },
+        {
+          "accession": "NC_010548.1",
+          "organism": "Cryptomeria japonica",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Pinopsida",
+            "Pinidae",
+            "Conifers II",
+            "Cupressales",
+            "Cupressaceae",
+            "Cryptomeria"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_010548.1",
+          "genome_length_bp": 131810,
+          "seeds": [
+            {
+              "id": "NC_010548.1",
+              "start_1based": 1,
+              "end_1based": 131810,
+              "strand": 1,
+              "length_bp": 131810
+            }
+          ]
+        },
+        {
+          "accession": "NC_007144.1",
+          "organism": "Cucumis sativus",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Cucurbitales",
+            "Cucurbitaceae",
+            "Benincaseae",
+            "Cucumis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007144.1",
+          "genome_length_bp": 155293,
+          "seeds": [
+            {
+              "id": "NC_007144.1",
+              "start_1based": 1,
+              "end_1based": 155293,
+              "strand": 1,
+              "length_bp": 155293
+            }
+          ]
+        },
+        {
+          "accession": "NC_009618.1",
+          "organism": "Cycas taitungensis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Cycadidae",
+            "Cycadales",
+            "Cycadaceae",
+            "Cycas"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_009618.1",
+          "genome_length_bp": 163403,
+          "seeds": [
+            {
+              "id": "NC_009618.1",
+              "start_1based": 1,
+              "end_1based": 163403,
+              "strand": 1,
+              "length_bp": 163403
+            }
+          ]
+        },
+        {
+          "accession": "NC_008325.1",
+          "organism": "Daucus carota",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "campanulids",
+            "Apiales",
+            "Apiaceae",
+            "Apioideae",
+            "Scandiceae",
+            "Daucinae",
+            "Daucus",
+            "Daucus sect. Daucus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008325.1",
+          "genome_length_bp": 155911,
+          "seeds": [
+            {
+              "id": "NC_008325.1",
+              "start_1based": 1,
+              "end_1based": 155911,
+              "strand": 1,
+              "length_bp": 155911
+            }
+          ]
+        },
+        {
+          "accession": "NC_011954.1",
+          "organism": "Ephedra equisetina",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Gnetopsida",
+            "Gnetidae",
+            "Ephedrales",
+            "Ephedraceae",
+            "Ephedra"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_011954.1",
+          "genome_length_bp": 109518,
+          "seeds": [
+            {
+              "id": "NC_011954.1",
+              "start_1based": 1,
+              "end_1based": 109518,
+              "strand": 1,
+              "length_bp": 109518
+            }
+          ]
+        },
+        {
+          "accession": "NC_014699.1",
+          "organism": "Equisetum arvense",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Equisetidae",
+            "Equisetales",
+            "Equisetaceae",
+            "Equisetum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014699.1",
+          "genome_length_bp": 133309,
+          "seeds": [
+            {
+              "id": "NC_014699.1",
+              "start_1based": 1,
+              "end_1based": 133309,
+              "strand": 1,
+              "length_bp": 133309
+            }
+          ]
+        },
+        {
+          "accession": "NC_008115.1",
+          "organism": "Eucalyptus globulus subsp. globulus",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Myrtales",
+            "Myrtaceae",
+            "Myrtoideae",
+            "Eucalypteae",
+            "Eucalyptus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008115.1",
+          "genome_length_bp": 160286,
+          "seeds": [
+            {
+              "id": "NC_008115.1",
+              "start_1based": 1,
+              "end_1based": 160286,
+              "strand": 1,
+              "length_bp": 160286
+            }
+          ]
+        },
+        {
+          "accession": "NC_016986.1",
+          "organism": "Ginkgo biloba",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Ginkgoidae",
+            "Ginkgoales",
+            "Ginkgoaceae",
+            "Ginkgo"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_016986.1",
+          "genome_length_bp": 156988,
+          "seeds": [
+            {
+              "id": "NC_016986.1",
+              "start_1based": 1,
+              "end_1based": 156988,
+              "strand": 1,
+              "length_bp": 156988
+            }
+          ]
+        },
+        {
+          "accession": "NC_007942.1",
+          "organism": "Glycine max",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Fabales",
+            "Fabaceae",
+            "Papilionoideae",
+            "50 kb inversion clade",
+            "NPAAA clade",
+            "indigoferoid/millettioid clade",
+            "Phaseoleae",
+            "Glycine",
+            "Glycine subgen. Soja"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007942.1",
+          "genome_length_bp": 152218,
+          "seeds": [
+            {
+              "id": "NC_007942.1",
+              "start_1based": 1,
+              "end_1based": 152218,
+              "strand": 1,
+              "length_bp": 152218
+            }
+          ]
+        },
+        {
+          "accession": "NC_011942.1",
+          "organism": "Gnetum parvifolium",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Gnetopsida",
+            "Gnetidae",
+            "Gnetales",
+            "Gnetaceae",
+            "Gnetum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_011942.1",
+          "genome_length_bp": 114914,
+          "seeds": [
+            {
+              "id": "NC_011942.1",
+              "start_1based": 1,
+              "end_1based": 114914,
+              "strand": 1,
+              "length_bp": 114914
+            }
+          ]
+        },
+        {
+          "accession": "NC_007944.1",
+          "organism": "Gossypium hirsutum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Malvales",
+            "Malvaceae",
+            "Malvoideae",
+            "Gossypium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007944.1",
+          "genome_length_bp": 160301,
+          "seeds": [
+            {
+              "id": "NC_007944.1",
+              "start_1based": 1,
+              "end_1based": 160301,
+              "strand": 1,
+              "length_bp": 160301
+            }
+          ]
+        },
+        {
+          "accession": "NC_007977.1",
+          "organism": "Helianthus annuus",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "campanulids",
+            "Asterales",
+            "Asteraceae",
+            "Asteroideae",
+            "Heliantheae alliance",
+            "Heliantheae",
+            "Helianthus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007977.1",
+          "genome_length_bp": 151104,
+          "seeds": [
+            {
+              "id": "NC_007977.1",
+              "start_1based": 1,
+              "end_1based": 151104,
+              "strand": 1,
+              "length_bp": 151104
+            }
+          ]
+        },
+        {
+          "accession": "NC_008590.1",
+          "organism": "Hordeum vulgare subsp. vulgare",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "BOP clade",
+            "Pooideae",
+            "Triticodae",
+            "Triticeae",
+            "Hordeinae",
+            "Hordeum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008590.1",
+          "genome_length_bp": 136462,
+          "seeds": [
+            {
+              "id": "NC_008590.1",
+              "start_1based": 1,
+              "end_1based": 136462,
+              "strand": 1,
+              "length_bp": 136462
+            }
+          ]
+        },
+        {
+          "accession": "NC_006861.1",
+          "organism": "Huperzia lucidula",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Lycopodiopsida",
+            "Lycopodiales",
+            "Lycopodiaceae",
+            "Huperzioideae",
+            "Huperzia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006861.1",
+          "genome_length_bp": 154373,
+          "seeds": [
+            {
+              "id": "NC_006861.1",
+              "start_1based": 1,
+              "end_1based": 154373,
+              "strand": 1,
+              "length_bp": 154373
+            }
+          ]
+        },
+        {
+          "accession": "NC_014675.1",
+          "organism": "Isoetes flaccida",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Lycopodiopsida",
+            "Isoetales",
+            "Isoetaceae",
+            "Isoetes"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014675.1",
+          "genome_length_bp": 145303,
+          "seeds": [
+            {
+              "id": "NC_014675.1",
+              "start_1based": 1,
+              "end_1based": 145303,
+              "strand": 1,
+              "length_bp": 145303
+            }
+          ]
+        },
+        {
+          "accession": "NC_007578.1",
+          "organism": "Lactuca sativa",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "campanulids",
+            "Asterales",
+            "Asteraceae",
+            "Cichorioideae",
+            "Cichorieae",
+            "Lactucinae",
+            "Lactuca"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007578.1",
+          "genome_length_bp": 152765,
+          "seeds": [
+            {
+              "id": "NC_007578.1",
+              "start_1based": 1,
+              "end_1based": 152765,
+              "strand": 1,
+              "length_bp": 152765
+            }
+          ]
+        },
+        {
+          "accession": "NC_022136.1",
+          "organism": "Lygodium japonicum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Polypodiidae",
+            "Schizaeales",
+            "Lygodiaceae",
+            "Lygodium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_022136.1",
+          "genome_length_bp": 157260,
+          "seeds": [
+            {
+              "id": "NC_022136.1",
+              "start_1based": 1,
+              "end_1based": 157260,
+              "strand": 1,
+              "length_bp": 157260
+            }
+          ]
+        },
+        {
+          "accession": "NC_001319.1",
+          "organism": "Marchantia paleacea",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Marchantiophyta",
+            "Marchantiopsida",
+            "Marchantiidae",
+            "Marchantiales",
+            "Marchantiaceae",
+            "Marchantia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001319.1",
+          "genome_length_bp": 121024,
+          "seeds": [
+            {
+              "id": "NC_001319.1",
+              "start_1based": 1,
+              "end_1based": 121024,
+              "strand": 1,
+              "length_bp": 121024
+            }
+          ]
+        },
+        {
+          "accession": "NC_003119.8",
+          "organism": "Medicago truncatula",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Fabales",
+            "Fabaceae",
+            "Papilionoideae",
+            "50 kb inversion clade",
+            "NPAAA clade",
+            "Hologalegina",
+            "IRL clade",
+            "Trifolieae",
+            "Medicago"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_003119.8",
+          "genome_length_bp": 124033,
+          "seeds": [
+            {
+              "id": "NC_003119.8",
+              "start_1based": 1,
+              "end_1based": 124033,
+              "strand": 1,
+              "length_bp": 124033
+            }
+          ]
+        },
+        {
+          "accession": "NC_014592.1",
+          "organism": "Myriopteris lindheimeri",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Polypodiidae",
+            "Polypodiales",
+            "Pteridineae",
+            "Pteridaceae",
+            "Cheilanthoideae",
+            "Myriopteris"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014592.1",
+          "genome_length_bp": 155770,
+          "seeds": [
+            {
+              "id": "NC_014592.1",
+              "start_1based": 1,
+              "end_1based": 155770,
+              "strand": 1,
+              "length_bp": 155770
+            }
+          ]
+        },
+        {
+          "accession": "NC_001879.2",
+          "organism": "Nicotiana tabacum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "lamiids",
+            "Solanales",
+            "Solanaceae",
+            "Nicotianoideae",
+            "Nicotianeae",
+            "Nicotiana"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001879.2",
+          "genome_length_bp": 155943,
+          "seeds": [
+            {
+              "id": "NC_001879.2",
+              "start_1based": 1,
+              "end_1based": 155943,
+              "strand": 1,
+              "length_bp": 155943
+            }
+          ]
+        },
+        {
+          "accession": "NC_006050.1",
+          "organism": "Nymphaea alba",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Nymphaeales",
+            "Nymphaeaceae",
+            "Nymphaea"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006050.1",
+          "genome_length_bp": 159930,
+          "seeds": [
+            {
+              "id": "NC_006050.1",
+              "start_1based": 1,
+              "end_1based": 159930,
+              "strand": 1,
+              "length_bp": 159930
+            }
+          ]
+        },
+        {
+          "accession": "NC_020147.1",
+          "organism": "Ophioglossum californicum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Ophioglossidae",
+            "Ophioglossales",
+            "Ophioglossaceae",
+            "Ophioglossoideae",
+            "Ophioglossum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_020147.1",
+          "genome_length_bp": 138270,
+          "seeds": [
+            {
+              "id": "NC_020147.1",
+              "start_1based": 1,
+              "end_1based": 138270,
+              "strand": 1,
+              "length_bp": 138270
+            }
+          ]
+        },
+        {
+          "accession": "NC_006290.1",
+          "organism": "Panax ginseng",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "asterids",
+            "campanulids",
+            "Apiales",
+            "Araliaceae",
+            "Panax"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006290.1",
+          "genome_length_bp": 156318,
+          "seeds": [
+            {
+              "id": "NC_006290.1",
+              "start_1based": 1,
+              "end_1based": 156318,
+              "strand": 1,
+              "length_bp": 156318
+            }
+          ]
+        },
+        {
+          "accession": "NC_005087.2",
+          "organism": "Physcomitrium patens",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Bryophyta",
+            "Bryophytina",
+            "Bryopsida",
+            "Funariidae",
+            "Funariales",
+            "Funariaceae",
+            "Physcomitrium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_005087.2",
+          "genome_length_bp": 122890,
+          "seeds": [
+            {
+              "id": "NC_005087.2",
+              "start_1based": 1,
+              "end_1based": 122890,
+              "strand": 1,
+              "length_bp": 122890
+            }
+          ]
+        },
+        {
+          "accession": "NC_001631.1",
+          "organism": "Pinus thunbergii",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Pinopsida",
+            "Pinidae",
+            "Conifers I",
+            "Pinales",
+            "Pinaceae",
+            "Pinus",
+            "Pinus subgen. Pinus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001631.1",
+          "genome_length_bp": 119707,
+          "seeds": [
+            {
+              "id": "NC_001631.1",
+              "start_1based": 1,
+              "end_1based": 119707,
+              "strand": 1,
+              "length_bp": 119707
+            }
+          ]
+        },
+        {
+          "accession": "NC_009143.1",
+          "organism": "Populus trichocarpa",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Malpighiales",
+            "Salicaceae",
+            "Saliceae",
+            "Populus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_009143.1",
+          "genome_length_bp": 157033,
+          "seeds": [
+            {
+              "id": "NC_009143.1",
+              "start_1based": 1,
+              "end_1based": 157033,
+              "strand": 1,
+              "length_bp": 157033
+            }
+          ]
+        },
+        {
+          "accession": "NC_014697.1",
+          "organism": "Prunus persica",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "fabids",
+            "Rosales",
+            "Rosaceae",
+            "Amygdaloideae",
+            "Amygdaleae",
+            "Prunus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014697.1",
+          "genome_length_bp": 157790,
+          "seeds": [
+            {
+              "id": "NC_014697.1",
+              "start_1based": 1,
+              "end_1based": 157790,
+              "strand": 1,
+              "length_bp": 157790
+            }
+          ]
+        },
+        {
+          "accession": "NC_003386.1",
+          "organism": "Psilotum nudum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Polypodiopsida",
+            "Ophioglossidae",
+            "Psilotales",
+            "Psilotaceae",
+            "Psilotum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_003386.1",
+          "genome_length_bp": 138829,
+          "seeds": [
+            {
+              "id": "NC_003386.1",
+              "start_1based": 1,
+              "end_1based": 138829,
+              "strand": 1,
+              "length_bp": 138829
+            }
+          ]
+        },
+        {
+          "accession": "NC_008602.1",
+          "organism": "Sorghum bicolor",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "PACMAD clade",
+            "Panicoideae",
+            "Andropogonodae",
+            "Andropogoneae",
+            "Sorghinae",
+            "Sorghum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008602.1",
+          "genome_length_bp": 140754,
+          "seeds": [
+            {
+              "id": "NC_008602.1",
+              "start_1based": 1,
+              "end_1based": 140754,
+              "strand": 1,
+              "length_bp": 140754
+            }
+          ]
+        },
+        {
+          "accession": "NC_002202.1",
+          "organism": "Spinacia oleracea",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "Caryophyllales",
+            "Amaranthaceae",
+            "Chenopodioideae",
+            "Anserineae",
+            "Spinacia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002202.1",
+          "genome_length_bp": 150725,
+          "seeds": [
+            {
+              "id": "NC_002202.1",
+              "start_1based": 1,
+              "end_1based": 150725,
+              "strand": 1,
+              "length_bp": 150725
+            }
+          ]
+        },
+        {
+          "accession": "NC_020321.1",
+          "organism": "Taxus mairei",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Pinopsida",
+            "Pinidae",
+            "Conifers II",
+            "Cupressales",
+            "Taxaceae",
+            "Taxus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_020321.1",
+          "genome_length_bp": 127665,
+          "seeds": [
+            {
+              "id": "NC_020321.1",
+              "start_1based": 1,
+              "end_1based": 127665,
+              "strand": 1,
+              "length_bp": 127665
+            }
+          ]
+        },
+        {
+          "accession": "NC_014676.2",
+          "organism": "Theobroma cacao",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Malvales",
+            "Malvaceae",
+            "Byttnerioideae",
+            "Theobroma"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014676.2",
+          "genome_length_bp": 160619,
+          "seeds": [
+            {
+              "id": "NC_014676.2",
+              "start_1based": 1,
+              "end_1based": 160619,
+              "strand": 1,
+              "length_bp": 160619
+            }
+          ]
+        },
+        {
+          "accession": "NC_002762.1",
+          "organism": "Triticum aestivum",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "BOP clade",
+            "Pooideae",
+            "Triticodae",
+            "Triticeae",
+            "Triticinae",
+            "Triticum"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002762.1",
+          "genome_length_bp": 134545,
+          "seeds": [
+            {
+              "id": "NC_002762.1",
+              "start_1based": 1,
+              "end_1based": 134545,
+              "strand": 1,
+              "length_bp": 134545
+            }
+          ]
+        },
+        {
+          "accession": "NC_007957.1",
+          "organism": "Vitis vinifera",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "Vitales",
+            "Vitaceae",
+            "Viteae",
+            "Vitis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007957.1",
+          "genome_length_bp": 160928,
+          "seeds": [
+            {
+              "id": "NC_007957.1",
+              "start_1based": 1,
+              "end_1based": 160928,
+              "strand": 1,
+              "length_bp": 160928
+            }
+          ]
+        },
+        {
+          "accession": "NC_010654.1",
+          "organism": "Welwitschia mirabilis",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Gnetopsida",
+            "Gnetidae",
+            "Welwitschiales",
+            "Welwitschiaceae",
+            "Welwitschia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_010654.1",
+          "genome_length_bp": 119726,
+          "seeds": [
+            {
+              "id": "NC_010654.1",
+              "start_1based": 1,
+              "end_1based": 119726,
+              "strand": 1,
+              "length_bp": 119726
+            }
+          ]
+        },
+        {
+          "accession": "JX416857.1",
+          "organism": "Zamia furfuracea",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Cycadidae",
+            "Cycadales",
+            "Zamiaceae",
+            "Zamia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/JX416857.1",
+          "genome_length_bp": 164953,
+          "seeds": [
+            {
+              "id": "JX416857.1",
+              "start_1based": 1,
+              "end_1based": 164953,
+              "strand": 1,
+              "length_bp": 164953
+            }
+          ]
+        },
+        {
+          "accession": "NC_001666.2",
+          "organism": "Zea mays",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "Liliopsida",
+            "Poales",
+            "Poaceae",
+            "PACMAD clade",
+            "Panicoideae",
+            "Andropogonodae",
+            "Andropogoneae",
+            "Tripsacinae",
+            "Zea"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001666.2",
+          "genome_length_bp": 140384,
+          "seeds": [
+            {
+              "id": "NC_001666.2",
+              "start_1based": 1,
+              "end_1based": 140384,
+              "strand": 1,
+              "length_bp": 140384
+            }
+          ]
+        },
+        {
+          "accession": "NC_000932.1",
+          "organism": "Arabidopsis thaliana",
+          "taxonomy": [
+            "Eukaryota",
+            "Viridiplantae",
+            "Streptophyta",
+            "Embryophyta",
+            "Tracheophyta",
+            "Spermatophyta",
+            "Magnoliopsida",
+            "eudicotyledons",
+            "Gunneridae",
+            "Pentapetalae",
+            "rosids",
+            "malvids",
+            "Brassicales",
+            "Brassicaceae",
+            "Camelineae",
+            "Arabidopsis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_000932.1",
+          "genome_length_bp": 154478,
+          "seeds": [
+            {
+              "id": "NC_000932.1",
+              "start_1based": 1,
+              "end_1based": 154478,
+              "strand": 1,
+              "length_bp": 154478
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "changes": "v20261007: added Arabidopsis thaliana (NC_037304.1 mitochondrion, NC_000932.1 plastid) to the seeds. It is no longer a held-out species, so a run on Arabidopsis is seeded with its own genome."
+}

@@ -26,13 +26,20 @@ cargo build --release            # Rust 1.80 or newer
 
 ## Use
 
-You need whole-genome reads (HiFi, or Illumina with `--read-type sr`) and a close relative's organelle genomes as seeds.
-Give both organelles' seeds so each claims its own reads:
+You need whole-genome reads: HiFi, or Illumina with `--read-type sr`. No reference file is needed:
+
+```bash
+ovasm run --reads sample.hifi.fastq.gz --organelle both --out out/ --threads 8
+```
+
+ovasm uses its built-in land-plant seed library (`seeddb/`, 16 mitochondrial and 44 plastid genomes, including
+*Arabidopsis thaliana*; compiled into the program) to pick out the organelle reads, and writes the seeds it used to
+`out/seeds/`. To use a close relative of your own instead, give it per organelle; whatever you leave out still comes
+from the library:
 
 ```bash
 ovasm run --reads sample.hifi.fastq.gz --organelle both \
-  --seeds mitochondrion=mt_reference.fasta --seeds plastid=pt_reference.fasta \
-  --out out/ --threads 8
+  --seeds mitochondrion=mt_reference.fasta --seeds plastid=pt_reference.fasta --out out/ --threads 8
 ```
 
 Results are written to `out/mitochondrion/` and `out/plastid/` (for one organelle, `--organelle mitochondrion` or
@@ -49,9 +56,11 @@ Results are written to `out/mitochondrion/` and `out/plastid/` (for one organell
 
 Check `summary.json` (`k_accepted`, `decisive`) before trusting a result.
 
-Without a reference, `--recruit discover` tries to find organelle reads by k-mer depth (HiFi only). It needs the
-organelle reads to stand out from the nuclear background and can fail; give seeds when you have them.
-The [OrganelleVerse](https://github.com/forageseed/organelleverse) Python package ships a ready-made seed database.
+The library holds a handful of species per lineage, so a distant species may recruit few reads; then give a closer
+reference with `--seeds`. `--recruit discover` needs no seeds at all: it finds organelle reads by k-mer depth (HiFi
+only). It needs the organelle reads to stand out from the nuclear background and can fail; `--recruit both` combines
+the seeds with it. Because *Arabidopsis thaliana* is in the library, a run on Arabidopsis is seeded with its own
+genome and is not a blind test.
 
 ## Commands
 
