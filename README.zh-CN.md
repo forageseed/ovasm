@@ -28,13 +28,19 @@ cargo build --release            # 需要 Rust 1.80 或更高版本
 
 ## 使用
 
-需要全基因组测序数据（HiFi；Illumina 加 `--read-type sr`），以及近缘物种的细胞器基因组作为种子。
-两个细胞器的种子一起给，这样各自招募各自的 reads：
+需要全基因组测序数据：HiFi，或 Illumina（加 `--read-type sr`）。不需要提供任何参考序列：
+
+```bash
+ovasm run --reads sample.hifi.fastq.gz --organelle both --out out/ --threads 8
+```
+
+ovasm 用内置的陆生植物种子库（`seeddb/`，16 个线粒体和 44 个叶绿体基因组，包括拟南芥，已编进程序）
+挑出细胞器 reads，并把用到的种子写到 `out/seeds/`。想改用你自己的近缘物种，按细胞器分别给；
+没给的那个细胞器仍然用内置库：
 
 ```bash
 ovasm run --reads sample.hifi.fastq.gz --organelle both \
-  --seeds mitochondrion=mt_reference.fasta --seeds plastid=pt_reference.fasta \
-  --out out/ --threads 8
+  --seeds mitochondrion=mt_reference.fasta --seeds plastid=pt_reference.fasta --out out/ --threads 8
 ```
 
 结果写在 `out/mitochondrion/` 和 `out/plastid/`（只拼一个细胞器时，`--organelle mitochondrion` 或
@@ -51,9 +57,10 @@ ovasm run --reads sample.hifi.fastq.gz --organelle both \
 
 用结果之前先看 `summary.json`（`k_accepted`、`decisive`）。
 
-没有参考序列时，`--recruit discover` 会尝试按 k-mer 深度找出细胞器 reads（只支持 HiFi）。
-它要求细胞器 reads 的深度明显高于核背景，可能失败；有种子时请给种子。
-[OrganelleVerse](https://github.com/forageseed/organelleverse) 的 Python 包自带一套现成的种子库。
+种子库每个类群只有少数几个物种，物种太远时可能招到的 reads 很少，这时用 `--seeds` 给一个更近的参考。
+`--recruit discover` 完全不需要种子：按 k-mer 深度找细胞器 reads（只支持 HiFi），
+要求细胞器 reads 的深度明显高于核背景，可能失败；`--recruit both` 把种子和它合在一起用。
+因为种子库里有拟南芥，拿拟南芥做测试时种子就是它自己的基因组，不算盲测。
 
 ## 命令
 

@@ -15,6 +15,7 @@ mod panel;
 mod pipeline;
 mod recruit;
 mod replicate;
+mod seeddb;
 mod seedfree;
 mod unify;
 
@@ -133,9 +134,10 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = pipeline::ReadSet::WholeGenome)]
     read_set: pipeline::ReadSet,
     /// Seed FASTA as ORGANELLE=PATH (mitochondrion=mt.fa, plastid=pt.fa; repeat for more
-    /// files); a bare PATH seeds the --organelle. Seed both organelles even when one is
-    /// wanted: each then claims its own reads. The built-in SeedDB ships with the Python
-    /// package (`organelleverse._ovasm_seeddb.bundled_seed`); pass its FASTA files here.
+    /// files); a bare PATH seeds the --organelle. Optional: an organelle without --seeds uses
+    /// the built-in land-plant seed library (seeddb/, compiled in; it includes Arabidopsis
+    /// thaliana), written to <out>/seeds/. Both organelles are always seeded unless
+    /// --single-seed, so that each claims its own reads.
     #[arg(long = "seeds")]
     seeds: Vec<String>,
     /// How whole-genome reads are recruited: seeds; discover (no seeds: depth clusters called
@@ -206,6 +208,33 @@ fn run(args: RunArgs) -> Result<()> {
             }
         };
         seeds.entry(name.to_string()).or_default().push(path.into());
+    }
+    // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
+    // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
+    if args.read_set == pipeline::ReadSet::WholeGenome
+        && args.recruit != pipeline::RecruitBy::Discover
+    {
+        let mut seeded: Vec<&str> = match single {
+            Some(organelle) => vec![organelle],
+            None => vec!["mitochondrion", "plastid"],
+        };
+        if let (Some(organelle), false) = (single, args.single_seed) {
+            seeded.push(if organelle == "mitochondrion" { "plastid" } else { "mitochondrion" });
+        }
+        let missing: Vec<&str> = seeded
+            .into_iter()
+            .filter(|o| !seeds.contains_key(*o))
+            .collect();
+        if !missing.is_empty() {
+            let dir = args.out.join("seeds");
+            seeds.extend(seeddb::write(&dir, &missing)?);
+            eprintln!(
+                "[ovasm] run: no --seeds for {}: using the built-in seed library {} ({})",
+                missing.join(" and "),
+                seeddb::VERSION,
+                dir.display()
+            );
+        }
     }
     let report = pipeline::run(&pipeline::RunConfig {
         reads: args.reads,

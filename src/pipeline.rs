@@ -1484,9 +1484,8 @@ fn validate(cfg: &RunConfig) -> Result<()> {
     for o in wanted {
         if !cfg.seeds.contains_key(*o) {
             bail!(
-                "whole-genome reads need seeds for the {o}: give --seeds {o}=<fasta> (the \
-                 built-in SeedDB ships with the Python package: \
-                 organelleverse._ovasm_seeddb.bundled_seed(\"{o}\") returns its FASTA), or use \
+                "whole-genome reads need seeds for the {o}: give --seeds {o}=<fasta> (`ovasm \
+                 run` takes the built-in seed library when --seeds is left out), or use \
                  --recruit discover, or give the target reads with --read-set target"
             );
         }
