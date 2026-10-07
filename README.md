@@ -15,6 +15,78 @@ Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 - **One small Rust program.** No conda, no containers, no system libraries (gzip is pure Rust), so it builds on Windows, Linux and macOS.
 - **Pangenome-ready.** The graph is also written as OV-GFA, which `ovasm pan` merges across samples.
 
+## How it works
+
+1. **Recruit.** The raw reads are read once. Reads that share k-mers with the seed genomes (or, without seeds, reads
+   that are far deeper than the nuclear genome) are kept; the rest is never looked at again.
+2. **Assemble.** The organelle reads are turned into a sparse de Bruijn graph over closed syncmers. The k is chosen
+   automatically, and ovasm retries with a smaller k until the molecules explain at least half of the graph.
+3. **Count the evidence.** For every link, branch and repeat pairing in the graph, ovasm counts the reads that
+   support it.
+4. **Unfold.** Representative molecules are traced along read-supported paths. ovasm says whether the reads single
+   one structure out (`decisive`), because plant mitochondria usually exist in several forms at once.
+5. **Export.** The graph is rewritten as OV-GFA (blunt links, PanSN paths) so that many samples can be merged into
+   a pangenome with `ovasm pan`.
+
+What sets it apart: it returns the **graph and its evidence**, not just one sequence; it **tells you when the reads
+cannot decide**; the `--mode standard` option assembles downsampled replicates and reports, for every junction, the
+share of replicates that reproduce it; it takes **HiFi, ONT (with self-correction), CLR and Illumina** reads; and it
+is **one program** that needs no conda environment or container.
+
+## Compared with other tools
+
+All numbers below were measured by us, on the data named in each row. Read the notes under the tables before
+drawing conclusions.
+
+**Same data, same scoring: *Arabidopsis thaliana* Col-0 mitochondrion** (HiFi, 11 GB, reads given to each tool in full;
+truth: the NC_037304 graph with 8 junctions):
+
+| Tool | Junctions found | Linear sequence against the reference | Pieces | Time |
+|---|---|---|---|---|
+| **ovasm** | 7/8 (8/8 with the tolerant rule) | one closed circle, 367,808 bp, 100% covered, 100% identical | 1 | **about 3 min** |
+| Oatk | 8/8 | 98.97% covered, 99.9997% identical | 4 | 31 min |
+| HiMT | 6/8 (7/8 tolerant) | 99.82% covered, 99.990% identical | 15 | 98 min |
+
+**Same scoring, 63 chloroplast genomes** (the Arabidopsis cohort of Zou et al. 2025, one run per sample and tool):
+
+| Tool | Success | Single circle | Exact length | Within 10 bp | Median time | Median peak memory |
+|---|---|---|---|---|---|---|
+| **ovasm** | 63/63 | 63 | 61 | 63 | **2 s** | **58 MB** |
+| Oatk | 63/63 | 63 | 56 | 63 | 87 s | 1,093 MB |
+| PMAT | 62/63 | 58 | 11 | 58 | 154 s | 1,129 MB |
+| HiMT | 0/63 | – | – | – | – | – |
+
+**Summary**
+
+| | ovasm | Oatk | HiMT | PMAT |
+|---|---|---|---|---|
+| Success (63 chloroplasts) | 63/63 | 63/63 | 0/63, see note | 62/63 |
+| Accuracy (Col-0 mitochondrion) | complete circle, 100% | 99.0% in 4 pieces | 99.8% in 15 pieces | not run |
+| Time (Col-0, full reads) | about 3 min | 31 min | 98 min | – |
+| Memory (63 chloroplasts, median) | 58 MB | 1,093 MB | 297 MB | 1,129 MB |
+| Cross-platform | one program; built and tested on Linux and Windows | conda environment | conda environment | container |
+
+Notes, so that the numbers are not over-read:
+
+- **ovasm is not shown to be better across species.** In four rounds of frozen blind tests on new species (pre-registered
+  thresholds, identity at least 0.9999, 12 tasks each: mitochondrion and chloroplast of 6 species), ovasm passed 3/12, 6/12,
+  8/12 and 7/12; the first round (3 species) passed 2/6. The other tools were not scored under the same thresholds on those species, so there is no
+  head-to-head blind comparison. Fixes made while looking at those data raise the replays (for example 10/12 on one round),
+  but replays are not blind tests. The two tables above are on data we had already seen.
+- **Col-0 mitochondrion:** the seed was Col-0's own reference genome, which makes recruitment easy; it affects which reads
+  are recruited, not how the graph is built. When Oatk and HiMT were given the 150x reads that ovasm recruited, both found
+  8/8 junctions in 42 s and 84 s (plus about 200 s of recruitment); Oatk then gave 3 pieces and HiMT 14.
+- **Chloroplast cohort:** the "truth" is the cohort's own published assembly, not an independent gold standard, and it was a
+  post-hoc comparison. HiMT is a mitochondrial assembler: its 63 runs failed because it did not produce the chloroplast
+  output we asked for, which says nothing about its quality. ovasm failed on 2 samples at its first k and was fixed by
+  retrying with a smaller k, a rule that is now built into `ovasm run`.
+- **Time:** measured on a busy shared server, so read the times as upper bounds. ovasm's time is mostly the single pass
+  over the raw reads.
+- **Memory:** ovasm peaks at 229 MB for recruitment on Col-0 and stays under 170 MB for the later steps. The heaviest steps are
+  seed-free `discover` (6.9 GB) and hybrid correction of ONT reads (2.3 GB).
+- **Platforms:** on Windows the program builds in 93 s (17 MB), its 141 tests pass, and a full run on the example reads
+  takes 5 s. macOS has not been tested.
+
 ## Install
 
 ```bash
