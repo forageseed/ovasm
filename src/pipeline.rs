@@ -106,6 +106,8 @@ pub struct RunConfig {
     pub read_set: ReadSet,
     /// Seed FASTA files per organelle (`mitochondrion`, `plastid`).
     pub seeds: BTreeMap<String, Vec<PathBuf>>,
+    /// The organelles whose `seeds` are the built-in library (`summary.json` says `builtin`).
+    pub builtin_seeds: BTreeSet<String>,
     pub recruit: RecruitBy,
     /// `ovasm recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
@@ -738,7 +740,17 @@ fn recruit_all(
                 };
                 let own = seed_files(organelle);
                 source = own.join(", ");
-                seed_info.insert("source".into(), "custom".into());
+                let seed_source = |o: &str| {
+                    if cfg.builtin_seeds.contains(o) {
+                        "builtin"
+                    } else {
+                        "custom"
+                    }
+                };
+                seed_info.insert("source".into(), seed_source(organelle).into());
+                if cfg.builtin_seeds.contains(organelle) {
+                    seed_info.insert("version".into(), crate::seeddb::VERSION.into());
+                }
                 seed_info.insert("file".into(), own.first().cloned().into());
                 seed_info.insert("files".into(), own.into());
                 // The other organelle is seeded too, so that its reads are claimed by their own
@@ -750,7 +762,11 @@ fn recruit_all(
                 seed_info.insert(
                     "competing_seed".into(),
                     if cfg.seeds.contains_key(other) {
-                        json!({"organelle": other, "files": seed_files(other)})
+                        json!({
+                            "organelle": other,
+                            "source": seed_source(other),
+                            "files": seed_files(other),
+                        })
                     } else {
                         Value::Null
                     },
@@ -1910,6 +1926,7 @@ mod tests {
             read_type: ReadType::Hifi,
             read_set: ReadSet::Target,
             seeds: BTreeMap::new(),
+            builtin_seeds: BTreeSet::new(),
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
             single_seed: false,
@@ -2009,6 +2026,43 @@ mod tests {
             assert!(unified.contains("\nP\tdesktop#1#"), "a PanSN path");
         }
         assert!(cfg.out.join("recruit/recruit.json").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn summary_says_whether_the_seeds_were_the_built_in_library_or_the_users() {
+        // the mitochondrial seed stands in for the library, the plastid seed is the user's own
+        let dir = tmpdir("seed-source");
+        let (mito, plastid, nuclear) = (seq(30_000, 101), seq(20_000, 202), seq(400_000, 303));
+        let mut reads = tile(&mito, 4000, 50, "m");
+        reads.extend(tile(&plastid, 4000, 17, "p"));
+        reads.extend(
+            (0..nuclear.len() - 4000)
+                .step_by(4000)
+                .enumerate()
+                .map(|(i, st)| (format!("n{i}"), nuclear[st..st + 4000].to_vec())),
+        );
+        let wgs = dir.join("wgs.fa");
+        fasta(&wgs, &reads);
+        let (mt_seed, pt_seed) = (dir.join("mt.fa"), dir.join("pt.fa"));
+        fasta(&mt_seed, &[("mt".into(), mito)]);
+        fasta(&pt_seed, &[("pt".into(), plastid)]);
+        let mut cfg = config(wgs, OrganelleChoice::Both, dir.join("out"));
+        cfg.read_set = ReadSet::WholeGenome;
+        cfg.seeds.insert("mitochondrion".into(), vec![mt_seed]);
+        cfg.seeds.insert("plastid".into(), vec![pt_seed]);
+        cfg.builtin_seeds.insert("mitochondrion".into());
+        run(&cfg).unwrap();
+
+        let mito_summary = read_json(&cfg.out.join("mitochondrion/summary.json")).unwrap();
+        assert_eq!(mito_summary["seed_database"]["source"], "builtin");
+        assert_eq!(mito_summary["seed_database"]["version"], crate::seeddb::VERSION);
+        assert_eq!(mito_summary["seed_database"]["competing_seed"]["source"], "custom");
+
+        let plastid_summary = read_json(&cfg.out.join("plastid/summary.json")).unwrap();
+        assert_eq!(plastid_summary["seed_database"]["source"], "custom");
+        assert!(plastid_summary["seed_database"].get("version").is_none());
+        assert_eq!(plastid_summary["seed_database"]["competing_seed"]["source"], "builtin");
         fs::remove_dir_all(&dir).ok();
     }
 
