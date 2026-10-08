@@ -5,7 +5,7 @@
 //! The files are written under `<out>/seeds/` (with their manifest) so a run records exactly
 //! which seeds it used.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -24,6 +24,31 @@ fn fasta(organelle: &str) -> Option<(&'static str, &'static [u8])> {
         "plastid" => Some(("landplants.plastid.fasta", PLASTID)),
         _ => None,
     }
+}
+
+/// Give every organelle that needs seeds and has none the built-in library. The organelles that
+/// need seeds are the one asked for (`single`; both when `None`) and, unless `single_seed`, the
+/// other one too, so that each organelle claims its own reads. Seeds already in `seeds` are left
+/// alone. Returns the organelles that took the library (empty: nothing was written).
+pub fn fill_missing(
+    seeds: &mut BTreeMap<String, Vec<PathBuf>>,
+    dir: &Path,
+    single: Option<&str>,
+    single_seed: bool,
+) -> Result<BTreeSet<String>> {
+    let mut needed: Vec<&str> = match single {
+        Some(organelle) => vec![organelle],
+        None => vec!["mitochondrion", "plastid"],
+    };
+    if let (Some(organelle), false) = (single, single_seed) {
+        needed.push(if organelle == "mitochondrion" { "plastid" } else { "mitochondrion" });
+    }
+    let missing: Vec<&str> = needed.into_iter().filter(|o| !seeds.contains_key(*o)).collect();
+    if missing.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    seeds.extend(write(dir, &missing)?);
+    Ok(missing.into_iter().map(str::to_string).collect())
 }
 
 /// Write the seed FASTA of each requested organelle, and the manifest, into `dir`; return the
@@ -77,6 +102,64 @@ mod tests {
                 .sum();
             assert_eq!(db["total_bases"].as_u64().unwrap() as usize, bases);
         }
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ovasm-seeddb-{name}-{}", std::process::id()))
+    }
+
+    fn names(set: &BTreeSet<String>) -> Vec<&str> {
+        set.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn nothing_given_means_both_organelles_take_the_library() {
+        let dir = tmp("fill-both");
+        let mut seeds = BTreeMap::new();
+        let filled = fill_missing(&mut seeds, &dir, None, false).unwrap();
+        assert_eq!(names(&filled), ["mitochondrion", "plastid"]);
+        assert_eq!(seeds.len(), 2);
+        assert!(dir.join("landplants.mitochondrion.fasta").is_file());
+        assert!(dir.join("landplants.plastid.fasta").is_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seeds_the_user_gave_are_kept_and_not_reported_as_the_library() {
+        let dir = tmp("fill-mixed");
+        let mine = PathBuf::from("my_mt.fasta");
+        let mut seeds = BTreeMap::from([("mitochondrion".to_string(), vec![mine.clone()])]);
+        let filled = fill_missing(&mut seeds, &dir, None, false).unwrap();
+        assert_eq!(names(&filled), ["plastid"]);
+        assert_eq!(seeds["mitochondrion"], vec![mine]);
+        assert!(!dir.join("landplants.mitochondrion.fasta").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_organelle_still_seeds_the_other_unless_single_seed() {
+        let (dir, dir_single) = (tmp("fill-one"), tmp("fill-single"));
+        let mut seeds = BTreeMap::new();
+        let filled = fill_missing(&mut seeds, &dir, Some("mitochondrion"), false).unwrap();
+        assert_eq!(names(&filled), ["mitochondrion", "plastid"]);
+
+        let mut seeds = BTreeMap::new();
+        let filled = fill_missing(&mut seeds, &dir_single, Some("plastid"), true).unwrap();
+        assert_eq!(names(&filled), ["plastid"]);
+        assert!(!seeds.contains_key("mitochondrion"));
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir_single).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_written_when_every_needed_organelle_has_seeds() {
+        let dir = tmp("fill-none");
+        let mut seeds = BTreeMap::from([
+            ("mitochondrion".to_string(), vec![PathBuf::from("m.fa")]),
+            ("plastid".to_string(), vec![PathBuf::from("p.fa")]),
+        ]);
+        assert!(fill_missing(&mut seeds, &dir, None, false).unwrap().is_empty());
+        assert!(!dir.exists());
     }
 
     #[test]

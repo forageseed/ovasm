@@ -211,26 +211,16 @@ fn run(args: RunArgs) -> Result<()> {
     }
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
+    let mut builtin_seeds = std::collections::BTreeSet::new();
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
-        let mut seeded: Vec<&str> = match single {
-            Some(organelle) => vec![organelle],
-            None => vec!["mitochondrion", "plastid"],
-        };
-        if let (Some(organelle), false) = (single, args.single_seed) {
-            seeded.push(if organelle == "mitochondrion" { "plastid" } else { "mitochondrion" });
-        }
-        let missing: Vec<&str> = seeded
-            .into_iter()
-            .filter(|o| !seeds.contains_key(*o))
-            .collect();
-        if !missing.is_empty() {
-            let dir = args.out.join("seeds");
-            seeds.extend(seeddb::write(&dir, &missing)?);
+        let dir = args.out.join("seeds");
+        builtin_seeds = seeddb::fill_missing(&mut seeds, &dir, single, args.single_seed)?;
+        if !builtin_seeds.is_empty() {
             eprintln!(
                 "[ovasm] run: no --seeds for {}: using the built-in seed library {} ({})",
-                missing.join(" and "),
+                builtin_seeds.iter().cloned().collect::<Vec<_>>().join(" and "),
                 seeddb::VERSION,
                 dir.display()
             );
@@ -243,6 +233,7 @@ fn run(args: RunArgs) -> Result<()> {
         read_type: args.read_type,
         read_set: args.read_set,
         seeds,
+        builtin_seeds,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
         single_seed: args.single_seed,
