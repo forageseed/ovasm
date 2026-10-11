@@ -10,9 +10,9 @@ Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 
 ## Why ovasm
 
-- **One pass over the raw reads.** Organelle reads are picked out once; everything after that works on that small set.
+- **Choose the input scope.** Standard assembly recruits organelle reads. Multichrom graph construction uses the original whole-genome HiFi reads to retain independent components.
 - **An assembly graph with evidence, not just a sequence.** Every junction comes with the number of reads that support it, and `molecules.fasta` holds the representative molecule(s). When the reads cannot tell structures apart, `decisive` is `false` instead of a silent guess.
-- **One program, no setup.** No conda, no containers, no system libraries (gzip is pure Rust), and a built-in seed library, so no reference file is needed either. Tested on Linux and Windows.
+- **One program with a built-in seed library.** The portable stages use Rust gzip. The native multichrom kernel runs on Linux and needs a C compiler and zlib development headers; a seed reference is optional.
 - **Pangenome-ready.** The graph is also written as OV-GFA, which `ovasm pan` merges across samples.
 
 ## Install
@@ -24,15 +24,18 @@ install Rust, build, and make sure the `ovasm` program is on your `PATH`. `cargo
 <summary><b>Linux</b> (tested)</summary>
 
 ```bash
-# 1. Rust (skip if `cargo --version` already works); needs a C compiler such as gcc
+# 1. Linux native-kernel dependencies (Debian/Ubuntu)
+sudo apt-get install build-essential zlib1g-dev
+
+# 2. Rust (skip if `cargo --version` already works)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. Build and install into ~/.cargo/bin
+# 3. Build and install into ~/.cargo/bin
 git clone https://github.com/forageseed/ovasm.git
 cd ovasm
 cargo install --path .
 
-# 3. Check (open a new shell first if the command is not found)
+# 4. Check (open a new shell first if the command is not found)
 ovasm --version
 ```
 
@@ -224,3 +227,22 @@ OrganelleVerse finds the program through the `ORG_VERSE_OVASM_BIN` environment v
 ## License
 
 MIT
+
+
+## Multichrom graphs and two sequence scores
+
+The Linux build includes the attributed Syncasm kernel for corrected, read-threaded multichrom graphs. Supply a coverage-derived cutoff; it is not chosen from a reference genome:
+
+```bash
+ovasm assemble --reads sample.hifi.fastq.gz --multichrom-graph --min-count <coverage-derived-cutoff> --out graph.gfa --out-json graph.json --threads 8
+```
+
+This graph stage operates on the original WGS reads. `ovasm components` accepts `--read-origins` evidence and can write `--out-assigned-gfa` and `--out-unassigned-gfa` separately; unresolved source evidence is retained. `ovasm primary` exports representative sequence records from an overlap-aware graph. See each command's `--help`. Native multichrom construction is supported on Linux; macOS and Windows retain portable stages, and Windows users need a Linux compute environment for this kernel.
+
+With a supplied reference FASTA, [the scoring script](scripts/assembly_benchmarks/score_independent_multichrom.py) reports **relaxed** and **strict** acceptance for the same complete candidate output. Relaxed requires a distinct complete, accurate candidate for every reference record and permits extra records. Strict also requires a bijection and limits total-length deviation and extra-sequence fraction to 0.1%. Identity minimum is 99.99%; query and reference coverage minimum is 99.9% for both. Scores are binary 0/1 acceptance values, with per-reference detail and extra-sequence counts. Empty output, missing records, merged records and insufficient identity fail both. Historical `accepted` remains the strict result.
+
+```bash
+python scripts/assembly_benchmarks/score_independent_multichrom.py --truth reference.fasta --candidate all-output.fasta --circular-identifiers circular-reference-ids.json --minimap2 /path/to/minimap2 --output scores/
+```
+
+`circular-reference-ids.json` is a JSON list of reference identifiers, or `[]` when no supplied reference is annotated circular. References are used only after assembly for evaluation. Sequence record matching does not establish physical chromosome count, topology or organelle origin. In the existing Schoenoplectus development check, 8/8 references match exactly and 7 extra records / 12,862 bp remain: relaxed passes, strict fails. This is previously seen data, not an independent holdout.

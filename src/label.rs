@@ -309,9 +309,12 @@ pub fn label_graph(gfa: &Path, genes: &GeneIndex, p: &LabelParams) -> Result<Vec
                 // Genes of both organelles without a 3:1 majority: a mitochondrial chromosome
                 // with large plastid-derived stretches (Narthecium's 100.8 kb second chromosome,
                 // 15 mitochondrial and 7 plastid genes, its own component) is still the
-                // organelle its depth cluster holds, where its own genes agree.
-                Some(Err(())) => by_component()
-                    .or(cluster_organelle.filter(|&o| counts[u][o] > counts[u][1 - o])),
+                // organelle its depth cluster holds, where its own genes agree. One gene (below
+                // `min_genes`) is no such evidence: Isothecium's 21.5 kb nuclear unitig with one
+                // mitochondrial gene hit joined the mitochondrial seed through its cluster and
+                // gave 24 kb of extra molecules.
+                Some(Err(())) => by_component().or(cluster_organelle
+                    .filter(|&o| counts[u][o] >= p.min_genes && counts[u][o] > counts[u][1 - o])),
                 None => by_component(),
             };
             let mut per = [Vec::new(), Vec::new()];
@@ -537,15 +540,17 @@ mod tests {
             String::from_utf8(genes.iter().flat_map(|g| back_translate(g)).collect()).unwrap()
         };
         // u0: clearly mitochondrial; u1 (own component): 3 mitochondrial + 2 plastid genes;
-        // u2 (own component): 2 mitochondrial + 3 plastid genes
+        // u2 (own component): 2 mitochondrial + 3 plastid genes; u3 (own component): one
+        // mitochondrial gene, too little to take the cluster's organelle
         let gfa = dir.join("g.gfa");
         std::fs::write(
             &gfa,
             format!(
-                "H\tVN:Z:1.0\nS\tu0\t{}\nS\tu1\t{}\nS\tu2\t{}\n",
+                "H\tVN:Z:1.0\nS\tu0\t{}\nS\tu1\t{}\nS\tu2\t{}\nS\tu3\t{}\n",
                 dna(&[&mt[0], &mt[1], &mt[2]]),
                 dna(&[&mt[3], &mt[4], &mt[5], &pt[0], &pt[1]]),
                 dna(&[&mt[0], &mt[1], &pt[2], &pt[3], &pt[4]]),
+                dna(&[&mt[4]]),
             ),
         )
         .unwrap();
@@ -558,6 +563,10 @@ mod tests {
         );
         assert_eq!(
             (l[2].by_genes.as_str(), l[2].label.as_str()),
+            ("ambiguous", "none")
+        );
+        assert_eq!(
+            (l[3].by_genes.as_str(), l[3].label.as_str()),
             ("ambiguous", "none")
         );
         std::fs::remove_dir_all(&dir).ok();

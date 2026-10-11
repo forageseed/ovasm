@@ -7,7 +7,7 @@
 //! length form traversals `X -> S -> Y`; at a repeat with two entries and two exits these give
 //! the two pairings (the "master" and the recombinant configuration) and the minority share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -26,7 +26,7 @@ pub type Oriented = (usize, bool);
 pub struct Graph {
     pub names: Vec<String>,
     pub seqs: Vec<Vec<u8>>,
-    /// (from, to) with GFA orientation.
+    /// Unique physical adjacencies (from, to) with GFA orientation.
     pub links: Vec<(Oriented, Oriented)>,
     /// Overlap (bp) of each link: the end of `from` equals the start of `to` over this length.
     pub overlaps: Vec<usize>,
@@ -73,6 +73,7 @@ pub fn parse_gfa(path: &Path) -> Result<Graph> {
             g.seqs.push(f[2].as_bytes().to_ascii_uppercase());
         }
     }
+    let mut adjacencies = BTreeSet::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         if f.first() != Some(&"L") {
@@ -98,8 +99,13 @@ pub fn parse_gfa(path: &Path) -> Result<Graph> {
         if overlap >= g.seqs[a.0].len() || overlap >= g.seqs[b.0].len() {
             bail!("link {line:?}: overlap is not shorter than both segments");
         }
-        g.links.push((a, b));
-        g.overlaps.push(overlap);
+        // Some producers emit both A -> B and reverse-complement B -> A.
+        // These are the same adjacency, not competing read assignments. Different
+        // orientations or overlaps still describe distinct candidate junctions.
+        if adjacencies.insert((Graph::link_key(a, b), overlap)) {
+            g.links.push((a, b));
+            g.overlaps.push(overlap);
+        }
     }
     Ok(g)
 }
@@ -451,6 +457,17 @@ fn canonical_walk(w: &[Oriented]) -> Vec<Oriented> {
     } else {
         rc
     }
+}
+
+fn observed_walk_counts(read_walks: &[Vec<Vec<Oriented>>]) -> BTreeMap<Vec<Oriented>, u64> {
+    let mut counts = BTreeMap::new();
+    for ws in read_walks {
+        let unique: BTreeSet<_> = ws.iter().map(|w| canonical_walk(w)).collect();
+        for w in unique {
+            *counts.entry(w).or_default() += 1;
+        }
+    }
+    counts
 }
 
 /// Traversals X -> S -> Y: three consecutive segments of a walk.
@@ -832,6 +849,9 @@ pub struct RepeatPairing {
 pub struct EvidenceReport {
     pub graph: String,
     pub reads_scanned: u64,
+    /// Longest supplied read, including reads without informative graph alignments.
+    /// Length eligibility does not establish support at a particular repeat locus.
+    pub maximum_read_length: usize,
     pub reads_with_support: u64,
     pub links: Vec<LinkSupport>,
     pub links_supported: usize,
@@ -852,6 +872,10 @@ pub struct EvidenceReport {
     pub median_depth: Option<f64>,
     /// Unique -> repeat(s) -> unique paths observed in single reads, most supported first.
     pub phased_paths: Vec<Traversal>,
+    /// Maximal consecutive junction chains observed within individual reads. Each path is
+    /// counted once per read, merging its reverse complement. Unlike phased_paths, these
+    /// preserve linkage between multiple repeat contexts; marginal counts cannot recover it.
+    pub observed_walks: Vec<Traversal>,
     pub params: serde_json::Value,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
@@ -916,6 +940,7 @@ pub fn run(
     let mut link_ambiguous = vec![0u64; g.links.len()];
     let mut traversal_reads: BTreeMap<(Oriented, Oriented, Oriented), u64> = BTreeMap::new();
     let (mut scanned, mut supported) = (0u64, 0u64);
+    let mut maximum_read_length = 0;
     type PerRead = (
         Vec<Crossing>,
         Vec<usize>,
@@ -927,6 +952,8 @@ pub fn run(
     let mut read_walks: Vec<Vec<Vec<Oriented>>> = Vec::new();
     for batch in rx {
         scanned += batch.len() as u64;
+        maximum_read_length =
+            maximum_read_length.max(batch.iter().map(|r| r.seq.len()).max().unwrap_or(0));
         let per_read: Vec<PerRead> = batch
             .par_iter()
             .map(|r| {
@@ -1128,6 +1155,7 @@ pub fn run(
     let report = EvidenceReport {
         graph: gfa.display().to_string(),
         reads_scanned: scanned,
+        maximum_read_length,
         reads_with_support: supported,
         links_supported: link_reads.iter().filter(|&&n| n > 0).count(),
         links,
@@ -1161,6 +1189,15 @@ pub fn run(
             v.sort_by(|a, b| b.reads.cmp(&a.reads).then_with(|| a.path.cmp(&b.path)));
             v
         },
+        observed_walks: {
+            observed_walk_counts(&read_walks)
+                .into_iter()
+                .map(|(w, reads)| Traversal {
+                    path: w.iter().map(|&o| g.label(o)).collect::<Vec<_>>().join(" "),
+                    reads,
+                })
+                .collect()
+        },
         params: serde_json::json!({
             "k": p.k, "flank": p.flank, "min_anchor": p.min_anchor, "diag_tol": p.diag_tol,
             "min_side_hits": p.min_side_hits, "spacing_tol": p.spacing_tol, "bootstrap": p.bootstrap,
@@ -1179,11 +1216,69 @@ pub fn run(
 mod tests {
     use super::*;
 
+    #[test]
+    fn joint_walks_keep_repeat_linkage_and_count_once_per_read() {
+        let a = vec![(0, true), (1, true), (2, true), (3, true), (4, true)];
+        let b = vec![(0, true), (1, true), (5, true), (3, true), (6, true)];
+        let rc: Vec<_> = a.iter().rev().map(|&o| flip(o)).collect();
+        let counts = observed_walk_counts(&[
+            vec![a.clone(), a.clone(), rc],
+            vec![a.clone()],
+            vec![b.clone()],
+        ]);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[&canonical_walk(&a)], 2);
+        assert_eq!(counts[&canonical_walk(&b)], 1);
+        assert!(counts.keys().all(|w| w.len() == 5));
+    }
+
     fn rng_seq(n: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;
         (0..n)
             .map(|_| b"ACGT"[(splitmix(&mut s) % 4) as usize])
             .collect()
+    }
+
+    #[test]
+    fn longest_uninformative_read_is_recorded_without_inventing_support() {
+        let directory =
+            std::env::temp_dir().join(format!("ovasm-evidence-length-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let a = rng_seq(1000, 281);
+        let b = rng_seq(1000, 282);
+        let graph = directory.join("graph.gfa");
+        fs::write(
+            &graph,
+            format!(
+                "S\tA\t{}\nS\tB\t{}\nL\tA\t+\tB\t+\t0M\n",
+                String::from_utf8_lossy(&a),
+                String::from_utf8_lossy(&b)
+            ),
+        )
+        .unwrap();
+        let reads = directory.join("reads.fasta");
+        fs::write(
+            &reads,
+            format!(
+                ">informative\n{}{}\n>long-unrelated\n{}\n",
+                String::from_utf8_lossy(&a[600..]),
+                String::from_utf8_lossy(&b[..400]),
+                String::from_utf8_lossy(&rng_seq(3000, 283))
+            ),
+        )
+        .unwrap();
+        let report = run(
+            &graph,
+            vec![reads],
+            params(),
+            &directory.join("evidence.json"),
+        )
+        .unwrap();
+        assert_eq!(report.reads_scanned, 2);
+        assert_eq!(report.maximum_read_length, 3000);
+        assert_eq!(report.reads_with_support, 1);
+        assert_eq!(report.links[0].reads, 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn params() -> EvidenceParams {
@@ -1313,6 +1408,68 @@ mod tests {
             overlaps: vec![0; 4],
         };
         (g, [a, b, c, d, r])
+    }
+
+    #[test]
+    fn mirrored_gfa_links_preserve_read_support_and_repeat_pairing() {
+        let (original, [a, b, _, _, r]) = repeat_graph();
+        let mut text = String::new();
+        for (name, seq) in original.names.iter().zip(&original.seqs) {
+            text.push_str(&format!("S\t{name}\t{}\n", String::from_utf8_lossy(seq)));
+        }
+        for &(from, to) in &original.links {
+            for (x, y) in [(from, to), (flip(to), flip(from)), (from, to)] {
+                text.push_str(&format!(
+                    "L\t{}\t{}\t{}\t{}\t0M\n",
+                    original.names[x.0],
+                    if x.1 { '+' } else { '-' },
+                    original.names[y.0],
+                    if y.1 { '+' } else { '-' },
+                ));
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("ovasm-mirrored-links-{}.gfa", std::process::id()));
+        fs::write(&path, text).unwrap();
+        let graph = parse_gfa(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(graph.links, original.links);
+        let idx = build_index(&graph, &params());
+        let read = cat(&[&a[1400..], &r, &b[..600]]);
+        for read in [read.clone(), revcomp(&read)] {
+            let (kept, ambiguous) = assign(&graph, crossings(&read, &idx, &params()), 0.05);
+            let mut links: Vec<_> = kept.iter().map(|c| c.link).collect();
+            links.sort();
+            assert_eq!(links, vec![0, 2]);
+            assert!(ambiguous.is_empty());
+            let tr = traversals(&graph, &read_steps(&graph, &kept), 0.05);
+            assert_eq!(tr.len(), 1, "the read resolves A -> R -> B");
+        }
+    }
+
+    #[test]
+    fn mirrored_gfa_dedup_keeps_different_orientations_and_overlaps() {
+        let path =
+            std::env::temp_dir().join(format!("ovasm-distinct-links-{}.gfa", std::process::id()));
+        fs::write(
+            &path,
+            "S\tA\tACGTACGT\nS\tB\tACGTACGT\n\
+            L\tA\t+\tB\t+\t0M\nL\tB\t-\tA\t-\t0M\n\
+            L\tA\t+\tB\t+\t2M\nL\tB\t-\tA\t-\t2M\n\
+            L\tA\t+\tB\t-\t0M\nL\tB\t+\tA\t-\t0M\n",
+        )
+        .unwrap();
+        let graph = parse_gfa(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            graph.links,
+            vec![
+                ((0, true), (1, true)),
+                ((0, true), (1, true)),
+                ((0, true), (1, false))
+            ]
+        );
+        assert_eq!(graph.overlaps, vec![0, 2, 0]);
     }
 
     /// S -> U1 and S -> U2, where U1 and U2 begin with `shared` bp of identical sequence.

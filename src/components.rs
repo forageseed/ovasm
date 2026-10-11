@@ -10,8 +10,10 @@
 //! kept when it is the reference, when it holds target genes at a depth that is not far below
 //! the reference's, or when it holds no genes and its depth is close to the reference's (the
 //! small circles of a multi-chromosome mitochondrion may hold no panel gene at all); it is
-//! removed when its genes are the other organelle's or when its depth is elsewhere. Without
-//! a reference nothing is removed. Every component, kept or removed, is in the JSON report
+//! removed when its genes are the other organelle's or when its depth is elsewhere. Optional
+//! original-read context can exclude an unmarked component when every associated read
+//! favors nuclear context and those reads cover its full sequence. Missing, shared and
+//! unresolved evidence leaves the original rule unchanged. Every component is in the report
 //! with its length, depth, genes and the reason.
 //!
 //! The thresholds were set on cases whose published genomes had been seen (see
@@ -22,7 +24,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashSet;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::evidence::parse_gfa;
 use crate::panel::{sequence_genes, Panel, PanelParams};
@@ -31,6 +34,18 @@ use crate::panel::{sequence_genes, Panel, PanelParams};
 /// later Oatk species, reads pooled from seeds and depth clusters), not from unseen data.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentParams {
+    /// Original-read context evidence. Without it the existing panel/depth rule applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_origins: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_assigned_gfa: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_unassigned_gfa: Option<PathBuf>,
+    /// An independent component with only the other organelle's genes is excluded. Target
+    /// genes, including a single one, prevent this stricter call; gene-free components still
+    /// use the depth rule. Enabled only by the multichrom primary-sequence profile.
+    #[serde(skip_serializing_if = "is_false")]
+    pub reject_other_only: bool,
     /// A component without genes is kept when its depth is within this factor of the
     /// reference's, either way. Components without genes that are in no published genome sat
     /// at 0.09-0.45 of the reference depth (0.45: a 14.5 kb circle beside the Climacium
@@ -57,6 +72,10 @@ pub struct ComponentParams {
 impl Default for ComponentParams {
     fn default() -> Self {
         Self {
+            read_origins: None,
+            out_assigned_gfa: None,
+            out_unassigned_gfa: None,
+            reject_other_only: false,
             depth_factor: 2.0,
             gene_depth_factor: 2.5,
             min_other_genes: 5,
@@ -65,6 +84,65 @@ impl Default for ComponentParams {
             min_hits: 5,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SegmentOrigin {
+    pub segment: String,
+    #[serde(skip_serializing)]
+    pub sequence: String,
+    pub associated_reads: u64,
+    pub nuclear_context_reads: u64,
+    pub periodic_compatible_reads: u64,
+    pub unresolved_reads: u64,
+    pub nuclear_covered_intervals: Vec<(usize, usize)>,
+}
+
+impl SegmentOrigin {
+    fn nuclear_only(&self) -> Result<bool> {
+        if self.associated_reads
+            != self.nuclear_context_reads + self.periodic_compatible_reads + self.unresolved_reads
+        {
+            bail!("read-origin counts disagree for {}", self.segment);
+        }
+        let mut intervals = self.nuclear_covered_intervals.clone();
+        for &(a, b) in &intervals {
+            if a >= b || b > self.sequence.len() {
+                bail!("read-origin interval outside {}", self.segment);
+            }
+        }
+        intervals.sort_unstable();
+        let mut end = 0;
+        for (a, b) in intervals {
+            if a > end {
+                return Ok(false);
+            }
+            end = end.max(b);
+        }
+        Ok(self.associated_reads > 0
+            && self.nuclear_context_reads == self.associated_reads
+            && end == self.sequence.len())
+    }
+}
+
+#[derive(Deserialize)]
+struct ReadOrigins {
+    schema: String,
+    original_reads: String,
+    scanned_reads: u64,
+    scope: String,
+    segments: Vec<SegmentOrigin>,
+}
+
+#[derive(Serialize)]
+pub struct ReadOriginInput {
+    original_reads: String,
+    scanned_reads: u64,
+    scope: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What the rule looks at in one component.
@@ -111,7 +189,9 @@ pub fn decide(stats: &[Stat], p: &ComponentParams) -> (Option<usize>, Vec<(bool,
             let Some(d) = s.depth else {
                 return (true, "no_depth");
             };
-            if s.other_genes >= p.min_other_genes && s.other_genes >= 2 * s.target_genes {
+            if p.reject_other_only && s.target_genes == 0 && s.other_genes > 0 {
+                (false, "other_organelle_only")
+            } else if s.other_genes >= p.min_other_genes && s.other_genes >= 2 * s.target_genes {
                 (false, "other_organelle")
             } else if s.target_genes > 0 {
                 if d * p.gene_depth_factor >= ref_depth {
@@ -150,6 +230,12 @@ pub struct ComponentReport {
     /// "other_organelle", "target_genes_but_depth_far_below_reference", "depth_below_reference",
     /// "depth_above_reference" (removed).
     pub reason: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_origin_evidence: Vec<SegmentOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_origin_status: Option<&'static str>,
+    /// Source competition can prevent target assignment without excluding sequence.
+    pub target_assignment: &'static str,
 }
 
 #[derive(Serialize)]
@@ -159,9 +245,11 @@ pub struct ComponentsReport {
     pub graph: String,
     pub organelle: String,
     pub params: ComponentParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_origin_input: Option<ReadOriginInput>,
     pub panel_proteins: usize,
     pub panel_genes: usize,
-    /// `id` of the reference component (None: no component holds target genes, nothing removed).
+    /// `id` of the reference component (None: the panel/depth rule removes nothing).
     pub reference_component: Option<usize>,
     pub reference_depth: Option<f64>,
     pub kept_components: usize,
@@ -304,15 +392,116 @@ pub fn run(
         genes.push((target.gene_segments, other.gene_segments));
     }
     let (reference, calls) = decide(&stats, p);
+    let mut read_origin_input = None;
+    let origins: Vec<SegmentOrigin> = if let Some(path) = &p.read_origins {
+        let evidence: ReadOrigins = serde_json::from_str(&fs::read_to_string(path)?)?;
+        if evidence.schema != "ovasm.read-origins.v1"
+            || evidence.original_reads.is_empty()
+            || evidence.scanned_reads == 0
+        {
+            bail!("read-origin evidence needs original reads and a nonzero scanned count");
+        }
+        let mut seen = FxHashSet::default();
+        for origin in &evidence.segments {
+            if !seen.insert(&origin.segment) {
+                bail!("duplicate read-origin segment {}", origin.segment);
+            }
+            let Some(i) = g.names.iter().position(|n| n == &origin.segment) else {
+                bail!(
+                    "read-origin segment {} is absent from graph",
+                    origin.segment
+                );
+            };
+            if g.seqs[i] != origin.sequence.as_bytes() {
+                bail!(
+                    "read-origin sequence differs from graph segment {}",
+                    origin.segment
+                );
+            }
+            origin.nuclear_only()?;
+        }
+        read_origin_input = Some(ReadOriginInput {
+            original_reads: evidence.original_reads,
+            scanned_reads: evidence.scanned_reads,
+            scope: evidence.scope,
+        });
+        evidence.segments
+    } else {
+        Vec::new()
+    };
     let reference_depth = reference.and_then(|r| stats[r].depth);
     let mut removed: FxHashSet<&str> = FxHashSet::default();
     let mut components = Vec::new();
     for (id, (((part, stat), (target_genes, other_genes)), &(kept, reason))) in
         parts.iter().zip(&stats).zip(genes).zip(&calls).enumerate()
     {
+        let read_origin_evidence: Vec<SegmentOrigin> = origins
+            .iter()
+            .filter(|o| part.iter().any(|&s| g.names[s] == o.segment))
+            .cloned()
+            .collect();
+        let nuclear_only = !part.is_empty()
+            && read_origin_evidence.len() == part.len()
+            && read_origin_evidence
+                .iter()
+                .map(|o| o.nuclear_only())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .all(|v| v);
+        // The producer compares one periodic sequence. A multi-segment path or
+        // an inversion needs its own competing path model, not a per-unitig circle.
+        let periodic_model_applies = part.len() == 1
+            && g.links.iter().any(|&(a, b)| a.0 == part[0] && a == b)
+            && g.links.iter().all(|&(a, b)| a.0 != part[0] || a == b);
+        let read_origin_status = if read_origin_evidence.is_empty() {
+            None
+        } else if read_origin_evidence.len() != part.len() {
+            Some("incomplete_component_evidence")
+        } else if !periodic_model_applies {
+            Some("unsupported_component_path_model")
+        } else if nuclear_only {
+            Some(if target_genes.is_empty() && other_genes.is_empty() {
+                "nuclear_context_only"
+            } else {
+                "marker_protected"
+            })
+        } else if read_origin_evidence
+            .iter()
+            .any(|o| o.periodic_compatible_reads > 0)
+        {
+            Some("periodic_compatible_or_shared")
+        } else if read_origin_evidence.iter().any(|o| o.unresolved_reads > 0) {
+            Some("unresolved_context")
+        } else {
+            Some("incomplete_nuclear_coverage")
+        };
+        // A marker-bearing target or any compatible/unresolved original read vetoes removal.
+        let (kept, reason) = if periodic_model_applies
+            && nuclear_only
+            && target_genes.is_empty()
+            && other_genes.is_empty()
+        {
+            (false, "nuclear_read_context")
+        } else {
+            (kept, reason)
+        };
         if !kept {
             removed.extend(part.iter().map(|&s| g.names[s].as_str()));
         }
+        let target_assignment = if !kept {
+            "excluded"
+        } else if periodic_model_applies
+            && read_origin_evidence.len() == part.len()
+            && target_genes.is_empty()
+            && other_genes.is_empty()
+            && read_origin_evidence.iter().any(|o| o.nuclear_context_reads > 0)
+        {
+            // An alternative source is observed. Compatible periodic reads and
+            // missing context prevent exclusion, but depth cannot settle origin.
+            "unassigned"
+        } else {
+            "candidate_target"
+        };
         components.push(ComponentReport {
             id,
             segments: part.iter().map(|&s| g.names[s].clone()).collect(),
@@ -326,7 +515,21 @@ pub fn run(
             other_genes,
             kept,
             reason,
+            read_origin_evidence,
+            read_origin_status,
+            target_assignment,
         });
+    }
+    for (path, assignment) in [
+        (&p.out_assigned_gfa, "candidate_target"),
+        (&p.out_unassigned_gfa, "unassigned"),
+    ] {
+        if let Some(path) = path {
+            let omit: FxHashSet<&str> = components.iter()
+                .filter(|c| c.target_assignment != assignment)
+                .flat_map(|c| c.segments.iter().map(String::as_str)).collect();
+            fs::write(path, filter_gfa(&text, &omit).0)?;
+        }
     }
     let (filtered, removed_lines) = filter_gfa(&text, &removed);
     fs::create_dir_all(out_gfa.parent().unwrap_or(Path::new(".")))?;
@@ -341,6 +544,7 @@ pub fn run(
         graph: gfa.display().to_string(),
         organelle: organelle.to_string(),
         params: p.clone(),
+        read_origin_input,
         panel_proteins,
         panel_genes,
         reference_component: reference,
@@ -371,7 +575,7 @@ pub fn summary(r: &ComponentsReport) -> String {
         r.removed_components,
         r.removed_length,
         r.reference_depth
-            .map_or("none (nothing removed)".to_string(), |d| format!("{d:.1}")),
+            .map_or("none".to_string(), |d| format!("{d:.1}")),
     );
     for c in r.components.iter().filter(|c| !c.kept) {
         let _ = writeln!(
@@ -392,6 +596,30 @@ pub fn summary(r: &ComponentsReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_only_rule_preserves_target_genes_and_gene_free_chromosomes() {
+        let stats = [
+            stat(500_000, 100.0, 15, 0),
+            stat(20_000, 100.0, 0, 1),
+            stat(20_000, 100.0, 0, 0),
+            stat(20_000, 100.0, 1, 2),
+        ];
+        let (_, old) = decide(&stats, &ComponentParams::default());
+        assert!(old.iter().all(|x| x.0));
+        let (_, new) = decide(
+            &stats,
+            &ComponentParams {
+                reject_other_only: true,
+                ..ComponentParams::default()
+            },
+        );
+        assert_eq!(
+            new.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![true, false, true, true]
+        );
+        assert_eq!(new[1].1, "other_organelle_only");
+    }
 
     const RESIDUES: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
     /// One codon per residue, in the order of `RESIDUES`.
@@ -761,5 +989,158 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn original_read_filter_removes_only_fully_explained_unmarked_components() {
+        let dir = std::env::temp_dir().join(format!("ovasm-read-origin-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let sequences = [
+            ("marker", gene(1)),
+            ("nuclear", noncoding(500, 20)),
+            ("gene_free_circle", noncoding(500, 21)),
+            ("shared", noncoding(500, 22)),
+            ("unresolved", noncoding(500, 23)),
+            ("gap", noncoding(500, 24)),
+            ("multi_a", noncoding(500, 25)),
+            ("multi_b", noncoding(500, 26)),
+        ];
+        let mut graph: String = sequences
+            .iter()
+            .map(|(name, seq)| format!("S\t{name}\t{seq}\tdp:f:100\nL\t{name}\t+\t{name}\t+\t0M\n"))
+            .collect();
+        graph += "L\tmulti_a\t+\tmulti_b\t+\t0M\n";
+        fs::write(dir.join("g.gfa"), graph).unwrap();
+        let baseline = run(
+            &dir.join("g.gfa"),
+            "mitochondrion",
+            &panel(),
+            &ComponentParams::default(),
+            &dir.join("before.gfa"),
+            &dir.join("before.json"),
+        )
+        .unwrap();
+        assert_eq!(baseline.kept_components, 7);
+        let mut origins: Vec<SegmentOrigin> = sequences
+            .iter()
+            .map(|(name, seq)| SegmentOrigin {
+                segment: name.to_string(),
+                sequence: seq.clone(),
+                associated_reads: 2,
+                nuclear_context_reads: 2,
+                periodic_compatible_reads: 0,
+                unresolved_reads: 0,
+                nuclear_covered_intervals: vec![(0, seq.len())],
+            })
+            .collect();
+        origins[2].nuclear_context_reads = 0;
+        origins[2].periodic_compatible_reads = 2;
+        origins[3].nuclear_context_reads = 1;
+        origins[3].periodic_compatible_reads = 1;
+        origins[4].nuclear_context_reads = 1;
+        origins[4].unresolved_reads = 1;
+        origins[5].nuclear_covered_intervals = vec![(0, 200), (201, 500)];
+        // Sequence is omitted from the output report, but is required in input evidence.
+        let entries: Vec<serde_json::Value> = origins
+            .iter()
+            .map(|o| {
+                let mut v = serde_json::to_value(o).unwrap();
+                v["sequence"] = o.sequence.clone().into();
+                v
+            })
+            .collect();
+        let mut document = serde_json::json!({"schema":"ovasm.read-origins.v1",
+            "original_reads":"fixture.fastq", "scanned_reads":16,
+            "scope":"controlled complete read-context comparisons", "segments":entries});
+        let origin_path = dir.join("origins.json");
+        fs::write(&origin_path, document.to_string()).unwrap();
+        let p = ComponentParams {
+            read_origins: Some(origin_path.clone()),
+            out_assigned_gfa: Some(dir.join("assigned.gfa")),
+            out_unassigned_gfa: Some(dir.join("unassigned.gfa")),
+            ..ComponentParams::default()
+        };
+        let after = run(
+            &dir.join("g.gfa"),
+            "mitochondrion",
+            &panel(),
+            &p,
+            &dir.join("after.gfa"),
+            &dir.join("after.json"),
+        )
+        .unwrap();
+        assert_eq!((after.kept_components, after.removed_components), (6, 1));
+        assert_eq!(after.components[2].target_assignment, "candidate_target");
+        assert_eq!(after.components[3].target_assignment, "unassigned");
+        assert_eq!(after.components[4].target_assignment, "unassigned");
+        assert_eq!(after.components[5].target_assignment, "unassigned");
+        assert_eq!(after.components[6].target_assignment, "candidate_target");
+        let assigned = fs::read_to_string(dir.join("assigned.gfa")).unwrap();
+        let unassigned = fs::read_to_string(dir.join("unassigned.gfa")).unwrap();
+        assert!(assigned.contains("S\tgene_free_circle\t"));
+        assert!(!assigned.contains("S\tshared\t"));
+        assert!(unassigned.contains("S\tshared\t"));
+        assert!(unassigned.contains("S\tunresolved\t"));
+        assert_eq!(after.components[1].reason, "nuclear_read_context");
+        assert!(after.components[0].kept);
+        assert!(after.components[2..].iter().all(|c| c.kept));
+        let output = fs::read_to_string(dir.join("after.gfa")).unwrap();
+        assert!(!output.contains("\tnuclear\t"));
+        assert!(output.contains("\tgene_free_circle\t"));
+        assert_eq!(
+            after.components[1].read_origin_evidence[0].associated_reads,
+            2
+        );
+        document["segments"][1]["sequence"] = "wrong graph".into();
+        fs::write(&origin_path, document.to_string()).unwrap();
+        assert!(run(
+            &dir.join("g.gfa"),
+            "mitochondrion",
+            &panel(),
+            &p,
+            &dir.join("stale.gfa"),
+            &dir.join("stale.json")
+        )
+        .is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    fn certificate() -> SegmentOrigin {
+        SegmentOrigin {
+            segment: "repeat".into(),
+            sequence: "ACGTACGT".into(),
+            associated_reads: 2,
+            nuclear_context_reads: 2,
+            periodic_compatible_reads: 0,
+            unresolved_reads: 0,
+            nuclear_covered_intervals: vec![(0, 4), (4, 8)],
+        }
+    }
+    #[test]
+    fn all_reads_and_full_sequence_needed() {
+        let mut o = certificate();
+        assert!(o.nuclear_only().unwrap());
+        o.nuclear_covered_intervals = vec![(0, 3), (4, 8)];
+        assert!(!o.nuclear_only().unwrap());
+        o.nuclear_covered_intervals = vec![(0, 8)];
+        o.nuclear_context_reads = 1;
+        o.periodic_compatible_reads = 1;
+        assert!(!o.nuclear_only().unwrap());
+        o.periodic_compatible_reads = 0;
+        o.unresolved_reads = 1;
+        assert!(!o.nuclear_only().unwrap());
+    }
+    #[test]
+    fn invalid_counts_and_coordinates_are_errors() {
+        let mut o = certificate();
+        o.associated_reads = 3;
+        assert!(o.nuclear_only().is_err());
+        o.associated_reads = 2;
+        o.nuclear_covered_intervals = vec![(0, 9)];
+        assert!(o.nuclear_only().is_err());
     }
 }

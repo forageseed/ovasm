@@ -11,7 +11,7 @@ name = "ovasm"
 path = "src/main.rs"
 
 [dependencies]
-# Pure-Rust gzip only (no bzip2/xz/zstd C libraries) so Windows builds need no system toolchain.
+# Portable gzip uses Rust; the Linux native multichrom kernel also requires C and zlib.
 needletail = { version = "0.6", default-features = false, features = ["flate2"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rayon = "1.10"
