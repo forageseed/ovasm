@@ -10,11 +10,10 @@
 
 ## 为什么用 ovasm
 
-- **原始数据只扫一遍。** 一次挑出细胞器 reads，之后的计算都在这一小份数据上做。
+- **按任务选择输入范围。** 常规组装先招募细胞器 reads；多染色体建图使用原始全基因组 HiFi reads，保留独立组件。
 - **输出带证据的组装图，而不只是序列。** 每个连接点都有支持它的 reads 数；`molecules.fasta` 是代表分子。
   reads 分不出结构时，`decisive` 会写 `false`，不会悄悄猜一个。
-- **一个程序，不用配环境。** 不需要 conda、容器或系统库（gzip 是纯 Rust 实现），还内置了种子库，
-  连参考文件都不用准备。在 Linux 和 Windows 上测试过。
+- **单个程序，内置种子库。** 常规阶段使用 Rust gzip；多染色体原生内核在 Linux 上运行，编译需要 C 工具链和 zlib 开发头文件。种子参考可选。
 - **直接可用于泛基因组。** 图同时写成 OV-GFA，`ovasm pan` 可以把多个样本合并。
 
 ## 安装
@@ -212,3 +211,22 @@ OrganelleVerse 通过环境变量 `ORG_VERSE_OVASM_BIN` 或 `PATH` 找到这个�
 ## 许可证
 
 MIT
+
+
+## 多染色体与宽松、严格双评分
+
+Linux 构建包含带来源署名的 Syncasm 多染色体图内核。编译前安装 C 工具链与 zlib 开发包（Debian/Ubuntu：`sudo apt-get install build-essential zlib1g-dev`）。原生多染色体建图使用原始 WGS HiFi reads，并显式传入根据读段覆盖估计的 `--min-count`，不能照真值选阈值：
+
+```bash
+ovasm assemble --reads sample.hifi.fastq.gz --multichrom-graph --min-count <读段覆盖导出的阈值> --out graph.gfa --out-json graph.json --threads 8
+```
+
+`ovasm components` 可接收 `--read-origins` 来源证据，分别输出 `--out-assigned-gfa` 和 `--out-unassigned-gfa`；来源未定组件继续保留。`ovasm primary` 按图重叠坐标导出代表序列记录。具体参数见各命令的 `--help`。macOS/Windows 保留可移植阶段；此原生内核需要 Linux 计算环境。
+
+[打分脚本](scripts/assembly_benchmarks/score_independent_multichrom.py) 对同一份完整输出给出两种分数：宽松分要求每条参考都有独立、完整、准确的匹配，允许额外记录；严格分还要求记录一一对应，总长偏差和额外序列比例均不超过 0.1%。两者的一致性下限均为 99.99%，候选与参考覆盖下限均为 99.9%。分数是 0/1 的验收值，报告同时列出逐参考结果与额外序列；旧 `accepted` 字段仍表示严格结果。缺失参考、合并参考、低一致性和空输出，两种评分都不通过。
+
+```bash
+python scripts/assembly_benchmarks/score_independent_multichrom.py --truth reference.fasta --candidate all-output.fasta --circular-identifiers circular-reference-ids.json --minimap2 /path/to/minimap2 --output scores/
+```
+
+环状参考 ID 文件是 JSON 列表，没有明确环状注释时用 `[]`。参考只用于组装后的评分，不参与建图和来源筛选。已有 Schoenoplectus 开发数据中，8/8 条参考精确匹配，仍有 7 条额外记录 / 12,862 bp：宽松通过、严格失败。这是已看数据；FASTA 记录数与序列匹配不证明物理染色体数、构型或细胞器来源。

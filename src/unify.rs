@@ -630,48 +630,55 @@ pub fn run(
         };
         // (haplotype, molecule number, molecule) in output order
         let mut chosen: Vec<(usize, usize, &Value)> = Vec::new();
-        match lin["components"].as_array() {
-            // unringing: each component's best cover is one set of molecules; its near-tied
-            // alternative covers (same molecule count) are further haplotypes of them
-            Some(comps) => {
-                let mut offset = 0;
-                for c in comps.iter().filter(|c| c["best"].is_object()) {
-                    let mut covers = vec![&c["best"]];
-                    if c["decisive"] == Value::Bool(false) {
-                        covers.extend(
-                            c["alternatives"]
+        if lin["representation"] == "primary_path_and_unplaced_segments" {
+            let records = lin["records"]
+                .as_array()
+                .context("primary representation without records")?;
+            chosen.extend(records.iter().enumerate().map(|(i, r)| (0, i, r)));
+        } else {
+            match lin["components"].as_array() {
+                // unringing: each component's best cover is one set of molecules; its near-tied
+                // alternative covers (same molecule count) are further haplotypes of them
+                Some(comps) => {
+                    let mut offset = 0;
+                    for c in comps.iter().filter(|c| c["best"].is_object()) {
+                        let mut covers = vec![&c["best"]];
+                        if c["decisive"] == Value::Bool(false) {
+                            covers.extend(
+                                c["alternatives"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|a| near(&c["best"], a))
+                                    .take(p.max_alternatives),
+                            );
+                        }
+                        for (hap, cover) in covers.iter().enumerate() {
+                            for (j, m) in cover["molecules"]
                                 .as_array()
                                 .into_iter()
                                 .flatten()
-                                .filter(|a| near(&c["best"], a))
-                                .take(p.max_alternatives),
-                        );
-                    }
-                    for (hap, cover) in covers.iter().enumerate() {
-                        for (j, m) in cover["molecules"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .enumerate()
-                        {
-                            chosen.push((hap, offset + j, m));
+                                .enumerate()
+                            {
+                                chosen.push((hap, offset + j, m));
+                            }
                         }
+                        offset += c["best"]["molecules"].as_array().map_or(0, Vec::len);
                     }
-                    offset += c["best"]["molecules"].as_array().map_or(0, Vec::len);
                 }
-            }
-            // a report from before unringing: one path and its alternatives
-            None => {
-                if lin["best"].is_object() {
-                    chosen.push((0, 0, &lin["best"]));
-                    if lin["decisive"] == Value::Bool(false) {
-                        let alts = lin["alternatives"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|a| near(&lin["best"], a))
-                            .take(p.max_alternatives);
-                        chosen.extend(alts.enumerate().map(|(h, a)| (h + 1, 0, a)));
+                // a report from before unringing: one path and its alternatives
+                None => {
+                    if lin["best"].is_object() {
+                        chosen.push((0, 0, &lin["best"]));
+                        if lin["decisive"] == Value::Bool(false) {
+                            let alts = lin["alternatives"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|a| near(&lin["best"], a))
+                                .take(p.max_alternatives);
+                            chosen.extend(alts.enumerate().map(|(h, a)| (h + 1, 0, a)));
+                        }
                     }
                 }
             }
@@ -704,6 +711,9 @@ pub fn run(
             )?;
             if circular {
                 gfa_out.push_str("\tTP:Z:circular");
+            }
+            if let Some(kind @ ("primary_path" | "unplaced_segment")) = c["kind"].as_str() {
+                write!(gfa_out, "\trk:Z:{kind}\tcf:Z:unresolved")?;
             }
             gfa_out.push('\n');
             paths.push(path_name);

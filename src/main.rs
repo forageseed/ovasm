@@ -13,10 +13,12 @@ mod linearize;
 mod pan;
 mod panel;
 mod pipeline;
+mod primary;
 mod recruit;
 mod replicate;
 mod seeddb;
 mod seedfree;
+mod syncasm;
 mod unify;
 
 use std::path::PathBuf;
@@ -45,6 +47,9 @@ enum Command {
     Evidence(EvidenceArgs),
     /// Representative linear (or circular) sequence through read-supported phased paths.
     Linearize(LinearizeArgs),
+    /// Export a depth-constrained primary path and unplaced graph segments per component.
+    /// These assembly records are not certificates of physical chromosome count.
+    Primary(PrimaryArgs),
     /// Rewrite a backend's assembly graph as OV-GFA v1: blunt links, PanSN paths, common tags.
     Unify(UnifyArgs),
     /// Merge samples' OV-GFA graphs into one pangenome graph, keeping every configuration path.
@@ -362,6 +367,10 @@ struct AssembleArgs {
     /// Minimum reads for a node or an edge (default: a tenth of the typical node depth, >= 3).
     #[arg(long)]
     min_count: Option<u32>,
+    /// Use the attributed, embedded Syncasm correction and repeat-unzipping kernel (Linux).
+    /// Requires --min-count from read coverage; k defaults to 1001 compressed runs.
+    #[arg(long)]
+    multichrom_graph: bool,
     #[arg(long)]
     threads: Option<usize>,
     /// Output assembly graph (GFA, exact nM overlaps).
@@ -372,54 +381,112 @@ struct AssembleArgs {
 }
 
 fn assemble(args: AssembleArgs) -> Result<()> {
+    if args.multichrom_graph {
+        let cutoff = args
+            .min_count
+            .context("--multichrom-graph requires --min-count derived from read coverage")?;
+        let r = syncasm::run(
+            args.reads,
+            args.k.unwrap_or(1001),
+            args.s,
+            cutoff,
+            args.threads.unwrap_or(8),
+            &args.out,
+            &args.out_json,
+        )?;
+        eprintln!(
+            "[ovasm] native Syncasm: {} unitigs, {} bp, {:.1}s",
+            r.unitigs, r.total_length, r.elapsed_seconds
+        );
+        return Ok(());
+    }
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()?;
     }
-    let r = match args.k {
-        None if args.s != 0 => {
-            let r = assemble::run_auto_k(
-                args.reads,
-                args.s,
-                args.min_count,
-                args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
-                &args.out,
-                &args.out_json,
-            )?;
-            let tried: Vec<String> = r
-                .k_tried
-                .iter()
-                .map(|(k, d)| format!("k {k}: node depth {d:.0}"))
-                .collect();
-            eprintln!("[ovasm] automatic k {} ({})", r.k, tried.join(", "));
-            r
-        }
-        k => {
-            let k = match k {
-                Some(k) => k,
-                None => {
-                    let (k, median) = assemble::dense_k(&args.reads)?;
-                    eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}");
-                    k
-                }
-            };
-            assemble::run(
-                args.reads,
-                assemble::AssembleParams {
-                    k,
-                    s: args.s,
-                    min_count: args.min_count,
-                },
-                &args.out,
-                &args.out_json,
-            )?
+    let r = {
+        match args.k {
+            None if args.s != 0 => {
+                let r = assemble::run_auto_k(
+                    args.reads,
+                    args.s,
+                    args.min_count,
+                    args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
+                    &args.out,
+                    &args.out_json,
+                )?;
+                let tried: Vec<String> = r
+                    .k_tried
+                    .iter()
+                    .map(|(k, d)| format!("k {k}: node depth {d:.0}"))
+                    .collect();
+                eprintln!("[ovasm] automatic k {} ({})", r.k, tried.join(", "));
+                r
+            }
+            k => {
+                let k = match k {
+                    Some(k) => k,
+                    None => {
+                        let (k, median) = assemble::dense_k(&args.reads)?;
+                        eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}");
+                        k
+                    }
+                };
+                assemble::run(
+                    args.reads,
+                    assemble::AssembleParams {
+                        k,
+                        s: args.s,
+                        min_count: args.min_count,
+                    },
+                    &args.out,
+                    &args.out_json,
+                )?
+            }
         }
     };
     eprintln!(
         "[ovasm] {} reads; {} sampled k-mers, {} distinct; depth ~{:.0}, min count {}; {} nodes, {} edges -> {} unitigs ({} bp, N50 {}), {} links; {:.1}s",
         r.reads, r.sampled_kmers, r.distinct_nodes, r.node_depth, r.min_count, r.nodes_kept,
         r.edges_kept, r.unitigs, r.total_length, r.n50, r.links, r.elapsed_seconds
+    );
+    Ok(())
+}
+
+#[derive(clap::Args)]
+struct PrimaryArgs {
+    #[arg(long)]
+    gfa: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long)]
+    out_json: PathBuf,
+    /// Maximum segment copies inferred from relative depth.
+    #[arg(long, default_value_t = 10)]
+    max_copy: usize,
+    /// Search expansions per connected component. Exceeding it fails without a primary FASTA.
+    #[arg(long, default_value_t = 1_000_000)]
+    max_steps: usize,
+    /// Prefer a circular path when it covers this fraction of the longest linear path.
+    #[arg(long, default_value_t = 0.9)]
+    circular_fraction: f64,
+}
+
+fn primary(args: PrimaryArgs) -> Result<()> {
+    let report = primary::run(
+        &args.gfa,
+        &args.out,
+        &args.out_json,
+        args.max_copy,
+        args.max_steps,
+        args.circular_fraction,
+    )?;
+    eprintln!(
+        "[ovasm] primary: {} assembly records, {} bp; {} unplaced segments",
+        report.records.len(),
+        report.total_length,
+        report.unplaced_segments
     );
     Ok(())
 }
@@ -497,6 +564,15 @@ struct PanelArgs {
 
 #[derive(clap::Args)]
 struct ComponentsArgs {
+    /// Complete original-read competing-context evidence (ovasm.read-origins.v1 JSON).
+    #[arg(long)]
+    read_origins: Option<PathBuf>,
+    /// Target candidates after abstaining on components with competing origins.
+    #[arg(long)]
+    out_assigned_gfa: Option<PathBuf>,
+    /// Preserved components whose target source cannot be assigned.
+    #[arg(long)]
+    out_unassigned_gfa: Option<PathBuf>,
     /// The assembly graph (GFA with sequences; depth from dp, DP, KC or RC tags).
     #[arg(long)]
     gfa: PathBuf,
@@ -522,6 +598,10 @@ struct ComponentsArgs {
     /// component the other organelle's.
     #[arg(long, default_value_t = 5)]
     min_other_genes: usize,
+    /// Exclude an independent component with other-organelle genes and no target gene.
+    /// Components lacking both classes of genes still use the depth window.
+    #[arg(long)]
+    reject_other_only: bool,
     /// Protein panel FASTA (headers `class|gene|species`); default: the built-in panel.
     #[arg(long)]
     panel: Option<PathBuf>,
@@ -553,9 +633,13 @@ fn components(args: ComponentsArgs) -> Result<()> {
         &args.organelle,
         &panel,
         &components::ComponentParams {
+            read_origins: args.read_origins,
+            out_assigned_gfa: args.out_assigned_gfa,
+            out_unassigned_gfa: args.out_unassigned_gfa,
             depth_factor: args.depth_factor,
             gene_depth_factor: args.gene_depth_factor,
             min_other_genes: args.min_other_genes,
+            reject_other_only: args.reject_other_only,
             k: args.k,
             min_orf: args.min_orf,
             min_hits: args.min_hits,
@@ -1208,6 +1292,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Linearize(args) => linearize(args),
         Command::Unify(args) => unify(args),
         Command::Assemble(args) => assemble(args),
+        Command::Primary(args) => primary(args),
         Command::Correct(args) => correct(args),
         Command::Pan(args) => pan(args),
         Command::Identify(args) => identify(args),

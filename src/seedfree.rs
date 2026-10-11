@@ -91,7 +91,14 @@ fn build_sketch(inputs: &[PathBuf], p: &DiscoverParams, threshold: u64) -> Resul
     Ok(sketch)
 }
 
-/// Mode of the k-mer count histogram above the error spike (count 1).
+fn histogram_peak(hist: &FxHashMap<u32, u64>) -> u32 {
+    hist.iter()
+        .max_by_key(|&(&c, &n)| (n, std::cmp::Reverse(c)))
+        .map_or(1, |(&c, _)| c)
+}
+
+/// Raw mode retained for audits: recurrent sequencing errors can also occur at count 2.
+#[cfg(test)]
 fn nuclear_peak(counts: &FxHashMap<u64, u32>) -> u32 {
     let mut hist: FxHashMap<u32, u64> = FxHashMap::default();
     for &c in counts.values() {
@@ -99,10 +106,58 @@ fn nuclear_peak(counts: &FxHashMap<u64, u32>) -> u32 {
             *hist.entry(c).or_insert(0) += 1;
         }
     }
-    hist.into_iter()
-        .max_by_key(|&(c, n)| (n, std::cmp::Reverse(c)))
-        .map(|(c, _)| c)
-        .unwrap_or(1)
+    histogram_peak(&hist)
+}
+
+/// A recurrent k-mer contributes to the nuclear histogram only when its count agrees
+/// with the middle half of a carrier read's depth profile. This excludes low-count
+/// errors on deeper reads without excluding genuinely shallow genomic sequence.
+fn context_supported_keys(keys: Vec<u64>, counts: &FxHashMap<u64, u32>) -> Vec<u64> {
+    let mut depths: Vec<u32> = keys.iter().map(|key| counts[key]).collect();
+    if depths.is_empty() {
+        return Vec::new();
+    }
+    depths.sort_unstable();
+    let q = |f: f64| depths[((depths.len() - 1) as f64 * f).round() as usize];
+    let (lo, hi) = (q(0.25), q(0.75));
+    keys.into_iter()
+        .filter(|key| {
+            let count = counts[key];
+            count >= 2 && count >= lo && count <= hi
+        })
+        .collect()
+}
+
+fn read_context_histogram(
+    inputs: &[PathBuf],
+    sketch: &Sketch,
+    p: &DiscoverParams,
+    threshold: u64,
+) -> Result<FxHashMap<u32, u64>> {
+    let (rx, reader) = read_batches(inputs);
+    let mut supported = rustc_hash::FxHashSet::default();
+    let mut bases = 0;
+    for batch in rx.iter() {
+        bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
+        let selected: Vec<Vec<u64>> = batch
+            .par_iter()
+            .map(|r| {
+                context_supported_keys(sampled(&r.seq, p.k, threshold).collect(), &sketch.counts)
+            })
+            .collect();
+        // Each distinct k-mer contributes once, even when many reads support it.
+        supported.extend(selected.into_iter().flatten());
+        if p.sketch_bases > 0 && bases >= p.sketch_bases {
+            break;
+        }
+    }
+    drop(rx);
+    reader.join().expect("reader thread panicked")?;
+    let mut histogram = FxHashMap::default();
+    for key in supported {
+        *histogram.entry(sketch.counts[&key]).or_insert(0) += 1;
+    }
+    Ok(histogram)
 }
 
 /// Per-read depth features from the sketch.
@@ -226,7 +281,9 @@ impl DepthGate {
         };
         let threshold = u64::MAX / params.scale;
         let sketch = build_sketch(inputs, &params, threshold)?;
-        let nuclear = nuclear_peak(&sketch.counts);
+        let nuclear = histogram_peak(&read_context_histogram(
+            inputs, &sketch, &params, threshold,
+        )?);
         Ok(Self {
             sketch,
             threshold,
@@ -301,7 +358,7 @@ pub fn run(inputs: Vec<PathBuf>, p: DiscoverParams, out_dir: PathBuf) -> Result<
     }
     let threshold = u64::MAX / p.scale;
     let sketch = build_sketch(&inputs, &p, threshold)?;
-    let nuclear = nuclear_peak(&sketch.counts);
+    let nuclear = histogram_peak(&read_context_histogram(&inputs, &sketch, &p, threshold)?);
     let organelle_min = nuclear as f64 * p.depth_fold;
     eprintln!(
         "[ovasm] sketch: {:.2} Gbp, {} sampled k-mers, nuclear peak {}x, organelle threshold {:.0}x (sketch depth)",
@@ -469,6 +526,10 @@ pub fn run(inputs: Vec<PathBuf>, p: DiscoverParams, out_dir: PathBuf) -> Result<
 }
 
 #[cfg(test)]
+#[path = "seedfree_diagnostics.rs"]
+mod diagnostic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -485,6 +546,48 @@ mod tests {
             counts.insert(i, 40); // organelle
         }
         assert_eq!(nuclear_peak(&counts), 7);
+    }
+
+    #[test]
+    fn read_context_rejects_recurrent_errors_without_a_fixed_depth_floor() {
+        let mut counts = FxHashMap::default();
+        let mut supported = rustc_hash::FxHashSet::default();
+        // Three recurrent error keys per read dominate the raw distinct-key mode.
+        // Their carrier reads otherwise agree at depth 17.
+        for i in 0..100u64 {
+            counts.insert(i, 17);
+        }
+        for i in 100..400u64 {
+            counts.insert(i, 2);
+        }
+        for i in 400..450u64 {
+            counts.insert(i, 100); // organelle: deep, but fewer distinct keys
+        }
+        assert_eq!(nuclear_peak(&counts), 2);
+        for i in 0..100u64 {
+            let mut keys: Vec<_> = (0..20).map(|j| (i + j) % 100).collect();
+            keys.extend(100 + i * 3..103 + i * 3);
+            supported.extend(context_supported_keys(keys, &counts));
+        }
+        supported.extend(context_supported_keys((400..450).collect(), &counts));
+        let mut hist = FxHashMap::default();
+        for key in supported {
+            *hist.entry(counts[&key]).or_insert(0) += 1;
+        }
+        assert_eq!(histogram_peak(&hist), 17);
+        assert!(!hist.contains_key(&2));
+
+        // Truly shallow genomic reads remain usable; count 2 is not an error label.
+        let shallow = context_supported_keys((100..400).collect(), &counts);
+        assert_eq!(shallow.len(), 300);
+        assert!(context_supported_keys(Vec::new(), &counts).is_empty());
+    }
+
+    #[test]
+    fn histogram_peak_breaks_ties_toward_the_lower_depth() {
+        let hist = FxHashMap::from_iter([(3, 100), (7, 100), (30, 20)]);
+        assert_eq!(histogram_peak(&hist), 3);
+        assert_eq!(histogram_peak(&FxHashMap::default()), 1);
     }
 
     #[test]

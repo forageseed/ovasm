@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_set_of_reads_is_called_from_its_genes() {
-        let dir = std::env::temp_dir().join(format!("ovasm-identify-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ovasm-panel-call-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut fa = String::new();
         for (i, seed) in [(0, 1u64), (1, 2), (2, 1), (3, 2), (4, 1), (5, 2)] {

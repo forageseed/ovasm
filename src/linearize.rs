@@ -10,9 +10,10 @@
 //! molecules that together visit every anchor exactly once through bridges (with one molecule, a
 //! Hamiltonian path in the small anchor graph); repeats are laid down as often as the chosen
 //! bridges cross them. A molecule is circular when a bridge leads from its last anchor back to
-//! its first. The fewest molecules that cover a component win (a master circle or path before
-//! sub-circles); among covers of that size, `cover_order` ranks them by circularity and by
-//! `path_score`: the likelihood of the paths when each anchor's exit is chosen in proportion to
+//! its first. Covers of every permitted size compete together; `cover_order` ranks them by
+//! circularity, junction evidence, and `path_score`. `path_score` is the likelihood
+//! of the paths when each anchor's exit is
+//! chosen in proportion to
 //! the reads on its bridges. A best path whose end leads back into its own interior is
 //! reported as the circle and its tail (`cut_tail`). An anchor without any bridge is a
 //! linear molecule of its own when it is at least `MIN_UNBRIDGED_BP` long.
@@ -33,6 +34,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::evidence::{flip, parse_gfa, Graph, Oriented};
+
+#[cfg(test)]
+#[path = "multichrom_diagnostics.rs"]
+mod multichrom_diagnostics;
 
 #[derive(Clone, Debug)]
 struct Bridge {
@@ -866,7 +871,7 @@ fn link_overlap(g: &Graph, a: Oriented, b: Oriented) -> Option<usize> {
 
 /// Sequence of a walk, each link's overlap written once. A circular walk also drops the overlap
 /// of the closing link from its end.
-fn spell(g: &Graph, walk: &[Oriented], circular: bool) -> Result<Vec<u8>> {
+pub(crate) fn spell(g: &Graph, walk: &[Oriented], circular: bool) -> Result<Vec<u8>> {
     let mut seq = g.oriented_seq(walk[0]);
     for w in walk.windows(2) {
         let ov = link_overlap(g, w[0], w[1]).with_context(|| {
@@ -905,6 +910,9 @@ pub struct CoverReport {
     pub molecules: Vec<Linearization>,
     /// Bridges taken at otherwise dead anchor ends that the cover passes (see `bridges`).
     pub weak_bridges: usize,
+    /// Junctions supplied by graph topology because no read phases them. Their synthetic
+    /// weights describe possible paths, not observations of a chromosome configuration.
+    pub topological_bridges: usize,
     /// Repeat copies laid down more or fewer times than the repeats' depths say (see
     /// `copy_deviation`); each costs `COPY_PENALTY_LN` in the ranking.
     pub copy_deviation: usize,
@@ -918,6 +926,10 @@ impl CoverReport {
     /// Score the ranking uses: the likelihood less the copy-number penalty.
     fn ranked_score(&self) -> f64 {
         self.score - COPY_PENALTY_LN * self.copy_deviation as f64
+    }
+
+    fn incomplete_junction_evidence(&self) -> bool {
+        self.weak_bridges > 0 || self.topological_bridges > 0
     }
 }
 
@@ -949,13 +961,30 @@ fn copy_deviation(expected: &[Option<usize>], br: &[Bridge], cover: &[Found]) ->
     dev
 }
 
-/// Order of two covers of one component with the same number of molecules; `Less` ranks first.
+/// Order of two covers of one component, across cover sizes; `Less` ranks first.
 /// Fewer linear molecules first: a linear molecule lacks its closing bridge, whose ln share is
-/// never positive, so scores alone would favour opening circles. Then the likelier cover.
+/// never positive, so scores alone would favour opening circles. Prefer covers whose every
+/// junction has sufficient read support. Where all covers need unphased or weak junctions,
+/// their synthetic weights cannot resolve molecule count: choose the smallest feasible
+/// representative, while retaining the larger covers as ambiguous alternatives. Fully
+/// read-supported covers compete by score across molecule counts.
 fn cover_order(a: &CoverReport, b: &CoverReport) -> Ordering {
     a.linear()
         .cmp(&b.linear())
+        .then(
+            a.incomplete_junction_evidence()
+                .cmp(&b.incomplete_junction_evidence()),
+        )
+        .then_with(|| {
+            if a.incomplete_junction_evidence() && b.incomplete_junction_evidence() {
+                a.molecules.len().cmp(&b.molecules.len())
+            } else {
+                Ordering::Equal
+            }
+        })
         .then(b.ranked_score().total_cmp(&a.ranked_score()))
+        // A deterministic representative when the evidence ties, not extra evidence.
+        .then(a.molecules.len().cmp(&b.molecules.len()))
 }
 
 /// Anchors joined by bridges, and the molecules unringing finds for them.
@@ -964,7 +993,7 @@ pub struct ComponentReport {
     pub anchors: Vec<String>,
     /// Length-weighted median depth of the anchors, when the evidence records depth.
     pub depth: Option<f64>,
-    /// Fewest molecules that cover the component, plus the tails cut off (0 when unsolved or
+    /// Molecules in the selected cover, plus the tails cut off (0 when unsolved or
     /// skipped).
     pub molecules: usize,
     /// Required anchors bridged at one end only: each must end a linear molecule, so the
@@ -976,12 +1005,19 @@ pub struct ComponentReport {
     pub skipped: bool,
     pub candidates: usize,
     pub search_truncated: bool,
+    /// Largest cover size enumerated for this component (zero when skipped).
+    pub searched_max_molecules: usize,
+    /// Larger cover sizes, up to one molecule per anchor, were excluded by the configured
+    /// molecule-count limit. Even a complete expansion search cannot rule those covers out.
+    pub cover_size_limited: bool,
     pub best: Option<CoverReport>,
     /// For a component without a cover: the paths its read bridges make (see `partial_paths`),
     /// so that its sequence is reported. Not a solution: `best` stays empty, `molecules` 0, and
     /// the component counts among `unsolved_components`.
     pub partial: Option<CoverReport>,
-    /// Log-likelihood lead of the best cover over the runner-up with as many linear molecules.
+    /// Bridge/copy score lead of the selected representative over its strongest competitor
+    /// with as many linear molecules, across all searched cover sizes. May be negative when
+    /// incomplete junction evidence requires a parsimonious representative.
     pub margin_ln: Option<f64>,
     pub decisive: bool,
     /// Bridges left out where the best cover's linear molecule led back into itself and is
@@ -1033,13 +1069,18 @@ pub struct LinearizeReport {
     pub unplaced_segments: Vec<String>,
     pub candidates: usize,
     pub search_truncated: bool,
+    /// At least one searched component omitted cover sizes because of `max_molecules`.
+    pub cover_size_limited: bool,
     /// The longest molecule; `alternatives` and `margin_ln` refer to its component.
     pub best: Option<Linearization>,
-    /// Log-likelihood lead of the best path over the runner-up (None with a single candidate).
+    /// Bridge/copy score lead of the main component's representative over its strongest
+    /// competitor of the same circularity (None with no such competitor).
     pub margin_ln: Option<f64>,
-    /// Whether every component's best cover is at least twice as likely as its runner-up. When
-    /// false, the reads support several configurations about equally and the molecules are one
-    /// representative of them.
+    /// Every searched component has no omitted cover sizes, a complete expansion search,
+    /// no weak or topological bridges, and a score lead of
+    /// at least ln(2) over a runner-up with the same number of linear molecules (when present).
+    /// This is confidence within the bridge/copy score and configured cover-size limit,
+    /// not certification of physical chromosome count.
     pub decisive: bool,
     pub alternatives: Vec<Linearization>,
     /// Repeats no molecule lays down (no read-supported path crosses them).
@@ -1235,6 +1276,11 @@ pub fn run(
                 .flat_map(|f| &f.bridges)
                 .filter(|&&i| br[i].weak)
                 .count(),
+            topological_bridges: cover
+                .iter()
+                .flat_map(|f| &f.bridges)
+                .filter(|&&i| br[i].topological)
+                .count(),
             copy_deviation: copy_deviation(&expected, &br, cover),
         };
         Ok((walks, report))
@@ -1255,6 +1301,8 @@ pub fn run(
             skipped: comp.iter().all(|&a| optional[a]),
             candidates: 0,
             search_truncated: false,
+            searched_max_molecules: 0,
+            cover_size_limited: false,
             best: None,
             partial: None,
             margin_ln: None,
@@ -1274,12 +1322,16 @@ pub fn run(
             .collect();
         rep.path_ends = ends.iter().map(|&a| g.names[a].clone()).collect();
         rep.min_molecules = ends.len().div_ceil(2).max(1);
-        // fewest molecules first: stop at the first cover size that has any cover
+        // Compare every feasible cover size under the same bridge/copy score. A component
+        // sharing repeats can hold several chromosomes; finding a single-molecule cover
+        // does not establish that it is the representative best supported by the reads.
         let mut ranked: Vec<(Vec<Vec<Oriented>>, CoverReport, Vec<Found>)> = Vec::new();
-        for m in rep.min_molecules..=p.max_molecules.max(1) {
+        let mut seen = BTreeSet::new();
+        rep.searched_max_molecules = p.max_molecules.max(1).min(comp.len());
+        rep.cover_size_limited = rep.searched_max_molecules < comp.len();
+        for m in rep.min_molecules..=rep.searched_max_molecules {
             let (found, truncated) = search(g.names.len(), &comp, &optional, &br, m, p.max_steps);
             rep.search_truncated |= truncated;
-            let mut seen = BTreeSet::new();
             for cover in found {
                 let (walks, report) = cover_report(&cover)?;
                 let mut key: Vec<(bool, Vec<Oriented>)> = walks
@@ -1292,10 +1344,6 @@ pub fn run(
                     ranked.push((walks, report, cover));
                 }
             }
-            if !ranked.is_empty() {
-                rep.molecules = m;
-                break;
-            }
         }
         if ranked.is_empty() {
             let paths = partial_paths(g.names.len(), &comp, &optional, &br, &frac);
@@ -1305,17 +1353,28 @@ pub fn run(
         }
         ranked.sort_by(|(wa, a, _), (wb, b, _)| cover_order(a, b).then_with(|| wa.cmp(wb)));
         rep.candidates = ranked.len();
-        rep.margin_ln = match (ranked.first(), ranked.get(1)) {
-            (Some((_, a, _)), Some((_, b, _))) if a.linear() == b.linear() => {
-                Some(a.ranked_score() - b.ranked_score())
-            }
-            _ => None,
-        };
-        // a cover through a pairing read fewer than `min_reads` times is not decisive
-        rep.decisive = ranked.first().is_some_and(|(_, c, _)| c.weak_bridges == 0)
+        rep.margin_ln = ranked.first().and_then(|(_, best, _)| {
+            ranked
+                .iter()
+                .skip(1)
+                .filter(|(_, other, _)| other.linear() == best.linear())
+                .map(|(_, other, _)| other.ranked_score())
+                .max_by(f64::total_cmp)
+                .map(|other| best.ranked_score() - other)
+        });
+        // A partial search cannot establish the score margin over unseen covers. Omitted
+        // cover sizes, weak/topological bridges and ties also prevent a decisive
+        // result. Representative parsimony must never manufacture confidence: compare against
+        // every competitor of the same circularity, not only the next ranked representative.
+        rep.decisive = !rep.search_truncated
+            && !rep.cover_size_limited
+            && ranked
+                .first()
+                .is_some_and(|(_, c, _)| !c.incomplete_junction_evidence())
             && rep.margin_ln.map_or(true, |m| m >= DECISIVE_LN);
         let mut it = ranked.into_iter();
         if let Some((mut walks, mut best, cover)) = it.next() {
+            rep.molecules = best.molecules.len();
             // a linear molecule that leads back into itself: the circle and its tail
             let mut cut: Vec<Found> = Vec::new();
             for f in &cover {
@@ -1388,10 +1447,13 @@ pub fn run(
             skipped: false,
             candidates: 1,
             search_truncated: false,
+            searched_max_molecules: 1,
+            cover_size_limited: false,
             best: Some(CoverReport {
                 score: 0.0,
                 molecules: vec![lin],
                 weak_bridges: 0,
+                topological_bridges: 0,
                 copy_deviation: 0,
             }),
             partial: None,
@@ -1483,6 +1545,7 @@ pub fn run(
         partial_paths: partial.iter().map(|(_, l)| l.clone()).collect(),
         candidates: comps.iter().map(|c| c.candidates).sum(),
         search_truncated: comps.iter().any(|c| c.search_truncated),
+        cover_size_limited: comps.iter().any(|c| c.cover_size_limited),
         best: chosen.first().map(|(_, l)| l.clone()),
         margin_ln: main.and_then(|c| c.margin_ln),
         decisive: !chosen.is_empty() && comps.iter().all(|c| c.skipped || c.decisive),
@@ -1826,6 +1889,7 @@ mod tests {
             score: m.iter().map(|l| l.score).sum(),
             molecules: m,
             weak_bridges: 0,
+            topological_bridges: 0,
             copy_deviation: 0,
         };
         let circles = cover(vec![mol(true, -1.0), mol(true, -1.0)]);
@@ -2361,9 +2425,10 @@ mod tests {
     }
 
     #[test]
-    fn an_anchor_between_both_ends_of_an_unspanned_repeat_joins_the_circle() {
+    fn an_anchor_between_both_ends_of_an_unspanned_repeat_stays_in_the_cover() {
         // Buddleja mitochondrion: u1 sits between both ends of repeat u4, which no read spans
-        // into u1; reads cross u4 only from u3 to u2. The genome is u0 u3 u4 u1 u4 u2.
+        // into u1; reads cross u4 only from u3 to u2. All anchor sequence and both repeat
+        // copies must be reported, but these reads do not establish one physical circle.
         let s = |n, seed| String::from_utf8(seq(n, seed)).unwrap();
         let gfa = format!(
             "H\tVN:Z:1.0\nS\tu0\t{}\nS\tu1\t{}\nS\tu2\t{}\nS\tu3\t{}\nS\tu4\t{}\n\
@@ -2386,15 +2451,14 @@ mod tests {
             ],
         });
         let r = run_graph(&gfa, ev, "ovasm-buddleja");
-        let best = r.best.as_ref().unwrap();
-        assert!(best.circular, "{}", best.path);
+        let cover = r.components[0].best.as_ref().unwrap();
+        assert!(cover.molecules.iter().all(|m| m.circular));
         assert_eq!(
-            best.length,
+            cover.molecules.iter().map(|m| m.length).sum::<usize>(),
             400 + 200 + 60 + 300 + 60 + 100,
-            "{}",
-            best.path
+            "all anchors and both repeat copies must remain in the cover"
         );
-        assert!(best.path.contains("u1"));
+        assert!(cover.molecules.iter().any(|m| m.path.contains("u1")));
         assert!(r.unbridged_anchors.is_empty());
         assert!(!r.decisive);
     }
