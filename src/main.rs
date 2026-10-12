@@ -225,7 +225,11 @@ fn run(args: RunArgs) -> Result<()> {
         if !builtin_seeds.is_empty() {
             eprintln!(
                 "[ovasm] run: no --seeds for {}: using the built-in seed library {} ({})",
-                builtin_seeds.iter().cloned().collect::<Vec<_>>().join(" and "),
+                builtin_seeds
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" and "),
                 seeddb::VERSION,
                 dir.display()
             );
@@ -901,6 +905,9 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct EvidenceArgs {
+    /// Count exact overlap-edge words separately from long-span repeat phasing.
+    #[arg(long)]
+    short_read_adjacency: bool,
     /// Assembly graph with segment sequences and 0M links.
     #[arg(long)]
     gfa: PathBuf,
@@ -951,6 +958,7 @@ fn evidence(args: EvidenceArgs) -> Result<()> {
         &args.gfa,
         args.reads,
         evidence::EvidenceParams {
+            short_read_adjacency: args.short_read_adjacency,
             k: args.k,
             flank: args.flank,
             min_anchor: args.min_anchor,

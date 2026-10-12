@@ -161,7 +161,13 @@ fn bridges(
         .as_array()
         .context("evidence has no links")?
     {
-        let reads = l["reads"].as_u64().unwrap_or(0);
+        // Exact dense-edge words establish adjacency between anchors. They never
+        // enter phased_paths or authorize an entry/exit pairing through a repeat.
+        // max is a conservative lower bound because the two read sets can overlap.
+        let reads = l["reads"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(l["adjacency_reads"].as_u64().unwrap_or(0));
         let a = parse_label(&index, l["from"].as_str().context("link without from")?)?;
         let b = parse_label(&index, l["to"].as_str().context("link without to")?)?;
         if repeat[a.0] || repeat[b.0] {
@@ -1604,6 +1610,30 @@ mod tests {
     }
 
     type Solution = (Vec<Oriented>, bool, Vec<u64>, Vec<f64>);
+
+    #[test]
+    fn local_adjacency_joins_anchors_but_never_phases_a_repeat() {
+        let g = graph();
+        let repeat = vec![false, false, false, false, true];
+        let ev = json!({
+            "phased_paths": [],
+            "links": [
+                {"from": "B+", "to": "C+", "reads": 0, "adjacency_reads": 15},
+                {"from": "A+", "to": "R+", "reads": 0, "adjacency_reads": 30},
+                {"from": "R+", "to": "B+", "reads": 0, "adjacency_reads": 30},
+            ],
+        });
+        let (br, _) = bridges(&g, &ev, &repeat, 2).unwrap();
+        let bc = br
+            .iter()
+            .find(|b| b.walk == vec![(1, true), (2, true)])
+            .unwrap();
+        assert_eq!(bc.reads, 15);
+        assert!(!bc.topological && !bc.weak);
+        let through_repeat: Vec<_> = br.iter().filter(|b| b.walk.contains(&(4, true))).collect();
+        assert!(!through_repeat.is_empty());
+        assert!(through_repeat.iter().all(|b| b.topological));
+    }
 
     fn solve(g: &Graph, ev: &Value) -> Vec<Solution> {
         let repeat = vec![false, false, false, false, true];
