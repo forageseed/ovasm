@@ -556,6 +556,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
+        bait.prepare_lookup();
         let res = scan(&cfg.inputs, &bait, &cfg.params, &cfg.out_dir, &numt_path)?;
         let last = it + 1 == cfg.iterations.max(1);
         let mut added = vec![0; n_targets];
@@ -819,6 +820,67 @@ mod tests {
         let (call, score) = classify(&genome[100..600], &bait, &params());
         assert_eq!(call, Call::Organelle(1));
         assert!(score.cover_frac > 0.99);
+    }
+
+    #[test]
+    fn presence_index_preserves_calls_and_scores_across_read_contexts() {
+        for (k, gap, hit, numt) in [
+            (21, 50, 0.2, 1000),
+            (15, 200, 0.05, 2000),
+            (21, 40, 0.2, usize::MAX),
+            (31, 0, 0.2, 40),
+        ] {
+            let shared = pseudo_random(2500, 39);
+            let mut exact = BaitSet::new(k);
+            let mut reads = vec![Vec::new(), vec![b'N'; 300], pseudo_random(5000, 99)];
+            for i in 0..8 {
+                let t = exact.target(&format!("target{i}")).unwrap();
+                let genome = pseudo_random(5000, 7 + i);
+                exact.add_sequence(t, &genome);
+                exact.add_sequence(t, &shared);
+                reads.push(genome.clone());
+                let mut flanked = pseudo_random(2500, 101);
+                flanked.extend_from_slice(&genome[1000..3500]);
+                flanked.extend(pseudo_random(2500, 103));
+                reads.push(flanked);
+                let mut with_gap = genome;
+                with_gap[2000..2500].fill(b'N');
+                reads.push(with_gap);
+            }
+            reads.push(shared);
+            let reverse_reads: Vec<Vec<u8>> = reads
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .rev()
+                        .map(|b| match b {
+                            b'A' => b'T',
+                            b'C' => b'G',
+                            b'G' => b'C',
+                            b'T' => b'A',
+                            _ => b'N',
+                        })
+                        .collect()
+                })
+                .collect();
+            reads.extend(reverse_reads);
+            let mut indexed = exact.clone();
+            indexed.prepare_lookup();
+            let p = ClassifyParams {
+                min_cover: 0.8,
+                min_hit_frac: hit,
+                numt_min_block: numt,
+                block_gap: gap,
+            };
+            for read in &reads {
+                let (a, x) = classify(read, &exact, &p);
+                let (b, y) = classify(read, &indexed, &p);
+                assert_eq!(a, b);
+                assert_eq!(x.cover_frac.to_bits(), y.cover_frac.to_bits());
+                assert_eq!(x.hit_frac.to_bits(), y.hit_frac.to_bits());
+                assert_eq!(x.longest_block, y.longest_block);
+            }
+        }
     }
 
     #[test]
