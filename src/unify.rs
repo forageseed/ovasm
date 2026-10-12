@@ -500,8 +500,8 @@ pub fn run(
         )?)
     };
 
-    // Read support per canonical link.
-    let mut support: FxHashMap<usize, u64> = FxHashMap::default();
+    // Keep strict long-span, local adjacency and ambiguous-local counts separate.
+    let mut support: FxHashMap<usize, [u64; 3]> = FxHashMap::default();
     if let Some(ev) = evidence {
         let ev = read_json(ev)?;
         for l in ev["links"].as_array().context("evidence has no links")? {
@@ -518,7 +518,12 @@ pub fn run(
                 .get(&canonical(walk[0], walk[1]))
                 .with_context(|| format!("evidence link {:?} is not in the GFA", l))?;
             let e = support.entry(i).or_default();
-            *e = (*e).max(l["reads"].as_u64().unwrap_or(0));
+            for (slot, key) in ["reads", "adjacency_reads", "adjacency_ambiguous_reads"]
+                .iter()
+                .enumerate()
+            {
+                e[slot] = e[slot].max(l[*key].as_u64().unwrap_or(0));
+            }
         }
     }
 
@@ -587,7 +592,7 @@ pub fn run(
             piece_links.insert(canon((pair[0].0, pair[0].1), (pair[1].0, pair[1].1)));
         }
     }
-    let mut ev_of: FxHashMap<(PieceEnd, PieceEnd), u64> = FxHashMap::default();
+    let mut ev_of: FxHashMap<(PieceEnd, PieceEnd), [u64; 3]> = FxHashMap::default();
     for (i, &((a, c), ov)) in b.links.iter().enumerate() {
         let (Some(&from), Some(&to)) = (b.after(&g, a, 0)?.last(), b.after(&g, c, ov)?.first())
         else {
@@ -599,7 +604,9 @@ pub fn run(
         }
         if let Some(&n) = support.get(&i) {
             let e = ev_of.entry(key).or_default();
-            *e = (*e).max(n);
+            for slot in 0..3 {
+                e[slot] = e[slot].max(n[slot]);
+            }
         }
     }
     let mut links_out = 0;
@@ -613,7 +620,13 @@ pub fn run(
             sign(y.1)
         )?;
         if let Some(n) = ev_of.get(&(x, y)) {
-            write!(gfa_out, "\tev:i:{n}")?;
+            write!(gfa_out, "\tev:i:{}", n[0])?;
+            if n[1] > 0 {
+                write!(gfa_out, "\taj:i:{}", n[1])?;
+            }
+            if n[2] > 0 {
+                write!(gfa_out, "\taa:i:{}", n[2])?;
+            }
         }
         gfa_out.push('\n');
         links_out += 1;

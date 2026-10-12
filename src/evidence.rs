@@ -136,6 +136,8 @@ impl Graph {
 
 #[derive(Clone, Copy)]
 pub struct EvidenceParams {
+    /// Count exact overlap-edge words separately from long-span repeat evidence.
+    pub short_read_adjacency: bool,
     pub k: usize,
     pub flank: usize,
     pub min_anchor: usize,
@@ -166,6 +168,121 @@ struct Index {
     junctions: Vec<Junction>,
     /// canonical k-mer -> (junction, position in junction, k-mer is forward-canonical there)
     map: FxHashMap<u64, Vec<(u32, u32, bool)>>,
+}
+
+struct AdjacencyWord {
+    seq: Vec<u8>,
+    reverse: Vec<u8>,
+    links: Vec<usize>,
+    occurs_inside_segment: bool,
+}
+
+struct AdjacencyIndex {
+    words: Vec<AdjacencyWord>,
+    prefixes: FxHashMap<u64, Vec<(usize, bool)>>,
+    k: usize,
+}
+
+/// A dense de Bruijn edge is witnessed by its overlap plus a base on either side.
+/// Keep at least the evidence k bases when the overlap is shorter. This word proves
+/// local adjacency only: it never enters the crossing, traversal or phasing counts.
+fn adjacency_index(g: &Graph, p: &EvidenceParams) -> AdjacencyIndex {
+    let mut index = AdjacencyIndex {
+        words: Vec::new(),
+        prefixes: FxHashMap::default(),
+        k: p.k,
+    };
+    let mut identical: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+    if !p.short_read_adjacency {
+        return index;
+    }
+    for (li, &(a, b)) in g.links.iter().enumerate() {
+        let ov = g.overlaps[li];
+        if ov == 0 {
+            continue;
+        }
+        let (left, right) = (g.oriented_seq(a), g.oriented_seq(b));
+        if left[left.len() - ov..] != right[..ov] {
+            continue;
+        }
+        let extra = p.k.saturating_sub(ov).max(2);
+        let (l, r) = (extra / 2, extra - extra / 2);
+        if left.len() - ov < l || right.len() - ov < r {
+            continue;
+        }
+        let mut word = left[left.len() - ov - l..].to_vec();
+        word.extend_from_slice(&right[ov..ov + r]);
+        let reverse = revcomp(&word);
+        identical.entry(word.min(reverse)).or_default().push(li);
+    }
+    for (seq, links) in identical {
+        let (pos, key) = CanonicalKmers::new(&seq, p.k).next().unwrap();
+        let fwd = forward_is_canonical(&seq[pos..pos + p.k], key);
+        index
+            .prefixes
+            .entry(key)
+            .or_default()
+            .push((index.words.len(), fwd));
+        index.words.push(AdjacencyWord {
+            reverse: revcomp(&seq),
+            seq,
+            links,
+            occurs_inside_segment: false,
+        });
+    }
+    // An edge word also found inside a segment cannot identify that edge from a
+    // short read. Retain its count as ambiguous instead of claiming adjacency.
+    for seq in &g.seqs {
+        for wi in matching_adjacency_words(seq, &index) {
+            index.words[wi].occurs_inside_segment = true;
+        }
+    }
+    index
+}
+
+fn matching_adjacency_words(read: &[u8], index: &AdjacencyIndex) -> BTreeSet<usize> {
+    let mut matches = BTreeSet::new();
+    for (pos, key) in CanonicalKmers::new(read, index.k) {
+        let Some(words) = index.prefixes.get(&key) else {
+            continue;
+        };
+        let fwd = forward_is_canonical(&read[pos..pos + index.k], key);
+        for &(wi, prefix_fwd) in words {
+            let word = &index.words[wi];
+            let (start, target) = if fwd == prefix_fwd {
+                (Some(pos), &word.seq)
+            } else {
+                ((pos + index.k).checked_sub(word.seq.len()), &word.reverse)
+            };
+            let Some(start) = start else {
+                continue;
+            };
+            let Some(aligned) = read.get(start..start + target.len()) else {
+                continue;
+            };
+            if !aligned.eq_ignore_ascii_case(target) {
+                continue;
+            }
+            matches.insert(wi);
+        }
+    }
+    matches
+}
+
+fn adjacencies(read: &[u8], index: &AdjacencyIndex) -> (Vec<usize>, Vec<usize>) {
+    let (mut supported, mut ambiguous) = (BTreeSet::new(), BTreeSet::new());
+    for wi in matching_adjacency_words(read, index) {
+        let word = &index.words[wi];
+        if word.links.len() == 1 && !word.occurs_inside_segment {
+            supported.insert(word.links[0]);
+        } else {
+            ambiguous.extend(word.links.iter().copied());
+        }
+    }
+    (
+        supported.into_iter().collect(),
+        ambiguous.into_iter().collect(),
+    )
 }
 
 fn forward_is_canonical(kmer_seq: &[u8], canon: u64) -> bool {
@@ -809,6 +926,10 @@ pub struct LinkSupport {
     pub reads: u64,
     /// Reads that matched this link and a rival equally well (counted for neither).
     pub ambiguous_reads: u64,
+    /// Exact overlap-edge word support, independent of long-span crossing support.
+    pub adjacency_reads: u64,
+    /// The exact edge word occurs at multiple graph links, so it assigns none.
+    pub adjacency_ambiguous_reads: u64,
 }
 
 #[derive(Serialize)]
@@ -855,6 +976,7 @@ pub struct EvidenceReport {
     pub reads_with_support: u64,
     pub links: Vec<LinkSupport>,
     pub links_supported: usize,
+    pub adjacency_supported_links: usize,
     pub branches: Vec<BranchSupport>,
     pub traversals: Vec<Traversal>,
     pub repeats: Vec<RepeatPairing>,
@@ -934,10 +1056,13 @@ pub fn run(
     let depths = segment_depths(&gfa_text, &g);
     let rdepths = repeat_depths(&gfa_text, &g);
     let idx = build_index(&g, &p);
+    let adjacency = adjacency_index(&g, &p);
     let (rx, reader) = read_batches(&inputs);
 
     let mut link_reads = vec![0u64; g.links.len()];
     let mut link_ambiguous = vec![0u64; g.links.len()];
+    let mut adjacency_reads = vec![0u64; g.links.len()];
+    let mut adjacency_ambiguous = vec![0u64; g.links.len()];
     let mut traversal_reads: BTreeMap<(Oriented, Oriented, Oriented), u64> = BTreeMap::new();
     let (mut scanned, mut supported) = (0u64, 0u64);
     let mut maximum_read_length = 0;
@@ -946,6 +1071,8 @@ pub fn run(
         Vec<usize>,
         Vec<(Oriented, Oriented, Oriented)>,
         Vec<Vec<Oriented>>,
+        Vec<usize>,
+        Vec<usize>,
     );
     // Walks of each informative read; phased paths need the repeats, and the repeats need the
     // link support of the whole scan.
@@ -964,10 +1091,17 @@ pub fn run(
                     .into_iter()
                     .filter(|w| w.len() >= 3)
                     .collect();
-                (cs, ambiguous, tr, ws)
+                let (adj, adj_ambiguous) = adjacencies(&r.seq, &adjacency);
+                (cs, ambiguous, tr, ws, adj, adj_ambiguous)
             })
             .collect();
-        for (cs, ambiguous, tr, ws) in per_read {
+        for (cs, ambiguous, tr, ws, adj, adj_ambiguous) in per_read {
+            for link in adj {
+                adjacency_reads[link] += 1;
+            }
+            for link in adj_ambiguous {
+                adjacency_ambiguous[link] += 1;
+            }
             if !ws.is_empty() {
                 read_walks.push(ws);
             }
@@ -1145,11 +1279,14 @@ pub fn run(
         .links
         .iter()
         .zip(link_reads.iter().zip(&link_ambiguous))
-        .map(|(&(a, b), (&n, &amb))| LinkSupport {
+        .enumerate()
+        .map(|(i, (&(a, b), (&n, &amb)))| LinkSupport {
             from: g.label(a),
             to: g.label(b),
             reads: n,
             ambiguous_reads: amb,
+            adjacency_reads: adjacency_reads[i],
+            adjacency_ambiguous_reads: adjacency_ambiguous[i],
         })
         .collect();
     let report = EvidenceReport {
@@ -1158,6 +1295,7 @@ pub fn run(
         maximum_read_length,
         reads_with_support: supported,
         links_supported: link_reads.iter().filter(|&&n| n > 0).count(),
+        adjacency_supported_links: adjacency_reads.iter().filter(|&&n| n > 0).count(),
         links,
         branches,
         traversals: traversal_reads
@@ -1202,6 +1340,8 @@ pub fn run(
             "k": p.k, "flank": p.flank, "min_anchor": p.min_anchor, "diag_tol": p.diag_tol,
             "min_side_hits": p.min_side_hits, "spacing_tol": p.spacing_tol, "bootstrap": p.bootstrap,
             "max_repeat_len": p.max_repeat_len,
+            "short_read_adjacency": p.short_read_adjacency,
+            "adjacency_rule": "exact overlap-edge word; local adjacency only, not repeat phase",
             "repeat_rule": if depths.is_some() { "branching + depth, then phasing" } else { "branching, then phasing" },
         }),
         elapsed_seconds: t0.elapsed().as_secs_f64(),
@@ -1215,6 +1355,100 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dense_edge() -> (Graph, Vec<u8>) {
+        let seq = rng_seq(500, 510);
+        (
+            Graph {
+                names: vec!["left".into(), "right".into()],
+                seqs: vec![seq[..300].to_vec(), seq[174..].to_vec()],
+                links: vec![((0, true), (1, true))],
+                overlaps: vec![126],
+            },
+            seq,
+        )
+    }
+
+    #[test]
+    fn dense_edge_word_supports_short_read_adjacency_without_long_span_evidence() {
+        let (g, seq) = dense_edge();
+        let mut p = params();
+        p.min_anchor = 40;
+        p.min_side_hits = 5;
+        p.short_read_adjacency = true;
+        let read = &seq[160..310];
+        assert!(crossings(read, &build_index(&g, &p), &p).is_empty());
+        let idx = adjacency_index(&g, &p);
+        assert_eq!(adjacencies(read, &idx), (vec![0], vec![]));
+        assert_eq!(adjacencies(&revcomp(read), &idx), (vec![0], vec![]));
+        assert_eq!(adjacencies(&seq[174..300], &idx), (vec![], vec![]));
+        let mut wrong = read.to_vec();
+        wrong[13] = if wrong[13] == b'A' { b'C' } else { b'A' };
+        assert_eq!(adjacencies(&wrong, &idx), (vec![], vec![]));
+        p.short_read_adjacency = false;
+        assert_eq!(
+            adjacencies(read, &adjacency_index(&g, &p)),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn identical_dense_edge_words_are_ambiguous_and_assign_no_link() {
+        let (mut g, seq) = dense_edge();
+        g.names.push("duplicate".into());
+        g.seqs.push(g.seqs[1].clone());
+        g.links.push(((0, true), (2, true)));
+        g.overlaps.push(126);
+        let mut p = params();
+        p.short_read_adjacency = true;
+        assert_eq!(
+            adjacencies(&seq[160..310], &adjacency_index(&g, &p)),
+            (vec![], vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn an_edge_word_inside_another_segment_is_ambiguous() {
+        let (mut g, seq) = dense_edge();
+        g.names.push("internal_copy".into());
+        g.seqs.push(revcomp(&seq[150..320]));
+        let mut p = params();
+        p.short_read_adjacency = true;
+        let idx = adjacency_index(&g, &p);
+        assert_eq!(adjacencies(&seq[160..310], &idx), (vec![], vec![0]));
+        assert_eq!(
+            adjacencies(&revcomp(&seq[160..310]), &idx),
+            (vec![], vec![0])
+        );
+    }
+
+    #[test]
+    fn local_adjacencies_do_not_create_a_long_repeat_traversal() {
+        let repeat = rng_seq(2000, 511);
+        let left = [rng_seq(200, 512), repeat[..126].to_vec()].concat();
+        let right = [repeat[1874..].to_vec(), rng_seq(200, 513)].concat();
+        let g = Graph {
+            names: vec!["a".into(), "repeat".into(), "b".into()],
+            seqs: vec![left.clone(), repeat.clone(), right.clone()],
+            links: vec![((0, true), (1, true)), ((1, true), (2, true))],
+            overlaps: vec![126, 126],
+        };
+        let mut p = params();
+        p.short_read_adjacency = true;
+        p.min_anchor = 40;
+        let reads = [
+            [left[199..200].to_vec(), repeat[..127].to_vec()].concat(),
+            [repeat[1873..].to_vec(), right[126..127].to_vec()].concat(),
+        ];
+        let idx = adjacency_index(&g, &p);
+        for (i, read) in reads.iter().enumerate() {
+            assert_eq!(adjacencies(read, &idx), (vec![i], vec![]));
+            let (crossed, _) = assign(&g, crossings(read, &build_index(&g, &p), &p), p.spacing_tol);
+            let steps = read_steps(&g, &crossed);
+            assert!(traversals(&g, &steps, p.spacing_tol).is_empty());
+            assert!(walks(&g, &steps, p.spacing_tol).is_empty());
+        }
+    }
 
     #[test]
     fn joint_walks_keep_repeat_linkage_and_count_once_per_read() {
@@ -1283,6 +1517,7 @@ mod tests {
 
     fn params() -> EvidenceParams {
         EvidenceParams {
+            short_read_adjacency: false,
             k: 21,
             flank: 500,
             min_anchor: 200,

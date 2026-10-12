@@ -389,7 +389,7 @@ fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType)
         ReadType::Hifi => ("10", "500"),
         ReadType::Sr => ("5", "40"),
     };
-    Argv::new("evidence")
+    let argv = Argv::new("evidence")
         .opt("--gfa", gfa)
         .opt("--out", out)
         .opt("--k", "21")
@@ -397,7 +397,12 @@ fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType)
         .opt("--min-side-hits", side_hits)
         .opt("--min-anchor", anchor)
         .opt("--bootstrap", "1000")
-        .each("--reads", reads)
+        .each("--reads", reads);
+    if read_type == ReadType::Sr {
+        argv.arg("--short-read-adjacency")
+    } else {
+        argv
+    }
 }
 
 impl Attempts for GraphAttempts<'_> {
@@ -1361,6 +1366,7 @@ fn assemble_organelle(
         "kept_attempt": ladder.chosen,
         "unitigs": assembly["unitigs"],
         "supported_links": evidence["links_supported"],
+        "adjacency_supported_links": evidence["adjacency_supported_links"],
         "links": n_links,
         "molecules": molecules.len(),
         "lengths": molecules.iter().map(|m| m["length"].clone()).collect::<Vec<_>>(),
@@ -2056,13 +2062,22 @@ mod tests {
 
         let mito_summary = read_json(&cfg.out.join("mitochondrion/summary.json")).unwrap();
         assert_eq!(mito_summary["seed_database"]["source"], "builtin");
-        assert_eq!(mito_summary["seed_database"]["version"], crate::seeddb::VERSION);
-        assert_eq!(mito_summary["seed_database"]["competing_seed"]["source"], "custom");
+        assert_eq!(
+            mito_summary["seed_database"]["version"],
+            crate::seeddb::VERSION
+        );
+        assert_eq!(
+            mito_summary["seed_database"]["competing_seed"]["source"],
+            "custom"
+        );
 
         let plastid_summary = read_json(&cfg.out.join("plastid/summary.json")).unwrap();
         assert_eq!(plastid_summary["seed_database"]["source"], "custom");
         assert!(plastid_summary["seed_database"].get("version").is_none());
-        assert_eq!(plastid_summary["seed_database"]["competing_seed"]["source"], "builtin");
+        assert_eq!(
+            plastid_summary["seed_database"]["competing_seed"]["source"],
+            "builtin"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
