@@ -25,6 +25,29 @@ pub struct BaitSet {
     pub k: usize,
     map: FxHashMap<u64, u8>,
     pub targets: Vec<Target>,
+    lookup: Option<LookupIndex>,
+}
+
+/// Compact presence index for the immutable bait used during one scan. An unset
+/// bit proves absence; set bits always go through the exact target-mask map.
+/// Collisions only add map lookups, never bait hits or recruitment decisions.
+#[derive(Clone)]
+struct LookupIndex {
+    bits: Vec<u64>,
+    mask: usize,
+}
+
+impl LookupIndex {
+    #[inline]
+    fn slot(&self, key: u64) -> usize {
+        key.wrapping_mul(0x517CC1B727220A95).rotate_left(23) as usize & self.mask
+    }
+
+    #[inline]
+    fn may_contain(&self, key: u64) -> bool {
+        let slot = self.slot(key);
+        self.bits[slot >> 6] & (1u64 << (slot & 63)) != 0
+    }
 }
 
 impl BaitSet {
@@ -33,6 +56,7 @@ impl BaitSet {
             k,
             map: FxHashMap::default(),
             targets: Vec::new(),
+            lookup: None,
         }
     }
 
@@ -76,6 +100,7 @@ impl BaitSet {
     /// (Nipponbare: the NC_011033 seed held 211 bp of a 1.4 kb stretch, which no short read was
     /// recruited for). The genome-size estimate is the number of solid k-mers.
     pub fn add_seed_reads(&mut self, target: usize, path: &Path, min_count: u32) -> Result<usize> {
+        self.lookup = None;
         let mut reader = needletail::parse_fastx_file(path)
             .with_context(|| format!("cannot read seed reads {}", path.display()))?;
         let mut reads: Vec<Vec<u8>> = Vec::new();
@@ -108,6 +133,7 @@ impl BaitSet {
 
     /// `add_sequence`, returning how many k-mers were new to the target.
     pub fn add_sequence_counted(&mut self, target: usize, seq: &[u8]) -> usize {
+        self.lookup = None;
         let bit = 1u8 << target;
         let mut added = 0;
         for (_, kmer) in CanonicalKmers::new(seq, self.k) {
@@ -128,6 +154,7 @@ impl BaitSet {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        self.lookup = None;
         let bit = 1u8 << target;
         let mut added = 0;
         for kmer in solid_kmers(self.k, reads, min_count, 0.1) {
@@ -142,7 +169,30 @@ impl BaitSet {
 
     #[inline]
     pub fn get(&self, kmer: u64) -> u8 {
+        if self
+            .lookup
+            .as_ref()
+            .is_some_and(|index| !index.may_contain(kmer))
+        {
+            return 0;
+        }
         self.map.get(&kmer).copied().unwrap_or(0)
+    }
+
+    /// Rebuild after extension, before scanning reads. Eight presence bits per
+    /// bait key keep the index much smaller than the exact key-to-mask map.
+    /// This changes lookup cost only: masks and all classification scores are exact.
+    pub fn prepare_lookup(&mut self) {
+        let size = (self.map.len() * 8).max(64).next_power_of_two();
+        let mut index = LookupIndex {
+            bits: vec![0; size / 64],
+            mask: size - 1,
+        };
+        for &key in self.map.keys() {
+            let slot = index.slot(key);
+            index.bits[slot >> 6] |= 1u64 << (slot & 63);
+        }
+        self.lookup = Some(index);
     }
 
     pub fn len(&self) -> usize {
@@ -211,6 +261,33 @@ mod tests {
                 b"ACGT"[(s >> 62) as usize]
             })
             .collect()
+    }
+
+    #[test]
+    fn prepared_lookup_preserves_masks_and_extension_invalidates_it() {
+        let mut bait = BaitSet::new(21);
+        for t in 0..MAX_TARGETS {
+            let target = bait.target(&format!("t{t}")).unwrap();
+            bait.add_sequence(target, &genome(5000, t as u64 + 1));
+        }
+        let shared = genome(1000, 81);
+        for t in 0..MAX_TARGETS {
+            bait.add_sequence(t, &shared);
+        }
+        let exact = bait.clone();
+        bait.prepare_lookup();
+        for seq in [genome(100_000, 19), shared.clone(), genome(5000, 1)] {
+            for (_, key) in CanonicalKmers::new(&seq, bait.k) {
+                assert_eq!(bait.get(key), exact.get(key));
+            }
+        }
+        assert!(CanonicalKmers::new(&shared, bait.k).all(|(_, key)| bait.get(key) == u8::MAX));
+        let added = genome(1000, 101);
+        bait.add_sequence(0, &added);
+        assert!(CanonicalKmers::new(&added, bait.k).all(|(_, key)| bait.get(key) & 1 != 0));
+        bait.prepare_lookup();
+        bait.extend_from_reads(1, [added.as_slice(), added.as_slice(), added.as_slice()], 3);
+        assert!(CanonicalKmers::new(&added, bait.k).all(|(_, key)| bait.get(key) & 3 == 3));
     }
 
     #[test]
