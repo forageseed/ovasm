@@ -6,7 +6,9 @@
 
 Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 
-<p align="center"><img src="docs/workflow.svg" alt="ovasm workflow" width="780"></p>
+<p align="center"><img src="docs/figures/ovasm-mechanism-v2.svg" alt="OVASM mechanism: read selection, graph construction, repeat resolution, consensus, component assessment, export and optional scoring" width="1100"></p>
+
+[Figure caption and scope](docs/figures/README.md) · [Editable SVG](docs/figures/ovasm-mechanism-v2.svg) · [PDF](docs/figures/ovasm-mechanism-v2.pdf)
 
 ## Why ovasm
 
