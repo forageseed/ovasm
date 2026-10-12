@@ -6,7 +6,9 @@
 
 [OrganelleVerse](https://github.com/forageseed/organelleverse) 的一部分。
 
-<p align="center"><img src="docs/workflow.svg" alt="ovasm 流程" width="780"></p>
+<p align="center"><img src="docs/figures/ovasm-mechanism-v2.svg" alt="OVASM 机制：读段选择、建图、重复解析、共识、组件评估、导出及可选评分" width="1100"></p>
+
+[图注与适用范围](docs/figures/README.md) · [可编辑 SVG](docs/figures/ovasm-mechanism-v2.svg) · [PDF](docs/figures/ovasm-mechanism-v2.pdf)
 
 ## 为什么用 ovasm
 
