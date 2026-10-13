@@ -37,6 +37,12 @@ The workflow proceeds as follows:
    that graph with the supported reference intervals using the existing exact pan merge,
    retaining every input segment, link and path. This retains novel target sequence;
    unobserved reference sequence is not used to fill gaps.
+   One-base alleles cannot match a long node-internal k-mer. After the exact merge,
+   parallel nodes are joined only if their sequence and both oriented neighbour
+   sets are identical. This removes duplicate representations of the same allele
+   while preserving different alleles, isolated components and tandem self-loops.
+   Every affected segment, link and P-walk spelling is checked; the direct node
+   mapping is retained in `individual.parallel-nodes.tsv`.
 5. Write `individual.gfa` and `individual.fasta` for each organelle. FASTA records are
    maximal nonbranching graph walks. Branches remain in the GFA, and a graph cycle does
    not certify a physical circular chromosome.
