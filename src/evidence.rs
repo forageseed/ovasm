@@ -1129,7 +1129,17 @@ pub fn run(
     }
     reader.join().expect("reader thread panicked")?;
 
-    let supported_links: Vec<bool> = link_reads.iter().map(|&n| n > 0).collect();
+    // Both measurements identify a local graph adjacency. Dense overlaps can be
+    // longer than a short read's two flanking anchors, so a uniquely matched edge
+    // word may be the only observation of a branch. Ignoring it here turns a
+    // depth-backed repeat into a single-copy anchor. These counts never enter
+    // read_walks, traversals or phased_reads: independent junctions do not phase
+    // the repeat between them.
+    let supported_links: Vec<bool> = link_reads
+        .iter()
+        .zip(&adjacency_reads)
+        .map(|(&crossing, &adjacency)| crossing > 0 || adjacency > 0)
+        .collect();
     let mut repeat = repeat_segments(&g, p.max_repeat_len, &supported_links, rdepths.as_deref());
     for (r, c) in repeat.iter_mut().zip(crossroads(&g, &link_reads)) {
         *r |= c;
@@ -1342,6 +1352,7 @@ pub fn run(
             "max_repeat_len": p.max_repeat_len,
             "short_read_adjacency": p.short_read_adjacency,
             "adjacency_rule": "exact overlap-edge word; local adjacency only, not repeat phase",
+            "repeat_adjacency_rule": "unique strict crossing or unique exact edge word; neither infers a repeat pairing",
             "repeat_rule": if depths.is_some() { "branching + depth, then phasing" } else { "branching, then phasing" },
         }),
         elapsed_seconds: t0.elapsed().as_secs_f64(),
@@ -1367,6 +1378,56 @@ mod tests {
             },
             seq,
         )
+    }
+
+    #[test]
+    fn dense_branch_adjacencies_identify_a_repeat_without_phasing_it() {
+        let r = rng_seq(360, 521);
+        let left1 = [rng_seq(500, 522), r[..126].to_vec()].concat();
+        let left2 = [rng_seq(500, 523), r[..126].to_vec()].concat();
+        let right1 = [r[234..].to_vec(), rng_seq(500, 524)].concat();
+        let right2 = [r[234..].to_vec(), rng_seq(500, 525)].concat();
+        let seqs = [&left1, &left2, &r, &right1, &right2];
+        let dir = std::env::temp_dir().join(format!("ovasm-dense-repeat-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let gfa = dir.join("graph.gfa");
+        let reads = dir.join("reads.fastq");
+        let mut graph = String::new();
+        for (i, seq) in seqs.iter().enumerate() {
+            graph.push_str(&format!("S\tn{i}\t{}\tdp:f:{}\n", std::str::from_utf8(seq).unwrap(), if i == 2 { 20 } else { 10 }));
+        }
+        for (a, b) in [(0, 2), (1, 2), (2, 3), (2, 4)] {
+            graph.push_str(&format!("L\tn{a}\t+\tn{b}\t+\t126M\n"));
+        }
+        fs::write(&gfa, graph).unwrap();
+        let junctions = [
+            [left1[499..500].to_vec(), r[..127].to_vec()].concat(),
+            [left2[499..500].to_vec(), r[..127].to_vec()].concat(),
+            [r[233..].to_vec(), right1[126..127].to_vec()].concat(),
+            [r[233..].to_vec(), right2[126..127].to_vec()].concat(),
+        ];
+        let mut fq = String::new();
+        for (i, seq) in junctions.iter().enumerate() {
+            fq.push_str(&format!("@r{i}\n{}\n+\n{}\n", std::str::from_utf8(seq).unwrap(), "I".repeat(seq.len())));
+        }
+        fs::write(&reads, fq).unwrap();
+        let mut p = params();
+        p.short_read_adjacency = true;
+        p.min_anchor = 40;
+        p.min_side_hits = 5;
+        p.bootstrap = 0;
+        let report = run(&gfa, vec![reads.clone()], p, &dir.join("evidence.json")).unwrap();
+        assert_eq!(report.reads_scanned, 4);
+        assert!(report.links.iter().all(|l| l.reads == 0 && l.adjacency_reads == 1));
+        assert_eq!(report.repeat_segments, vec!["n2"]);
+        assert!(report.phased_paths.is_empty());
+        assert!(report.traversals.is_empty());
+        // With the short-read evidence disabled the old strict measurement
+        // observes none of these links, so it cannot identify the branch.
+        p.short_read_adjacency = false;
+        let strict = run(&gfa, vec![reads], p, &dir.join("strict.json")).unwrap();
+        assert!(strict.repeat_segments.is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
