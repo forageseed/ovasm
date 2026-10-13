@@ -77,8 +77,16 @@ enum Command {
 #[derive(clap::Args)]
 struct ReconstructArgs {
     /// Target WGS read files, including both paired FASTQ mates.
-    #[arg(long = "reads", required = true)]
+    #[arg(
+        long = "reads",
+        required_unless_present = "target_reads",
+        conflicts_with = "target_reads"
+    )]
     reads: Vec<PathBuf>,
+    /// Already recruited target files as ORGANELLE=PATH; both organelles required.
+    /// Explicit target-input mode preserves an earlier recruitment without rescanning WGS.
+    #[arg(long = "target-reads", conflicts_with = "target_depth")]
+    target_reads: Vec<String>,
     /// Blunt reference pan GFA as mitochondrion=PATH or plastid=PATH; both required.
     #[arg(long = "reference", required = true)]
     references: Vec<String>,
@@ -108,6 +116,19 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
             bail!("give one mitochondrial and one plastid reference GFA");
         }
     }
+    let mut target_reads = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for spec in args.target_reads {
+        let (o, p) = spec
+            .split_once('=')
+            .context("target reads must be ORGANELLE=PATH")?;
+        if !["mitochondrion", "plastid"].contains(&o) {
+            bail!("invalid target organelle {o}");
+        }
+        target_reads
+            .entry(o.to_string())
+            .or_default()
+            .push(PathBuf::from(p));
+    }
     if let Some(n) = args.threads {
         if n == 0 {
             bail!("threads must be positive");
@@ -118,6 +139,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
     }
     reconstruct::run(&reconstruct::Config {
         reads: args.reads,
+        target_reads,
         references,
         sample: args.sample,
         out: args.out,
