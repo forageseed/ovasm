@@ -93,3 +93,43 @@ Terminal run IDs are `ovasm-eight-pan-WGS-v1`, `ovasm-eight-pan-WGS-target-v2` a
 `d84b60f78811a97e8519134acbbf097ac0bd521f`. Reports, manifests, resource samples and
 the independently inspected terminal outputs are retained under the server project's
 `pan-wgs-validation` task directory.
+
+## Exact short-read adjacency and repeat classification repair
+
+The retained-read follow-up `ovasm-mt-pan-wgs-adjacency-repeat-v1` used source
+788d4d8 and the same target files and eight reference runs. Two dense-overlap
+edges had 35 and 23 unique exact adjacency records but zero strict long-span
+crossings. Repeat classification previously ignored those adjacency records,
+misclassifying a branching 360-bp, depth-42.3 segment as a single-copy anchor.
+Unique adjacency now contributes to identifying a branch; it never contributes
+to read traversals or to selecting a repeat entry/exit pairing.
+
+The main MT component now has 28 complete anchor-cover candidates instead of
+zero. Its selected five linear representatives have lengths 94,370, 72,825,
+72,733, 44,881 and 6,022 bp; the independent 1,455-bp component remains. The
+combined representative length is 292,286 bp. All input graph sequence and
+reference projections are unchanged, and the plastid representative FASTA is
+byte-identical. MT `decisive=false` remains: the selected cover has ten
+topological bridges and the alternative scores are nearly tied. This repair
+resolves the anchor-cover failure; it does not identify physical chromosomes.
+
+The independent terminal audit verified input preservation and every final
+path/FASTA spelling. Scoped server checks passed 24 evidence tests, 36 path
+tests (one existing ignored), nine reconstruction tests and eight public API
+tests. Windows passed 24 evidence tests and eight public API tests. The first
+server build lacked the existing zlib include path; it was preserved and the
+build succeeded with the existing py313 headers/libraries. No default full
+Python suite was rerun or reclassified as passing.
+
+A held-out candidate comparison finds 15,212 bp absent from these representatives.
+This is a development sequence comparison, not independent truth. A separate
+full-prefix raw-read audit scanned all 155,554,892 records in 565.182 seconds and
+found exact compatibility across all those missing bases. The two large intervals
+(8,490 and 6,645 bp) had 34,024 and 18,147 compatible query names, respectively.
+Those names can denote fragments where mates share a name; counts are not source
+certificates. The eight-source panel matches only 561 bp of the first interval
+and none of the second. The original seed recruitment stopped after two of its
+20 allowed rounds, with net growth below the existing five-percent rule; this
+was not a fixed-point test. No reads were rescued using held-out coordinates.
+The separate reference-free WGS novelty-channel pilot is still under evaluation;
+complete reconstruction has not been claimed.
