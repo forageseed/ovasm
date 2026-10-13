@@ -637,6 +637,7 @@ fn export_individual(
 
 pub struct Config {
     pub reads: Vec<PathBuf>,
+    pub target_reads: BTreeMap<String, Vec<PathBuf>>,
     pub references: BTreeMap<String, PathBuf>,
     pub sample: String,
     pub out: PathBuf,
@@ -648,7 +649,18 @@ pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
     }
-    if cfg.reads.is_empty() {
+    let targeted = !cfg.target_reads.is_empty();
+    if targeted {
+        if !cfg.reads.is_empty()
+            || cfg.target_depth.is_some()
+            || cfg.target_reads.len() != 2
+            || ["mitochondrion", "plastid"]
+                .iter()
+                .any(|&o| cfg.target_reads.get(o).map_or(true, |p| p.is_empty()))
+        {
+            bail!("target mode needs both labelled organelle read sets, no raw WGS input or depth sampling");
+        }
+    } else if cfg.reads.is_empty() {
         bail!("give target WGS reads");
     }
     if let Some(d) = cfg.target_depth {
@@ -689,32 +701,41 @@ pub fn run(cfg: &Config) -> Result<Value> {
         cfg.out.join("reference.json"),
         serde_json::to_string_pretty(&reference_info)?,
     )?;
-    let recruitment = recruit::run(
-        bait,
-        recruit::RecruitConfig {
-            inputs: cfg.reads.clone(),
-            params: recruit::ClassifyParams {
-                min_cover: 0.8,
-                min_hit_frac: 0.2,
-                numt_min_block: usize::MAX,
-                block_gap: 40,
+    let recruitment = if targeted {
+        json!({"status":"not_run_explicit_target_inputs","inputs":cfg.target_reads,
+            "upstream_recruitment_certified":false})
+    } else {
+        serde_json::to_value(recruit::run(
+            bait,
+            recruit::RecruitConfig {
+                inputs: cfg.reads.clone(),
+                params: recruit::ClassifyParams {
+                    min_cover: 0.8,
+                    min_hit_frac: 0.2,
+                    numt_min_block: usize::MAX,
+                    block_gap: 40,
+                },
+                iterations: 20,
+                extend_min_count: 3,
+                extend_depth: 200.0,
+                saturation: 0.05,
+                target_depth: cfg.target_depth,
+                salt: cfg.salt,
+                out_dir: cfg.out.join("recruit"),
+                bootstrap: false,
+                extend_gate: false,
             },
-            iterations: 20,
-            extend_min_count: 3,
-            extend_depth: 200.0,
-            saturation: 0.05,
-            target_depth: cfg.target_depth,
-            salt: cfg.salt,
-            out_dir: cfg.out.join("recruit"),
-            bootstrap: false,
-            extend_gate: false,
-        },
-    )?;
+        )?)?
+    };
     let mut organelles = BTreeMap::new();
     for (&o, r) in &references {
         let dir = cfg.out.join(o);
         fs::create_dir_all(&dir)?;
-        let reads = vec![cfg.out.join("recruit").join(format!("{o}.fastq"))];
+        let reads = if targeted {
+            cfg.target_reads[o].clone()
+        } else {
+            vec![cfg.out.join("recruit").join(format!("{o}.fastq"))]
+        };
         eprintln!("[ovasm] reconstruct {o}: projecting exact target read contexts on all {} reference paths",r.walks.len());
         let projection = project(r, &reads, &cfg.sample, &dir)?;
         let assembly = pipeline::run(&pipeline::RunConfig {
@@ -734,7 +755,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             single_seed: false,
             mode: pipeline::Mode::Fast,
             replicates: 3,
-            max_replicates: 10,
+            max_replicates: 5,
             replicate_depth: None,
             salt: cfg.salt,
             sample: format!("{}_denovo", cfg.sample),
@@ -753,8 +774,14 @@ pub fn run(cfg: &Config) -> Result<Value> {
             "de_novo":match assembly {Ok(s)=>s,Err(e)=>json!({"error":format!("{e:#}")})} }),
         );
     }
+    let workflow_completed = organelles
+        .values()
+        .all(|s| s["de_novo"].get("error").is_none());
     let result = json!({"tool":"ovasm reconstruct","format":"organelleverse.reference-reconstruction.v1","sample":cfg.sample,
-        "inputs":cfg.reads,"reference_graphs":cfg.references,"recruitment":recruitment,"organelles":organelles,
+        "workflow_completed":workflow_completed,
+        "inputs":cfg.reads,"target_read_inputs":cfg.target_reads,
+        "input_scope":if targeted {"explicit_target_reads"} else {"whole_genome_recruitment"},
+        "reference_graphs":cfg.references,"recruitment":recruitment,"organelles":organelles,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,
         "physical_molecule_count":null,"physical_topology_identified":false});
@@ -762,6 +789,9 @@ pub fn run(cfg: &Config) -> Result<Value> {
         cfg.out.join("reconstruction.json"),
         serde_json::to_string_pretty(&result)?,
     )?;
+    if !workflow_completed {
+        bail!("de novo target assembly failed; reconstruction.json preserves errors and partial graph evidence");
+    }
     Ok(result)
 }
 

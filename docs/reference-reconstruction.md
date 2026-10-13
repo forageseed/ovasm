@@ -61,6 +61,24 @@ remains false: local read support alone does not identify complete chromosome pa
 Strict and relaxed scores stay null until an independent compatible truth is supplied.
 Physical molecule count stays null and physical topology stays unidentified.
 
+An explicit target-input stage can reuse previously recruited files without scanning the
+whole WGS library again:
+
+```bash
+ovasm reconstruct \
+  --reference mitochondrion=species-mt.gfa --reference plastid=species-pt.gfa \
+  --target-reads mitochondrion=earlier/recruit/mitochondrion.fastq \
+  --target-reads plastid=earlier/recruit/plastid.fastq \
+  --sample individual --threads 8 --out target-stage
+```
+
+This mode reports `explicit_target_reads` and does not run recruitment or depth
+sampling. Its upstream recruitment is not certified by the command itself; retain
+the original input/recruitment manifests when chaining stages. It cannot be combined
+with raw `--reads` or `--target-depth`. A de novo failure writes its diagnostic report
+and partial graph evidence, then exits with an error rather than declaring the whole
+workflow completed.
+
 The exact projection has a deliberately bounded interpretation. Sequencing errors and
 alleles absent from all source paths fail the complete-read exact test; the de novo
 graph is their separate sequence channel. A new recombinant target walk may not occur
