@@ -886,9 +886,10 @@ struct LinearizeArgs {
     /// of the median bridge support.
     #[arg(long, default_value_t = 0.5)]
     optional_below: f64,
-    /// Most molecules (sub-circles, chromosomes sharing repeats) one connected part of the graph
-    /// may be unringed into before it is reported unsolved.
-    #[arg(long, default_value_t = 4)]
+    /// Cover-size limit per component. 0 (automatic) uses the existing four-cover search
+    /// envelope raised to the necessary bound from graph path ends. A positive value is
+    /// an explicit limit; omitted cover sizes remain reported and preclude decisive output.
+    #[arg(long, default_value_t = 0)]
     max_molecules: usize,
 }
 
@@ -940,7 +941,7 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
                 "[ovasm]   {} anchors: no cover of {}..={} molecules{}; path ends {}",
                 c.anchors.len(),
                 c.min_molecules,
-                args.max_molecules,
+                c.searched_max_molecules,
                 if c.search_truncated {
                     " (search truncated)"
                 } else {

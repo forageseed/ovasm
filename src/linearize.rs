@@ -71,7 +71,8 @@ pub struct LinearizeParams {
     /// Upper bound on search expansions per component and cover size (the anchor graph is small,
     /// but stay bounded).
     pub max_steps: u64,
-    /// Most molecules one component may be split into before it is reported unsolved.
+    /// Explicit cover-size bound; zero uses the existing four-cover search envelope
+    /// raised to the component's necessary path-end lower bound.
     pub max_molecules: usize,
     pub max_alternatives: usize,
     /// An anchor shallower than this fraction of the median depth is optional: a low-frequency
@@ -1333,7 +1334,16 @@ pub fn run(
         // does not establish that it is the representative best supported by the reads.
         let mut ranked: Vec<(Vec<Vec<Oriented>>, CoverReport, Vec<Found>)> = Vec::new();
         let mut seen = BTreeSet::new();
-        rep.searched_max_molecules = p.max_molecules.max(1).min(comp.len());
+        // An automatic envelope must include the topological lower bound:
+        // otherwise the feasible-size loop is empty before any search.
+        // Explicit caller limits remain authoritative, and omitted larger
+        // sizes still prohibit a decisive claim. No support threshold changes.
+        let envelope = if p.max_molecules == 0 {
+            4.max(rep.min_molecules)
+        } else {
+            p.max_molecules
+        };
+        rep.searched_max_molecules = envelope.min(comp.len());
         rep.cover_size_limited = rep.searched_max_molecules < comp.len();
         for m in rep.min_molecules..=rep.searched_max_molecules {
             let (found, truncated) = search(g.names.len(), &comp, &optional, &br, m, p.max_steps);
@@ -1984,6 +1994,34 @@ mod tests {
     /// `run` on a GFA and an evidence report written to a scratch directory.
     fn run_on(gfa: &str, ev: &Value, dir_name: &str) -> LinearizeReport {
         run_files(gfa, ev, dir_name, 4).0
+    }
+
+    #[test]
+    fn automatic_cover_envelope_includes_five_path_end_pairs_and_keeps_explicit_limits() {
+        let mut gfa = String::from("H\tVN:Z:1.0\nS\tR\tACGTACGTACGTACGTACGT\n");
+        let mut links = Vec::new();
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            gfa.push_str(&format!(
+                "S\tA{i}\t{}\nS\tB{i}\t{}\nL\tA{i}\t+\tR\t+\t0M\nL\tR\t+\tB{i}\t+\t0M\n",
+                String::from_utf8(seq(100, i + 1)).unwrap(),
+                String::from_utf8(seq(100, i + 10)).unwrap()
+            ));
+            links.push(json!({"from":format!("A{i}+"),"to":"R+","reads":50}));
+            links.push(json!({"from":"R+","to":format!("B{i}+"),"reads":50}));
+            for j in 0..5 {
+                paths.push(json!({"path":format!("A{i}+ R+ B{j}+"),"reads":10}));
+            }
+        }
+        let ev = json!({"repeat_segments":["R"],"links":links,"phased_paths":paths});
+        let explicit = run_files(&gfa, &ev, "ovasm-explicit-cover-four", 4).0;
+        assert_eq!(explicit.components[0].min_molecules, 5);
+        assert_eq!(explicit.unsolved_components, 1);
+        let automatic = run_files(&gfa, &ev, "ovasm-auto-cover-five", 0).0;
+        assert_eq!(automatic.components[0].searched_max_molecules, 5);
+        assert_eq!(automatic.unsolved_components, 0);
+        assert_eq!(automatic.molecules, 5);
+        assert!(automatic.cover_size_limited && !automatic.decisive);
     }
 
     /// As `run_on`, with the molecule FASTA and the partial FASTA as written (`None`: no such

@@ -94,6 +94,14 @@ versus organelle origin. Short reads cannot select a whole configuration through
 identical repeats. Those uncertainties must be retained when comparing materials or
 building a species pan graph from the resulting individual graphs.
 
+The default representative-path search includes the necessary lower bound from
+path ends. Its existing four-cover computational envelope is raised only when that
+bound exceeds four; otherwise the search interval would be empty without examining
+a feasible size. `linearize --max-molecules N` with positive N retains an explicit
+limit. Omitted larger cover sizes and expansion-budget exhaustion remain reported
+and continue to prevent a decisive result. No support, optional-anchor or scoring
+threshold is loosened.
+
 An eight-run reference graph is a usable panel, not a universal minimum sample count
 or proof of eight independent biological individuals. Reference and target identities
 must be checked separately; a target's held-out HiFi graph must not be added to its
