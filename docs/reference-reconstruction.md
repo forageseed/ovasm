@@ -106,3 +106,6 @@ An eight-run reference graph is a usable panel, not a universal minimum sample c
 or proof of eight independent biological individuals. Reference and target identities
 must be checked separately; a target's held-out HiFi graph must not be added to its
 reference or used to select paths during reconstruction.
+
+See [the eight-run validation record](reference-reconstruction-validation.md) for
+actual input scope, measured stages, first failures, graph results and remaining limits.
