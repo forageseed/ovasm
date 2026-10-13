@@ -14,6 +14,7 @@ mod pan;
 mod panel;
 mod pipeline;
 mod primary;
+mod reconstruct;
 mod recruit;
 mod replicate;
 mod seeddb;
@@ -39,6 +40,8 @@ enum Command {
     /// until the molecules explain half of the graph), evidence, linearize, unify; --mode
     /// standard adds downsampled replicates. The other subcommands are its stages.
     Run(RunArgs),
+    /// Reconstruct one WGS sample using all paths of mitochondrial and plastid reference graphs.
+    Reconstruct(ReconstructArgs),
     /// Recruit mitochondrial/plastid reads from whole-genome sequencing data in one pass.
     Recruit(RecruitArgs),
     /// Seed-free discovery: find organelle reads by k-mer depth, split them into depth clusters.
@@ -69,6 +72,59 @@ enum Command {
     /// Keep the connected components of an assembly graph that are the target organelle (by
     /// conserved proteins and depth); for graphs of reads found by `discover`.
     Components(ComponentsArgs),
+}
+
+#[derive(clap::Args)]
+struct ReconstructArgs {
+    /// Target WGS read files, including both paired FASTQ mates.
+    #[arg(long = "reads", required = true)]
+    reads: Vec<PathBuf>,
+    /// Blunt reference pan GFA as mitochondrion=PATH or plastid=PATH; both required.
+    #[arg(long = "reference", required = true)]
+    references: Vec<String>,
+    #[arg(long)]
+    sample: String,
+    #[arg(long)]
+    out: PathBuf,
+    /// Optional resource cap: kept bases / stored reference graph bases (each node once).
+    /// This basis is neither eight genomes summed nor certified physical genome size.
+    #[arg(long)]
+    target_depth: Option<f64>,
+    #[arg(long, default_value_t = 0)]
+    salt: u64,
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+fn reconstruct(args: ReconstructArgs) -> Result<()> {
+    let mut references = std::collections::BTreeMap::new();
+    for spec in args.references {
+        let (o, p) = spec
+            .split_once('=')
+            .context("reference must be ORGANELLE=GFA")?;
+        if !["mitochondrion", "plastid"].contains(&o)
+            || references.insert(o.to_string(), PathBuf::from(p)).is_some()
+        {
+            bail!("give one mitochondrial and one plastid reference GFA");
+        }
+    }
+    if let Some(n) = args.threads {
+        if n == 0 {
+            bail!("threads must be positive");
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()?;
+    }
+    reconstruct::run(&reconstruct::Config {
+        reads: args.reads,
+        references,
+        sample: args.sample,
+        out: args.out,
+        target_depth: args.target_depth,
+        salt: args.salt,
+    })?;
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -1294,6 +1350,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
 fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Run(args) => run(args),
+        Command::Reconstruct(args) => reconstruct(args),
         Command::Recruit(args) => recruit(args),
         Command::Discover(args) => discover(args),
         Command::Evidence(args) => evidence(args),

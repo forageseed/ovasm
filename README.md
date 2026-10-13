@@ -16,6 +16,7 @@ Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 - **An assembly graph with evidence, not just a sequence.** Every junction comes with the number of reads that support it, and `molecules.fasta` holds the representative molecule(s). When the reads cannot tell structures apart, `decisive` is `false` instead of a silent guess.
 - **One program with a built-in seed library.** The portable stages use Rust gzip. The native multichrom kernel runs on Linux and needs a C compiler and zlib development headers; a seed reference is optional.
 - **Pangenome-ready.** The graph is also written as OV-GFA, which `ovasm pan` merges across samples.
+- **Species reference graphs for WGS.** `ovasm reconstruct` uses all source paths of paired mitochondrial/plastid pan graphs, reports target read support, and exports individual FASTA/GFA while retaining unsupported regions and unresolved phase. [Method and command](docs/reference-reconstruction.md).
 
 ## Install
 
