@@ -559,6 +559,149 @@ fn unitigs(g: &Graph) -> Vec<(Vec<Oriented>, bool)> {
     output
 }
 
+/// Long node-internal k-mers cannot join a one-base allele between two already
+/// shared flanks. Quotient only exact parallel nodes with identical sequence
+/// and identical incoming/outgoing oriented neighbours. Distinct alleles,
+/// isolated components and tandem self-loops remain distinct.
+fn coalesce_parallel(file: &Path) -> Result<usize> {
+    let old = parse_gfa(file)?;
+    let text = fs::read_to_string(file)?;
+    let reversed: Vec<_> = old.seqs.iter().map(|s| revcomp(s) < *s).collect();
+    let seqs: Vec<_> = old
+        .seqs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| if reversed[i] { revcomp(s) } else { s.clone() })
+        .collect();
+    let mut owners: Vec<_> = (0..seqs.len()).collect();
+    let map = |o: Oriented, owners: &[usize]| (owners[o.0], o.1 != reversed[o.0]);
+    loop {
+        let mut incoming: BTreeMap<Oriented, BTreeSet<Oriented>> = BTreeMap::new();
+        let mut outgoing: BTreeMap<Oriented, BTreeSet<Oriented>> = BTreeMap::new();
+        for &(a, b) in &old.links {
+            let a = map(a, &owners);
+            let b = map(b, &owners);
+            for (x, y) in [(a, b), (flip(b), flip(a))] {
+                incoming.entry(y).or_default().insert(x);
+                outgoing.entry(x).or_default().insert(y);
+            }
+        }
+        let mut groups: BTreeMap<(Vec<u8>, Vec<Oriented>, Vec<Oriented>), usize> = BTreeMap::new();
+        let mut replacement = owners.clone();
+        let mut changed = false;
+        for i in 0..seqs.len() {
+            if owners[i] != i {
+                continue;
+            }
+            let (Some(left), Some(right)) = (incoming.get(&(i, true)), outgoing.get(&(i, true)))
+            else {
+                continue;
+            };
+            if left.iter().chain(right).any(|o| o.0 == i) {
+                continue;
+            }
+            let signature = (
+                seqs[i].clone(),
+                left.iter().copied().collect(),
+                right.iter().copied().collect(),
+            );
+            let representative = *groups.entry(signature).or_insert(i);
+            if representative != i {
+                replacement[i] = representative;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        for owner in &mut owners {
+            *owner = replacement[*owner];
+        }
+    }
+    let names: BTreeMap<_, _> = old
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let label = |o: Oriented| format!("{}{}", old.names[o.0], if o.1 { '+' } else { '-' });
+    let mut output = String::new();
+    let mut mapping = String::from("pan_node\tindividual_node\treversed\n");
+    for (i, n) in old.names.iter().enumerate() {
+        let o = map((i, true), &owners);
+        if if o.1 {
+            seqs[o.0].clone()
+        } else {
+            revcomp(&seqs[o.0])
+        } != old.seqs[i]
+        {
+            bail!("parallel-node integration changed an input segment sequence");
+        }
+        writeln!(mapping, "{n}\t{}\t{}", old.names[o.0], !o.1)?;
+        if owners[i] == i {
+            writeln!(
+                output,
+                "S\t{n}\t{}\tLN:i:{}",
+                std::str::from_utf8(&seqs[i])?,
+                seqs[i].len()
+            )?;
+        }
+    }
+    let links: BTreeSet<_> = old
+        .links
+        .iter()
+        .map(|&(a, b)| edge(map(a, &owners), map(b, &owners)))
+        .collect();
+    for &(a, b) in &links {
+        writeln!(
+            output,
+            "L\t{}\t{}\t{}\t{}\t0M",
+            old.names[a.0],
+            if a.1 { '+' } else { '-' },
+            old.names[b.0],
+            if b.1 { '+' } else { '-' }
+        )?;
+    }
+    for line in text.lines() {
+        let mut f: Vec<_> = line.split('\t').map(str::to_string).collect();
+        if f[0] == "H" {
+            output = format!("{line}\n{output}");
+        }
+        if f[0] != "P" {
+            continue;
+        }
+        let mut walk = Vec::new();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for s in f[2].split(',') {
+            let i = *names
+                .get(&s[..s.len() - 1])
+                .context("unknown integrated path node")?;
+            let o = (i, s.ends_with('+'));
+            let mapped = map(o, &owners);
+            before.extend(old.oriented_seq(o));
+            after.extend(if mapped.1 {
+                seqs[mapped.0].clone()
+            } else {
+                revcomp(&seqs[mapped.0])
+            });
+            walk.push(mapped);
+        }
+        if before != after || walk.windows(2).any(|p| !links.contains(&edge(p[0], p[1]))) {
+            bail!("parallel-node integration changed an input path or adjacency");
+        }
+        f[2] = walk.into_iter().map(label).collect::<Vec<_>>().join(",");
+        writeln!(output, "{}", f.join("\t"))?;
+    }
+    fs::write(file, output)?;
+    fs::write(file.with_extension("parallel-nodes.tsv"), mapping)?;
+    Ok(owners
+        .iter()
+        .enumerate()
+        .filter(|&(i, &owner)| i != owner)
+        .count())
+}
+
 fn export_individual(
     observed: &Path,
     denovo: Option<&Path>,
@@ -602,6 +745,8 @@ fn export_individual(
         }
     }
     fs::write(&file, &gfa)?;
+    let coalesced_parallel_nodes = coalesce_parallel(&file)?;
+    gfa = fs::read_to_string(&file)?;
     let graph = parse_gfa(&file)?;
     let mut fasta = String::new();
     let mut lengths = Vec::new();
@@ -628,7 +773,8 @@ fn export_individual(
     fs::write(out.join("individual.fasta"), fasta)?;
     Ok(
         json!({"individual_gfa":file,"individual_fasta":out.join("individual.fasta"),"contig_lengths":lengths,
-        "segments":graph.names.len(),"links":graph.links.len(),"stored_bases":merged.pan_bases,
+        "segments":graph.names.len(),"links":graph.links.len(),"stored_bases":graph.seqs.iter().map(Vec::len).sum::<usize>(),
+        "pre_context_merge_stored_bases":merged.pan_bases,"coalesced_parallel_nodes":coalesced_parallel_nodes,
         "verified_input_segments":merged.verified_segments,"verified_input_links":merged.verified_links,"verified_input_paths":merged.verified_paths,
         "reference_only_bases_emitted":0,"output_scope":"union_of_certain_read_compatible_reference_intervals_and_de_novo_target_graph",
         "complete_assembly":false,"long_range_phase_identified":false,"physical_molecule_count":null,"physical_topology_identified":false}),
@@ -933,5 +1079,24 @@ mod tests {
         let walks = unitigs(&r.graph);
         assert_eq!(walks.len(), 4);
         assert_eq!(walks.iter().map(|(w, _)| w.len()).sum::<usize>(), 4);
+    }
+    #[test]
+    fn parallel_exact_alleles_merge_but_distinct_alleles_and_isolates_do_not() {
+        let p = std::env::temp_dir().join(format!("ovasm-context-test-{}.gfa", std::process::id()));
+        fs::write(&p,"H\tVN:Z:1.0\nS\tl\tAAAA\nS\tx\tC\nS\ty\tG\nS\ta\tA\nS\tr\tTTTT\nS\tisolated\tC\nL\tl\t+\tx\t+\t0M\nL\tx\t+\tr\t+\t0M\nL\tl\t+\ty\t-\t0M\nL\ty\t-\tr\t+\t0M\nL\tl\t+\ta\t+\t0M\nL\ta\t+\tr\t+\t0M\nP\tfirst#1#pt\tl+,x+,r+\t*\nP\tsecond#1#pt\tl+,y-,r+\t*\n").unwrap();
+        assert_eq!(coalesce_parallel(&p).unwrap(), 1);
+        let g = parse_gfa(&p).unwrap();
+        assert_eq!(g.names.len(), 5);
+        assert_eq!(g.links.len(), 4);
+        assert!(g.names.iter().any(|n| n == "isolated"));
+        let paths: Vec<_> = fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .filter(|s| s.starts_with("P\t"))
+            .map(|s| s.split('\t').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(paths[0], paths[1]);
+        fs::remove_file(p.with_extension("parallel-nodes.tsv")).unwrap();
+        fs::remove_file(p).unwrap();
     }
 }
