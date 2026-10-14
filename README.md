@@ -2,7 +2,16 @@
 
 # ovasm
 
-**Assemble plant mitochondrial and chloroplast genomes from sequencing reads — and get the evidence, not just one sequence.**
+**Assemble plant mitochondrial and chloroplast genomes from whole-genome sequencing reads — and get the graph, the molecules, and the reads behind every junction.**
+
+ovasm is one Rust program: give it HiFi, ONT, CLR or Illumina whole-genome reads and it recruits the organelle fraction, builds the assembly graph, counts the reads supporting every link, branch and repeat, and unfolds representative molecules. Plant mitochondria often exist in several forms at once; when the reads cannot tell two structures apart, ovasm says so (`decisive: false`) instead of silently guessing.
+
+- **No reference required.** A built-in seed library — 16 mitochondrial and 44 plastid land-plant genomes — recruits the organelle reads. Bring a closer reference with `--seeds`, or run fully seed-free with `--recruit discover` (k-mer depth; HiFi).
+- **Evidence, not just a sequence.** Every junction carries its supporting-read counts in `evidence.json`; `--mode standard` adds downsampled replicates and reports how often each junction reappears.
+- **Fast and small.** About 3 minutes and 229 MB peak on the full *A. thaliana* Col-0 HiFi set, where the tools measured alongside needed 31–98 minutes and 0.3–1.1 GB ([comparison and caveats](#compared-with-other-tools)). One binary; built and tested on Linux and Windows.
+- **Pangenome-ready.** Every graph is exported as OV-GFA; `ovasm pan` merges samples into one pangenome graph; `ovasm reconstruct` rebuilds an individual's organelle genomes from species reference graphs with short reads.
+- **One program, every stage a command.** `ovasm run` chains recruitment, assembly, evidence, linearization and export; each stage is also a standalone subcommand.
+- **Honest by design.** Blind-test rounds — failures included — and the limits of every benchmark are published below; `k_accepted` and `decisive` are there to be checked before you trust a run.
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](https://github.com/forageseed/ovasm/wiki)
 
@@ -209,8 +218,10 @@ All numbers were measured by us on the data named in the figure; per-sample tabl
 | `assemble` | build the assembly graph |
 | `evidence` | count read support for every link of a graph |
 | `linearize` | pick the representative sequence(s) |
+| `primary` | export a depth-constrained primary path and unplaced segments per component |
 | `unify` | rewrite a graph as OV-GFA |
 | `pan` | merge OV-GFA graphs of several samples into one pangenome graph |
+| `reconstruct` | rebuild one sample's organelle genomes from paired species reference graphs with short reads |
 | `components` | keep only the connected parts that are the target organelle |
 | `identify` | find the closest reference genomes of an assembly |
 | `label` | label graph pieces mitochondrion or plastid by gene content |
