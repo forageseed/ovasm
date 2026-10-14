@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="ovasm logo" width="440"></p>
+
 # ovasm
 
 **Assemble plant mitochondrial and chloroplast genomes from sequencing reads — and get the evidence, not just one sequence.**
