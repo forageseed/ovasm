@@ -2,7 +2,16 @@
 
 # ovasm
 
-**用测序数据组装植物线粒体和叶绿体基因组，给出的不只是一条序列，还有证据。**
+**从全基因组测序数据组装植物线粒体和叶绿体基因组——拿到的是图、代表分子，以及每个连接背后的读段证据。**
+
+ovasm 是一个 Rust 程序：给它 HiFi、ONT、CLR 或 Illumina 全基因组 reads，它会招募细胞器读段、构建组装图、统计每条连接、分支和重复的支持读段数，再展开代表分子。植物线粒体通常同时存在多种构型；reads 分不清结构时，ovasm 会如实写 `decisive: false`，不会悄悄猜一个。
+
+- **不需要参考序列。** 内置 16 个线粒体、44 个叶绿体陆地植物基因组组成的种子库负责招募读段；可用 `--seeds` 换成更近缘的参考，也可用 `--recruit discover` 完全免种子（按 k-mer 深度，HiFi）。
+- **证据，而不只是序列。** 每个连接的支持读段数都写进 `evidence.json`；`--mode standard` 加做降采样重复，报告每个连接的复现率。
+- **又快又省。** 拟南芥 Col-0 全量 HiFi 约 3 分钟、峰值 229 MB；同期实测的其他工具需要 31–98 分钟、0.3–1.1 GB 内存（[对比与限制](#和现有工具比较)）。单个二进制，在 Linux 和 Windows 上构建并测试。
+- **泛基因组就绪。** 图同时导出为 OV-GFA；`ovasm pan` 把多个样本合并为一张泛基因组图；`ovasm reconstruct` 用短读段从物种参考图重建个体的细胞器基因组。
+- **一个程序，每个阶段都是命令。** `ovasm run` 串起招募、组装、证据、线性化和导出；每个阶段也都能单独调用。
+- **如实报告。** 盲测轮次（包括失败）和每项基准的限制都在下文公开；`k_accepted` 和 `decisive` 就是留着让你核对的，不是让你盲信的。
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](https://github.com/forageseed/ovasm/wiki/zh-Home)
 
@@ -193,8 +202,10 @@ ovasm run --reads sample.hifi.fastq.gz --organelle both \
 | `assemble` | 建组装图 |
 | `evidence` | 统计图上每个连接的 reads 支持 |
 | `linearize` | 选出代表序列 |
+| `primary` | 按深度约束导出主路径和各组件未安置的片段 |
 | `unify` | 把图改写成 OV-GFA |
 | `pan` | 把多个样本的 OV-GFA 合并成一个泛基因组图 |
+| `reconstruct` | 用短读段从成对的物种参考图重建一个样本的细胞器基因组 |
 | `components` | 只保留属于目标细胞器的连通部分 |
 | `identify` | 找组装结果最接近的参考基因组 |
 | `label` | 按基因组成给图的片段标注线粒体或质体 |
