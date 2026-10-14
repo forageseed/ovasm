@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="ovasm logo" width="440"></p>
+
 # ovasm
 
 **用测序数据组装植物线粒体和叶绿体基因组，给出的不只是一条序列，还有证据。**
