@@ -177,6 +177,10 @@ fn sample_dense(seq: &[u8], k: usize) -> Vec<Sample> {
 
 #[derive(Serialize)]
 pub struct AssembleReport {
+    /// Original-read support for structural junctions hidden by the long-k backbone.
+    /// Absent for the dense short-read graph, whose reads cannot span these contexts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub junction_rescue: Option<crate::junctions::JunctionReport>,
     pub k: usize,
     /// Automatic k: each k tried, largest first, with its node depth (see `run_auto_k`).
     pub k_tried: Vec<(usize, f64)>,
@@ -1342,10 +1346,32 @@ pub fn run_auto_k(
     out_gfa: &Path,
     out_json: &Path,
 ) -> Result<AssembleReport> {
+    run_auto_k_with_context(
+        inputs,
+        s,
+        min_count,
+        min_count_fraction,
+        target,
+        out_gfa,
+        out_json,
+        None,
+    )
+}
+
+pub fn run_auto_k_with_context(
+    inputs: Vec<PathBuf>,
+    s: usize,
+    min_count: Option<u32>,
+    min_count_fraction: Option<f64>,
+    target: f64,
+    out_gfa: &Path,
+    out_json: &Path,
+    context: Option<&Path>,
+) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
         for (i, &k) in K_LADDER.iter().enumerate() {
-            let r = run(
+            let r = run_backbone(
                 reads.to_vec(),
                 AssembleParams {
                     k,
@@ -1370,7 +1396,7 @@ pub fn run_auto_k(
     if r.node_depth < target {
         let corrected = out_gfa.with_extension("corrected.fa");
         crate::correct::run(
-            inputs,
+            inputs.clone(),
             Vec::new(),
             &[17, 25],
             &[15, 21, 25],
@@ -1390,12 +1416,87 @@ pub fn run_auto_k(
         r = ladder(std::slice::from_ref(&corrected), &mut tried)?;
         r.corrected_reads = Some(corrected.display().to_string());
     }
+    add_junctions(&mut r, &inputs, out_gfa, context)?;
     r.k_tried = tried;
     fs::write(out_json, serde_json::to_string_pretty(&r)?)?;
     Ok(r)
 }
 
 pub fn run(
+    inputs: Vec<PathBuf>,
+    p: AssembleParams,
+    out_gfa: &Path,
+    out_json: &Path,
+) -> Result<AssembleReport> {
+    run_with_context(inputs, p, out_gfa, out_json, None)
+}
+
+pub fn run_with_context(
+    inputs: Vec<PathBuf>,
+    p: AssembleParams,
+    out_gfa: &Path,
+    out_json: &Path,
+    context: Option<&Path>,
+) -> Result<AssembleReport> {
+    let mut r = run_backbone(inputs.clone(), p, out_gfa, out_json)?;
+    add_junctions(&mut r, &inputs, out_gfa, context)?;
+    fs::write(out_json, serde_json::to_string_pretty(&r)?)?;
+    Ok(r)
+}
+
+fn add_junctions(
+    r: &mut AssembleReport,
+    inputs: &[PathBuf],
+    out_gfa: &Path,
+    context: Option<&Path>,
+) -> Result<()> {
+    if r.s == 0 {
+        if context.is_some() {
+            bail!("whole-read nuclear context currently requires HiFi sparse assembly");
+        }
+        return Ok(());
+    }
+    let started = Instant::now();
+    let graph = crate::evidence::parse_gfa(out_gfa)?;
+    let context = context
+        .map(|path| {
+            crate::read_context::ReadContext::load(path, &graph, &crate::junctions::hifi_evidence())
+        })
+        .transpose()?;
+    let mut report =
+        crate::junctions::restore(out_gfa, inputs, r.k, r.s, r.min_count, |read, a, b| {
+            match &context {
+                Some(ctx) => ctx.nuclear_flanked(read, a, b),
+                None => Ok(false),
+            }
+        })?;
+    report.read_context = context.map(|ctx| ctx.summary);
+    if report.retained_junctions > 0 {
+        let graph = crate::evidence::parse_gfa(out_gfa)?;
+        let mut lengths: Vec<_> = graph.seqs.iter().map(Vec::len).collect();
+        lengths.sort_unstable_by(|a, b| b.cmp(a));
+        r.total_length = lengths.iter().sum();
+        r.unitigs = lengths.len();
+        r.longest = lengths.first().copied().unwrap_or(0);
+        r.links = graph.links.len();
+        r.links_with_overlap = graph.overlaps.iter().filter(|&&x| x > 0).count();
+        r.circular_unitigs = graph.links.iter().filter(|(a, b)| a == b).count();
+        let mut acc = 0;
+        r.n50 = lengths
+            .iter()
+            .find(|&&l| {
+                acc += l;
+                acc * 2 >= r.total_length
+            })
+            .copied()
+            .unwrap_or(0);
+    }
+    r.elapsed_seconds += started.elapsed().as_secs_f64();
+    r.junction_rescue = Some(report);
+    Ok(())
+}
+
+fn run_backbone(
     inputs: Vec<PathBuf>,
     p: AssembleParams,
     out_gfa: &Path,
@@ -1613,6 +1714,12 @@ pub fn run(
         writeln!(gfa, "L\tu{a}\t{}\tu{b}\t{}\t{ov}M", sign(af), sign(bf))?;
     }
     fs::create_dir_all(out_gfa.parent().unwrap_or(Path::new(".")))?;
+    // This is a new backbone attempt. Its optional rescue snapshot must not come
+    // from a preceding k or an earlier invocation using the same output path.
+    let prior_backbone = out_gfa.with_extension("backbone.gfa");
+    if prior_backbone.exists() {
+        fs::remove_file(prior_backbone)?;
+    }
     fs::write(out_gfa, &gfa)?;
 
     lengths.sort_unstable_by(|a, b| b.cmp(a));
@@ -1627,6 +1734,7 @@ pub fn run(
         .copied()
         .unwrap_or(0);
     let report = AssembleReport {
+        junction_rescue: None,
         k: p.k,
         s: p.s,
         reads,
