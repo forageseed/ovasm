@@ -69,8 +69,8 @@ if system == 'Windows':
     descriptor = file_offset(struct.unpack_from('<I', image, optional+120)[0])
     dependencies = []
     while any(image[descriptor:descriptor+20]):
-        name = file_offset(struct.unpack_from('<I', image, descriptor+12)[0])
-        dependencies.append(image[name:image.index(b'\0', name)].decode('ascii'))
+        name_offset = file_offset(struct.unpack_from('<I', image, descriptor+12)[0])
+        dependencies.append(image[name_offset:image.index(b'\0', name_offset)].decode('ascii'))
         descriptor += 20
     assert not any(n.lower().startswith(('vcruntime', 'msvcp')) for n in dependencies), dependencies
     info['imported_windows_libraries'] = dependencies
