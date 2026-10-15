@@ -182,6 +182,7 @@ struct ScanResult {
     reads: u64,
     bases: u64,
     multi_target: u64,
+    reclassified: u64,
 }
 
 /// A target's recruited reads of the current pass, in input order.
@@ -191,7 +192,7 @@ fn pass_path(out_dir: &Path, target: &str) -> PathBuf {
 
 /// Every record of a FASTQ written by `write_rec`, in order. A pass that recruited nothing
 /// leaves an empty file, which the parser rejects, so it is read as no records.
-fn for_each_rec(path: &Path, mut f: impl FnMut(Rec)) -> Result<()> {
+pub(crate) fn for_each_rec(path: &Path, mut f: impl FnMut(Rec)) -> Result<()> {
     if std::fs::metadata(path)
         .with_context(|| format!("cannot read {}", path.display()))?
         .len()
@@ -299,8 +300,16 @@ fn scan(
     p: &ClassifyParams,
     out_dir: &Path,
     numt_path: &Path,
+    mut replay: Option<&mut crate::replay::Replay>,
+    delta: Option<&BaitSet>,
+    final_outputs: bool,
 ) -> Result<ScanResult> {
-    let (rx, reader) = read_batches(inputs);
+    let replaying = replay.as_ref().is_some_and(|r| r.ready);
+    let (rx, reader) = if replaying && !final_outputs {
+        replay.as_ref().unwrap().batches()
+    } else {
+        crate::replay::source_batches(inputs)
+    };
     let mut writers = bait
         .targets
         .iter()
@@ -312,24 +321,82 @@ fn scan(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut numt_w = BufWriter::with_capacity(1 << 20, File::create(numt_path)?);
+    let expected_input = if final_outputs {
+        replay.as_ref().map(|cache| cache.batches())
+    } else {
+        None
+    };
     let mut out = ScanResult {
         recruited: vec![TargetCounts::default(); bait.targets.len()],
         numt: TargetCounts::default(),
         reads: 0,
         bases: 0,
         multi_target: 0,
+        reclassified: 0,
     };
     for batch in rx {
+        if let Some((expected, _)) = &expected_input {
+            let cached = expected
+                .recv()
+                .context("original input has more batches than its recruitment cache")?;
+            anyhow::ensure!(
+                cached.len() == batch.len()
+                    && cached
+                        .iter()
+                        .zip(&batch)
+                        .all(|(a, b)| a.rec.id == b.rec.id && a.rec.seq == b.rec.seq),
+                "original identifiers or sequences changed during recruitment replay"
+            );
+        }
+        if !replaying {
+            if let Some(cache) = replay.as_mut() {
+                cache.store(&batch)?;
+            }
+        }
+        let offset = out.reads as usize;
+        let previous = if replaying {
+            Some(
+                replay
+                    .as_ref()
+                    .unwrap()
+                    .calls
+                    .get(offset..offset + batch.len())
+                    .context("input has more records than the recruitment cache")?,
+            )
+        } else {
+            None
+        };
         out.reads += batch.len() as u64;
-        out.bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
-        let calls: Vec<(Call, Rec)> = batch
+        out.bases += batch.iter().map(|r| r.rec.seq.len() as u64).sum::<u64>();
+        let calls: Vec<(Call, crate::replay::Entry, bool)> = batch
             .into_par_iter()
-            .filter_map(|rec| {
-                let (call, _) = classify(&rec.seq, bait, p);
-                (call != Call::Other).then_some((call, rec))
+            .enumerate()
+            .map(|(i, rec)| {
+                let changed = previous.is_none()
+                    || (!final_outputs
+                        && CanonicalKmers::new(&rec.rec.seq, bait.k)
+                            .any(|(_, key)| delta.expect("replay has change set").get(key) != 0));
+                let call = if changed {
+                    classify(&rec.rec.seq, bait, p).0
+                } else {
+                    previous.unwrap()[i]
+                };
+                (call, rec, changed)
             })
             .collect();
-        for (call, rec) in calls {
+        for (i, (call, entry, changed)) in calls.into_iter().enumerate() {
+            out.reclassified += u64::from(changed);
+            if let Some(cache) = replay.as_mut() {
+                if replaying {
+                    cache.calls[offset + i] = call;
+                } else {
+                    cache.calls.push(call);
+                }
+            }
+            if call == Call::Other {
+                continue;
+            }
+            let rec = entry.rec;
             let len = rec.seq.len() as u64;
             match call {
                 Call::Organelle(mask) => {
@@ -352,6 +419,21 @@ fn scan(
         }
     }
     reader.join().expect("reader thread panicked")?;
+    if let Some((expected, reader)) = expected_input {
+        anyhow::ensure!(
+            expected.recv().is_err(),
+            "original input has fewer batches than its recruitment cache"
+        );
+        reader.join().expect("cache reader panicked")?;
+    }
+    if let Some(cache) = replay {
+        if !replaying {
+            cache.finish()?;
+        }
+        if !final_outputs {
+            cache.reclassified_reads.push(out.reclassified);
+        }
+    }
     for w in &mut writers {
         w.flush()?;
     }
@@ -419,6 +501,8 @@ pub struct RecruitReport {
     pub version: &'static str,
     pub k: usize,
     pub params: ClassifyParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_replay: Option<crate::replay::ReplayStats>,
     pub iterations_requested: usize,
     /// Passes actually run: iteration stops early once no target's bait grows.
     pub iterations_run: usize,
@@ -433,6 +517,7 @@ pub struct RecruitReport {
     pub outputs: Vec<TargetOutput>,
     pub numt_candidates: u64,
     pub numt_output: String,
+    pub source_candidates: serde_json::Value,
     pub bootstrap: bool,
     pub extend_gate: bool,
     /// Depth sketch of the bootstrap or extension gate, when one was built.
@@ -443,6 +528,8 @@ pub struct RecruitReport {
 }
 
 pub struct RecruitConfig {
+    /// Optional new directory for lossless, process-local input replay.
+    pub replay_dir: Option<PathBuf>,
     pub inputs: Vec<PathBuf>,
     pub params: ClassifyParams,
     pub iterations: usize,
@@ -539,7 +626,26 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let start = Instant::now();
     std::fs::create_dir_all(&cfg.out_dir)?;
     let mut iterations = Vec::new();
+    let mut replay = cfg
+        .replay_dir
+        .as_deref()
+        .map(crate::replay::Replay::new)
+        .transpose()?;
+    if replay.is_some() {
+        bait.track_changes();
+    }
     let mut result = None;
+    let input_metadata = if replay.is_some() {
+        cfg.inputs
+            .iter()
+            .map(|path| {
+                let meta = std::fs::metadata(path)?;
+                Ok((meta.len(), meta.modified()?))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let n_targets = bait.targets.len();
     let numt_path = cfg.out_dir.join("numt_candidates.fastq");
     // Reads already used to extend each target's bait: later passes count only new reads, so a
@@ -557,7 +663,20 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
         bait.prepare_lookup();
-        let res = scan(&cfg.inputs, &bait, &cfg.params, &cfg.out_dir, &numt_path)?;
+        let delta = replay
+            .as_ref()
+            .filter(|r| r.ready)
+            .map(|_| bait.take_changes());
+        let res = scan(
+            &cfg.inputs,
+            &bait,
+            &cfg.params,
+            &cfg.out_dir,
+            &numt_path,
+            replay.as_mut(),
+            delta.as_ref(),
+            false,
+        )?;
         let last = it + 1 == cfg.iterations.max(1);
         let mut added = vec![0; n_targets];
         let mut extended_from = vec![0u64; n_targets];
@@ -697,8 +816,37 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             break;
         }
     }
-    let res = result.expect("at least one iteration");
+    let mut res = result.expect("at least one iteration");
+    // All intermediate bait operations use only identifiers and sequence. Restore
+    // actual qualities in one original-input pass after the final calls are known.
+    if replay.is_some() && iterations.len() > 1 {
+        for (path, &(size, modified)) in cfg.inputs.iter().zip(&input_metadata) {
+            let meta = std::fs::metadata(path)?;
+            anyhow::ensure!(
+                meta.len() == size && meta.modified()? == modified,
+                "original input metadata changed during recruitment replay: {}",
+                path.display()
+            );
+        }
+        let final_res = scan(
+            &cfg.inputs,
+            &bait,
+            &cfg.params,
+            &cfg.out_dir,
+            &numt_path,
+            replay.as_mut(),
+            None,
+            true,
+        )?;
+        anyhow::ensure!(
+            final_res.reads == res.reads && final_res.bases == res.bases,
+            "original input changed during recruitment replay"
+        );
+        res = final_res;
+    }
 
+    let source_candidates =
+        crate::retained::recruitment(&cfg.out_dir, &numt_path, &bait, &cfg.params)?;
     // Final outputs from the last pass's files, downsampled to `target_depth`.
     let mut outputs = Vec::new();
     for (t, counts) in res.recruited.iter().enumerate() {
@@ -745,6 +893,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         version: env!("CARGO_PKG_VERSION"),
         k: bait.k,
         params: cfg.params.clone(),
+        input_replay: replay
+            .as_ref()
+            .map(|r| r.stats(iterations.len()))
+            .transpose()?,
         iterations_requested: cfg.iterations,
         iterations_run: iterations.len(),
         extend_min_count: cfg.extend_min_count,
@@ -758,6 +910,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         outputs,
         numt_candidates: res.numt.reads,
         numt_output: numt_path.display().to_string(),
+        source_candidates,
         bootstrap: cfg.bootstrap,
         extend_gate: cfg.extend_gate,
         bootstrap_nuclear_peak_depth: gate.as_ref().map(|g| g.nuclear_peak_depth),
@@ -769,6 +922,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         cfg.out_dir.join("recruit.json"),
         serde_json::to_string_pretty(&report)?,
     )?;
+    if let Some(cache) = replay {
+        cache.remove()?;
+    }
     Ok(report)
 }
 
@@ -783,6 +939,36 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_keys_preserve_calls_across_competing_target_growth() {
+        let a = pseudo_random(2000, 601);
+        let b = pseudo_random(2000, 602);
+        let mut bait = bait_from(&a[..400], 21);
+        bait.target("plastid").unwrap();
+        bait.track_changes();
+        let mut flanked = pseudo_random(1500, 603);
+        flanked.extend_from_slice(&a);
+        flanked.extend(pseudo_random(1500, 604));
+        let reads = [&a[..], &b[..], &a[..300], &flanked[..], &b[400..800]];
+        for (target, sequence) in [(0, &a[..]), (1, &a[..]), (1, &b[..])] {
+            let old: Vec<_> = reads
+                .iter()
+                .map(|r| classify(r, &bait, &params()).0)
+                .collect();
+            bait.add_sequence(target, sequence);
+            let delta = bait.take_changes();
+            for (read, previous) in reads.iter().zip(old) {
+                let changed = CanonicalKmers::new(read, 21).any(|(_, key)| delta.get(key) != 0);
+                let replayed = if changed {
+                    classify(read, &bait, &params()).0
+                } else {
+                    previous
+                };
+                assert_eq!(replayed, classify(read, &bait, &params()).0);
+            }
+        }
+    }
 
     fn bait_from(seq: &[u8], k: usize) -> BaitSet {
         let mut b = BaitSet::new(k);
@@ -1022,6 +1208,7 @@ mod tests {
         bait.targets[m].seed_length = mito.len() as u64;
         bait.targets[c].seed_length = plastid.len() as u64;
         let cfg = |bootstrap| RecruitConfig {
+            replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
                 min_cover: 0.8,
@@ -1100,6 +1287,7 @@ mod tests {
         let mut bait = bait_from(&mito, 21);
         bait.add_sequence(0, &nuclear[100_000..120_000]);
         let cfg = |extend_gate| RecruitConfig {
+            replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
                 min_cover: 0.8,
@@ -1232,10 +1420,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let reads = dir.join("reads.fa");
-        std::fs::write(&reads, fasta).unwrap();
+        let mut fastq = String::new();
+        let lines: Vec<_> = fasta.lines().collect();
+        for (i, pair) in lines.chunks(2).enumerate() {
+            let qual: String = (0..pair[1].len())
+                .map(|j| (33 + ((i + j) % 94) as u8) as char)
+                .collect();
+            fastq.push_str(&format!("@{}\n{}\n+\n{}\n", &pair[0][1..], pair[1], qual));
+        }
+        std::fs::write(&reads, fastq).unwrap();
         let mut bait = bait_from(&genome[..5000], 21);
         bait.targets[0].seed_length = genome.len() as u64;
         let cfg = |iterations| RecruitConfig {
+            replay_dir: None,
             inputs: vec![reads.clone()],
             params: ClassifyParams {
                 min_cover: 0.8,
@@ -1254,7 +1451,54 @@ mod tests {
             extend_gate: false,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
-        let many = run(bait, cfg(40)).unwrap();
+        let mut single_cfg = cfg(1);
+        single_cfg.out_dir = dir.join("replayed-one");
+        single_cfg.replay_dir = Some(dir.join("cache-one"));
+        let single = run(bait.clone(), single_cfg).unwrap();
+        assert_eq!(
+            single
+                .input_replay
+                .as_ref()
+                .unwrap()
+                .final_output_input_passes,
+            0
+        );
+        assert_eq!(
+            std::fs::read(&one.outputs[0].output).unwrap(),
+            std::fs::read(&single.outputs[0].output).unwrap()
+        );
+        let many = run(bait.clone(), cfg(40)).unwrap();
+        let mut replay_cfg = cfg(40);
+        replay_cfg.out_dir = dir.join("replayed");
+        replay_cfg.replay_dir = Some(dir.join("cache"));
+        let cached = run(bait, replay_cfg).unwrap();
+        assert_eq!(many.iterations_run, cached.iterations_run);
+        for (a, b) in many.iterations.iter().zip(&cached.iterations) {
+            let mut a = serde_json::to_value(a).unwrap();
+            let mut b = serde_json::to_value(b).unwrap();
+            a.as_object_mut().unwrap().remove("seconds");
+            b.as_object_mut().unwrap().remove("seconds");
+            assert_eq!(a, b);
+        }
+        for (a, b) in many.outputs.iter().zip(&cached.outputs) {
+            assert_eq!(
+                std::fs::read(&a.output).unwrap(),
+                std::fs::read(&b.output).unwrap()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&many.numt_output).unwrap(),
+            std::fs::read(&cached.numt_output).unwrap()
+        );
+        assert_eq!(
+            cached
+                .input_replay
+                .as_ref()
+                .unwrap()
+                .source_classification_passes,
+            1
+        );
+        assert!(!dir.join("cache").exists());
         let genome_reads = (genome.len() / 25) as u64;
         assert!(
             one.outputs[0].recruited_reads < genome_reads / 2,
