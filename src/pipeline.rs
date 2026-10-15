@@ -112,6 +112,7 @@ pub struct RunConfig {
     /// `ovasm recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
     pub recruit_cache: Option<PathBuf>,
+    pub read_context: Option<PathBuf>,
     /// Recruit one organelle without seeding the other.
     pub single_seed: bool,
     pub mode: Mode,
@@ -304,8 +305,9 @@ pub fn k_ladder(a: &mut impl Attempts, retry: bool) -> Result<Ladder> {
 }
 
 /// Files of one attempt, all in the organelle's output directory.
-const ATTEMPT_FILES: [&str; 8] = [
+const ATTEMPT_FILES: [&str; 9] = [
     "assembly.gfa",
+    "assembly.backbone.gfa",
     "assembly.json",
     "assembly.filtered.gfa",
     "components.json",
@@ -367,6 +369,7 @@ impl ComponentFilter {
 
 struct GraphAttempts<'a> {
     reads: &'a [PathBuf],
+    read_context: Option<&'a Path>,
     dir: &'a Path,
     read_type: ReadType,
     /// Reads found by depth: each graph goes through the component filter first.
@@ -427,6 +430,7 @@ impl Attempts for GraphAttempts<'_> {
             .opt("--out", &graph)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", self.reads);
+        if let Some(context) = self.read_context { asm = asm.opt("--read-context", context); }
         if let Some(k) = k {
             asm = asm.opt("--k", k.to_string());
         }
@@ -984,6 +988,7 @@ fn run_replicates(
             .opt("--out", &assembled)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", sub_reads);
+        if let Some(context) = &cfg.read_context { asm = asm.opt("--read-context", context); }
         // the same k in every replicate, so that their junction sets differ by what the reads
         // say and not by which repeats k spans
         if let Some(k) = k {
@@ -1249,6 +1254,7 @@ fn assemble_organelle(
     let ladder = k_ladder(
         &mut GraphAttempts {
             reads: &recruited.reads,
+            read_context: cfg.read_context.as_deref(),
             dir,
             read_type: cfg.read_type,
             filter: filter.as_ref(),
@@ -1946,6 +1952,7 @@ mod tests {
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
+            read_context: None,
             single_seed: false,
             mode: Mode::Fast,
             replicates: 3,

@@ -900,6 +900,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             recruit: pipeline::RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
+            read_context: None,
             single_seed: false,
             mode: pipeline::Mode::Fast,
             replicates: 3,

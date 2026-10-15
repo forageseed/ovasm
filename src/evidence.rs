@@ -512,6 +512,110 @@ fn assign(g: &Graph, cs: Vec<Crossing>, tol: f64) -> (Vec<Crossing>, Vec<usize>)
     (kept, ambiguous)
 }
 
+/// Complete original-record witnesses for a candidate junction. A read is counted once,
+/// even if the caller supplied the same record in more than one input file.
+#[derive(Clone, Debug, Serialize)]
+pub struct JunctionWitness {
+    pub read_id: String,
+    pub read_length: usize,
+    pub repeat_query_start: i64,
+    pub repeat_query_end: i64,
+    pub along: bool,
+    pub collinear_hits: u32,
+    pub nuclear_flanked: bool,
+}
+
+pub(crate) struct JunctionSupport {
+    pub records_scanned: u64,
+    pub unique_records: u64,
+    pub witnesses: Vec<Vec<JunctionWitness>>,
+    pub ambiguous_reads: Vec<u64>,
+}
+
+/// The same collinear-hit and competitive-assignment rules as `evidence`, without
+/// bootstrap or topology inference. `nuclear_flanked` evaluates the complete input
+/// record; it must not infer origin from a recruitment label or short shared match.
+pub(crate) fn junction_support<F>(
+    g: &Graph,
+    inputs: &[PathBuf],
+    p: &EvidenceParams,
+    nuclear_flanked: F,
+) -> Result<JunctionSupport>
+where
+    F: Fn(&crate::recruit::Rec, i64, i64) -> Result<bool> + Sync,
+{
+    use std::hash::Hasher;
+    let idx = build_index(g, p);
+    let mut witnesses = vec![Vec::new(); g.links.len()];
+    let mut ambiguous_reads = vec![0; g.links.len()];
+    let mut seen: FxHashMap<Vec<u8>, (usize, u64)> = FxHashMap::default();
+    let mut records_scanned = 0;
+    let (rx, reader) = read_batches(inputs);
+    for batch in rx {
+        records_scanned += batch.len() as u64;
+        let supported: Vec<Result<_>> = batch
+            .par_iter()
+            .map(|r| {
+                let id =
+                    r.id.split(|c| c.is_ascii_whitespace())
+                        .next()
+                        .unwrap_or(&[]);
+                if id.is_empty() {
+                    bail!("junction evidence requires nonempty original read IDs");
+                }
+                let name = std::str::from_utf8(id)?.to_string();
+                let mut hash = rustc_hash::FxHasher::default();
+                hash.write(&r.seq.to_ascii_uppercase());
+                let (cs, ambiguous) = assign(g, crossings(&r.seq, &idx, p), p.spacing_tol);
+                let mut rows = Vec::new();
+                for c in cs {
+                    let source = nuclear_flanked(r, c.to_start, c.from_end)?;
+                    rows.push((
+                        c.link,
+                        JunctionWitness {
+                            read_id: name.clone(),
+                            read_length: r.seq.len(),
+                            repeat_query_start: c.to_start,
+                            repeat_query_end: c.from_end,
+                            along: c.along,
+                            collinear_hits: c.score,
+                            nuclear_flanked: source,
+                        },
+                    ));
+                }
+                Ok((id.to_vec(), r.seq.len(), hash.finish(), rows, ambiguous))
+            })
+            .collect();
+        for result in supported {
+            let (id, length, hash, rows, mut ambiguous) = result?;
+            if let Some(previous) = seen.insert(id, (length, hash)) {
+                if previous != (length, hash) {
+                    bail!("the same read ID names different complete records in junction evidence");
+                }
+                continue;
+            }
+            let mut per_link = BTreeSet::new();
+            for (link, row) in rows {
+                if per_link.insert(link) {
+                    witnesses[link].push(row);
+                }
+            }
+            ambiguous.sort_unstable();
+            ambiguous.dedup();
+            for link in ambiguous {
+                ambiguous_reads[link] += 1;
+            }
+        }
+    }
+    reader.join().expect("reader thread panicked")?;
+    Ok(JunctionSupport {
+        records_scanned,
+        unique_records: seen.len() as u64,
+        witnesses,
+        ambiguous_reads,
+    })
+}
+
 /// Directed step in read order: (from, to, read start of `to`, read end of `from`).
 type Step = (Oriented, Oriented, i64, i64);
 
@@ -1394,7 +1498,11 @@ mod tests {
         let reads = dir.join("reads.fastq");
         let mut graph = String::new();
         for (i, seq) in seqs.iter().enumerate() {
-            graph.push_str(&format!("S\tn{i}\t{}\tdp:f:{}\n", std::str::from_utf8(seq).unwrap(), if i == 2 { 20 } else { 10 }));
+            graph.push_str(&format!(
+                "S\tn{i}\t{}\tdp:f:{}\n",
+                std::str::from_utf8(seq).unwrap(),
+                if i == 2 { 20 } else { 10 }
+            ));
         }
         for (a, b) in [(0, 2), (1, 2), (2, 3), (2, 4)] {
             graph.push_str(&format!("L\tn{a}\t+\tn{b}\t+\t126M\n"));
@@ -1408,7 +1516,11 @@ mod tests {
         ];
         let mut fq = String::new();
         for (i, seq) in junctions.iter().enumerate() {
-            fq.push_str(&format!("@r{i}\n{}\n+\n{}\n", std::str::from_utf8(seq).unwrap(), "I".repeat(seq.len())));
+            fq.push_str(&format!(
+                "@r{i}\n{}\n+\n{}\n",
+                std::str::from_utf8(seq).unwrap(),
+                "I".repeat(seq.len())
+            ));
         }
         fs::write(&reads, fq).unwrap();
         let mut p = params();
@@ -1418,7 +1530,10 @@ mod tests {
         p.bootstrap = 0;
         let report = run(&gfa, vec![reads.clone()], p, &dir.join("evidence.json")).unwrap();
         assert_eq!(report.reads_scanned, 4);
-        assert!(report.links.iter().all(|l| l.reads == 0 && l.adjacency_reads == 1));
+        assert!(report
+            .links
+            .iter()
+            .all(|l| l.reads == 0 && l.adjacency_reads == 1));
         assert_eq!(report.repeat_segments, vec!["n2"]);
         assert!(report.phased_paths.is_empty());
         assert!(report.traversals.is_empty());

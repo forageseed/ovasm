@@ -7,6 +7,7 @@ mod components;
 mod correct;
 mod evidence;
 mod identify;
+mod junctions;
 mod kmer;
 mod label;
 mod linearize;
@@ -16,6 +17,7 @@ mod pipeline;
 mod primary;
 mod reconstruct;
 mod recruit;
+mod read_context;
 mod replay;
 mod replicate;
 mod retained;
@@ -253,6 +255,9 @@ struct RunArgs {
     /// New scratch directory for lossless recruitment input replay (disk space required).
     #[arg(long)]
     recruit_cache: Option<PathBuf>,
+    /// Checked complete original-read nuclear alignments (ovasm.whole-read-context.v1).
+    #[arg(long)]
+    read_context: Option<PathBuf>,
     /// Recruit one organelle without a seed for the other (not advised: mitochondrial seeds
     /// alone can extend into the plastid genome).
     #[arg(long)]
@@ -342,6 +347,7 @@ fn run(args: RunArgs) -> Result<()> {
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
         recruit_cache: args.recruit_cache,
+        read_context: args.read_context,
         single_seed: args.single_seed,
         mode: args.mode,
         replicates: args.replicates,
@@ -475,6 +481,9 @@ struct AssembleArgs {
     /// 4 of 17 gained low-depth fragments or extra sequence, so it is opt-in.
     #[arg(long)]
     min_count_fraction: Option<f64>,
+    /// Complete original-read nuclear context; shared local matches do not establish source.
+    #[arg(long)]
+    read_context: Option<PathBuf>,
     /// Use the attributed, embedded Syncasm correction and repeat-unzipping kernel (Linux).
     /// Requires --min-count from read coverage; k defaults to 1001 compressed runs.
     #[arg(long)]
@@ -490,6 +499,7 @@ struct AssembleArgs {
 
 fn assemble(args: AssembleArgs) -> Result<()> {
     if args.multichrom_graph {
+        if args.read_context.is_some() { bail!("--read-context is currently supported by the Rust sparse assembler"); }
         if args.min_count_fraction.is_some() {
             bail!("--min-count-fraction does not apply to --multichrom-graph; give --min-count");
         }
@@ -519,7 +529,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
     let r = {
         match args.k {
             None if args.s != 0 => {
-                let r = assemble::run_auto_k(
+                let r = assemble::run_auto_k_with_context(
                     args.reads,
                     args.s,
                     args.min_count,
@@ -527,6 +537,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
                     args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
                     &args.out,
                     &args.out_json,
+                    args.read_context.as_deref(),
                 )?;
                 let tried: Vec<String> = r
                     .k_tried
@@ -545,7 +556,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
                         k
                     }
                 };
-                assemble::run(
+                assemble::run_with_context(
                     args.reads,
                     assemble::AssembleParams {
                         k,
@@ -555,6 +566,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
                     },
                     &args.out,
                     &args.out_json,
+                    args.read_context.as_deref(),
                 )?
             }
         }
