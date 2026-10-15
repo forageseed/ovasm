@@ -49,10 +49,43 @@ exact circular rotations. OATK's extra 22,834-bp record contributes 4,104 distin
 The separate packed input-replay development candidate e8a85b3 also completed
 on the same full HiFi input. All compared outputs were equivalent, but its
 public command took 23,549.547 seconds (6 h 32 min), versus 12,612.001 seconds
-for the released baseline: **1.867 times longer**. This candidate did not meet
-the acceleration objective and was not integrated into the released assembler.
+for the released baseline: **1.867 times longer**. This historical candidate did not meet
+the acceleration objective. Replay is now an explicit opt-in capability; its
+availability is not full-input acceleration evidence, and it is not the default.
 Prefix speed measurements must not be extrapolated to this whole-input run.
 
 Neither assembler is an independent biological truth for the other. Graph cycles
 do not establish physical molecule count or topology; strict and relaxed truth
 scores remain unevaluated.
+
+## Observed OATK stage intervals
+
+| Pre-annotation log interval | Minutes | Sampled peak RSS sum (GiB) |
+|---|---:|---:|
+| Raw-read syncmer collection | 51.70 | 117.333 |
+| Syncmer processing after collection | 55.23 | 168.723 |
+| Error syncmer detection | 16.97 | 168.352 |
+| Read error correction | 6.40 | 177.978 |
+| Graph construction | 3.25 | 159.293 |
+| Graph unitigging | 22.39 | 161.962 |
+| Graph cleanup | 0.08 | 161.968 |
+| Graph unzipping | 0.32 | 161.725 |
+| Read-to-graph alignment | 53.52 | 162.183 |
+| Final graph statistics interval | 11.75 | 160.064 |
+
+Start to first annotation-load log: 221.61 min. First to last annotation-load log:
+675.15 min. Last annotation-load log to terminal: 45.59 min. A batch can continue
+after its load log; these are timestamp observation windows, not exclusive internal
+stage costs. Rounded intervals need not sum exactly to the start-to-annotation interval.
+
+OVASM's controller including post-run auditing lasted 12,853.939 s; its public
+command lasted 12,612.001 s. Keep those scopes separate. The prior failed OATK
+96-GiB attempt is preserved separately from this completed attempt.
+
+## Updated graph evidence
+
+[Aligned graphs and methods](figures/README.md#zm4-hifi-ont-supported-gfa-comparison)
+show the subsequent read-backed repair: OVASM 9 nodes / 12 links and OATK 12 / 16,
+with all nodes and links visible. Main sequence compatibility does not establish
+branch completeness: the figure adds local read support and nuclear context.
+The original full-input benchmark was not rerun after the junction repair.

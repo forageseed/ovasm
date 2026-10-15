@@ -15,3 +15,47 @@ The figure describes the combined OVASM implementation. Technology selectors and
 - [Python source](draw_ovasm_mechanism_v2.py): Matplotlib source; requires Matplotlib and a compatible sans-serif font. Run `python draw_ovasm_mechanism_v2.py` to export into this directory. SVG metadata and font metrics may vary by environment.
 
 Final dimensions are 183 × 124 mm. Server audits of the supplied PDF found a minimum text size of 5.2 pt, no text below 5 pt, and no detected text collisions or clipping. The layout is a continuous seven-step schematic rather than a quantitative multi-panel plot. The previous workflow artwork remains at `../workflow.svg`.
+
+## ZM4 HiFi/ONT-supported GFA comparison
+
+![Homology-aligned complete GFA comparison](OVASM-OATK-homology-matched.svg)
+
+[SVG](OVASM-OATK-homology-matched.svg) · [PDF](OVASM-OATK-homology-matched.pdf) ·
+[Source data](zm4-gfa-comparison-data.json) · [Homology coordinates](zm4-homology-correspondence.tsv) ·
+[Read counts](zm4-link-read-support.tsv) · [Python source](draw_zm4_gfa_comparison.py)
+
+Every original node and link is retained. Exact A/B/R homology governs the shared
+layout, colours and displayed sequence direction; original GFA strands remain in
+labels and the link table. OATK u71133 matches OVASM jr4_0[319:1740) exactly and
+forward; u71134 matches jr4_1[81:1487). Boundary-crossing nodes use multiple homology
+colours and retain every base. Layout is schematic, not bp-scaled; crossings are
+not connections. Repeat-copy orthology is unresolved rather than arbitrarily assigned.
+
+All 28 edge counts use the same native k21 / 2-kb flank / 500-bp anchor / 30-bp
+diagonal / 5% spacing protocol on 29,287 complete recruited HiFi and 2,126 ascertained
+complete ONT candidate records. Counts overlap across links and are not physical
+configuration proportions. No assembler depth/EC/SC substitutes for read support.
+The JSON retains graph hashes, formal source/binary provenance and prior independent
+validation of all 28 overlaps and 20 non-nuclear-context nodes' exact sequence/direction.
+
+The grey u12151 branch has strong nuclear context: 22/32 branch-compatible ONT
+records meet >=95% whole-query coverage/identity and >=500-bp bilateral target-absent
+nuclear flanks. HiFi 44/44 meet the nuclear-alignment rule, but 0/44 have qualifying
+bilateral specific flanks. Other reads remain unresolved. Local edge support alone
+certifies neither physical origin nor physical circles. The same-plant relation of
+the HiFi/ONT materials is the user's material confirmation; no independent truth
+score is assigned.
+
+Reproduce the display from reviewed source data, without raw-read rescanning:
+
+```sh
+python docs/figures/draw_zm4_gfa_comparison.py --out /path/to/figure-output
+```
+
+Requires Matplotlib and NumPy. The script checks the complete graph inventory and
+measures final comparable-panel rectangles. Optional
+`--alignment-helper /path/to/audit_panel_alignment.py` adds publication QA.
+SVG/PDF: 183 x 247 mm, editable text, minimum 6.1 pt, no detected text collisions
+in the reviewed export. Font metrics can differ; inspect regenerated figures.
+This script reproduces presentation, not new origin inference or assembly.
+Native algorithm code remains in src/junctions.rs and src/read_context.rs.
