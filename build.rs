@@ -2,6 +2,9 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(syncasm_native)");
+    if env::var_os("CARGO_FEATURE_SYNCASM_C").is_none() {
+        return;
+    }
     println!("cargo:rerun-if-changed=vendor/syncasm");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=AR");

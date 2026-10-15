@@ -3,14 +3,15 @@
 //! unzipping, and returns a graph restored to base coordinates. No executable or reference
 //! assembly is invoked. Organelle selection and sequence export remain explicit stages.
 
+#[cfg(syncasm_native)]
 use crate::{evidence::parse_gfa, recruit::peak_rss_mb};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+#[cfg(syncasm_native)]
+use anyhow::Context;
 use serde::Serialize;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::path::{Path, PathBuf};
+#[cfg(syncasm_native)]
+use std::{fs, time::Instant};
 
 #[derive(Serialize)]
 pub struct SyncasmReport {
@@ -81,7 +82,7 @@ pub fn run(
     #[cfg(not(syncasm_native))]
     {
         let _ = (out, out_json);
-        bail!("the published syncmer graph kernel requires a Linux scientific provider; select the server");
+        bail!("this binary does not include the Syncasm C backend; use a Linux build with feature syncasm-c, or explicitly select the experimental --rust-hpc backend");
     }
     #[cfg(syncasm_native)]
     {

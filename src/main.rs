@@ -7,6 +7,7 @@ mod components;
 mod correct;
 mod evidence;
 mod identify;
+mod hpc;
 mod junctions;
 mod kmer;
 mod label;
@@ -488,6 +489,10 @@ struct AssembleArgs {
     /// Requires --min-count from read coverage; k defaults to 1001 compressed runs.
     #[arg(long)]
     multichrom_graph: bool,
+    /// Experimental independent Rust HPC graph and shared-coordinate run consensus.
+    /// Explicit --k and --min-count required; no C correction or repeat unzipping.
+    #[arg(long, conflicts_with_all = ["multichrom_graph", "read_context", "min_count_fraction", "auto_k_depth"])]
+    rust_hpc: bool,
     #[arg(long)]
     threads: Option<usize>,
     /// Output assembly graph (GFA, exact nM overlaps).
@@ -498,6 +503,16 @@ struct AssembleArgs {
 }
 
 fn assemble(args: AssembleArgs) -> Result<()> {
+    if args.rust_hpc {
+        let k = args.k.context("--rust-hpc requires explicit --k in compressed runs")?;
+        let cutoff = args.min_count.context("--rust-hpc requires explicit --min-count from read coverage")?;
+        if let Some(n) = args.threads {
+            rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
+        }
+        let r = hpc::run(&args.reads, k, args.s, cutoff, &args.out, &args.out_json)?;
+        eprintln!("[ovasm] independent Rust HPC: {} unitigs, {} bp, {} links; {:.1}s (experimental)", r.unitigs, r.total_length, r.links, r.elapsed_seconds);
+        return Ok(());
+    }
     if args.multichrom_graph {
         if args.read_context.is_some() { bail!("--read-context is currently supported by the Rust sparse assembler"); }
         if args.min_count_fraction.is_some() {
