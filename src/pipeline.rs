@@ -111,6 +111,7 @@ pub struct RunConfig {
     pub recruit: RecruitBy,
     /// `ovasm recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
+    pub recruit_cache: Option<PathBuf>,
     /// Recruit one organelle without seeding the other.
     pub single_seed: bool,
     pub mode: Mode,
@@ -702,6 +703,9 @@ fn recruit_all(
             }
         }
         // A multi-species marker database's summed length is not a sample genome size, so the
+        if let Some(dir) = &cfg.recruit_cache {
+            argv = argv.opt("--recruit-cache", dir);
+        }
         // depth is only capped when the caller says the seed is one (--recruit-depth).
         if let Some(d) = cfg.recruit_depth {
             argv = argv.opt("--target-depth", d.to_string());
@@ -1450,6 +1454,11 @@ fn component_filter_summary(report: &Value) -> Value {
 }
 
 fn validate(cfg: &RunConfig) -> Result<()> {
+    if cfg.recruit_cache.is_some()
+        && (cfg.read_set == ReadSet::Target || cfg.recruit == RecruitBy::Discover)
+    {
+        bail!("--recruit-cache requires whole-genome seed recruitment (seeds or both)");
+    }
     for r in &cfg.reads {
         if !r.is_file() {
             bail!(
@@ -1597,6 +1606,7 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
     let report = json!({
         "backend": "ovasm",
         "organelles": results,
+        "cross_organelle_candidates": crate::retained::cross_organelle(&cfg.out, &cfg.out, crate::kmer::MAX_K)?,
         "failed": failed,
         "elapsed_seconds": t0.elapsed().as_secs_f64(),
         "peak_rss_mb": peak_rss_mb(),
@@ -1935,6 +1945,7 @@ mod tests {
             builtin_seeds: BTreeSet::new(),
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
+            recruit_cache: None,
             single_seed: false,
             mode: Mode::Fast,
             replicates: 3,

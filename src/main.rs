@@ -16,7 +16,9 @@ mod pipeline;
 mod primary;
 mod reconstruct;
 mod recruit;
+mod replay;
 mod replicate;
+mod retained;
 mod seeddb;
 mod seedfree;
 mod syncasm;
@@ -72,6 +74,19 @@ enum Command {
     /// Keep the connected components of an assembly graph that are the target organelle (by
     /// conserved proteins and depth); for graphs of reads found by `discover`.
     Components(ComponentsArgs),
+    /// Retain exact MT/PT sharing evidence from an existing both-organelle assembly.
+    Sharing(SharingArgs),
+}
+
+#[derive(clap::Args)]
+struct SharingArgs {
+    #[arg(long)]
+    assembly: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    /// Exact word length; divergent homology and transfer direction are not inferred.
+    #[arg(long, default_value_t = 31)]
+    k: usize,
 }
 
 #[derive(clap::Args)]
@@ -235,6 +250,9 @@ struct RunArgs {
     /// leave unset for a multi-species seed database, whose summed length is no genome size.
     #[arg(long)]
     recruit_depth: Option<f64>,
+    /// New scratch directory for lossless recruitment input replay (disk space required).
+    #[arg(long)]
+    recruit_cache: Option<PathBuf>,
     /// Recruit one organelle without a seed for the other (not advised: mitochondrial seeds
     /// alone can extend into the plastid genome).
     #[arg(long)]
@@ -323,6 +341,7 @@ fn run(args: RunArgs) -> Result<()> {
         builtin_seeds,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
+        recruit_cache: args.recruit_cache,
         single_seed: args.single_seed,
         mode: args.mode,
         replicates: args.replicates,
@@ -1217,6 +1236,9 @@ struct RecruitArgs {
     /// Downsample each target to about this depth (recruited bases / seed length).
     #[arg(long)]
     target_depth: Option<f64>,
+    /// New scratch directory: classify original inputs once, replay sequences, then restore original qualities in one final input pass.
+    #[arg(long)]
+    recruit_cache: Option<PathBuf>,
     /// Salt for deterministic downsampling; change it to draw an independent replicate.
     #[arg(long, default_value_t = 0)]
     salt: u64,
@@ -1342,6 +1364,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     let report = recruit::run(
         bait,
         recruit::RecruitConfig {
+            replay_dir: args.recruit_cache,
             inputs: args.reads,
             params: recruit::ClassifyParams {
                 min_cover: args.min_cover,
@@ -1399,6 +1422,13 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Panel(args) => panel(args),
         Command::Label(args) => label(args),
         Command::Components(args) => components(args),
+        Command::Sharing(args) => {
+            if !(1..=kmer::MAX_K).contains(&args.k) {
+                bail!("--k must be between 1 and {}", kmer::MAX_K);
+            }
+            retained::cross_organelle(&args.assembly, &args.out, args.k)?;
+            Ok(())
+        }
     }
 }
 
