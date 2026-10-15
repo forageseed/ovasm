@@ -356,6 +356,7 @@ pub fn run(
                 k: p.assemble_k,
                 s: 31,
                 min_count: None,
+                min_count_fraction: None,
             },
             &gfa,
             &out_dir.join(format!("cluster{}.assembly.json", i + 1)),

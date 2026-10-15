@@ -41,6 +41,9 @@ pub struct AssembleParams {
     pub s: usize,
     /// Minimum reads for a node or an edge; `None` picks it from the node-count distribution.
     pub min_count: Option<u32>,
+    /// Fraction of the typical node depth used when `min_count` is `None` (default 0.1, floor 3).
+    /// Ignored when `min_count` is given. Must be in (0, 1].
+    pub min_count_fraction: Option<f64>,
 }
 
 #[inline]
@@ -1334,6 +1337,7 @@ pub fn run_auto_k(
     inputs: Vec<PathBuf>,
     s: usize,
     min_count: Option<u32>,
+    min_count_fraction: Option<f64>,
     target: f64,
     out_gfa: &Path,
     out_json: &Path,
@@ -1343,7 +1347,12 @@ pub fn run_auto_k(
         for (i, &k) in K_LADDER.iter().enumerate() {
             let r = run(
                 reads.to_vec(),
-                AssembleParams { k, s, min_count },
+                AssembleParams {
+                    k,
+                    s,
+                    min_count,
+                    min_count_fraction,
+                },
                 out_gfa,
                 out_json,
             )?;
@@ -1392,6 +1401,11 @@ pub fn run(
     out_gfa: &Path,
     out_json: &Path,
 ) -> Result<AssembleReport> {
+    if let Some(f) = p.min_count_fraction {
+        if !(f > 0.0 && f <= 1.0) {
+            bail!("min-count fraction must be in (0, 1], got {f}");
+        }
+    }
     let dense = p.s == 0;
     if p.k % 2 == 0 || (!dense && (p.s >= p.k || p.s > crate::kmer::MAX_K || p.s < 5)) {
         bail!(
@@ -1476,9 +1490,10 @@ pub fn run(
             .copied()
             .unwrap_or(0) as f64
     };
-    let min_count = p
-        .min_count
-        .unwrap_or_else(|| ((node_depth / 10.0) as u32).max(3));
+    let min_count = p.min_count.unwrap_or_else(|| match p.min_count_fraction {
+        Some(f) => ((node_depth * f + 1e-9) as u32).max(3),
+        None => ((node_depth / 10.0) as u32).max(3),
+    });
 
     // Keep nodes and edges seen at least min_count times, plus whatever gap rescue adds.
     let mut keep: FxHashSet<u64> = nodes
@@ -1730,6 +1745,7 @@ mod tests {
             k: 101,
             s: 15,
             min_count: Some(3),
+            min_count_fraction: None,
         }
     }
 
@@ -1842,6 +1858,7 @@ mod tests {
                 k: 101,
                 s: 15,
                 min_count: None,
+                min_count_fraction: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2107,6 +2124,7 @@ mod tests {
                 k: 101,
                 s: 15,
                 min_count: Some(3),
+                min_count_fraction: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2136,6 +2154,7 @@ mod tests {
             vec![fastq(&dir, &tile(&g, 3000, 50))],
             31,
             None,
+            None,
             AUTO_K_NODE_DEPTH,
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2149,6 +2168,7 @@ mod tests {
         let rep = run_auto_k(
             vec![fastq(&dir, &tile(&g, 3000, 600))],
             31,
+            None,
             None,
             AUTO_K_NODE_DEPTH,
             &dir.join("a.gfa"),
@@ -2172,5 +2192,59 @@ mod tests {
             2 * K_LADDER.len()
         );
         assert_eq!(json["corrected_reads"].as_str(), Some(corrected.as_str()));
+    }
+
+    #[test]
+    fn the_automatic_threshold_follows_the_min_count_fraction() {
+        let g = seq(12_000, 7);
+        let dir = tmpdir("min-count-fraction");
+        let input = fastq(&dir, &tile(&g, 3000, 50));
+        let at = |fraction: Option<f64>, name: &str| {
+            run(
+                vec![input.clone()],
+                AssembleParams {
+                    k: 101,
+                    s: 15,
+                    min_count: None,
+                    min_count_fraction: fraction,
+                },
+                &dir.join(format!("{name}.gfa")),
+                &dir.join(format!("{name}.json")),
+            )
+        };
+        let default = at(None, "default").unwrap();
+        // the unchanged rule: a tenth of the node depth, at least 3
+        assert_eq!(
+            default.min_count,
+            ((default.node_depth / 10.0) as u32).max(3)
+        );
+        assert!(default.min_count_auto);
+        let tenth = at(Some(0.1), "tenth").unwrap();
+        assert_eq!(tenth.min_count, default.min_count);
+        let half = at(Some(0.5), "half").unwrap();
+        assert_eq!(
+            half.min_count,
+            ((half.node_depth * 0.5 + 1e-9) as u32).max(3)
+        );
+        assert!(half.min_count > default.min_count);
+        // an explicit count still wins over the fraction
+        let explicit = run(
+            vec![input.clone()],
+            AssembleParams {
+                k: 101,
+                s: 15,
+                min_count: Some(4),
+                min_count_fraction: Some(0.5),
+            },
+            &dir.join("explicit.gfa"),
+            &dir.join("explicit.json"),
+        )
+        .unwrap();
+        assert_eq!(explicit.min_count, 4);
+        assert!(!explicit.min_count_auto);
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            assert!(at(Some(bad), "bad").is_err(), "{bad}");
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -449,6 +449,13 @@ struct AssembleArgs {
     /// Minimum reads for a node or an edge (default: a tenth of the typical node depth, >= 3).
     #[arg(long)]
     min_count: Option<u32>,
+    /// Automatic minimum reads as this fraction of the typical node depth (default 0.1, at
+    /// least 3; in (0, 1]). Ignored when --min-count is given. A lower fraction keeps
+    /// low-frequency connections but also more error nodes at high depth; on one HiFi sample
+    /// 0.03-0.05 recovered minor repeat-mediated junctions, and on 17 other HiFi samples
+    /// 4 of 17 gained low-depth fragments or extra sequence, so it is opt-in.
+    #[arg(long)]
+    min_count_fraction: Option<f64>,
     /// Use the attributed, embedded Syncasm correction and repeat-unzipping kernel (Linux).
     /// Requires --min-count from read coverage; k defaults to 1001 compressed runs.
     #[arg(long)]
@@ -464,6 +471,9 @@ struct AssembleArgs {
 
 fn assemble(args: AssembleArgs) -> Result<()> {
     if args.multichrom_graph {
+        if args.min_count_fraction.is_some() {
+            bail!("--min-count-fraction does not apply to --multichrom-graph; give --min-count");
+        }
         let cutoff = args
             .min_count
             .context("--multichrom-graph requires --min-count derived from read coverage")?;
@@ -494,6 +504,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
                     args.reads,
                     args.s,
                     args.min_count,
+                    args.min_count_fraction,
                     args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
                     &args.out,
                     &args.out_json,
@@ -521,6 +532,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
                         k,
                         s: args.s,
                         min_count: args.min_count,
+                        min_count_fraction: args.min_count_fraction,
                     },
                     &args.out,
                     &args.out_json,
