@@ -27,7 +27,7 @@ Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 
 - **Choose the input scope.** Standard assembly recruits organelle reads. Multichrom graph construction uses the original whole-genome HiFi reads to retain independent components.
 - **An assembly graph with evidence, not just a sequence.** Every junction comes with the number of reads that support it, and `molecules.fasta` holds the representative molecule(s). When the reads cannot tell structures apart, `decisive` is `false` instead of a silent guess.
-- **One program with a built-in seed library.** The portable stages use Rust gzip. The native multichrom kernel runs on Linux and needs a C compiler and zlib development headers; a seed reference is optional.
+- **One program with a built-in seed library.** The standard pipeline uses OVASM's Rust sparse graph. An explicit Linux multichrom option embeds the attributed Syncasm C kernel; installing the prebuilt package needs no compiler. See [graph backends and source attribution](docs/rust-kernel.md).
 - **Pangenome-ready.** The graph is also written as OV-GFA, which `ovasm pan` merges across samples.
 - **Species reference graphs for WGS.** `ovasm reconstruct` uses all source paths of paired mitochondrial/plastid pan graphs, reports target read support, and exports individual FASTA/GFA while retaining unsupported regions and unresolved phase. [Method and command](docs/reference-reconstruction.md).
 
@@ -337,7 +337,7 @@ MIT
 
 ## Multichrom graphs and two sequence scores
 
-The Linux build includes the attributed Syncasm kernel for corrected, read-threaded multichrom graphs. Supply a coverage-derived cutoff; it is not chosen from a reference genome:
+The standard `ovasm run` and `ovasm assemble` use OVASM's Rust graph code. The explicit `--multichrom-graph` option selects the attributed Syncasm C kernel embedded in Linux builds, including its correction and repeat unzipping. These are different backends, not different names for the same implementation. Supply a coverage-derived cutoff; it is not chosen from a reference genome:
 
 ```bash
 ovasm assemble --reads sample.hifi.fastq.gz --multichrom-graph --min-count <coverage-derived-cutoff> --out graph.gfa --out-json graph.json --threads 8

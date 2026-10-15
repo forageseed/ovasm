@@ -106,7 +106,7 @@ fn closed_syncmers(seq: &[u8], k: usize, s: usize) -> Vec<usize> {
 }
 
 /// (canonical k-mer hash, read shows the canonical strand?, start) for each sampled k-mer.
-fn sample_read(seq: &[u8], p: &AssembleParams) -> Vec<Sample> {
+pub(crate) fn sample_read(seq: &[u8], p: &AssembleParams) -> Vec<Sample> {
     if p.s == 0 {
         return sample_dense(seq, p.k);
     }
@@ -1502,6 +1502,19 @@ fn run_backbone(
     out_gfa: &Path,
     out_json: &Path,
 ) -> Result<AssembleReport> {
+    run_backbone_layout(inputs, p, out_gfa, out_json, false)
+}
+
+/// HPC consensus needs the original node-containing unitigs and their exact
+/// overlaps. Do not fill, shift or trim coordinates before observations are
+/// assigned. The default base-coordinate assembler retains its existing layout.
+pub(crate) fn run_backbone_layout(
+    inputs: Vec<PathBuf>,
+    p: AssembleParams,
+    out_gfa: &Path,
+    out_json: &Path,
+    preserve_overlaps: bool,
+) -> Result<AssembleReport> {
     if let Some(f) = p.min_count_fraction {
         if !(f > 0.0 && f <= 1.0) {
             bail!("min-count fraction must be in (0, 1], got {f}");
@@ -1678,7 +1691,9 @@ fn run_backbone(
     let mut links = links;
     let mut overlap_joins = 0;
     let circular: Vec<bool> = unitigs.iter().map(|t| t.circular).collect();
-    let gaps_filled = if dense {
+    let gaps_filled = if preserve_overlaps {
+        0
+    } else if dense {
         let joins = join_dead_ends(&seqs, &links, &circular, (p.k / 3).max(31), p.k - 2);
         overlap_joins = joins.len();
         links.extend(joins);
@@ -1686,8 +1701,8 @@ fn run_backbone(
     } else {
         fill_gaps(&mut seqs, &mut links, &circular, &inputs, LONG_GAP_MAX, 1)?
     };
-    let boundary_bp_moved = normalize_boundaries(&mut seqs, &links);
-    let (links, links_blunted) = blunt_links(&mut seqs, &links);
+    let boundary_bp_moved = if preserve_overlaps { 0 } else { normalize_boundaries(&mut seqs, &links) };
+    let (links, links_blunted) = if preserve_overlaps { (links, 0) } else { blunt_links(&mut seqs, &links) };
     let mut gfa = String::from("H\tVN:Z:1.0\n");
     let mut lengths = Vec::new();
     for (u, (t, seq)) in unitigs.iter().zip(&seqs).enumerate() {

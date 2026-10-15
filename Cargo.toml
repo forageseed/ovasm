@@ -22,6 +22,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
+[features]
+# Keep the attributed Linux C backend available for existing invocations. A
+# --no-default-features build contains only the portable Rust implementations.
+default = ["syncasm-c"]
+syncasm-c = []
+
 [profile.release]
 opt-level = 3
 lto = "thin"

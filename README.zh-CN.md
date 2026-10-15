@@ -28,7 +28,7 @@ ovasm 是一个 Rust 程序：给它 HiFi、ONT、CLR 或 Illumina 全基因组 
 - **按任务选择输入范围。** 常规组装先招募细胞器 reads；多染色体建图使用原始全基因组 HiFi reads，保留独立组件。
 - **输出带证据的组装图，而不只是序列。** 每个连接点都有支持它的 reads 数；`molecules.fasta` 是代表分子。
   reads 分不出结构时，`decisive` 会写 `false`，不会悄悄猜一个。
-- **单个程序，内置种子库。** 常规阶段使用 Rust gzip；多染色体原生内核在 Linux 上运行，编译需要 C 工具链和 zlib 开发头文件。种子参考可选。
+- **单个程序，内置种子库。** 常规流程使用 OVASM 自己的 Rust 稀疏图；显式开启的 Linux 多染色体选项内嵌带署名的 Syncasm C 内核。安装预编译包不需要编译器。[后端实现与来源](docs/rust-kernel.md)。
 - **直接可用于泛基因组。** 图同时写成 OV-GFA，`ovasm pan` 可以把多个样本合并。
 
 ## 安装
@@ -310,7 +310,7 @@ MIT
 
 ## 多染色体与宽松、严格双评分
 
-Linux 构建包含带来源署名的 Syncasm 多染色体图内核。编译前安装 C 工具链与 zlib 开发包（Debian/Ubuntu：`sudo apt-get install build-essential zlib1g-dev`）。原生多染色体建图使用原始 WGS HiFi reads，并显式传入根据读段覆盖估计的 `--min-count`，不能照真值选阈值：
+常规 `ovasm run` 和 `ovasm assemble` 使用 OVASM 的 Rust 建图代码；显式添加 `--multichrom-graph` 才会选择 Linux 构建内嵌的 Syncasm C 内核，使用它的纠错和重复解缠。两者是不同实现。安装预编译包不需要编译器；从源码构建该 C 后端才需要 C 工具链与 zlib 开发包（Debian/Ubuntu：`sudo apt-get install build-essential zlib1g-dev`）。该选项使用原始 WGS HiFi reads，显式传入根据读段覆盖估计的 `--min-count`，不能照真值选阈值：
 
 ```bash
 ovasm assemble --reads sample.hifi.fastq.gz --multichrom-graph --min-count <读段覆盖导出的阈值> --out graph.gfa --out-json graph.json --threads 8
