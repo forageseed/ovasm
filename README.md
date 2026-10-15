@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 <p align="center"><img src="docs/logo.png" alt="ovasm logo" width="440"></p>
 
 # ovasm
@@ -12,8 +14,6 @@ ovasm is one Rust program: give it HiFi, ONT, CLR or Illumina whole-genome reads
 - **Pangenome-ready.** Every graph is exported as OV-GFA; `ovasm pan` merges samples into one pangenome graph; `ovasm reconstruct` rebuilds an individual's organelle genomes from species reference graphs with short reads.
 - **One program, every stage a command.** `ovasm run` chains recruitment, assembly, evidence, linearization and export; each stage is also a standalone subcommand.
 - **Honest by design.** Blind-test rounds — failures included — and the limits of every benchmark are published below; `k_accepted` and `decisive` are there to be checked before you trust a run.
-
-[English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](https://github.com/forageseed/ovasm/wiki)
 
 Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 
@@ -33,8 +33,39 @@ Part of [OrganelleVerse](https://github.com/forageseed/organelleverse).
 
 ## Install
 
-ovasm is built from source with Rust 1.80 or newer; there are no pre-built binaries yet. Three steps on every system:
-install Rust, build, and make sure the `ovasm` program is on your `PATH`. `cargo install` does the last two together.
+**Prebuilt 0.2.0 — no compiler needed.**
+
+Download a ready-to-run package from [v0.2.0 Releases](https://github.com/forageseed/ovasm/releases/tag/v0.2.0).
+
+| Computer | Download |
+|---|---|
+| Linux x86_64 (glibc 2.34+) | [Linux tar.gz](https://github.com/forageseed/ovasm/releases/download/v0.2.0/ovasm-v0.2.0-linux-x86_64.tar.gz) |
+| Windows x86_64 | [Windows zip](https://github.com/forageseed/ovasm/releases/download/v0.2.0/ovasm-v0.2.0-windows-x86_64.zip) |
+
+**Windows:** unzip the package and run `install.cmd`. It installs for your user and
+adds OVASM to your user PATH. Open a new terminal, then run `ovasm --version`.
+No Rust, C compiler, administrator permission or separate CRT installation is needed.
+
+**Linux:** paste this line into a terminal; no sudo is needed.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.0/scripts/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+```
+
+```sh
+ovasm --version
+# ovasm 0.2.0
+```
+
+The installer verifies SHA-256 before extraction. Alternatively unpack the download
+and run `bin/ovasm.exe` or `bin/ovasm` directly. Seed references are embedded.
+Linux requires standard runtime libraries including zlib (`libz.so.1`), not development
+headers. The native multichrom kernel is provided on Linux; Windows provides the
+portable stages. macOS and ARM64 packages are not included in this release.
+[Installation details and offline packages](docs/installation.md).
+
+<details>
+<summary><b>Build from source (developers / other platforms)</b></summary>
 
 <details open>
 <summary><b>Linux</b> (tested)</summary>
@@ -116,6 +147,8 @@ export ORG_VERSE_OVASM_BIN=$HOME/.cargo/bin/ovasm          # Linux / macOS: put 
 [Environment]::SetEnvironmentVariable("ORG_VERSE_OVASM_BIN", "$env:USERPROFILE\.cargo\bin\ovasm.exe", "User")   # Windows
 ```
 
+</details>
+
 ## Use
 
 You need whole-genome reads: HiFi, or Illumina with `--read-type sr`. No reference file is needed:
@@ -184,8 +217,8 @@ replicates that reproduce it; it takes **HiFi, ONT (with self-correction), CLR a
 | Memory (63 chloroplasts, median) | 58 MB | 1,093 MB | 297 MB | 1,129 MB |
 | Platforms | one program; built and tested on Linux and Windows | conda environment | conda environment | container |
 
-All numbers were measured by us on the data named in the figure; per-sample tables are on the
-[wiki](https://github.com/forageseed/ovasm/wiki/Benchmarks). Read them with these limits in mind:
+All numbers were measured by us on the named data. Historical summaries remain below;
+new full-input resource and per-job WGS tables are included in this repository. Read them with these limits in mind:
 
 - **ovasm is not shown to be better across species.** In four rounds of frozen blind tests on new species
   (pre-registered thresholds, identity at least 0.9999, 12 tasks each: mitochondrion and chloroplast of 6 species),
@@ -292,6 +325,10 @@ ov.assembly.assemble(data, organelle="mitochondrion", method="ovasm")
 
 OrganelleVerse finds the program through the `ORG_VERSE_OVASM_BIN` environment variable, or on your `PATH`
 (see [Install](#install)).
+
+## Contributors
+
+- **Codex (OpenAI)** — AI-assisted implementation, testing, figure preparation and documentation.
 
 ## License
 

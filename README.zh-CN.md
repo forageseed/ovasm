@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 <p align="center"><img src="docs/logo.png" alt="ovasm logo" width="440"></p>
 
 # ovasm
@@ -12,8 +14,6 @@ ovasm 是一个 Rust 程序：给它 HiFi、ONT、CLR 或 Illumina 全基因组 
 - **泛基因组就绪。** 图同时导出为 OV-GFA；`ovasm pan` 把多个样本合并为一张泛基因组图；`ovasm reconstruct` 用短读段从物种参考图重建个体的细胞器基因组。
 - **一个程序，每个阶段都是命令。** `ovasm run` 串起招募、组装、证据、线性化和导出；每个阶段也都能单独调用。
 - **如实报告。** 盲测轮次（包括失败）和每项基准的限制都在下文公开；`k_accepted` 和 `decisive` 就是留着让你核对的，不是让你盲信的。
-
-[English](README.md) | [简体中文](README.zh-CN.md) | [Wiki](https://github.com/forageseed/ovasm/wiki/zh-Home)
 
 [OrganelleVerse](https://github.com/forageseed/organelleverse) 的一部分。
 
@@ -33,8 +33,36 @@ ovasm 是一个 Rust 程序：给它 HiFi、ONT、CLR 或 Illumina 全基因组 
 
 ## 安装
 
-ovasm 用 Rust（1.80 或更高版本）从源码编译，暂时没有预编译的程序。三个系统的步骤一样：
-装 Rust、编译、确保 `ovasm` 程序在 `PATH` 里。`cargo install` 一步完成后两件事。
+**0.2.0 已编译版本，无需自行编译。**
+
+从 [v0.2.0 下载页](https://github.com/forageseed/ovasm/releases/tag/v0.2.0) 选择对应系统的包。
+
+| 电脑 | 下载即用 |
+|---|---|
+| Linux x86_64（glibc 2.34+） | [Linux tar.gz](https://github.com/forageseed/ovasm/releases/download/v0.2.0/ovasm-v0.2.0-linux-x86_64.tar.gz) |
+| Windows x86_64 | [Windows zip](https://github.com/forageseed/ovasm/releases/download/v0.2.0/ovasm-v0.2.0-windows-x86_64.zip) |
+
+**Windows：下载、解压，双击 `install.cmd`。** 它会安装到当前用户目录并加入用户 PATH。
+安装后重开终端，运行 `ovasm --version`。不需要 Rust、C 编译器、管理员权限或另装 CRT。
+
+**Linux：终端粘贴这一行。** 安装到 `~/.local/bin`，不需要 sudo。
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.0/scripts/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+```
+
+```sh
+ovasm --version
+# ovasm 0.2.0
+```
+
+安装器先核对 SHA-256。也可以直接下载解压，运行包内的 `bin/ovasm.exe` 或 `bin/ovasm`。
+种子库已经内置，无需另下参考。Linux 需要系统常规运行库（含 `libz.so.1`），无需开发头文件；
+原生多染色体内核在 Linux 提供，Windows 提供可移植阶段。本次不提供 macOS 和 ARM64 预编译包。
+[安装细节与离线安装](docs/installation.md)。
+
+<details>
+<summary><b>从源码构建（开发者／其他平台）</b></summary>
 
 <details open>
 <summary><b>Linux</b>（已测试）</summary>
@@ -111,6 +139,8 @@ export ORG_VERSE_OVASM_BIN=$HOME/.cargo/bin/ovasm          # Linux / macOS：把
 [Environment]::SetEnvironmentVariable("ORG_VERSE_OVASM_BIN", "$env:USERPROFILE\.cargo\bin\ovasm.exe", "User")   # Windows
 ```
 
+</details>
+
 ## 使用
 
 需要全基因组测序数据：HiFi，或 Illumina（加 `--read-type sr`）。不需要提供任何参考序列：
@@ -172,8 +202,8 @@ ovasm run --reads sample.hifi.fastq.gz --organelle both \
 | 内存（63 个叶绿体，中位数） | 58 MB | 1,093 MB | 297 MB | 1,129 MB |
 | 平台 | 一个程序，在 Linux 和 Windows 上编译并测试过 | conda 环境 | conda 环境 | 容器 |
 
-所有数字都是我们自己在图中所写的数据上测的；逐样本的表格见
-[Wiki](https://github.com/forageseed/ovasm/wiki/zh-Benchmarks)。读的时候请记住这些限定：
+所有数字都是我们自己在图中所写的数据上测的；历史对比汇总保留于下文，
+新的完整输入资源统计和逐任务 WGS 表直接收录在本仓库。读的时候请记住这些限定：
 
 - **没有证明 ovasm 在跨物种上更好。** 在四轮对新物种的冻结盲测里（阈值事先固定，一致率至少 0.9999，每轮 12 个任务：
   6 个物种的线粒体和叶绿体），ovasm 严格通过 3/12、6/12、8/12 和 7/12；第一轮（3 个物种）通过 2/6。
@@ -268,6 +298,10 @@ ov.assembly.assemble(data, organelle="mitochondrion", method="ovasm")
 ```
 
 OrganelleVerse 通过环境变量 `ORG_VERSE_OVASM_BIN` 或 `PATH` 找到这个程序（见[安装](#安装)）。
+
+## 贡献者
+
+- **Codex（OpenAI）**：辅助代码实现、测试、科研图制作与文档维护。
 
 ## 许可证
 
