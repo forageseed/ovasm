@@ -1,0 +1,27 @@
+assembler	node	display_strand	homology	start	end	exact_bp	coordinate_system
+ovasm	u0	+	A	0	152685	152685	Homology backbone; zero-based half-open
+ovasm	u1__p0	+	B	0	4253	4253	Homology backbone; zero-based half-open
+ovasm	u1__p1	+	B	4253	6090	1837	Homology backbone; zero-based half-open
+ovasm	u1__p2	+	B	6090	78166	72076	Homology backbone; zero-based half-open
+ovasm	u1__p3	+	B	78166	80003	1837	Homology backbone; zero-based half-open
+ovasm	u1__p4	+	B	80003	137805	57802	Homology backbone; zero-based half-open
+ovasm	u2	-	R	0	8268	8268	Homology backbone; zero-based half-open
+oatk	u619	-	A	28410	152685	124275	Homology backbone; zero-based half-open
+oatk	u619	-	R	0	599	599	Homology backbone; zero-based half-open
+oatk	u12144	+	B	5241	78304	73063	Homology backbone; zero-based half-open
+oatk	u12145	-	R	6998	8268	1270	Homology backbone; zero-based half-open
+oatk	u12145	-	B	0	5494	5494	Homology backbone; zero-based half-open
+oatk	u12146	-	R	436	7057	6621	Homology backbone; zero-based half-open
+oatk	u12147	+	R	6998	8268	1270	Homology backbone; zero-based half-open
+oatk	u12147	+	A	0	22569	22569	Homology backbone; zero-based half-open
+oatk	u12148	-	B	79616	137805	58189	Homology backbone; zero-based half-open
+oatk	u12148	-	R	0	677	677	Homology backbone; zero-based half-open
+oatk	u12149	-	A	23102	28920	5818	Homology backbone; zero-based half-open
+oatk	u71135	-	B	78263	79670	1407	Homology backbone; zero-based half-open
+oatk	u71136	+	A	21714	22569	855	Homology backbone; zero-based half-open
+oatk	u71136	+	A	22569	23149	580	Homology backbone; zero-based half-open
+ovasm	jr4_0	+	J1	0	1837	1837	OVASM bridge sequence
+oatk	u71133	+	J1	319	1740	1421	OVASM bridge sequence
+ovasm	jr4_1	+	J2	0	1837	1837	OVASM bridge sequence
+oatk	u71134	+	J2	81	1487	1406	OVASM bridge sequence
+oatk	u12151	+	nuclear-context branch	0	2375		Homology backbone; zero-based half-open
