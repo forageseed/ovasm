@@ -26,6 +26,7 @@ pub struct BaitSet {
     map: FxHashMap<u64, u8>,
     pub targets: Vec<Target>,
     lookup: Option<LookupIndex>,
+    changes: Option<FxHashSet<u64>>,
 }
 
 /// Compact presence index for the immutable bait used during one scan. An unset
@@ -57,6 +58,7 @@ impl BaitSet {
             map: FxHashMap::default(),
             targets: Vec::new(),
             lookup: None,
+            changes: None,
         }
     }
 
@@ -117,7 +119,13 @@ impl BaitSet {
         );
         let bit = 1u8 << target;
         for &kmer in &solid {
-            *self.map.entry(kmer).or_insert(0) |= bit;
+            let entry = self.map.entry(kmer).or_insert(0);
+            if *entry & bit == 0 {
+                if let Some(changes) = self.changes.as_mut() {
+                    changes.insert(kmer);
+                }
+            }
+            *entry |= bit;
         }
         self.targets[target].seed_length += solid.len() as u64;
         self.targets[target]
@@ -139,6 +147,9 @@ impl BaitSet {
         for (_, kmer) in CanonicalKmers::new(seq, self.k) {
             let entry = self.map.entry(kmer).or_insert(0);
             if *entry & bit == 0 {
+                if let Some(changes) = self.changes.as_mut() {
+                    changes.insert(kmer);
+                }
                 *entry |= bit;
                 added += 1;
             }
@@ -160,6 +171,9 @@ impl BaitSet {
         for kmer in solid_kmers(self.k, reads, min_count, 0.1) {
             let entry = self.map.entry(kmer).or_insert(0);
             if *entry & bit == 0 {
+                if let Some(changes) = self.changes.as_mut() {
+                    changes.insert(kmer);
+                }
                 *entry |= bit;
                 added += 1;
             }
@@ -193,6 +207,20 @@ impl BaitSet {
             index.bits[slot >> 6] |= 1u64 << (slot & 63);
         }
         self.lookup = Some(index);
+    }
+
+    /// Only replay needs mutation tracking. A new target bit on an existing key
+    /// matters just as much as a new key: either can change a read's classification.
+    pub fn track_changes(&mut self) {
+        self.changes = Some(FxHashSet::default());
+    }
+
+    pub fn take_changes(&mut self) -> Self {
+        let keys = std::mem::take(self.changes.as_mut().expect("tracking enabled"));
+        let mut delta = Self::new(self.k);
+        delta.map = keys.into_iter().map(|key| (key, 1)).collect();
+        delta.prepare_lookup();
+        delta
     }
 
     pub fn len(&self) -> usize {
@@ -250,6 +278,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracking_includes_existing_keys_that_gain_another_target() {
+        let seq = genome(1000, 401);
+        let extra = genome(1000, 402);
+        let mut bait = BaitSet::new(21);
+        bait.target("a").unwrap();
+        bait.target("b").unwrap();
+        bait.add_sequence(0, &seq);
+        let before = bait.clone();
+        bait.track_changes();
+        bait.add_sequence(1, &seq);
+        bait.extend_from_reads(0, [extra.as_slice(), extra.as_slice(), extra.as_slice()], 3);
+        let delta = bait.take_changes();
+        for (&key, &mask) in &bait.map {
+            assert_eq!(delta.get(key) != 0, before.get(key) != mask);
+        }
+        assert_eq!(bait.take_changes().len(), 0);
+        assert!(CanonicalKmers::new(&seq, 21).all(|(_, key)| delta.get(key) != 0));
+    }
 
     fn genome(n: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;

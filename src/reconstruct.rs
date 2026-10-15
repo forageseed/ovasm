@@ -854,6 +854,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         serde_json::to_value(recruit::run(
             bait,
             recruit::RecruitConfig {
+                replay_dir: None,
                 inputs: cfg.reads.clone(),
                 params: recruit::ClassifyParams {
                     min_cover: 0.8,
@@ -898,6 +899,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             builtin_seeds: BTreeSet::new(),
             recruit: pipeline::RecruitBy::Seeds,
             recruit_depth: None,
+            recruit_cache: None,
             single_seed: false,
             mode: pipeline::Mode::Fast,
             replicates: 3,
