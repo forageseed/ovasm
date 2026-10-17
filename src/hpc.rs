@@ -18,12 +18,11 @@ use serde::Serialize;
 use std::{
     fmt::Write as _,
     fs,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
-fn compress(sequence: &[u8]) -> Result<(Vec<u8>, Vec<u32>)> {
+pub(crate) fn compress(sequence: &[u8]) -> Result<(Vec<u8>, Vec<u32>)> {
     let mut bases = Vec::new();
     let mut lengths: Vec<u32> = Vec::new();
     for b in sequence.iter().map(u8::to_ascii_uppercase) {
@@ -374,15 +373,21 @@ pub struct HpcReport {
 
 pub fn run(
     inputs: &[PathBuf],
-    k: usize,
-    s: usize,
-    min_count: u32,
+    p: AssembleParams,
     out: &Path,
     report: &Path,
     context: Option<&Path>,
 ) -> Result<HpcReport> {
-    if inputs.is_empty() || k < 3 || k % 2 == 0 || s < 5 || s > 31 || s >= k || min_count == 0 {
-        bail!("Rust HPC requires reads, odd k > s, s in 5..31 and positive --min-count");
+    let (k, s) = (p.k, p.s);
+    if inputs.is_empty()
+        || k < 3
+        || k % 2 == 0
+        || s < 5
+        || s > 31
+        || s >= k
+        || p.min_count == Some(0)
+    {
+        bail!("Rust HPC requires reads, odd k > s, s in 5..31 and a positive --min-count");
     }
     if out.exists() || report.exists() || out == report {
         bail!("Rust HPC requires distinct new graph/report output paths");
@@ -401,50 +406,29 @@ pub fn run(
     }
     fs::create_dir(&work)
         .context("Rust HPC intermediates already exist; do not reuse a failed run")?;
-    let compressed = work.join("reads.hpc.fasta");
-    let mut writer = BufWriter::new(fs::File::create(&compressed)?);
-    let (mut reads, mut bases, mut compressed_bases) = (0u64, 0u64, 0u64);
-    let (rx, reader) = read_batches(inputs);
-    for batch in rx {
-        for r in batch {
-            let (seq, _) = compress(&r.seq)?;
-            writeln!(writer, ">r{reads}")?;
-            writer.write_all(&seq)?;
-            writer.write_all(b"\n")?;
-            reads += 1;
-            bases += r.seq.len() as u64;
-            compressed_bases += seq.len() as u64;
-        }
-    }
-    reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("read parser panicked"))??;
-    writer.flush()?;
-    drop(writer);
-    if reads == 0 {
-        bail!("no reads");
-    }
-    let p = AssembleParams {
-        k,
-        s,
-        min_count: Some(min_count),
-        min_count_fraction: None,
-    };
+    // The backbone reads the original reads and run-compresses each one as it goes in; the
+    // compressed reads are never written out (they were 0.7x the input size).
     let hpc_graph = work.join("compressed.gfa");
     let backbone = assemble::run_backbone_layout(
-        vec![compressed],
+        inputs.to_vec(),
         p,
         &hpc_graph,
         &work.join("compressed.json"),
-        true,
+        assemble::Coordinates::HomopolymerRuns,
     )?;
+    if backbone.reads == 0 {
+        bail!("no reads");
+    }
+    let (reads, compressed_bases) = (backbone.reads, backbone.bases);
+    let (min_count, min_count_auto) = (backbone.min_count, backbone.min_count_auto);
     let graph = parse_gfa(&hpc_graph)?;
     if graph.seqs.is_empty() {
         bail!("Rust HPC retained no graph; no base graph emitted");
     }
     let consensus = restore(&graph, inputs, &p)?;
-    if (reads, bases) != (consensus.stats.reads, consensus.stats.bases) {
-        bail!("input statistics changed between compression and consensus");
+    let bases = consensus.stats.bases;
+    if reads != consensus.stats.reads {
+        bail!("input read count changed between the graph pass and consensus");
     }
     for (path, before) in inputs.iter().zip(fingerprints) {
         let m = fs::metadata(path)?;
@@ -529,7 +513,7 @@ pub fn run(
         n50: shape.n50,
         longest: shape.longest,
         circular_unitigs: shape.circular_unitigs,
-        min_count_auto: false,
+        min_count_auto,
         coordinates: assemble::Coordinates::HomopolymerRuns,
         cleaning_audit: backbone.cleaning_audit.clone(),
         junction_rescue,
@@ -566,6 +550,14 @@ mod tests {
             root.canonicalize().unwrap()
         );
         p
+    }
+    fn params(k: usize, s: usize, min_count: Option<u32>) -> AssembleParams {
+        AssembleParams {
+            k,
+            s,
+            min_count,
+            min_count_fraction: None,
+        }
     }
     fn random_runs(n: usize) -> Vec<u8> {
         random_runs_seed(n, 311)
@@ -610,13 +602,9 @@ mod tests {
         assert_eq!(m, n.into_iter().rev().collect::<Vec<_>>());
     }
     #[test]
-    fn invalid_backend_combinations_and_missing_parameters_fail() {
+    fn invalid_backend_combinations_fail_and_defaults_are_shared() {
         use clap::Parser;
-        for flag in [
-            "--multichrom-graph",
-            "--auto-k-depth",
-            "--min-count-fraction",
-        ] {
+        for flag in ["--multichrom-graph", "--auto-k-depth"] {
             let mut args = vec![
                 "ovasm",
                 "assemble",
@@ -634,22 +622,19 @@ mod tests {
             }
             assert!(crate::Cli::try_parse_from(args).is_err());
         }
-        let cli = crate::Cli::try_parse_from([
-            "ovasm",
-            "assemble",
-            "--reads",
-            "missing",
-            "--rust-hpc",
-            "--out",
-            "g.gfa",
-            "--out-json",
-            "g.json",
-        ])
-        .unwrap();
-        assert!(crate::dispatch(cli.command)
-            .unwrap_err()
-            .to_string()
-            .contains("explicit --k"));
+        // The same --min-count / --min-count-fraction options apply to both encodings, and k
+        // and min-count may be omitted: the run then fails on the missing reads, not on a
+        // missing parameter.
+        for extra in [vec![], vec!["--min-count-fraction", "0.1"], vec!["--min-count", "5"]] {
+            let mut args = vec![
+                "ovasm", "assemble", "--reads", "missing", "--rust-hpc", "--out", "g.gfa",
+                "--out-json", "g.json",
+            ];
+            args.extend(extra);
+            let cli = crate::Cli::try_parse_from(args).unwrap();
+            let error = crate::dispatch(cli.command).unwrap_err().to_string();
+            assert!(!error.contains("explicit"), "{error}");
+        }
     }
     #[test]
     fn shared_reverse_overlap_uses_distinct_observations() {
@@ -711,9 +696,8 @@ mod tests {
         assert_eq!(base.overlaps, vec![300]);
         fs::remove_dir_all(d).unwrap();
     }
-    #[test]
-    fn rust_graph_recovers_two_independent_circles() {
-        let d = dir();
+    /// Two circles of doubled runs, 16 reads each, as FASTA text.
+    fn two_circle_reads() -> (Vec<u8>, Vec<u8>, String) {
         let a = random_runs(1800);
         let b = revcomp(&random_runs_seed(2700, 557));
         let mut fasta = String::new();
@@ -731,10 +715,56 @@ mod tests {
                 writeln!(fasta, ">c{c}_{i}\n{}", String::from_utf8(seq).unwrap()).unwrap();
             }
         }
+        (a, b, fasta)
+    }
+
+    #[test]
+    fn the_engine_decides_min_count_for_runs_and_writes_no_compressed_reads() {
+        let d = dir();
+        let (_, _, fasta) = two_circle_reads();
+        let input = d.join("reads.fa");
+        fs::write(&input, fasta).unwrap();
+        let manual = run(
+            &[input.clone()],
+            params(101, 15, Some(3)),
+            &d.join("manual.gfa"),
+            &d.join("manual.json"),
+            None,
+        )
+        .unwrap();
+        let auto = run(
+            &[input.clone()],
+            params(101, 15, None),
+            &d.join("auto.gfa"),
+            &d.join("auto.json"),
+            None,
+        )
+        .unwrap();
+        assert!(!manual.min_count_auto && auto.min_count_auto);
+        assert!(auto.min_count >= 3, "the automatic floor is 3");
+        assert_eq!((auto.reads, auto.unitigs, auto.links), (32, 2, 2));
+        if auto.min_count == manual.min_count {
+            assert_eq!(
+                fs::read(d.join("auto.gfa")).unwrap(),
+                fs::read(d.join("manual.gfa")).unwrap()
+            );
+        }
+        // compressed reads stay in memory: the intermediates hold graphs, not a read file
+        for work in [d.join("manual.rust-hpc"), d.join("auto.rust-hpc")] {
+            assert!(!work.join("reads.hpc.fasta").exists());
+            assert!(work.join("compressed.gfa").exists());
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn rust_graph_recovers_two_independent_circles() {
+        let d = dir();
+        let (a, b, fasta) = two_circle_reads();
         let input = d.join("reads.fa");
         fs::write(&input, fasta).unwrap();
         let out = d.join("graph.gfa");
-        let result = run(&[input], 101, 15, 3, &out, &d.join("report.json"), None).unwrap();
+        let result = run(&[input], params(101, 15, Some(3)), &out, &d.join("report.json"), None).unwrap();
         assert_eq!((result.reads, result.unitigs, result.links), (32, 2, 2));
         assert!(!result.uses_syncasm && !result.read_threaded_unzipping);
         assert_eq!(result.consensus.unknown_run_positions, 0);
@@ -797,8 +827,14 @@ mod tests {
         let input = d.join("reads.fa");
         fs::write(&input, &fasta).unwrap();
         let graph = d.join("graph.gfa");
-        let report =
-            run(&[input.clone()], 101, 31, 5, &graph, &d.join("graph.json"), None).unwrap();
+        let report = run(
+            &[input.clone()],
+            params(101, 31, Some(5)),
+            &graph,
+            &d.join("graph.json"),
+            None,
+        )
+        .unwrap();
         assert_eq!((report.reads, report.bases), (258, 8 * 32 * 7000 + 311));
         let primary = crate::primary::run(
             &graph,

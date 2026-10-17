@@ -485,14 +485,14 @@ struct AssembleArgs {
     #[arg(long)]
     read_context: Option<PathBuf>,
     /// Legacy name of `--rust-hpc` kept for existing callers; not a chromosome-count setting.
-    /// Requires read-derived --min-count; k defaults to 1001 compressed runs.
-    #[arg(long, hide = true, conflicts_with_all = ["min_count_fraction", "auto_k_depth"])]
+    #[arg(long, hide = true, conflicts_with = "auto_k_depth")]
     multichrom_graph: bool,
     /// Experimental homopolymer-run coordinates for the same assembly engine: reads are
-    /// run-compressed for the graph, run lengths restored from original reads, then the shared
-    /// junction stage runs. Explicit --k (in runs) and --min-count required; read correction
-    /// and general repeat unzipping are not implemented.
-    #[arg(long, conflicts_with_all = ["multichrom_graph", "min_count_fraction", "auto_k_depth"])]
+    /// run-compressed as they are read in, run lengths restored from original reads, then the
+    /// shared junction stage runs. --k counts runs (default 1001); --min-count and
+    /// --min-count-fraction act as in base coordinates. Read correction and general repeat
+    /// unzipping are not implemented.
+    #[arg(long, conflicts_with_all = ["multichrom_graph", "auto_k_depth"])]
     rust_hpc: bool,
     #[arg(long)]
     threads: Option<usize>,
@@ -504,12 +504,6 @@ struct AssembleArgs {
 }
 
 fn assemble(args: AssembleArgs) -> Result<()> {
-    if args.rust_hpc && args.k.is_none() {
-        bail!("--rust-hpc requires explicit --k in compressed runs");
-    }
-    if (args.rust_hpc || args.multichrom_graph) && args.min_count.is_none() {
-        bail!("--rust-hpc requires explicit --min-count from read coverage");
-    }
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)

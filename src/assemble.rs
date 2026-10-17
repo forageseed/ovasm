@@ -1630,6 +1630,7 @@ fn add_junctions(
 
 /// What `run_engine` is asked to do. `k: None` picks k automatically, which is defined in
 /// bases only (`K_LADDER`); homopolymer coordinates take k in runs (default `HPC_DEFAULT_K`).
+/// `min_count: None` is decided by the backbone from node depth in either encoding.
 pub struct EngineParams<'a> {
     pub coordinates: Coordinates,
     pub k: Option<usize>,
@@ -1658,15 +1659,20 @@ pub fn run_engine(
 ) -> Result<EngineReport> {
     match p.coordinates {
         Coordinates::HomopolymerRuns => {
-            if p.min_count_fraction.is_some() {
-                bail!("homopolymer coordinates need an explicit read-derived --min-count");
-            }
-            let min_count = p
-                .min_count
-                .context("homopolymer coordinates need an explicit read-derived --min-count")?;
             let k = p.k.unwrap_or(HPC_DEFAULT_K);
-            crate::hpc::run(&inputs, k, p.s, min_count, out_gfa, out_json, p.context)
-                .map(EngineReport::HomopolymerRuns)
+            crate::hpc::run(
+                &inputs,
+                AssembleParams {
+                    k,
+                    s: p.s,
+                    min_count: p.min_count,
+                    min_count_fraction: p.min_count_fraction,
+                },
+                out_gfa,
+                out_json,
+                p.context,
+            )
+            .map(EngineReport::HomopolymerRuns)
         }
         Coordinates::Bases => match p.k {
             None if p.s != 0 => run_auto_k_with_context(
@@ -1713,19 +1719,22 @@ fn run_backbone(
     out_gfa: &Path,
     out_json: &Path,
 ) -> Result<AssembleReport> {
-    run_backbone_layout(inputs, p, out_gfa, out_json, false)
+    run_backbone_layout(inputs, p, out_gfa, out_json, Coordinates::Bases)
 }
 
-/// HPC consensus needs the original node-containing unitigs and their exact
-/// overlaps. Do not fill, shift or trim coordinates before observations are
-/// assigned. The default base-coordinate assembler retains its existing layout.
+/// The backbone for either coordinate encoding; `inputs` are always the original reads.
+/// Homopolymer coordinates run-compress each read as it is read in (no intermediate file) and
+/// keep the original node-containing unitigs and their exact overlaps: HPC consensus needs
+/// them, so nothing is filled, shifted or trimmed before observations are assigned. The
+/// default base-coordinate assembler retains its existing layout.
 pub(crate) fn run_backbone_layout(
     inputs: Vec<PathBuf>,
     p: AssembleParams,
     out_gfa: &Path,
     out_json: &Path,
-    preserve_overlaps: bool,
+    coordinates: Coordinates,
 ) -> Result<AssembleReport> {
+    let preserve_overlaps = coordinates == Coordinates::HomopolymerRuns;
     if let Some(f) = p.min_count_fraction {
         if !(f > 0.0 && f <= 1.0) {
             bail!("min-count fraction must be in (0, 1], got {f}");
@@ -1756,6 +1765,12 @@ pub(crate) fn run_backbone_layout(
     for mut batch in rx {
         for r in &mut batch {
             r.seq.make_ascii_uppercase();
+        }
+        if coordinates == Coordinates::HomopolymerRuns {
+            batch.par_iter_mut().try_for_each(|r| -> Result<()> {
+                r.seq = crate::hpc::compress(&r.seq)?.0;
+                Ok(())
+            })?;
         }
         let per_read: Vec<Vec<Sample>> =
             batch.par_iter().map(|r| sample_read(&r.seq, &p)).collect();
