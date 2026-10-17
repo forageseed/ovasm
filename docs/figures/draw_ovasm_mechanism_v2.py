@@ -53,7 +53,7 @@ T(7, R1 + 39.5, "whole-genome or\norganelle-enriched input", 5.8, GREY)
 
 # 2 read selection and graph
 card(46, R1, 56, H1, 2, "Read selection and graph")
-lanes = [("HiFi", "native closed-syncmer graph\n(Syncasm, from Oatk) or portable graph", TEAL),
+lanes = [("HiFi", "Rust closed-syncmer graph\nhomopolymer-aware graph option", TEAL),
          ("ONT / CLR", "self-correction,\nthen graph construction", VIOLET),
          ("Illumina", "dense k-mer graph", GREY)]
 for k, (lab, desc, col) in enumerate(lanes):

@@ -55,6 +55,19 @@ fn complement(b: u8) -> u8 {
     }
 }
 
+/// Length of a sequence in the graph's k units: bases, or homopolymer runs when the
+/// backbone was built on run-compressed reads (its k then counts runs, not bases).
+fn k_units(seq: &[u8], runs: bool) -> usize {
+    if runs {
+        seq.iter()
+            .enumerate()
+            .filter(|&(i, b)| i == 0 || seq[i - 1] != *b)
+            .count()
+    } else {
+        seq.len()
+    }
+}
+
 /// Maximal nonoverlapping inverted repeats with room for the existing unique-flank
 /// anchors. A repeat already as long as k is not a hidden sub-k junction.
 pub(crate) fn inverted_repeats(
@@ -62,6 +75,7 @@ pub(crate) fn inverted_repeats(
     k: usize,
     s: usize,
     anchor: usize,
+    k_in_runs: bool,
 ) -> Vec<InvertedRepeat> {
     let mut found = BTreeSet::new();
     for (segment, seq) in g.seqs.iter().enumerate() {
@@ -104,7 +118,11 @@ pub(crate) fn inverted_repeats(
                         .entry(diagonal)
                         .or_default()
                         .push((a, a + length - s));
-                    if length >= k
+                    // k and s are both in the graph's units: a repeat of fewer than s
+                    // runs is shorter than the backbone's own seed word.
+                    let units = k_units(&seq[a..a + length], k_in_runs);
+                    if units >= k
+                        || units < s
                         || a <= anchor
                         || b + length + anchor >= seq.len()
                         || b - (a + length) < 2 * anchor
@@ -246,7 +264,10 @@ fn parent_tags(text: &str) -> BTreeMap<&str, Vec<&str>> {
                     f[3..]
                         .iter()
                         .copied()
-                        .filter(|t| !t.starts_with("LN:") && !t.starts_with("NC:"))
+                        // whole-segment counts would be wrong on a split piece
+                        .filter(|t| {
+                            !t.starts_with("LN:") && !t.starts_with("NC:") && !t.starts_with("HC:")
+                        })
                         .collect(),
                 )
             })
@@ -390,6 +411,7 @@ pub fn restore<F>(
     k: usize,
     s: usize,
     threshold: u32,
+    k_in_runs: bool,
     nuclear_flanked: F,
 ) -> Result<JunctionReport>
 where
@@ -399,7 +421,7 @@ where
     let g = evidence::parse_gfa(gfa)?;
     let text = fs::read_to_string(gfa)?;
     let p = hifi_evidence();
-    let repeats = inverted_repeats(&g, k, s, p.min_anchor);
+    let repeats = inverted_repeats(&g, k, s, p.min_anchor, k_in_runs);
     let mut report = JunctionReport {
         method: "sub-k inverted-repeat complete-read junction support",
         source: "current backbone and original input records; no external assembly",
@@ -545,7 +567,7 @@ mod tests {
         s.extend(evidence::revcomp(&repeat));
         s.extend(seq(2600, 31));
         let g = graph(s);
-        let r = inverted_repeats(&g, 1001, 31, 500)
+        let r = inverted_repeats(&g, 1001, 31, 500, false)
             .into_iter()
             .find(|r| r.left <= a && r.right <= b && r.length >= 83)
             .unwrap();
@@ -558,7 +580,7 @@ mod tests {
             &g.seqs[0][r.left..r.left + r.length],
             &evidence::revcomp(&g.seqs[0][r.right..r.right + r.length])
         );
-        assert!(inverted_repeats(&g, r.length, 31, 500)
+        assert!(inverted_repeats(&g, r.length, 31, 500, false)
             .iter()
             .all(|x| x.length < r.length));
     }
@@ -645,7 +667,7 @@ mod tests {
     fn distinct_complete_reads_promote_both_links_without_lowering_quorum() {
         let dir = workspace("support");
         let (gfa, reads) = fixture(&dir);
-        let report = restore(&gfa, &[reads], 1001, 31, 3, |_, _, _| Ok(false)).unwrap();
+        let report = restore(&gfa, &[reads], 1001, 31, 3, false, |_, _, _| Ok(false)).unwrap();
         assert_eq!(report.retained_junctions, 2);
         assert!(report
             .calls
@@ -658,7 +680,7 @@ mod tests {
     fn duplicate_records_cannot_inflate_support() {
         let dir = workspace("duplicate");
         let (gfa, reads) = fixture(&dir);
-        let report = restore(&gfa, &[reads.clone(), reads], 1001, 31, 4, |_, _, _| {
+        let report = restore(&gfa, &[reads.clone(), reads], 1001, 31, 4, false, |_, _, _| {
             Ok(false)
         })
         .unwrap();
@@ -672,7 +694,7 @@ mod tests {
         let dir = workspace("nuclear");
         let (gfa, reads) = fixture(&dir);
         let before = fs::read(&gfa).unwrap();
-        let report = restore(&gfa, &[reads], 1001, 31, 3, |_, _, _| Ok(true)).unwrap();
+        let report = restore(&gfa, &[reads], 1001, 31, 3, false, |_, _, _| Ok(true)).unwrap();
         assert_eq!(report.retained_junctions, 0);
         assert!(report
             .calls

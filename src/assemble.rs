@@ -199,6 +199,8 @@ pub struct AssembleReport {
     pub nodes_kept: usize,
     pub edges_kept: usize,
     pub cleaning: CleanStats,
+    /// FASTA of every unitig `clean` removed, with its rule, round, length and depth.
+    pub cleaning_audit: String,
     /// Dead ends reconnected through k-mers the reads agree on (see `rescue_gaps`).
     pub rescue: RescueStats,
     /// Dense mode: dead ends joined by an exact overlap shorter than k - 1 (see
@@ -820,10 +822,23 @@ pub struct RescueStats {
     pub nodes: usize,
 }
 
-/// Graph over the kept k-mers: edges seen `min_count` times between kept nodes, plus `extra`.
+/// An edge between two kept nodes is kept when its reads reach `min_count` or this fraction of
+/// the shallower node's count. A node count is the number of error-free observations of one
+/// long word, the edge count those of two consecutive words, so a real junction can fall under
+/// an absolute node cutoff chosen to exclude low-depth background (Schoenoplectus WGS at
+/// min_count 80: repeat exits with 61-76 reads between nodes of ~130 were lost). The same
+/// relative rule, 0.35 of the smaller node coverage, is the arc filter of Syncasm (Oatk 1.0,
+/// `make_syncmer_graph`, `min_a_cov_f`). It only adds edges between nodes already kept.
+pub const ARC_FRACTION: f64 = 0.35;
+/// The relative rule never keeps an edge fewer reads show than the automatic min_count's floor.
+pub const ARC_MIN_READS: u32 = 3;
+
+/// Graph over the kept k-mers: edges between kept nodes seen `min_count` times or
+/// `ARC_FRACTION` of the shallower node's count, plus `extra`.
 /// Returns the node hashes (index = node id), adjacency and the number of edges kept.
 fn build_graph(
     keep: &FxHashSet<u64>,
+    nodes: &FxHashMap<u64, (u32, Vec<u8>)>,
     edges: &FxHashMap<EdgeKey, u32>,
     extra: &[EdgeKey],
     min_count: u32,
@@ -835,7 +850,13 @@ fn build_graph(
     let slot = |o: ONode| 2 * o.0 + o.1 as usize;
     let mut kept: Vec<(ONode, ONode, u32)> = edges
         .iter()
-        .filter(|(_, &c)| c >= min_count)
+        .filter(|(&(a, b, _), &c)| {
+            c >= min_count
+                || (c >= ARC_MIN_READS
+                    && keep.contains(&a.0)
+                    && keep.contains(&b.0)
+                    && c as f64 >= ARC_FRACTION * nodes[&a.0].0.min(nodes[&b.0].0) as f64)
+        })
         .map(|(&e, _)| e)
         .chain(extra.iter().copied())
         .filter_map(|(a, b, d)| Some(((*index.get(&a.0)?, a.1), (*index.get(&b.0)?, b.1), d)))
@@ -1070,6 +1091,8 @@ fn clean(
     kmers: &[&[u8]],
     alive: &mut [bool],
     stats: &mut CleanStats,
+    audit: &mut Vec<CleanEvent>,
+    keep_short_isolated: bool,
 ) -> usize {
     let n = unitigs.len();
     let len: Vec<usize> = unitigs
@@ -1131,6 +1154,7 @@ fn clean(
         }
     }
     let mut remove = vec![false; n];
+    let mut why = vec![""; n];
     for u in 0..n {
         let [l, r] = &nb[u];
         // Joined only to itself (a hairpin or self-loop, e.g. a (CG)n run that is its own
@@ -1152,6 +1176,7 @@ fn clean(
                 };
                 if period < k {
                     remove[u] = true;
+                    why[u] = "tandem_circle";
                     let unit = unitig_prefix(t, kmers, k, true, period);
                     let circle = TandemCircle {
                         period,
@@ -1161,8 +1186,11 @@ fn clean(
                     if !stats.tandem_circles.contains(&circle) {
                         stats.tandem_circles.push(circle);
                     }
-                } else if !t.circular && (dp[u] < 0.25 * depth || len[u] < 2 * k) {
+                } else if !t.circular
+                    && (dp[u] < 0.25 * depth || (len[u] < 2 * k && !keep_short_isolated))
+                {
                     remove[u] = true;
+                    why[u] = "isolated";
                     stats.isolated_removed += 1;
                 }
             }
@@ -1171,6 +1199,7 @@ fn clean(
                 let strongest = side.iter().map(|&v| dp[v]).fold(floor, f64::max);
                 if len[u] < short && dp[u] < 0.5 * strongest && !strongest_at[u] {
                     remove[u] = true;
+                    why[u] = "tip";
                     stats.tips_removed += 1;
                 }
             }
@@ -1185,6 +1214,7 @@ fn clean(
                     && has_detour(u, &out, &len, len[u] + 2 * k)
                 {
                     remove[u] = true;
+                    why[u] = "bubble";
                     stats.bubbles_popped += 1;
                 }
             }
@@ -1247,6 +1277,7 @@ fn clean(
             b.truncate(want);
             if shared_share(a, &b) >= VARIANT_SHARE {
                 remove[u] = true;
+                why[u] = "variant_arm";
                 stats.variant_arms_removed += 1;
                 stats.variant_arm_bp += a.len();
             }
@@ -1291,25 +1322,61 @@ fn clean(
         }
         if deepest[&r] < 0.3 * depth {
             remove[u] = true;
+            why[u] = "shallow_component";
             stats.shallow_component_removed += 1;
         } else if longest[&r] < fragmented {
             remove[u] = true;
+            why[u] = "fragmented_component";
             stats.fragmented_component_removed += 1;
         }
     }
     let mut removed = 0;
-    for t in unitigs
-        .iter()
-        .zip(&remove)
-        .filter(|(_, &r)| r)
-        .map(|(t, _)| t)
-    {
+    for (u, t) in unitigs.iter().enumerate().filter(|&(u, _)| remove[u]) {
         for (o, _) in &t.nodes {
             alive[o.0] = false;
         }
         removed += 1;
+        audit.push(CleanEvent {
+            round: stats.rounds,
+            rule: why[u],
+            length: len[u],
+            depth: dp[u],
+            neighbours: [nb[u][0].len(), nb[u][1].len()],
+            sequence: unitig_prefix(t, kmers, k, true, usize::MAX),
+        });
     }
     removed
+}
+
+/// One unitig removed by `clean`: kept so a lost region can be traced to the rule that removed
+/// it. Lengths and sequence are in the graph's own coordinates (compressed runs in HPC).
+pub(crate) struct CleanEvent {
+    round: usize,
+    rule: &'static str,
+    length: usize,
+    depth: f64,
+    neighbours: [usize; 2],
+    sequence: Vec<u8>,
+}
+
+fn write_clean_audit(path: &Path, audit: &[CleanEvent]) -> Result<()> {
+    let mut text = String::new();
+    for (i, e) in audit.iter().enumerate() {
+        writeln!(
+            text,
+            ">c{i} rule={} round={} length={} depth={:.1} left_links={} right_links={}
+{}",
+            e.rule,
+            e.round,
+            e.length,
+            e.depth,
+            e.neighbours[0],
+            e.neighbours[1],
+            std::str::from_utf8(&e.sequence)?
+        )?;
+    }
+    fs::write(path, text)?;
+    Ok(())
 }
 
 /// k values tried by `run_auto_k`, largest first.
@@ -1444,56 +1511,200 @@ pub fn run_with_context(
     Ok(r)
 }
 
-fn add_junctions(
-    r: &mut AssembleReport,
-    inputs: &[PathBuf],
+/// Coordinates the one assembly engine builds its graph in. Homopolymer runs are an internal
+/// encoding: reads are run-compressed for the backbone and every graph run length is restored
+/// from original-read observations before the shared stages that follow. Graph k and lengths
+/// inside the backbone are then counted in runs, never base-pair parameters reinterpreted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coordinates {
+    Bases,
+    HomopolymerRuns,
+}
+
+/// k, in homopolymer runs, when that encoding is requested without one.
+pub const HPC_DEFAULT_K: usize = 1001;
+
+/// Shape statistics of a written GFA, in bases.
+pub(crate) struct GraphShape {
+    pub unitigs: usize,
+    pub links: usize,
+    pub links_with_overlap: usize,
+    pub circular_unitigs: usize,
+    pub total_length: usize,
+    pub n50: usize,
+    pub longest: usize,
+}
+
+pub(crate) fn graph_shape(gfa: &Path) -> Result<GraphShape> {
+    let graph = crate::evidence::parse_gfa(gfa)?;
+    let mut lengths: Vec<_> = graph.seqs.iter().map(Vec::len).collect();
+    lengths.sort_unstable_by(|a, b| b.cmp(a));
+    let total_length = lengths.iter().sum();
+    let mut acc = 0;
+    let n50 = lengths
+        .iter()
+        .find(|&&l| {
+            acc += l;
+            acc * 2 >= total_length
+        })
+        .copied()
+        .unwrap_or(0);
+    Ok(GraphShape {
+        unitigs: lengths.len(),
+        links: graph.links.len(),
+        links_with_overlap: graph.overlaps.iter().filter(|&&x| x > 0).count(),
+        circular_unitigs: graph.links.iter().filter(|(a, b)| a == b).count(),
+        total_length,
+        n50,
+        longest: lengths.first().copied().unwrap_or(0),
+    })
+}
+
+/// Shared engine stage after the backbone: original-read support for junctions hidden inside
+/// long-k unitigs (see `junctions`), with optional whole-read nuclear context. Runs on the
+/// base-sequence GFA in both coordinate encodings; `k` is in the backbone's own units.
+pub(crate) fn restore_junctions(
     out_gfa: &Path,
+    inputs: &[PathBuf],
+    k: usize,
+    s: usize,
+    min_count: u32,
+    coordinates: Coordinates,
     context: Option<&Path>,
-) -> Result<()> {
-    if r.s == 0 {
+) -> Result<Option<crate::junctions::JunctionReport>> {
+    if s == 0 {
         if context.is_some() {
             bail!("whole-read nuclear context currently requires HiFi sparse assembly");
         }
-        return Ok(());
+        return Ok(None);
     }
-    let started = Instant::now();
     let graph = crate::evidence::parse_gfa(out_gfa)?;
     let context = context
         .map(|path| {
             crate::read_context::ReadContext::load(path, &graph, &crate::junctions::hifi_evidence())
         })
         .transpose()?;
-    let mut report =
-        crate::junctions::restore(out_gfa, inputs, r.k, r.s, r.min_count, |read, a, b| {
-            match &context {
-                Some(ctx) => ctx.nuclear_flanked(read, a, b),
-                None => Ok(false),
-            }
-        })?;
+    let mut report = crate::junctions::restore(
+        out_gfa,
+        inputs,
+        k,
+        s,
+        min_count,
+        coordinates == Coordinates::HomopolymerRuns,
+        |read, a, b| match &context {
+            Some(ctx) => ctx.nuclear_flanked(read, a, b),
+            None => Ok(false),
+        },
+    )?;
     report.read_context = context.map(|ctx| ctx.summary);
+    Ok(Some(report))
+}
+
+fn add_junctions(
+    r: &mut AssembleReport,
+    inputs: &[PathBuf],
+    out_gfa: &Path,
+    context: Option<&Path>,
+) -> Result<()> {
+    let started = Instant::now();
+    let Some(report) =
+        restore_junctions(out_gfa, inputs, r.k, r.s, r.min_count, Coordinates::Bases, context)?
+    else {
+        return Ok(());
+    };
     if report.retained_junctions > 0 {
-        let graph = crate::evidence::parse_gfa(out_gfa)?;
-        let mut lengths: Vec<_> = graph.seqs.iter().map(Vec::len).collect();
-        lengths.sort_unstable_by(|a, b| b.cmp(a));
-        r.total_length = lengths.iter().sum();
-        r.unitigs = lengths.len();
-        r.longest = lengths.first().copied().unwrap_or(0);
-        r.links = graph.links.len();
-        r.links_with_overlap = graph.overlaps.iter().filter(|&&x| x > 0).count();
-        r.circular_unitigs = graph.links.iter().filter(|(a, b)| a == b).count();
-        let mut acc = 0;
-        r.n50 = lengths
-            .iter()
-            .find(|&&l| {
-                acc += l;
-                acc * 2 >= r.total_length
-            })
-            .copied()
-            .unwrap_or(0);
+        let g = graph_shape(out_gfa)?;
+        r.total_length = g.total_length;
+        r.unitigs = g.unitigs;
+        r.longest = g.longest;
+        r.links = g.links;
+        r.links_with_overlap = g.links_with_overlap;
+        r.circular_unitigs = g.circular_unitigs;
+        r.n50 = g.n50;
     }
     r.elapsed_seconds += started.elapsed().as_secs_f64();
     r.junction_rescue = Some(report);
     Ok(())
+}
+
+/// What `run_engine` is asked to do. `k: None` picks k automatically, which is defined in
+/// bases only (`K_LADDER`); homopolymer coordinates take k in runs (default `HPC_DEFAULT_K`).
+pub struct EngineParams<'a> {
+    pub coordinates: Coordinates,
+    pub k: Option<usize>,
+    pub s: usize,
+    pub min_count: Option<u32>,
+    pub min_count_fraction: Option<f64>,
+    pub auto_k_depth: f64,
+    pub context: Option<&'a Path>,
+}
+
+/// The report of one engine run, in the encoding's existing JSON schema.
+pub enum EngineReport {
+    Bases(AssembleReport),
+    HomopolymerRuns(crate::hpc::HpcReport),
+}
+
+/// The one assembly engine: one backbone (closed-syncmer graph, relative arc rule, audited
+/// cleaning, read-agreed gap rescue), then the shared original-read junction stage. The
+/// homopolymer encoding adds run compression before and run-length restoration after the
+/// backbone; it is not a separate product or a statement about chromosome number.
+pub fn run_engine(
+    inputs: Vec<PathBuf>,
+    p: EngineParams,
+    out_gfa: &Path,
+    out_json: &Path,
+) -> Result<EngineReport> {
+    match p.coordinates {
+        Coordinates::HomopolymerRuns => {
+            if p.min_count_fraction.is_some() {
+                bail!("homopolymer coordinates need an explicit read-derived --min-count");
+            }
+            let min_count = p
+                .min_count
+                .context("homopolymer coordinates need an explicit read-derived --min-count")?;
+            let k = p.k.unwrap_or(HPC_DEFAULT_K);
+            crate::hpc::run(&inputs, k, p.s, min_count, out_gfa, out_json, p.context)
+                .map(EngineReport::HomopolymerRuns)
+        }
+        Coordinates::Bases => match p.k {
+            None if p.s != 0 => run_auto_k_with_context(
+                inputs,
+                p.s,
+                p.min_count,
+                p.min_count_fraction,
+                p.auto_k_depth,
+                out_gfa,
+                out_json,
+                p.context,
+            )
+            .map(EngineReport::Bases),
+            k => {
+                let k = match k {
+                    Some(k) => k,
+                    None => {
+                        let (k, median) = dense_k(&inputs)?;
+                        eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}");
+                        k
+                    }
+                };
+                run_with_context(
+                    inputs,
+                    AssembleParams {
+                        k,
+                        s: p.s,
+                        min_count: p.min_count,
+                        min_count_fraction: p.min_count_fraction,
+                    },
+                    out_gfa,
+                    out_json,
+                    p.context,
+                )
+                .map(EngineReport::Bases)
+            }
+        },
+    }
 }
 
 fn run_backbone(
@@ -1617,9 +1828,16 @@ pub(crate) fn run_backbone_layout(
         .collect();
     let mut extra: Vec<EdgeKey> = Vec::new();
     let mut cleaning = CleanStats::default();
+    let mut audit = Vec::new();
     let mut rescue = RescueStats::default();
+    // The first cleaning keeps short isolated pieces so that gap rescue can see them: near a
+    // molecule end or a hard stretch, single nodes just over min_count lose the edges between
+    // them and are otherwise deleted before reads are asked whether they continue a dead end
+    // (Schoenoplectus WGS: the last 1,384 runs of one chromosome). The graph is then rebuilt
+    // and cleaned as usual, so pieces no reads join are still removed.
+    let mut deferring = !dense;
     let (ids, edges_kept, unitigs, links) = loop {
-        let (ids, adj, edges_kept) = build_graph(&keep, &edges, &extra, min_count);
+        let (ids, adj, edges_kept) = build_graph(&keep, &nodes, &edges, &extra, min_count);
         let count: Vec<u32> = ids.iter().map(|h| nodes[h].0).collect();
         let kmers: Vec<&[u8]> = ids.iter().map(|h| nodes[h].1.as_slice()).collect();
         let mut alive = vec![true; ids.len()];
@@ -1635,18 +1853,22 @@ pub(crate) fn run_backbone_layout(
                 &kmers,
                 &mut alive,
                 &mut cleaning,
+                &mut audit,
+                deferring,
             );
             cleaning.rounds += 1;
             if removed == 0 || cleaning.rounds >= 50 {
                 break (unitigs, links);
             }
         };
-        if rescue.rounds >= 2 {
+        let deferred = std::mem::replace(&mut deferring, false);
+        // the deferred pass adds one rescue round before the usual two
+        if !deferred && rescue.rounds >= 2 + usize::from(!dense) {
             break (ids, edges_kept, unitigs, links);
         }
         rescue.rounds += 1;
         let found = rescue_gaps(&ids, &unitigs, &links, &read_samples, p.k);
-        if found.is_empty() {
+        if found.is_empty() && !deferred {
             break (ids, edges_kept, unitigs, links);
         }
         for chain in &found {
@@ -1736,6 +1958,8 @@ pub(crate) fn run_backbone_layout(
         fs::remove_file(prior_backbone)?;
     }
     fs::write(out_gfa, &gfa)?;
+    let cleaning_audit = out_gfa.with_extension("cleaning.fa");
+    write_clean_audit(&cleaning_audit, &audit)?;
 
     lengths.sort_unstable_by(|a, b| b.cmp(a));
     let total: usize = lengths.iter().sum();
@@ -1750,6 +1974,7 @@ pub(crate) fn run_backbone_layout(
         .unwrap_or(0);
     let report = AssembleReport {
         junction_rescue: None,
+        cleaning_audit: cleaning_audit.display().to_string(),
         k: p.k,
         s: p.s,
         reads,
@@ -1799,6 +2024,25 @@ mod tests {
                 b"ACGT"[(s >> 62) as usize]
             })
             .collect()
+    }
+
+    #[test]
+    fn an_edge_under_min_count_survives_when_it_holds_a_share_of_its_nodes() {
+        let nodes: FxHashMap<u64, (u32, Vec<u8>)> =
+            [(1, 100), (2, 100), (3, 100), (4, 5), (5, 5), (9, 1)]
+                .into_iter()
+                .map(|(h, c)| (h, (c, Vec::new())))
+                .collect();
+        let keep: FxHashSet<u64> = [1, 2, 3, 4, 5].into_iter().collect();
+        let mut edges = FxHashMap::default();
+        edges.insert(((1, true), (2, true), 10), 40); // 0.40 of its nodes: kept under 80
+        edges.insert(((2, true), (3, true), 10), 20); // 0.20: not kept
+        edges.insert(((4, true), (5, true), 10), 2); // 0.40 but under three reads: not kept
+        edges.insert(((3, true), (9, true), 10), 90); // a node below min_count: not kept
+        let (_, _, kept) = build_graph(&keep, &nodes, &edges, &[], 80);
+        assert_eq!(kept, 1);
+        let (_, _, kept) = build_graph(&keep, &nodes, &edges, &[], 2);
+        assert_eq!(kept, 4 - 1, "min_count alone still keeps every edge it reaches");
     }
 
     #[test]

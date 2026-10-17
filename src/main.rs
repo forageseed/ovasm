@@ -24,7 +24,6 @@ mod replicate;
 mod retained;
 mod seeddb;
 mod seedfree;
-mod syncasm;
 mod unify;
 
 use std::path::PathBuf;
@@ -485,13 +484,15 @@ struct AssembleArgs {
     /// Complete original-read nuclear context; shared local matches do not establish source.
     #[arg(long)]
     read_context: Option<PathBuf>,
-    /// Use the attributed, embedded Syncasm correction and repeat-unzipping kernel (Linux).
-    /// Requires --min-count from read coverage; k defaults to 1001 compressed runs.
-    #[arg(long)]
+    /// Legacy name of `--rust-hpc` kept for existing callers; not a chromosome-count setting.
+    /// Requires read-derived --min-count; k defaults to 1001 compressed runs.
+    #[arg(long, hide = true, conflicts_with_all = ["min_count_fraction", "auto_k_depth"])]
     multichrom_graph: bool,
-    /// Experimental independent Rust HPC graph and shared-coordinate run consensus.
-    /// Explicit --k and --min-count required; no C correction or repeat unzipping.
-    #[arg(long, conflicts_with_all = ["multichrom_graph", "read_context", "min_count_fraction", "auto_k_depth"])]
+    /// Experimental homopolymer-run coordinates for the same assembly engine: reads are
+    /// run-compressed for the graph, run lengths restored from original reads, then the shared
+    /// junction stage runs. Explicit --k (in runs) and --min-count required; read correction
+    /// and general repeat unzipping are not implemented.
+    #[arg(long, conflicts_with_all = ["multichrom_graph", "min_count_fraction", "auto_k_depth"])]
     rust_hpc: bool,
     #[arg(long)]
     threads: Option<usize>,
@@ -503,89 +504,55 @@ struct AssembleArgs {
 }
 
 fn assemble(args: AssembleArgs) -> Result<()> {
-    if args.rust_hpc {
-        let k = args.k.context("--rust-hpc requires explicit --k in compressed runs")?;
-        let cutoff = args.min_count.context("--rust-hpc requires explicit --min-count from read coverage")?;
-        if let Some(n) = args.threads {
-            rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
-        }
-        let r = hpc::run(&args.reads, k, args.s, cutoff, &args.out, &args.out_json)?;
-        eprintln!("[ovasm] independent Rust HPC: {} unitigs, {} bp, {} links; {:.1}s (experimental)", r.unitigs, r.total_length, r.links, r.elapsed_seconds);
-        return Ok(());
+    if args.rust_hpc && args.k.is_none() {
+        bail!("--rust-hpc requires explicit --k in compressed runs");
     }
-    if args.multichrom_graph {
-        if args.read_context.is_some() { bail!("--read-context is currently supported by the Rust sparse assembler"); }
-        if args.min_count_fraction.is_some() {
-            bail!("--min-count-fraction does not apply to --multichrom-graph; give --min-count");
-        }
-        let cutoff = args
-            .min_count
-            .context("--multichrom-graph requires --min-count derived from read coverage")?;
-        let r = syncasm::run(
-            args.reads,
-            args.k.unwrap_or(1001),
-            args.s,
-            cutoff,
-            args.threads.unwrap_or(8),
-            &args.out,
-            &args.out_json,
-        )?;
-        eprintln!(
-            "[ovasm] native Syncasm: {} unitigs, {} bp, {:.1}s",
-            r.unitigs, r.total_length, r.elapsed_seconds
-        );
-        return Ok(());
+    if (args.rust_hpc || args.multichrom_graph) && args.min_count.is_none() {
+        bail!("--rust-hpc requires explicit --min-count from read coverage");
     }
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()?;
     }
-    let r = {
-        match args.k {
-            None if args.s != 0 => {
-                let r = assemble::run_auto_k_with_context(
-                    args.reads,
-                    args.s,
-                    args.min_count,
-                    args.min_count_fraction,
-                    args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
-                    &args.out,
-                    &args.out_json,
-                    args.read_context.as_deref(),
-                )?;
-                let tried: Vec<String> = r
-                    .k_tried
-                    .iter()
-                    .map(|(k, d)| format!("k {k}: node depth {d:.0}"))
-                    .collect();
-                eprintln!("[ovasm] automatic k {} ({})", r.k, tried.join(", "));
-                r
-            }
-            k => {
-                let k = match k {
-                    Some(k) => k,
-                    None => {
-                        let (k, median) = assemble::dense_k(&args.reads)?;
-                        eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}");
-                        k
-                    }
-                };
-                assemble::run_with_context(
-                    args.reads,
-                    assemble::AssembleParams {
-                        k,
-                        s: args.s,
-                        min_count: args.min_count,
-                        min_count_fraction: args.min_count_fraction,
-                    },
-                    &args.out,
-                    &args.out_json,
-                    args.read_context.as_deref(),
-                )?
-            }
-        }
+    let coordinates = if args.rust_hpc || args.multichrom_graph {
+        assemble::Coordinates::HomopolymerRuns
+    } else {
+        assemble::Coordinates::Bases
     };
+    let automatic_k = args.k.is_none() && args.s != 0;
+    let report = assemble::run_engine(
+        args.reads,
+        assemble::EngineParams {
+            coordinates,
+            k: args.k,
+            s: args.s,
+            min_count: args.min_count,
+            min_count_fraction: args.min_count_fraction,
+            auto_k_depth: args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
+            context: args.read_context.as_deref(),
+        },
+        &args.out,
+        &args.out_json,
+    )?;
+    let r = match report {
+        assemble::EngineReport::HomopolymerRuns(r) => {
+            eprintln!(
+                "[ovasm] homopolymer-run coordinates: {} unitigs, {} bp, {} links; {:.1}s (experimental)",
+                r.unitigs, r.total_length, r.links, r.elapsed_seconds
+            );
+            return Ok(());
+        }
+        assemble::EngineReport::Bases(r) => r,
+    };
+    if automatic_k {
+        let tried: Vec<String> = r
+            .k_tried
+            .iter()
+            .map(|(k, d)| format!("k {k}: node depth {d:.0}"))
+            .collect();
+        eprintln!("[ovasm] automatic k {} ({})", r.k, tried.join(", "));
+    }
     eprintln!(
         "[ovasm] {} reads; {} sampled k-mers, {} distinct; depth ~{:.0}, min count {}; {} nodes, {} edges -> {} unitigs ({} bp, N50 {}), {} links; {:.1}s",
         r.reads, r.sampled_kmers, r.distinct_nodes, r.node_depth, r.min_count, r.nodes_kept,

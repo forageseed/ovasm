@@ -1,14 +1,14 @@
-# Prebuilt installation (0.2.0)
+# Prebuilt installation (0.2.1)
 
-[Download the release](https://github.com/forageseed/ovasm/releases/tag/v0.2.0).
+[Download the release](https://github.com/forageseed/ovasm/releases/tag/v0.2.1).
 These packages contain the executable and built-in seed references. Building from
 source, installing Rust/C compilers and administrator permission are unnecessary.
 
 ## Windows x86_64
 
-1. Download `ovasm-v0.2.0-windows-x86_64.zip` and extract it completely.
+1. Download `ovasm-v0.2.1-windows-x86_64.zip` and extract it completely.
 2. Double-click `install.cmd` in the extracted folder.
-3. Open a new terminal and run `ovasm --version` (expected: `ovasm 0.2.0`).
+3. Open a new terminal and run `ovasm --version` (expected: `ovasm 0.2.1`).
 
 The installer checks the executable against the packaged SHA-256 manifest,
 copies it to `%LOCALAPPDATA%\Programs\ovasm` and adds that directory to the
@@ -27,13 +27,12 @@ skips all persistent user PATH changes. Uninstall by removing the installed
 
 ## Linux x86_64
 
-Requires glibc >=2.34 and normal system runtime libraries, including `libz.so.1`.
+Requires glibc >=2.34 and normal system runtime libraries.
 The package is built on Ubuntu 24.04; the minimum glibc symbol requirement is
-checked on the actual executable. C/zlib development headers are build-time
-requirements only and are not needed to run this binary.
+checked on the actual executable. No graph-kernel C compiler or zlib development headers are needed.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.1/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -45,7 +44,7 @@ different location or an already-downloaded package:
 
 ```sh
 sh scripts/install.sh --bin-dir /path/to/my/bin \
-  --archive /path/to/ovasm-v0.2.0-linux-x86_64.tar.gz \
+  --archive /path/to/ovasm-v0.2.1-linux-x86_64.tar.gz \
   --checksums /path/to/SHA256SUMS
 ```
 
@@ -55,7 +54,7 @@ For future terminals add that directory to your shell PATH if not already presen
 
 ## Platform scope
 
-Linux includes the native multichrom kernel. Windows includes the portable
-stages, not the Linux-only kernel. This release provides no macOS, ARM64, or
-musl/Alpine executable. Platform availability is separate from biological
-acceptance: inspect evidence, unresolved branches and sequence scores for each run.
+Both packages provide the Rust graph implementations. The HPC multichrom option
+is experimental and does not yet implement read correction or repeat unzipping.
+No macOS, ARM64 or musl/Alpine executable is supplied. Platform availability and
+biological validation are separate; inspect graph evidence and unresolved paths.
