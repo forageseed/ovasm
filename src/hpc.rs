@@ -3,7 +3,9 @@
 //! Uses OVASM's Rust sparse graph, not Syncasm/FFI. Exact compressed overlaps
 //! identify shared graph positions. Original read positions contribute once per
 //! shared coordinate, even when several overlapping anchors observe them. This
-//! experimental backend does not implement read correction or repeat unzipping.
+//! is the homopolymer encoding of `assemble::run_engine`: once run lengths are restored, the
+//! base graph goes through the engine's shared original-read junction stage. Read correction
+//! and general read-threaded repeat unzipping are not implemented.
 
 use crate::{
     assemble::{self, AssembleParams, AssembleReport},
@@ -332,6 +334,10 @@ fn base_graph(graph: &Graph, consensus: &Consensus) -> Result<Graph> {
 #[derive(Serialize)]
 pub struct HpcReport {
     pub graph_engine: &'static str,
+    /// Source metadata retained under the existing public-API field names.
+    pub upstream: &'static str,
+    pub upstream_revision: &'static str,
+    pub upstream_patches: &'static [&'static str],
     pub experimental: bool,
     pub uses_syncasm: bool,
     pub homopolymer_compressed_k: bool,
@@ -347,6 +353,17 @@ pub struct HpcReport {
     pub unitigs: usize,
     pub links: usize,
     pub total_length: usize,
+    pub node_depth: f64,
+    pub n50: usize,
+    pub longest: usize,
+    pub circular_unitigs: usize,
+    pub min_count_auto: bool,
+    /// Encoding of the shared engine (`homopolymer_runs`); k and `HC` lengths count runs.
+    pub coordinates: assemble::Coordinates,
+    /// FASTA of unitigs removed by graph cleaning (compressed coordinates).
+    pub cleaning_audit: String,
+    /// The shared original-read junction stage, run on the restored base graph.
+    pub junction_rescue: Option<crate::junctions::JunctionReport>,
     pub consensus_estimator: &'static str,
     pub consensus: ConsensusStats,
     pub compressed_backbone: AssembleReport,
@@ -362,6 +379,7 @@ pub fn run(
     min_count: u32,
     out: &Path,
     report: &Path,
+    context: Option<&Path>,
 ) -> Result<HpcReport> {
     if inputs.is_empty() || k < 3 || k % 2 == 0 || s < 5 || s > 31 || s >= k || min_count == 0 {
         bail!("Rust HPC requires reads, odd k > s, s in 5..31 and positive --min-count");
@@ -434,6 +452,9 @@ pub fn run(
             bail!("input changed during assembly: {}", path.display());
         }
     }
+    // Exact overlaps are kept: the base path's boundary normalization and blunting move
+    // junction bases into repeat unitigs, which `primary` does not export unless a path uses
+    // them. On Schoenoplectus that lost exported reference sequence, so it is not applied.
     let restored = base_graph(&graph, &consensus)?;
     let mut text = String::from("H\tVN:Z:1.0\tPG:Z:ovasm-rust-hpc-experimental\n");
     let source = fs::read_to_string(&hpc_graph)?;
@@ -470,17 +491,58 @@ pub fn run(
             restored.overlaps[i]
         )?;
     }
-    let r = HpcReport { graph_engine: "ovasm-rust-hpc", experimental: true, uses_syncasm: false,
-        homopolymer_compressed_k: true, read_error_correction: false, read_threaded_unzipping: false,
-        physical_topology_identified: false, reads, bases, compressed_bases, k, s, min_count,
-        unitigs: restored.seqs.len(), links: restored.links.len(), total_length: restored.seqs.iter().map(Vec::len).sum(),
-        consensus_estimator: "rounded mean of distinct original read/run observations per shared graph position; terminal runs censored; multiple placements retained",
-        consensus: consensus.stats, compressed_backbone: backbone, intermediates: work,
-        elapsed_seconds: started.elapsed().as_secs_f64(), peak_rss_mb: peak_rss_mb() };
-    if let Some(parent) = report.parent() {
+    if let Some(parent) = out.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(out, text)?;
+    let junction_rescue = assemble::restore_junctions(
+        out,
+        inputs,
+        k,
+        s,
+        min_count,
+        assemble::Coordinates::HomopolymerRuns,
+        context,
+    )?;
+    let shape = assemble::graph_shape(out)?;
+    let r = HpcReport {
+        graph_engine: "ovasm",
+        upstream: "OVASM Rust assembly engine",
+        upstream_revision: env!("CARGO_PKG_VERSION"),
+        upstream_patches: &[],
+        experimental: true,
+        uses_syncasm: false,
+        homopolymer_compressed_k: true,
+        read_error_correction: false,
+        read_threaded_unzipping: false,
+        physical_topology_identified: false,
+        reads,
+        bases,
+        compressed_bases,
+        k,
+        s,
+        min_count,
+        unitigs: shape.unitigs,
+        links: shape.links,
+        total_length: shape.total_length,
+        node_depth: backbone.node_depth,
+        n50: shape.n50,
+        longest: shape.longest,
+        circular_unitigs: shape.circular_unitigs,
+        min_count_auto: false,
+        coordinates: assemble::Coordinates::HomopolymerRuns,
+        cleaning_audit: backbone.cleaning_audit.clone(),
+        junction_rescue,
+        consensus_estimator: "rounded mean of distinct original read/run observations per shared graph position; terminal runs censored; multiple placements retained",
+        consensus: consensus.stats,
+        compressed_backbone: backbone,
+        intermediates: work,
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        peak_rss_mb: peak_rss_mb(),
+    };
+    if let Some(parent) = report.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(report, serde_json::to_string_pretty(&r)?)?;
     Ok(r)
 }
@@ -554,7 +616,6 @@ mod tests {
             "--multichrom-graph",
             "--auto-k-depth",
             "--min-count-fraction",
-            "--read-context",
         ] {
             let mut args = vec![
                 "ovasm",
@@ -589,29 +650,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("explicit --k"));
-        let d = dir();
-        let input = d.join("reads.fa");
-        fs::write(&input, ">x\nACGT\n").unwrap();
-        #[cfg(not(syncasm_native))]
-        {
-            let error = crate::syncasm::run(
-                vec![input],
-                101,
-                11,
-                1,
-                1,
-                &d.join("g.gfa"),
-                &d.join("g.json"),
-            );
-            assert!(error
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("does not include"));
-        }
-        #[cfg(syncasm_native)]
-        let _ = input;
-        fs::remove_dir_all(d).unwrap();
     }
     #[test]
     fn shared_reverse_overlap_uses_distinct_observations() {
@@ -696,7 +734,7 @@ mod tests {
         let input = d.join("reads.fa");
         fs::write(&input, fasta).unwrap();
         let out = d.join("graph.gfa");
-        let result = run(&[input], 101, 15, 3, &out, &d.join("report.json")).unwrap();
+        let result = run(&[input], 101, 15, 3, &out, &d.join("report.json"), None).unwrap();
         assert_eq!((result.reads, result.unitigs, result.links), (32, 2, 2));
         assert!(!result.uses_syncasm && !result.read_threaded_unzipping);
         assert_eq!(result.consensus.unknown_run_positions, 0);
@@ -718,6 +756,80 @@ mod tests {
                         .any(|s| expanded.repeat(2).windows(s.len()).any(|w| w == s))
             }));
         }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn eight_chromosomes_and_ambiguous_short_reads_are_preserved() {
+        let d = dir();
+        let mut state = 17u64;
+        let mut truth = Vec::new();
+        let mut fasta = String::new();
+        for chr in 0..8 {
+            let circle: Vec<_> = (0..6000)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    b"ACGT"[(state % 4) as usize]
+                })
+                .collect();
+            let tripled = circle.repeat(3);
+            for i in 0..32 {
+                let start = i * 173 % circle.len();
+                let mut read = tripled[start..start + 7000].to_vec();
+                if chr == 0 && i == 0 {
+                    read[3500] = b'N';
+                }
+                if i % 2 == 1 {
+                    read = revcomp(&read);
+                }
+                writeln!(fasta, ">c{chr}_r{i}\n{}", String::from_utf8(read).unwrap()).unwrap();
+            }
+            truth.push(circle);
+        }
+        writeln!(
+            fasta,
+            ">unused_short_with_Ns\n{}NNNNCC\n>short_raw_read\nACNTA",
+            "A".repeat(300)
+        )
+        .unwrap();
+        let input = d.join("reads.fa");
+        fs::write(&input, &fasta).unwrap();
+        let graph = d.join("graph.gfa");
+        let report =
+            run(&[input.clone()], 101, 31, 5, &graph, &d.join("graph.json"), None).unwrap();
+        assert_eq!((report.reads, report.bases), (258, 8 * 32 * 7000 + 311));
+        let primary = crate::primary::run(
+            &graph,
+            &d.join("primary.fa"),
+            &d.join("primary.json"),
+            10,
+            1_000_000,
+            0.9,
+        )
+        .unwrap();
+        assert_eq!((primary.records.len(), primary.total_length), (8, 48000));
+        let mut parser = needletail::parse_fastx_file(d.join("primary.fa")).unwrap();
+        let mut matched = [false; 8];
+        while let Some(record) = parser.next() {
+            let record = record.unwrap();
+            let sequence = record.seq();
+            let rc = revcomp(&sequence);
+            let i = truth
+                .iter()
+                .position(|s| {
+                    s.len() == sequence.len()
+                        && s.repeat(2)
+                            .windows(s.len())
+                            .any(|w| w == sequence.as_ref() || w == rc.as_slice())
+                })
+                .unwrap();
+            assert!(!matched[i]);
+            matched[i] = true;
+        }
+        assert!(matched.iter().all(|x| *x));
+        assert_eq!(fs::read_to_string(input).unwrap(), fasta);
         fs::remove_dir_all(d).unwrap();
     }
 }

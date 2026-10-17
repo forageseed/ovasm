@@ -50,7 +50,8 @@ for script in (('install.cmd', 'install.ps1') if system == 'Windows' else ('inst
 info = {'version': version, 'target': target, 'source_commit': commit,
         'source_directory': str(root), 'tracked_source_dirty': dirty,
         'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-        'native_multichrom_kernel': system == 'Linux',
+        'graph_implementation': 'Rust',
+        'multichrom_graph': 'experimental Rust HPC',
         'windows_static_crt': system == 'Windows'}
 if system == 'Windows':
     image = binary.read_bytes()
