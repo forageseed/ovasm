@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from score_independent_multichrom import read_fasta, score  # noqa: E402
 
-FIELDS = ['k', 's', 'reads', 'bases', 'min_count', 'node_depth', 'nodes_kept', 'edges_kept',
+FIELDS = ['k', 's', 'reads', 'bases', 'min_count', 'min_count_auto', 'node_depth', 'nodes_kept', 'edges_kept',
           'unitigs', 'circular_unitigs', 'links', 'total_length', 'n50', 'longest']
 
 
@@ -63,7 +63,7 @@ def fasta_lengths(path: Path) -> list[int]:
 
 
 def route(binary: Path, reads: Path, out: Path, encoding: str, min_count: int | None,
-          threads: int) -> dict:
+          threads: int, auto_min_count: bool = False) -> dict:
     out.mkdir(parents=True)
     gfa, report = out / 'graph.gfa', out / 'graph.json'
     steps = []
@@ -77,8 +77,9 @@ def route(binary: Path, reads: Path, out: Path, encoding: str, min_count: int | 
                                   '--out-fasta', out / 'sequences.fasta', '--out-json', out / 'linear.json',
                                   '--min-reads', 2], out, 'linearize', threads))
     else:
+        cutoff = [] if auto_min_count else ['--min-count', min_count]
         steps.append(run(binary, ['assemble', '--rust-hpc', '--reads', reads, '--k', 1001, '--s', 31,
-                                  '--min-count', min_count, '--threads', threads,
+                                  *cutoff, '--threads', threads,
                                   '--out', gfa, '--out-json', report], out, 'assemble', threads))
         steps.append(run(binary, ['primary', '--gfa', gfa, '--out', out / 'sequences.fasta',
                                   '--out-json', out / 'linear.json'], out, 'primary', threads))
@@ -96,6 +97,9 @@ def main():
     ap.add_argument('--minimap2', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--threads', type=int, default=8)
+    ap.add_argument('--candidate-auto-min-count', action='store_true',
+                    help='candidate homopolymer route omits --min-count (the engine decides); '
+                         'the control keeps the base route\'s value')
     a = ap.parse_args()
     root = Path(__file__).resolve().parents[2]
     a.out.mkdir(parents=True, exist_ok=False)
@@ -103,6 +107,7 @@ def main():
     receipt = {'formal_source': str(root), 'test_source': str(Path(__file__).resolve()),
                'control': str(a.control.resolve()), 'control_sha256': sha(a.control),
                'candidate': str(a.candidate.resolve()), 'candidate_sha256': sha(a.candidate),
+               'candidate_auto_min_count': a.candidate_auto_min_count,
                'scope': __doc__.split('\n')[0], 'reference_use': 'post-assembly scoring only',
                'physical_molecule_count': None, 'physical_topology_identified': False, 'cases': []}
 
@@ -122,7 +127,8 @@ def main():
                     cutoff = None
                     if encoding == 'homopolymer_runs':
                         cutoff = entry['routes']['bases']['control']['report']['min_count']
-                    result = route(binary, reads, out, encoding, cutoff, a.threads)
+                    result = route(binary, reads, out, encoding, cutoff, a.threads,
+                                   auto_min_count=a.candidate_auto_min_count and label == 'candidate')
                     if case.get('truth') and result['sequence_lengths']:
                         # hifiasm-style names: a trailing 'c' marks a circular record, 'l' linear
                         circular = {n for n in read_fasta(Path(case['truth'])) if n.endswith('c')}
