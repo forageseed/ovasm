@@ -37,6 +37,8 @@ type Sample = (u64, bool, u32);
 
 #[derive(Clone, Copy)]
 pub struct AssembleParams {
+    /// Record cleaning proposals on a scratch alive mask; retain the actual graph.
+    pub cleaning_audit_only: bool,
     pub k: usize,
     pub s: usize,
     /// Minimum reads for a node or an edge; `None` picks it from the node-count distribution.
@@ -177,6 +179,7 @@ fn sample_dense(seq: &[u8], k: usize) -> Vec<Sample> {
 
 #[derive(Serialize)]
 pub struct AssembleReport {
+    pub cleaning_audit_only: bool,
     /// Original-read support for structural junctions hidden by the long-k backbone.
     /// Absent for the dense short-read graph, whose reads cannot span these contexts.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1337,6 +1340,11 @@ fn clean(
         }
         removed += 1;
         audit.push(CleanEvent {
+            nodes: t
+                .nodes
+                .iter()
+                .map(|(o, _)| hash_bytes(kmers[o.0]))
+                .collect(),
             round: stats.rounds,
             rule: why[u],
             length: len[u],
@@ -1351,6 +1359,7 @@ fn clean(
 /// One unitig removed by `clean`: kept so a lost region can be traced to the rule that removed
 /// it. Lengths and sequence are in the graph's own coordinates (compressed runs in HPC).
 pub(crate) struct CleanEvent {
+    nodes: Vec<u64>,
     round: usize,
     rule: &'static str,
     length: usize,
@@ -1359,12 +1368,12 @@ pub(crate) struct CleanEvent {
     sequence: Vec<u8>,
 }
 
-fn write_clean_audit(path: &Path, audit: &[CleanEvent]) -> Result<()> {
+fn write_clean_audit(path: &Path, audit: &[CleanEvent], audit_only: bool) -> Result<()> {
     let mut text = String::new();
     for (i, e) in audit.iter().enumerate() {
         writeln!(
             text,
-            ">c{i} rule={} round={} length={} depth={:.1} left_links={} right_links={}
+            ">c{i} rule={} round={} length={} depth={:.1} left_links={} right_links={} action={}
 {}",
             e.rule,
             e.round,
@@ -1372,6 +1381,11 @@ fn write_clean_audit(path: &Path, audit: &[CleanEvent]) -> Result<()> {
             e.depth,
             e.neighbours[0],
             e.neighbours[1],
+            if audit_only {
+                "proposed_retained"
+            } else {
+                "removed"
+            },
             std::str::from_utf8(&e.sequence)?
         )?;
     }
@@ -1435,12 +1449,37 @@ pub fn run_auto_k_with_context(
     out_json: &Path,
     context: Option<&Path>,
 ) -> Result<AssembleReport> {
+    run_auto_k_cleaning(
+        inputs,
+        s,
+        min_count,
+        min_count_fraction,
+        target,
+        out_gfa,
+        out_json,
+        context,
+        false,
+    )
+}
+
+fn run_auto_k_cleaning(
+    inputs: Vec<PathBuf>,
+    s: usize,
+    min_count: Option<u32>,
+    min_count_fraction: Option<f64>,
+    target: f64,
+    out_gfa: &Path,
+    out_json: &Path,
+    context: Option<&Path>,
+    cleaning_audit_only: bool,
+) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
         for (i, &k) in K_LADDER.iter().enumerate() {
             let r = run_backbone(
                 reads.to_vec(),
                 AssembleParams {
+                    cleaning_audit_only,
                     k,
                     s,
                     min_count,
@@ -1485,6 +1524,9 @@ pub fn run_auto_k_with_context(
     }
     add_junctions(&mut r, &inputs, out_gfa, context)?;
     r.k_tried = tried;
+    if cleaning_audit_only {
+        bind_cleaning_audit(out_gfa, &out_gfa.with_extension("cleaning.json"))?;
+    }
     fs::write(out_json, serde_json::to_string_pretty(&r)?)?;
     Ok(r)
 }
@@ -1507,6 +1549,9 @@ pub fn run_with_context(
 ) -> Result<AssembleReport> {
     let mut r = run_backbone(inputs.clone(), p, out_gfa, out_json)?;
     add_junctions(&mut r, &inputs, out_gfa, context)?;
+    if p.cleaning_audit_only {
+        bind_cleaning_audit(out_gfa, &out_gfa.with_extension("cleaning.json"))?;
+    }
     fs::write(out_json, serde_json::to_string_pretty(&r)?)?;
     Ok(r)
 }
@@ -1524,6 +1569,15 @@ pub enum Coordinates {
 
 /// k, in homopolymer runs, when that encoding is requested without one.
 pub const HPC_DEFAULT_K: usize = 1001;
+
+pub(crate) fn bind_cleaning_audit(gfa: &Path, audit: &Path) -> Result<()> {
+    let mut v: serde_json::Value = serde_json::from_str(&fs::read_to_string(audit)?)?;
+    v["restored_graph_fingerprint"] = serde_json::json!(crate::unzip::graph_fingerprint(
+        &crate::evidence::parse_gfa(gfa)?
+    ));
+    fs::write(audit, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
 
 /// Shape statistics of a written GFA, in bases.
 pub(crate) struct GraphShape {
@@ -1608,8 +1662,15 @@ fn add_junctions(
     context: Option<&Path>,
 ) -> Result<()> {
     let started = Instant::now();
-    let Some(report) =
-        restore_junctions(out_gfa, inputs, r.k, r.s, r.min_count, Coordinates::Bases, context)?
+    let Some(report) = restore_junctions(
+        out_gfa,
+        inputs,
+        r.k,
+        r.s,
+        r.min_count,
+        Coordinates::Bases,
+        context,
+    )?
     else {
         return Ok(());
     };
@@ -1632,6 +1693,7 @@ fn add_junctions(
 /// bases only (`K_LADDER`); homopolymer coordinates take k in runs (default `HPC_DEFAULT_K`).
 /// `min_count: None` is decided by the backbone from node depth in either encoding.
 pub struct EngineParams<'a> {
+    pub cleaning_audit_only: bool,
     pub coordinates: Coordinates,
     pub k: Option<usize>,
     pub s: usize,
@@ -1663,6 +1725,7 @@ pub fn run_engine(
             crate::hpc::run(
                 &inputs,
                 AssembleParams {
+                    cleaning_audit_only: p.cleaning_audit_only,
                     k,
                     s: p.s,
                     min_count: p.min_count,
@@ -1675,7 +1738,7 @@ pub fn run_engine(
             .map(EngineReport::HomopolymerRuns)
         }
         Coordinates::Bases => match p.k {
-            None if p.s != 0 => run_auto_k_with_context(
+            None if p.s != 0 => run_auto_k_cleaning(
                 inputs,
                 p.s,
                 p.min_count,
@@ -1684,6 +1747,7 @@ pub fn run_engine(
                 out_gfa,
                 out_json,
                 p.context,
+                p.cleaning_audit_only,
             )
             .map(EngineReport::Bases),
             k => {
@@ -1698,6 +1762,7 @@ pub fn run_engine(
                 run_with_context(
                     inputs,
                     AssembleParams {
+                        cleaning_audit_only: p.cleaning_audit_only,
                         k,
                         s: p.s,
                         min_count: p.min_count,
@@ -1859,6 +1924,7 @@ pub(crate) fn run_backbone_layout(
         let (unitigs, links) = loop {
             let unitigs = compact(&adj, &alive);
             let links = unitig_links(&adj, &alive, &unitigs, p.k);
+            let saved_alive = p.cleaning_audit_only.then(|| alive.clone());
             let removed = clean(
                 &unitigs,
                 &links,
@@ -1872,6 +1938,10 @@ pub(crate) fn run_backbone_layout(
                 deferring,
             );
             cleaning.rounds += 1;
+            if let Some(saved) = saved_alive {
+                alive = saved;
+                break (unitigs, links);
+            }
             if removed == 0 || cleaning.rounds >= 50 {
                 break (unitigs, links);
             }
@@ -1938,8 +2008,16 @@ pub(crate) fn run_backbone_layout(
     } else {
         fill_gaps(&mut seqs, &mut links, &circular, &inputs, LONG_GAP_MAX, 1)?
     };
-    let boundary_bp_moved = if preserve_overlaps { 0 } else { normalize_boundaries(&mut seqs, &links) };
-    let (links, links_blunted) = if preserve_overlaps { (links, 0) } else { blunt_links(&mut seqs, &links) };
+    let boundary_bp_moved = if preserve_overlaps {
+        0
+    } else {
+        normalize_boundaries(&mut seqs, &links)
+    };
+    let (links, links_blunted) = if preserve_overlaps {
+        (links, 0)
+    } else {
+        blunt_links(&mut seqs, &links)
+    };
     let mut gfa = String::from("H\tVN:Z:1.0\n");
     let mut lengths = Vec::new();
     for (u, (t, seq)) in unitigs.iter().zip(&seqs).enumerate() {
@@ -1974,7 +2052,25 @@ pub(crate) fn run_backbone_layout(
     }
     fs::write(out_gfa, &gfa)?;
     let cleaning_audit = out_gfa.with_extension("cleaning.fa");
-    write_clean_audit(&cleaning_audit, &audit)?;
+    write_clean_audit(&cleaning_audit, &audit, p.cleaning_audit_only)?;
+    if p.cleaning_audit_only {
+        let proposals:Vec<_>=audit.iter().enumerate().map(|(i,e)| {
+            let event_nodes:BTreeSet<_>=e.nodes.iter().copied().collect();
+            let retained:Vec<_>=unitigs.iter().enumerate().filter(|(_,t)|t.nodes.iter().any(|(o,_)|event_nodes.contains(&ids[o.0])))
+                .map(|(u,_)|format!("u{u}")).collect();
+            serde_json::json!({"id":format!("c{i}"),"rule":e.rule,"round":e.round,"length":e.length,
+                "depth":e.depth,"retained_backbone_segments":retained,"applied":false,
+                "entry_read_support":null,"exit_read_support":null})
+        }).collect();
+        fs::write(
+            out_gfa.with_extension("cleaning.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode":"audit_only","coordinate_unit":if preserve_overlaps {"runs"}else{"bases"},
+                "stage":"backbone before original-read junction restoration", "proposals":proposals,
+                "support_note":"proposals are structural; original-read support is measured separately on the restored base graph"
+            }))?,
+        )?;
+    }
 
     lengths.sort_unstable_by(|a, b| b.cmp(a));
     let total: usize = lengths.iter().sum();
@@ -1988,6 +2084,7 @@ pub(crate) fn run_backbone_layout(
         .copied()
         .unwrap_or(0);
     let report = AssembleReport {
+        cleaning_audit_only: p.cleaning_audit_only,
         junction_rescue: None,
         cleaning_audit: cleaning_audit.display().to_string(),
         k: p.k,
@@ -2057,7 +2154,11 @@ mod tests {
         let (_, _, kept) = build_graph(&keep, &nodes, &edges, &[], 80);
         assert_eq!(kept, 1);
         let (_, _, kept) = build_graph(&keep, &nodes, &edges, &[], 2);
-        assert_eq!(kept, 4 - 1, "min_count alone still keeps every edge it reaches");
+        assert_eq!(
+            kept,
+            4 - 1,
+            "min_count alone still keeps every edge it reaches"
+        );
     }
 
     #[test]
@@ -2124,6 +2225,7 @@ mod tests {
 
     fn params() -> AssembleParams {
         AssembleParams {
+            cleaning_audit_only: false,
             k: 101,
             s: 15,
             min_count: Some(3),
@@ -2237,6 +2339,7 @@ mod tests {
         let rep = run(
             vec![fastq(&dir, &reads)],
             AssembleParams {
+                cleaning_audit_only: false,
                 k: 101,
                 s: 15,
                 min_count: None,
@@ -2261,6 +2364,53 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(rep.circular_unitigs, 1);
+    }
+
+    #[test]
+    fn audit_cleaning_records_proposals_and_preserves_their_nodes() {
+        let genome = seq(20_000, 31);
+        let mut reads = tile(&genome, 3000, 50);
+        for (i, rd) in reads.iter_mut().enumerate() {
+            let within = (5000 + genome.len() - (i * 50) % genome.len()) % genome.len();
+            if i % 5 == 0 && within < rd.len() {
+                let p = if i % 2 == 0 {
+                    within
+                } else {
+                    rd.len() - 1 - within
+                };
+                rd[p] = if rd[p] == b'A' { b'C' } else { b'A' };
+            }
+        }
+        let dir = tmpdir("audit-clean");
+        let input = fastq(&dir, &reads);
+        let p = AssembleParams {
+            cleaning_audit_only: true,
+            k: 101,
+            s: 15,
+            min_count: None,
+            min_count_fraction: None,
+        };
+        let report = run_backbone(
+            vec![input],
+            p,
+            &dir.join("audit.gfa"),
+            &dir.join("audit.json"),
+        )
+        .unwrap();
+        assert!(report.cleaning_audit_only);
+        assert!(report.unitigs > 1);
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("audit.cleaning.json")).unwrap())
+                .unwrap();
+        let proposals = v["proposals"].as_array().unwrap();
+        assert!(!proposals.is_empty());
+        for row in proposals {
+            assert_eq!(row["applied"], false);
+            assert!(!row["retained_backbone_segments"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
@@ -2503,6 +2653,7 @@ mod tests {
         let rep = run(
             vec![fastq(&dir, &reads)],
             AssembleParams {
+                cleaning_audit_only: false,
                 k: 101,
                 s: 15,
                 min_count: Some(3),
@@ -2585,6 +2736,7 @@ mod tests {
             run(
                 vec![input.clone()],
                 AssembleParams {
+                    cleaning_audit_only: false,
                     k: 101,
                     s: 15,
                     min_count: None,
@@ -2613,6 +2765,7 @@ mod tests {
         let explicit = run(
             vec![input.clone()],
             AssembleParams {
+                cleaning_audit_only: false,
                 k: 101,
                 s: 15,
                 min_count: Some(4),

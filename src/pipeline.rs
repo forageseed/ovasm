@@ -430,7 +430,9 @@ impl Attempts for GraphAttempts<'_> {
             .opt("--out", &graph)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", self.reads);
-        if let Some(context) = self.read_context { asm = asm.opt("--read-context", context); }
+        if let Some(context) = self.read_context {
+            asm = asm.opt("--read-context", context);
+        }
         if let Some(k) = k {
             asm = asm.opt("--k", k.to_string());
         }
@@ -988,7 +990,9 @@ fn run_replicates(
             .opt("--out", &assembled)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", sub_reads);
-        if let Some(context) = &cfg.read_context { asm = asm.opt("--read-context", context); }
+        if let Some(context) = &cfg.read_context {
+            asm = asm.opt("--read-context", context);
+        }
         // the same k in every replicate, so that their junction sets differ by what the reads
         // say and not by which repeats k spans
         if let Some(k) = k {

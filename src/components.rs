@@ -494,7 +494,9 @@ pub fn run(
             && read_origin_evidence.len() == part.len()
             && target_genes.is_empty()
             && other_genes.is_empty()
-            && read_origin_evidence.iter().any(|o| o.nuclear_context_reads > 0)
+            && read_origin_evidence
+                .iter()
+                .any(|o| o.nuclear_context_reads > 0)
         {
             // An alternative source is observed. Compatible periodic reads and
             // missing context prevent exclusion, but depth cannot settle origin.
@@ -525,9 +527,11 @@ pub fn run(
         (&p.out_unassigned_gfa, "unassigned"),
     ] {
         if let Some(path) = path {
-            let omit: FxHashSet<&str> = components.iter()
+            let omit: FxHashSet<&str> = components
+                .iter()
                 .filter(|c| c.target_assignment != assignment)
-                .flat_map(|c| c.segments.iter().map(String::as_str)).collect();
+                .flat_map(|c| c.segments.iter().map(String::as_str))
+                .collect();
             fs::write(path, filter_gfa(&text, &omit).0)?;
         }
     }

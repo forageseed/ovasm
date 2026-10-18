@@ -14,6 +14,7 @@ mod label;
 mod linearize;
 mod pan;
 mod panel;
+mod phase;
 mod pipeline;
 mod primary;
 mod read_context;
@@ -460,6 +461,9 @@ fn correct(args: CorrectArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct AssembleArgs {
+    /// Record cleaning proposals without deleting unitigs (diagnostic, default off).
+    #[arg(long)]
+    cleaning_audit_only: bool,
     /// Organelle reads (e.g. from `ovasm recruit`), FASTQ/FASTA, optionally .gz.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -522,6 +526,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
     let report = assemble::run_engine(
         args.reads,
         assemble::EngineParams {
+            cleaning_audit_only: args.cleaning_audit_only,
             coordinates,
             k: args.k,
             s: args.s,
@@ -561,6 +566,9 @@ fn assemble(args: AssembleArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct PrimaryArgs {
+    /// Optional graph-bound U1 report; constrain only fully sampled repeat ends.
+    #[arg(long)]
+    phases: Option<PathBuf>,
     #[arg(long)]
     gfa: PathBuf,
     #[arg(long)]
@@ -579,13 +587,14 @@ struct PrimaryArgs {
 }
 
 fn primary(args: PrimaryArgs) -> Result<()> {
-    let report = primary::run(
+    let report = primary::run_phased(
         &args.gfa,
         &args.out,
         &args.out_json,
         args.max_copy,
         args.max_steps,
         args.circular_fraction,
+        args.phases.as_deref(),
     )?;
     eprintln!(
         "[ovasm] primary: {} assembly records, {} bp; {} unplaced segments",
@@ -879,6 +888,9 @@ fn unify(args: UnifyArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct LinearizeArgs {
+    /// Optional graph-bound U1 phase table; same conservative constraints as primary.
+    #[arg(long)]
+    phases: Option<PathBuf>,
     /// The assembly graph given to `ovasm evidence`.
     #[arg(long)]
     gfa: PathBuf,
@@ -917,7 +929,7 @@ struct LinearizeArgs {
 }
 
 fn linearize(args: LinearizeArgs) -> Result<()> {
-    let report = linearize::run(
+    let report = linearize::run_phased(
         &args.gfa,
         &args.evidence,
         linearize::LinearizeParams {
@@ -930,6 +942,7 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
         &args.out_fasta,
         args.out_partial_fasta.as_deref(),
         &args.out_json,
+        args.phases.as_deref(),
     )?;
     eprintln!(
         "[ovasm] {} anchors, {} bridges, {} components, {} candidates; {} molecules{}",
@@ -1049,6 +1062,15 @@ struct EvidenceArgs {
 
 #[derive(clap::Args)]
 struct UnzipArgs {
+    /// Audit-only cleaning JSON from this run; attach original-read adjacency and phase counts.
+    #[arg(long)]
+    cleaning_audit_json: Option<PathBuf>,
+    /// Optional unchanged graph plus supported entry-repeat-exit P records.
+    #[arg(long)]
+    out_gfa: Option<PathBuf>,
+    /// Optional graph with fully resolved one-to-one repeats split into context copies.
+    #[arg(long)]
+    materialize_gfa: Option<PathBuf>,
     /// Assembly graph with segment sequences (GFA).
     #[arg(long)]
     gfa: PathBuf,
@@ -1088,7 +1110,7 @@ fn unzip(args: UnzipArgs) -> Result<()> {
     if !(1..=kmer::MAX_K).contains(&args.k) {
         bail!("--k must be between 1 and {}", kmer::MAX_K);
     }
-    let report = unzip::run(
+    let report = unzip::run_audited(
         &args.gfa,
         args.reads,
         evidence::EvidenceParams {
@@ -1105,7 +1127,19 @@ fn unzip(args: UnzipArgs) -> Result<()> {
         },
         args.min_count,
         &args.out_json,
+        args.cleaning_audit_json.as_deref(),
     )?;
+    if args.out_gfa.is_some() || args.materialize_gfa.is_some() {
+        let exported = phase::export(
+            &args.gfa,
+            &args.out_json,
+            args.out_gfa.as_deref(),
+            args.materialize_gfa.as_deref(),
+        )?;
+        let mut json = serde_json::to_value(&report)?;
+        json["export"] = serde_json::to_value(exported)?;
+        std::fs::write(&args.out_json, serde_json::to_string_pretty(&json)?)?;
+    }
     let count = |class: &str| {
         report
             .repeat_nodes

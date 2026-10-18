@@ -353,6 +353,7 @@ pub fn run(
         assemble::run(
             vec![reads.clone()],
             AssembleParams {
+                cleaning_audit_only: false,
                 k: p.assemble_k,
                 s: 31,
                 min_count: None,
