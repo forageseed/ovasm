@@ -480,11 +480,32 @@ fn search(
     m: usize,
     max_steps: u64,
 ) -> (Vec<Vec<Found>>, bool) {
+    search_phased(
+        n_seg,
+        anchors,
+        optional,
+        br,
+        m,
+        max_steps,
+        &crate::phase::Constraints::default(),
+    )
+}
+
+fn search_phased(
+    n_seg: usize,
+    anchors: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    m: usize,
+    max_steps: u64,
+    phases: &crate::phase::Constraints,
+) -> (Vec<Vec<Found>>, bool) {
     let mut out_of: FxHashMap<Oriented, Vec<usize>> = FxHashMap::default();
     for (i, b) in br.iter().enumerate() {
         out_of.entry(b.walk[0]).or_default().push(i);
     }
     struct Ctx<'a> {
+        phases: &'a crate::phase::Constraints,
         out_of: &'a FxHashMap<Oriented, Vec<usize>>,
         br: &'a [Bridge],
         optional: &'a [bool],
@@ -519,6 +540,14 @@ fn search(
         }
         if s.covered < c.want {
             for &i in c.out_of.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
+                let mut walk = vec![start];
+                for &j in &s.path {
+                    walk.extend_from_slice(&c.br[j].walk[1..]);
+                }
+                walk.extend_from_slice(&c.br[i].walk[1..]);
+                if !c.phases.allows_walk(&walk, false) {
+                    continue;
+                }
                 let next = *c.br[i].walk.last().unwrap();
                 if s.used[next.0] {
                     continue;
@@ -540,6 +569,15 @@ fn search(
             v.iter()
                 .copied()
                 .filter(|&i| *c.br[i].walk.last().unwrap() == start)
+                .filter(|&i| {
+                    let mut walk = vec![start];
+                    for &j in &s.path {
+                        walk.extend_from_slice(&c.br[j].walk[1..]);
+                    }
+                    walk.extend_from_slice(&c.br[i].walk[1..]);
+                    walk.pop();
+                    c.phases.allows_walk(&walk, true)
+                })
                 .max_by_key(|&i| c.br[i].reads)
         });
         // A path ends only where it cannot go on: no bridge from either end reaches a required
@@ -548,7 +586,20 @@ fn search(
             c.out_of.get(&o).is_some_and(|v| {
                 v.iter().any(|&i| {
                     let a = c.br[i].walk.last().unwrap().0;
-                    !s.used[a] && !c.optional[a]
+                    if s.used[a] || c.optional[a] {
+                        return false;
+                    }
+                    let mut walk = vec![start];
+                    for &j in &s.path {
+                        walk.extend_from_slice(&c.br[j].walk[1..]);
+                    }
+                    if o == at {
+                        walk.extend_from_slice(&c.br[i].walk[1..]);
+                    } else {
+                        walk = rc_walk(&walk);
+                        walk.extend_from_slice(&c.br[i].walk[1..]);
+                    }
+                    c.phases.allows_walk(&walk, false)
                 })
             })
         };
@@ -596,6 +647,7 @@ fn search(
     }
 
     let ctx = Ctx {
+        phases,
         out_of: &out_of,
         br,
         optional,
@@ -647,6 +699,15 @@ const TAIL_MAX_FRACTION: f64 = 0.1;
 ///
 /// Returns the circle, the tail and the index of the bridge left out.
 fn cut_tail(g: &Graph, br: &[Bridge], f: &Found) -> Option<(Found, Found, usize)> {
+    cut_tail_phased(g, br, f, &crate::phase::Constraints::default())
+}
+
+fn cut_tail_phased(
+    g: &Graph,
+    br: &[Bridge],
+    f: &Found,
+    phases: &crate::phase::Constraints,
+) -> Option<(Found, Found, usize)> {
     if f.circular || f.bridges.is_empty() {
         return None;
     }
@@ -667,6 +728,11 @@ fn cut_tail(g: &Graph, br: &[Bridge], f: &Found) -> Option<(Found, Found, usize)
     let mut best: Option<(usize, u64, Found, Found, usize)> = None;
     let mut offer =
         |circle_bp: usize, tail_bp: usize, c: usize, circle: Found, tail: Found, cut| {
+            if !phases.allows_walk(&candidate_walk(br, &circle), true)
+                || !phases.allows_walk(&candidate_walk(br, &tail), false)
+            {
+                return;
+            }
             if tail_bp as f64 <= TAIL_MAX_FRACTION * circle_bp as f64
                 && best
                     .as_ref()
@@ -743,6 +809,24 @@ fn partial_paths(
     br: &[Bridge],
     frac: &[f64],
 ) -> Vec<Found> {
+    partial_paths_phased(
+        n_seg,
+        comp,
+        optional,
+        br,
+        frac,
+        &crate::phase::Constraints::default(),
+    )
+}
+
+fn partial_paths_phased(
+    n_seg: usize,
+    comp: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    frac: &[f64],
+    phases: &crate::phase::Constraints,
+) -> Vec<Found> {
     fn root(p: &mut [usize], mut x: usize) -> usize {
         while p[x] != x {
             p[x] = p[p[x]];
@@ -789,6 +873,19 @@ fn partial_paths(
             // would close a path on itself; closing comes last, at full length
             continue;
         }
+        let follow = |start: Oriented| {
+            let mut walk = vec![start];
+            while let Some(&j) = exit.get(walk.last().unwrap()) {
+                walk.extend_from_slice(&br[j].walk[1..]);
+            }
+            walk
+        };
+        let mut joined = rc_walk(&follow(flip(a)));
+        joined.extend_from_slice(&br[i].walk[1..]);
+        joined.extend_from_slice(&follow(b)[1..]);
+        if !phases.allows_walk(&joined, false) {
+            continue;
+        }
         parent[ra] = rb;
         exit.insert(a, i);
         exit.insert(flip(b), pos[rc_walk(&br[i].walk).as_slice()]);
@@ -796,6 +893,18 @@ fn partial_paths(
     let closing = |from: Oriented, to: Oriented| {
         (0..br.len())
             .filter(|&i| !br[i].topological && ends(i) == (from, to))
+            .filter(|&i| {
+                let mut walk = vec![to];
+                while *walk.last().unwrap() != from {
+                    let Some(&j) = exit.get(walk.last().unwrap()) else {
+                        return false;
+                    };
+                    walk.extend_from_slice(&br[j].walk[1..]);
+                }
+                walk.extend_from_slice(&br[i].walk[1..]);
+                walk.pop();
+                phases.allows_walk(&walk, true)
+            })
             .max_by_key(|&i| (!br[i].weak, br[i].reads))
     };
     let mut out = Vec::new();
@@ -1147,7 +1256,23 @@ pub fn run(
     out_partial: Option<&Path>,
     out_json: &Path,
 ) -> Result<LinearizeReport> {
+    run_phased(gfa, evidence, p, out_fasta, out_partial, out_json, None)
+}
+
+pub fn run_phased(
+    gfa: &Path,
+    evidence: &Path,
+    p: LinearizeParams,
+    out_fasta: &Path,
+    out_partial: Option<&Path>,
+    out_json: &Path,
+    phase_report: Option<&Path>,
+) -> Result<LinearizeReport> {
     let g = parse_gfa(gfa)?;
+    let phases = phase_report
+        .map(|p| crate::phase::Constraints::load(&g, p))
+        .transpose()?
+        .unwrap_or_default();
     let report: Value = serde_json::from_str(
         &fs::read_to_string(evidence)
             .with_context(|| format!("cannot read {}", evidence.display()))?,
@@ -1170,7 +1295,8 @@ pub fn run(
     if anchors.is_empty() {
         bail!("every segment is a repeat; nothing anchors a linear path");
     }
-    let (br, self_loops) = bridges(&g, &report, &repeat, p.min_reads)?;
+    let (mut br, self_loops) = bridges(&g, &report, &repeat, p.min_reads)?;
+    br.retain(|b| phases.allows_walk(&b.walk, false));
     let support = |a: usize| -> u64 {
         br.iter()
             .filter(|b| b.walk[0].0 == a || b.walk[b.walk.len() - 1].0 == a)
@@ -1346,7 +1472,15 @@ pub fn run(
         rep.searched_max_molecules = envelope.min(comp.len());
         rep.cover_size_limited = rep.searched_max_molecules < comp.len();
         for m in rep.min_molecules..=rep.searched_max_molecules {
-            let (found, truncated) = search(g.names.len(), &comp, &optional, &br, m, p.max_steps);
+            let (found, truncated) = search_phased(
+                g.names.len(),
+                &comp,
+                &optional,
+                &br,
+                m,
+                p.max_steps,
+                &phases,
+            );
             rep.search_truncated |= truncated;
             for cover in found {
                 let (walks, report) = cover_report(&cover)?;
@@ -1362,7 +1496,7 @@ pub fn run(
             }
         }
         if ranked.is_empty() {
-            let paths = partial_paths(g.names.len(), &comp, &optional, &br, &frac);
+            let paths = partial_paths_phased(g.names.len(), &comp, &optional, &br, &frac, &phases);
             let (walks, report) = cover_report(&paths)?;
             partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
             rep.partial = Some(report);
@@ -1394,7 +1528,7 @@ pub fn run(
             // a linear molecule that leads back into itself: the circle and its tail
             let mut cut: Vec<Found> = Vec::new();
             for f in &cover {
-                match cut_tail(&g, &br, f) {
+                match cut_tail_phased(&g, &br, f, &phases) {
                     Some((circle, tail, left_out)) => {
                         rep.tails_cut.push(label(&br[left_out].walk));
                         cut.push(circle);

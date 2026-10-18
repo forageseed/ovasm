@@ -41,9 +41,16 @@ pub fn fill_missing(
         None => vec!["mitochondrion", "plastid"],
     };
     if let (Some(organelle), false) = (single, single_seed) {
-        needed.push(if organelle == "mitochondrion" { "plastid" } else { "mitochondrion" });
+        needed.push(if organelle == "mitochondrion" {
+            "plastid"
+        } else {
+            "mitochondrion"
+        });
     }
-    let missing: Vec<&str> = needed.into_iter().filter(|o| !seeds.contains_key(*o)).collect();
+    let missing: Vec<&str> = needed
+        .into_iter()
+        .filter(|o| !seeds.contains_key(*o))
+        .collect();
     if missing.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -59,11 +66,14 @@ pub fn write(dir: &Path, organelles: &[&str]) -> Result<BTreeMap<String, Vec<Pat
         .with_context(|| format!("writing {}", dir.join("manifest.json").display()))?;
     let mut written: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for organelle in organelles {
-        let (name, bytes) = fasta(organelle)
-            .with_context(|| format!("no built-in seeds for {organelle:?}"))?;
+        let (name, bytes) =
+            fasta(organelle).with_context(|| format!("no built-in seeds for {organelle:?}"))?;
         let path = dir.join(name);
         fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-        written.entry((*organelle).to_string()).or_default().push(path);
+        written
+            .entry((*organelle).to_string())
+            .or_default()
+            .push(path);
     }
     Ok(written)
 }
@@ -84,8 +94,14 @@ mod tests {
         let mito = records(MITOCHONDRION);
         let plastid = records(PLASTID);
         assert_eq!((mito.len(), plastid.len()), (16, 44));
-        assert!(mito.iter().any(|a| a == "NC_037304.1"), "Arabidopsis mitochondrion");
-        assert!(plastid.iter().any(|a| a == "NC_000932.1"), "Arabidopsis plastid");
+        assert!(
+            mito.iter().any(|a| a == "NC_037304.1"),
+            "Arabidopsis mitochondrion"
+        );
+        assert!(
+            plastid.iter().any(|a| a == "NC_000932.1"),
+            "Arabidopsis plastid"
+        );
     }
 
     #[test]
@@ -94,7 +110,10 @@ mod tests {
         assert_eq!(manifest["version"], VERSION);
         for (organelle, bytes) in [("mitochondrion", MITOCHONDRION), ("plastid", PLASTID)] {
             let db = &manifest["databases"][organelle];
-            assert_eq!(db["reference_count"].as_u64().unwrap() as usize, records(bytes).len());
+            assert_eq!(
+                db["reference_count"].as_u64().unwrap() as usize,
+                records(bytes).len()
+            );
             let bases: usize = String::from_utf8_lossy(bytes)
                 .lines()
                 .filter(|l| !l.starts_with('>'))
@@ -158,7 +177,9 @@ mod tests {
             ("mitochondrion".to_string(), vec![PathBuf::from("m.fa")]),
             ("plastid".to_string(), vec![PathBuf::from("p.fa")]),
         ]);
-        assert!(fill_missing(&mut seeds, &dir, None, false).unwrap().is_empty());
+        assert!(fill_missing(&mut seeds, &dir, None, false)
+            .unwrap()
+            .is_empty());
         assert!(!dir.exists());
     }
 

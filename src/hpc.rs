@@ -332,6 +332,7 @@ fn base_graph(graph: &Graph, consensus: &Consensus) -> Result<Graph> {
 
 #[derive(Serialize)]
 pub struct HpcReport {
+    pub cleaning_audit_only: bool,
     pub graph_engine: &'static str,
     /// Source metadata retained under the existing public-API field names.
     pub upstream: &'static str,
@@ -489,7 +490,11 @@ pub fn run(
         context,
     )?;
     let shape = assemble::graph_shape(out)?;
+    if p.cleaning_audit_only {
+        assemble::bind_cleaning_audit(out, &hpc_graph.with_extension("cleaning.json"))?;
+    }
     let r = HpcReport {
+        cleaning_audit_only: p.cleaning_audit_only,
         graph_engine: "ovasm",
         upstream: "OVASM Rust assembly engine",
         upstream_revision: env!("CARGO_PKG_VERSION"),
@@ -553,6 +558,7 @@ mod tests {
     }
     fn params(k: usize, s: usize, min_count: Option<u32>) -> AssembleParams {
         AssembleParams {
+            cleaning_audit_only: false,
             k,
             s,
             min_count,
@@ -625,10 +631,21 @@ mod tests {
         // The same --min-count / --min-count-fraction options apply to both encodings, and k
         // and min-count may be omitted: the run then fails on the missing reads, not on a
         // missing parameter.
-        for extra in [vec![], vec!["--min-count-fraction", "0.1"], vec!["--min-count", "5"]] {
+        for extra in [
+            vec![],
+            vec!["--min-count-fraction", "0.1"],
+            vec!["--min-count", "5"],
+        ] {
             let mut args = vec![
-                "ovasm", "assemble", "--reads", "missing", "--rust-hpc", "--out", "g.gfa",
-                "--out-json", "g.json",
+                "ovasm",
+                "assemble",
+                "--reads",
+                "missing",
+                "--rust-hpc",
+                "--out",
+                "g.gfa",
+                "--out-json",
+                "g.json",
             ];
             args.extend(extra);
             let cli = crate::Cli::try_parse_from(args).unwrap();
@@ -662,6 +679,7 @@ mod tests {
         )
         .unwrap();
         let p = AssembleParams {
+            cleaning_audit_only: false,
             k: 51,
             s: 11,
             min_count: Some(1),
@@ -764,7 +782,14 @@ mod tests {
         let input = d.join("reads.fa");
         fs::write(&input, fasta).unwrap();
         let out = d.join("graph.gfa");
-        let result = run(&[input], params(101, 15, Some(3)), &out, &d.join("report.json"), None).unwrap();
+        let result = run(
+            &[input],
+            params(101, 15, Some(3)),
+            &out,
+            &d.join("report.json"),
+            None,
+        )
+        .unwrap();
         assert_eq!((result.reads, result.unitigs, result.links), (32, 2, 2));
         assert!(!result.uses_syncasm && !result.read_threaded_unzipping);
         assert_eq!(result.consensus.unknown_run_positions, 0);

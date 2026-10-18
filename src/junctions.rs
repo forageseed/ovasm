@@ -680,9 +680,15 @@ mod tests {
     fn duplicate_records_cannot_inflate_support() {
         let dir = workspace("duplicate");
         let (gfa, reads) = fixture(&dir);
-        let report = restore(&gfa, &[reads.clone(), reads], 1001, 31, 4, false, |_, _, _| {
-            Ok(false)
-        })
+        let report = restore(
+            &gfa,
+            &[reads.clone(), reads],
+            1001,
+            31,
+            4,
+            false,
+            |_, _, _| Ok(false),
+        )
         .unwrap();
         assert_eq!(report.records_scanned, 12);
         assert_eq!(report.unique_records, 6);

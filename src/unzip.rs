@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -179,6 +179,10 @@ pub struct RepeatReport {
 #[derive(Serialize)]
 pub struct UnzipReport {
     pub method: &'static str,
+    /// Structural identity, independent of GFA tags, line order and mirrored links.
+    pub graph_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleaning_support: Option<serde_json::Value>,
     pub min_count: u32,
     pub reads_scanned: u64,
     pub unique_records: u64,
@@ -191,6 +195,29 @@ pub struct UnzipReport {
     pub physical_topology_identified: bool,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
+}
+
+/// Pinned rustc-hash fingerprint for binding evidence to sequence and overlap topology.
+/// This is an identity check for accidental stale reports, not a cryptographic checksum.
+pub(crate) fn graph_fingerprint(g: &Graph) -> String {
+    let mut segments: Vec<_> = g.names.iter().zip(&g.seqs).collect();
+    segments.sort();
+    let mut links: Vec<_> = g
+        .links
+        .iter()
+        .zip(&g.overlaps)
+        .map(|(&(a, b), &ov)| {
+            let forward = (g.label(a), g.label(b), ov);
+            let reverse = (g.label(flip(b)), g.label(flip(a)), ov);
+            forward.min(reverse)
+        })
+        .collect();
+    links.sort();
+    links.dedup();
+    let mut h = rustc_hash::FxHasher::default();
+    segments.hash(&mut h);
+    links.hash(&mut h);
+    format!("fxhash-v1:{:016x}", h.finish())
 }
 
 fn classify(
@@ -291,11 +318,41 @@ pub fn run(
     min_count: u32,
     out_json: &Path,
 ) -> Result<UnzipReport> {
+    run_audited(gfa, inputs, p, min_count, out_json, None)
+}
+
+pub fn run_audited(
+    gfa: &Path,
+    inputs: Vec<PathBuf>,
+    p: EvidenceParams,
+    min_count: u32,
+    out_json: &Path,
+    cleaning_audit: Option<&Path>,
+) -> Result<UnzipReport> {
     if min_count == 0 || inputs.is_empty() {
         bail!("unzip needs reads and a positive --min-count");
     }
+    if out_json.exists() {
+        let out = fs::canonicalize(out_json)?;
+        if out == fs::canonicalize(gfa)?
+            || inputs
+                .iter()
+                .any(|p| fs::canonicalize(p).ok().as_ref() == Some(&out))
+        {
+            bail!("unzip report cannot overwrite the graph or input reads");
+        }
+    }
     let started = Instant::now();
     let g = parse_gfa(gfa)?;
+    let mut audit: Option<serde_json::Value> = cleaning_audit
+        .map(|path| -> Result<_> {
+            let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+            if v["restored_graph_fingerprint"].as_str() != Some(graph_fingerprint(&g).as_str()) {
+                bail!("cleaning audit is not bound to this restored graph");
+            }
+            Ok(v)
+        })
+        .transpose()?;
     let idx = build_index(&g, &p);
     let repeats = repeat_nodes(&g);
     let mut tally = Tally::default();
@@ -337,8 +394,37 @@ pub fn run(
         }
     }
     reader.join().expect("reader thread panicked")?;
+    if let Some(v) = audit.as_mut() {
+        let reports = report_nodes(&g, &tally, min_count);
+        let proposals = v["proposals"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("cleaning audit has no proposals"))?;
+        for proposal in proposals {
+            let mut rows = Vec::new();
+            for name in proposal["retained_backbone_segments"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("missing retained segments"))?
+            {
+                let name = name
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid retained segment"))?;
+                if let Some(s) = g.names.iter().position(|n| n == name) {
+                    let n = (s, true);
+                    let entries:Vec<_>=tally.adjacency.iter().filter(|((_,b),_)|*b==n).map(|(&(a,_),&count)|serde_json::json!({"segment":g.label(a),"reads":count})).collect();
+                    let exits:Vec<_>=tally.adjacency.iter().filter(|((a,_),_)|*a==n).map(|(&(_,b),&count)|serde_json::json!({"segment":g.label(b),"reads":count})).collect();
+                    rows.push(serde_json::json!({"segment":name,"status":"measured","entries":entries,"exits":exits,
+                        "repeat_phase":reports.iter().find(|r|r.segment==name)}));
+                } else {
+                    rows.push(serde_json::json!({"segment":name,"status":"not_present_after_junction_restoration"}));
+                }
+            }
+            proposal["original_read_evidence"] = serde_json::json!(rows);
+        }
+    }
     let report = UnzipReport {
         method: "complete original-read traversals of structurally branching nodes; one count per read; no graph change",
+        graph_fingerprint: graph_fingerprint(&g),
+        cleaning_support: audit,
         min_count,
         reads_scanned: tally.reads_scanned,
         unique_records: tally.unique_records,
@@ -563,6 +649,93 @@ mod tests {
         assert!(t.ambiguous);
         assert!(t.triples.is_empty());
         assert!(!t.adjacencies.is_empty());
+    }
+
+    #[test]
+    fn original_reads_materialize_resolved_copies_with_shared_overlaps_on_both_strands() {
+        let (mut g, [mut a, mut b, mut c, mut d, r]) = fixture();
+        a[1952..].copy_from_slice(&r[..48]);
+        c[1952..].copy_from_slice(&r[..48]);
+        b[..44].copy_from_slice(&r[1956..]);
+        d[..44].copy_from_slice(&r[1956..]);
+        g.seqs = vec![a.clone(), b.clone(), c.clone(), d.clone(), r.clone()];
+        g.overlaps = vec![48, 48, 44, 44];
+        // Store one physical link in its reverse-complement representation.
+        g.links[0] = (flip(g.links[0].1), flip(g.links[0].0));
+        let dir =
+            std::env::temp_dir().join(format!("ovasm-unzip-materialize-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut text = String::new();
+        for (name, seq) in g.names.iter().zip(&g.seqs) {
+            text.push_str(&format!(
+                "S\t{name}\t{}\tdp:f:100\n",
+                String::from_utf8_lossy(seq)
+            ));
+        }
+        for (&(x, y), ov) in g.links.iter().zip(&g.overlaps) {
+            text.push_str(&format!(
+                "L\t{}\t{}\t{}\t{}\t{ov}M\n",
+                g.names[x.0],
+                if x.1 { '+' } else { '-' },
+                g.names[y.0],
+                if y.1 { '+' } else { '-' }
+            ));
+        }
+        let graph = dir.join("in.gfa");
+        fs::write(&graph, &text).unwrap();
+        let mut reads = String::new();
+        for i in 0..80 {
+            for (j, (x, y)) in [(&a, &b), (&c, &d)].iter().enumerate() {
+                let forward = [&x[1400..], &r[48..], &y[44..600]].concat();
+                let sequence = if i % 2 == 0 {
+                    forward
+                } else {
+                    revcomp(&forward)
+                };
+                reads.push_str(&format!(
+                    ">r{i}_{j}\n{}\n",
+                    String::from_utf8_lossy(&sequence)
+                ));
+            }
+        }
+        let input = dir.join("reads.fa");
+        fs::write(&input, reads).unwrap();
+        let evidence = dir.join("phases.json");
+        let report = run(&graph, vec![input], params(), 80, &evidence).unwrap();
+        assert_eq!(report.unique_records, 160);
+        assert_eq!(node(&report.repeat_nodes, "R").classification, "resolved");
+        let out = dir.join("split.gfa");
+        assert!(
+            crate::phase::export(&graph, &evidence, None, Some(&out))
+                .unwrap()
+                .graph_changed
+        );
+        let split = parse_gfa(&out).unwrap();
+        let links: BTreeSet<_> = split
+            .links
+            .iter()
+            .flat_map(|&(a, b)| [(a, b), (flip(b), flip(a))])
+            .collect();
+        for (entry, exit) in [(0, 1), (2, 3)] {
+            let first = (
+                split
+                    .names
+                    .iter()
+                    .position(|n| n == &g.names[entry])
+                    .unwrap(),
+                true,
+            );
+            let middle = links.iter().find(|(a, _)| *a == first).unwrap().1;
+            let last = links.iter().find(|(a, _)| *a == middle).unwrap().1;
+            assert_eq!(split.names[last.0], g.names[exit]);
+            assert_eq!(
+                crate::linearize::spell(&split, &[first, middle, last], false).unwrap(),
+                crate::linearize::spell(&g, &[(entry, true), (4, true), (exit, true)], false)
+                    .unwrap()
+            );
+        }
+        assert_eq!(fs::read_to_string(&graph).unwrap(), text);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

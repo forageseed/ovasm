@@ -117,6 +117,7 @@ fn extend(
     adj: &[Vec<usize>],
     expansions: &mut usize,
     max_steps: usize,
+    phases: &crate::phase::Constraints,
 ) -> Result<Vec<Candidate>> {
     let mut counts = vec![0; budget.len()];
     for o in &initial {
@@ -130,11 +131,16 @@ fn extend(
             bail!("primary path search exceeded {max_steps} expansions");
         }
         let next = &adj[slot(*walk.last().unwrap())];
-        let circular = next.contains(&slot(walk[0]));
+        let circular = next.contains(&slot(walk[0])) && phases.allows_walk(&walk, true);
         let children: Vec<Oriented> = next
             .iter()
             .map(|&i| oriented(i))
-            .filter(|&o| o != walk[0] && counts[o.0] < budget[o.0])
+            .filter(|&o| {
+                o != walk[0]
+                    && counts[o.0] < budget[o.0]
+                    && (walk.len() < 2
+                        || phases.allows(walk[walk.len() - 2], *walk.last().unwrap(), o))
+            })
             .collect();
         if circular || children.is_empty() {
             terminal.push(Candidate {
@@ -159,6 +165,24 @@ fn solve(
     max_copy: usize,
     max_steps: usize,
     circular_fraction: f64,
+) -> Result<(Vec<(Candidate, &'static str)>, Vec<PrimaryComponent>)> {
+    solve_phased(
+        g,
+        depth,
+        max_copy,
+        max_steps,
+        circular_fraction,
+        &crate::phase::Constraints::default(),
+    )
+}
+
+fn solve_phased(
+    g: &Graph,
+    depth: &[f64],
+    max_copy: usize,
+    max_steps: usize,
+    circular_fraction: f64,
+    phases: &crate::phase::Constraints,
 ) -> Result<(Vec<(Candidate, &'static str)>, Vec<PrimaryComponent>)> {
     let n = g.names.len();
     let mut adj = vec![Vec::new(); 2 * n];
@@ -242,12 +266,20 @@ fn solve(
             &adj,
             &mut expansions,
             max_steps,
+            phases,
         )? {
             if first.circular {
                 candidates.push(first);
             } else {
                 let reverse = first.walk.into_iter().rev().map(flip).collect();
-                candidates.extend(extend(reverse, &budget, &adj, &mut expansions, max_steps)?);
+                candidates.extend(extend(
+                    reverse,
+                    &budget,
+                    &adj,
+                    &mut expansions,
+                    max_steps,
+                    phases,
+                )?);
             }
         }
         let mut ranked = Vec::new();
@@ -309,6 +341,26 @@ pub fn run(
     max_steps: usize,
     circular_fraction: f64,
 ) -> Result<PrimaryReport> {
+    run_phased(
+        gfa,
+        out,
+        out_json,
+        max_copy,
+        max_steps,
+        circular_fraction,
+        None,
+    )
+}
+
+pub fn run_phased(
+    gfa: &Path,
+    out: &Path,
+    out_json: &Path,
+    max_copy: usize,
+    max_steps: usize,
+    circular_fraction: f64,
+    phase_report: Option<&Path>,
+) -> Result<PrimaryReport> {
     if max_copy == 0 || max_steps == 0 || !(0.0..=1.0).contains(&circular_fraction) {
         bail!("invalid primary path search parameters");
     }
@@ -334,7 +386,12 @@ pub fn run(
         tagged.insert(f[1].to_owned(), d);
     }
     let depth: Vec<f64> = g.names.iter().map(|n| tagged[n]).collect();
-    let (paths, components) = solve(&g, &depth, max_copy, max_steps, circular_fraction)?;
+    let phases = phase_report
+        .map(|p| crate::phase::Constraints::load(&g, p))
+        .transpose()?
+        .unwrap_or_default();
+    let (paths, components) =
+        solve_phased(&g, &depth, max_copy, max_steps, circular_fraction, &phases)?;
     let mut records = Vec::new();
     let mut fasta = String::new();
     for (i, (candidate, kind)) in paths.iter().enumerate() {
