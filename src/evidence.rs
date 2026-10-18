@@ -163,7 +163,7 @@ struct Junction {
     anchor_right: i64,
 }
 
-struct Index {
+pub(crate) struct Index {
     k: usize,
     junctions: Vec<Junction>,
     /// canonical k-mer -> (junction, position in junction, k-mer is forward-canonical there)
@@ -299,7 +299,7 @@ fn forward_is_canonical(kmer_seq: &[u8], canon: u64) -> bool {
     v == canon
 }
 
-fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
+pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
     let mut idx = Index {
         k: p.k,
         junctions: Vec::new(),
@@ -336,7 +336,7 @@ fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
 /// A supported link in one read, in read coordinates and read direction: the read leaves
 /// `from` at `from_end` and enters `to` at `to_start` (`to_start = from_end - overlap`).
 #[derive(Clone, Copy, Debug)]
-struct Crossing {
+pub(crate) struct Crossing {
     link: usize,
     along: bool,
     to_start: i64,
@@ -345,7 +345,7 @@ struct Crossing {
     score: u32,
 }
 
-fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
+pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
     let k = idx.k as i64;
     // (junction, along) -> [(diagonal, junction position)]
     let mut hits: FxHashMap<(u32, bool), Vec<(i64, u32)>> = FxHashMap::default();
@@ -468,7 +468,7 @@ fn walked_through(g: &Graph, cs: &[Crossing], m: &Crossing, backward: bool, tol:
 /// is entirely a prefix of the other so the link's flanks cannot separate them, the read's next
 /// (or previous) crossing decides: the rival whose segment the read demonstrably walks through
 /// wins, if exactly one does.
-fn assign(g: &Graph, cs: Vec<Crossing>, tol: f64) -> (Vec<Crossing>, Vec<usize>) {
+pub(crate) fn assign(g: &Graph, cs: Vec<Crossing>, tol: f64) -> (Vec<Crossing>, Vec<usize>) {
     const SAME_PLACE: i64 = 100;
     let ends = |c: &Crossing| crossing_ends(g, c);
     let n = cs.len();
@@ -617,9 +617,9 @@ where
 }
 
 /// Directed step in read order: (from, to, read start of `to`, read end of `from`).
-type Step = (Oriented, Oriented, i64, i64);
+pub(crate) type Step = (Oriented, Oriented, i64, i64);
 
-fn read_steps(g: &Graph, cs: &[Crossing]) -> Vec<Step> {
+pub(crate) fn read_steps(g: &Graph, cs: &[Crossing]) -> Vec<Step> {
     let mut steps: Vec<Step> = cs
         .iter()
         .map(|c| {
@@ -692,7 +692,11 @@ fn observed_walk_counts(read_walks: &[Vec<Vec<Oriented>>]) -> BTreeMap<Vec<Orien
 }
 
 /// Traversals X -> S -> Y: three consecutive segments of a walk.
-fn traversals(g: &Graph, steps: &[Step], tol: f64) -> Vec<(Oriented, Oriented, Oriented)> {
+pub(crate) fn traversals(
+    g: &Graph,
+    steps: &[Step],
+    tol: f64,
+) -> Vec<(Oriented, Oriented, Oriented)> {
     let mut out: Vec<(Oriented, Oriented, Oriented)> = walks(g, steps, tol)
         .iter()
         .flat_map(|w| w.windows(3).map(canonical_walk).collect::<Vec<_>>())

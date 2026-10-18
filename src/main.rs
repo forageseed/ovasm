@@ -6,8 +6,8 @@ mod bait;
 mod components;
 mod correct;
 mod evidence;
-mod identify;
 mod hpc;
+mod identify;
 mod junctions;
 mod kmer;
 mod label;
@@ -16,15 +16,16 @@ mod pan;
 mod panel;
 mod pipeline;
 mod primary;
+mod read_context;
 mod reconstruct;
 mod recruit;
-mod read_context;
 mod replay;
 mod replicate;
 mod retained;
 mod seeddb;
 mod seedfree;
 mod unify;
+mod unzip;
 
 use std::path::PathBuf;
 
@@ -52,6 +53,9 @@ enum Command {
     Discover(DiscoverArgs),
     /// Read support for every link, branch and repeat pairing of an assembly graph (GFA).
     Evidence(EvidenceArgs),
+    /// Count the complete reads that walk entry -> node -> exit through every repeat node of a
+    /// graph. Diagnostic only: the graph is never changed.
+    Unzip(UnzipArgs),
     /// Representative linear (or circular) sequence through read-supported phased paths.
     Linearize(LinearizeArgs),
     /// Export a depth-constrained primary path and unplaced graph segments per component.
@@ -1043,6 +1047,87 @@ struct EvidenceArgs {
     threads: Option<usize>,
 }
 
+#[derive(clap::Args)]
+struct UnzipArgs {
+    /// Assembly graph with segment sequences (GFA).
+    #[arg(long)]
+    gfa: PathBuf,
+    /// Original long reads (FASTQ/FASTA, optionally .gz); repeat for several files.
+    #[arg(long = "reads", required = true)]
+    reads: Vec<PathBuf>,
+    /// Output JSON report.
+    #[arg(long)]
+    out_json: PathBuf,
+    /// A phase counts as supported with at least this many distinct reads. Give the value the
+    /// assembly resolved (its report's min_count); 3 is the engine's floor.
+    #[arg(long, default_value_t = 3)]
+    min_count: u32,
+    /// Alignment settings of `evidence`, at its HiFi preset.
+    #[arg(long, default_value_t = 21)]
+    k: usize,
+    #[arg(long, default_value_t = 2000)]
+    flank: usize,
+    #[arg(long, default_value_t = 500)]
+    min_anchor: usize,
+    #[arg(long, default_value_t = 30)]
+    diag_tol: i64,
+    #[arg(long, default_value_t = 10)]
+    min_side_hits: usize,
+    #[arg(long, default_value_t = 0.05)]
+    spacing_tol: f64,
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+fn unzip(args: UnzipArgs) -> Result<()> {
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()?;
+    }
+    if !(1..=kmer::MAX_K).contains(&args.k) {
+        bail!("--k must be between 1 and {}", kmer::MAX_K);
+    }
+    let report = unzip::run(
+        &args.gfa,
+        args.reads,
+        evidence::EvidenceParams {
+            short_read_adjacency: false,
+            k: args.k,
+            flank: args.flank,
+            min_anchor: args.min_anchor,
+            diag_tol: args.diag_tol,
+            min_side_hits: args.min_side_hits,
+            spacing_tol: args.spacing_tol,
+            bootstrap: 0,
+            seed: 0,
+            max_repeat_len: 20_000,
+        },
+        args.min_count,
+        &args.out_json,
+    )?;
+    let count = |class: &str| {
+        report
+            .repeat_nodes
+            .iter()
+            .filter(|n| n.classification == class)
+            .count()
+    };
+    eprintln!(
+        "[ovasm] unzip: {} repeat nodes (resolved {}, partial {}, mixed {}, conflicted {}, unresolved {}); {} of {} reads complete a traversal; {:.1}s",
+        report.repeat_nodes.len(),
+        count("resolved"),
+        count("partial"),
+        count("mixed"),
+        count("conflicted"),
+        count("unresolved"),
+        report.reads_with_complete_traversal,
+        report.unique_records,
+        report.elapsed_seconds
+    );
+    Ok(())
+}
+
 fn evidence(args: EvidenceArgs) -> Result<()> {
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -1400,6 +1485,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Recruit(args) => recruit(args),
         Command::Discover(args) => discover(args),
         Command::Evidence(args) => evidence(args),
+        Command::Unzip(args) => unzip(args),
         Command::Linearize(args) => linearize(args),
         Command::Unify(args) => unify(args),
         Command::Assemble(args) => assemble(args),
