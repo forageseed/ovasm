@@ -74,3 +74,9 @@ OATK 全流程含全输入图的 HMM 注释；启动到第一条注释加载日�
 `u12151`：32 条兼容完整 ONT 中，22 条满足严格双侧核侧翼标准。局部连接支持不能单独认证
 线粒体来源。没有同个体独立真值，宽松分和严格分仍记未评估；图中的环不认证物理拓扑。
 
+
+## Schoenoplectus 记录的原始读段检验
+
+[schoenoplectus-read-validation.md](schoenoplectus-read-validation.md) 用同一套规则，以全部原始读段同时检验
+OVASM 记录与 Oatk 的 `MITO.fasta`：加入叶绿体作竞争目标后，OVASM 主体 8/8、Oatk 7/8 通过；Oatk 的例外
+来自其序列集缺失的一段 69 kb 有读段支持的序列。
