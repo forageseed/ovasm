@@ -37,7 +37,7 @@
 完成命令的中位耗时 **49.34 分钟**，峰值 RSS 之和中位数 **2.458 GiB**。
 这是执行成功率，不是完整组装成功率：完成者中 **MT 0/14、PT 1/14 的内部
 `decisive=true`**，没有同个体独立真值，严格／宽松分均未评估。
-失败仍计入分母，见[逐任务时间与内存表](docs/existing-wgs-benchmark.md)。
+失败仍计入分母，见[逐任务时间与内存表](existing-wgs-benchmark.md)。
 这是冻结 `b529d67` 的首轮 WGS 子集，不冒充最新提交或全部 25 任务的新基准。
 
 ### 苜蓿 ZM4 完整 HiFi：时间、内存与图证据
@@ -57,18 +57,18 @@
 OATK 全流程含全输入图的 HMM 注释；启动到第一条注释加载日志为 **221.61 分钟**，
 与 OVASM 整个命令接近。**942.35 分钟不能当作纯建图时间。**
 进程 RSS 求和可能重复计算共享页，GNU 最大 RSS 是另一口径，不能混作物理内存。
-此前 96 GiB 限额下失败的 OATK 尝试单独保留。[分阶段时间、原始统计及限制](docs/hifi-configuration-comparison.md)。
+此前 96 GiB 限额下失败的 OATK 尝试单独保留。[分阶段时间、原始统计及限制](hifi-configuration-comparison.md)。
 
 表中全量时间对应注明的历史提交。最新连接修复保留了有读段支持的替代连接，主序列未变，
 但未再跑一遍 134 Gb 输入，不能把旧时间冒充当前提交的新基准。
 历史可选缓存候选 `e8a85b3` 全量 **392.49 分钟**，为基线的 **1.867 倍**，输出等价但更慢；
 小前缀的加速不能外推全量，当前 `--recruit-cache` 仍是显式可选项。
 
-![同源方向统一、带 HiFi/ONT 与核背景证据的完整 GFA 对照](docs/figures/OVASM-OATK-homology-matched.svg)
+![同源方向统一、带 HiFi/ONT 与核背景证据的完整 GFA 对照](figures/OVASM-OATK-homology-matched.svg)
 
-[SVG](docs/figures/OVASM-OATK-homology-matched.svg) · [PDF](docs/figures/OVASM-OATK-homology-matched.pdf) ·
-[逐连接支持](docs/figures/zm4-link-read-support.tsv) · [同源坐标](docs/figures/zm4-homology-correspondence.tsv) ·
-[绘图代码与方法](docs/figures/README.md#zm4-hifi-ont-supported-gfa-comparison)
+[SVG](figures/OVASM-OATK-homology-matched.svg) · [PDF](figures/OVASM-OATK-homology-matched.pdf) ·
+[逐连接支持](figures/zm4-link-read-support.tsv) · [同源坐标](figures/zm4-homology-correspondence.tsv) ·
+[绘图代码与方法](figures/README.md#zm4-hifi-ont-supported-gfa-comparison)
 
 修复后两图共同主干及 J1/J2 均保留，并都有 HiFi/ONT 支持。OATK 还保留有强核背景证据的
 `u12151`：32 条兼容完整 ONT 中，22 条满足严格双侧核侧翼标准。局部连接支持不能单独认证

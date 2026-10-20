@@ -43,7 +43,7 @@ For completed commands, median wall time was **49.34 min** and median peak
 RSS sum **2.458 GiB**. These are execution statistics, not complete-assembly
 success: **0/14 MT and 1/14 PT were internally decisive**, and independent
 truth scores were not evaluated. Failed jobs remain in the denominator and
-in the [per-job time/memory table](docs/existing-wgs-benchmark.md).
+in the [per-job time/memory table](existing-wgs-benchmark.md).
 This is the frozen `b529d67` first-attempt WGS subset, not a new full-queue
 or latest-commit benchmark.
 
@@ -65,7 +65,7 @@ OATK includes whole-input HMM annotation. Start to first annotation-load log was
 **221.61 min**, close to OVASM's complete command. **942.35 min is not pure graph-building time.**
 RSS sums can count shared pages more than once; GNU maximum RSS has a different scope.
 The prior 96-GiB OATK failure remains a separate attempt.
-[Stages, provenance and limits](docs/hifi-configuration-comparison.md).
+[Stages, provenance and limits](hifi-configuration-comparison.md).
 
 These costs belong to the named historical commits. The latest junction repair retained
 supported alternatives without changing the principal sequences, but no new complete
@@ -73,11 +73,11 @@ supported alternatives without changing the principal sequences, but no new comp
 **1.867 times longer** than the baseline, with equivalent outputs; prefix speedups
 must not be extrapolated to full input. `--recruit-cache` is opt-in.
 
-![Homology-aligned OVASM and OATK graphs with HiFi, ONT and nuclear-context evidence](docs/figures/OVASM-OATK-homology-matched.svg)
+![Homology-aligned OVASM and OATK graphs with HiFi, ONT and nuclear-context evidence](figures/OVASM-OATK-homology-matched.svg)
 
-[SVG](docs/figures/OVASM-OATK-homology-matched.svg) · [PDF](docs/figures/OVASM-OATK-homology-matched.pdf) ·
-[Per-link read support](docs/figures/zm4-link-read-support.tsv) · [Homology coordinates](docs/figures/zm4-homology-correspondence.tsv) ·
-[Figure source and methods](docs/figures/README.md#zm4-hifi-ont-supported-gfa-comparison)
+[SVG](figures/OVASM-OATK-homology-matched.svg) · [PDF](figures/OVASM-OATK-homology-matched.pdf) ·
+[Per-link read support](figures/zm4-link-read-support.tsv) · [Homology coordinates](figures/zm4-homology-correspondence.tsv) ·
+[Figure source and methods](figures/README.md#zm4-hifi-ont-supported-gfa-comparison)
 
 Both repaired graphs retain the shared backbone and local alternatives J1/J2, supported
 by HiFi and ONT. OATK additionally retains nuclear-context branch u12151: 22/32
