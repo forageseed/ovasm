@@ -85,3 +85,10 @@ branch-compatible complete ONT records meet the strict bilateral nuclear-flank c
 Local edge support is not source certification. Without independent same-individual truth,
 relaxed/strict scores remain unevaluated; graph cycles do not certify physical topology.
 
+
+## Read validation of the Schoenoplectus records
+
+Both the OVASM records and the Oatk `MITO.fasta` are checked against all original reads with
+the same rules in [schoenoplectus-read-validation.md](schoenoplectus-read-validation.md): with the
+plastid as a competing target, 8/8 OVASM main records and 7/8 Oatk records are read-validated;
+the Oatk exception comes from a 69-kb read-supported sequence that the Oatk set lacks.
