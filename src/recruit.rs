@@ -1009,15 +1009,21 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     continue;
                 }
                 // New reads of this pass, from its file: their depth sets the subsample
-                // fraction (at most `extend_depth`).
+                // fraction (at most `extend_depth`). The genome size is the one the target's reads
+                // stand for when the depth sketch gives it, else the seed length: a multi-species
+                // library's summed length (6.4 Mb of plastids) is no genome size, and the
+                // Medicago polymorpha plastid (~10,000x) extended from 128,386 reads.
                 let path = pass_path(&cfg.out_dir, &bait.targets[t].name);
                 let considered = if recount {
                     &res.recruited[t]
                 } else {
                     &res.fresh[t]
                 };
-                let seed_len = bait.targets[t].seed_length.max(1) as f64;
-                let depth = considered.bases as f64 / seed_len;
+                let genome = depths.implied_size[t]
+                    .filter(|_| cfg.extend_gate)
+                    .unwrap_or(bait.targets[t].seed_length)
+                    .max(1) as f64;
+                let depth = considered.bases as f64 / genome;
                 let fraction = if depth > cfg.extend_depth {
                     cfg.extend_depth / depth
                 } else {

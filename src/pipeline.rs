@@ -2118,7 +2118,7 @@ mod tests {
             auto_recruit_cache: true,
             gated_recruit: true,
             recruit_max_depth: Some(250.0),
-            recruit_max_bases: Some(1_500_000_000),
+            recruit_max_bases: Some(1_000_000_000),
             read_context: None,
             single_seed: false,
             mode: Mode::Fast,
