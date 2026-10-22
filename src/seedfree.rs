@@ -65,8 +65,15 @@ struct Sketch {
     bases: u64,
 }
 
-fn build_sketch(inputs: &[PathBuf], p: &DiscoverParams, threshold: u64) -> Result<Sketch> {
-    let (rx, reader) = read_batches(inputs);
+/// Batches of reads and the thread producing them: the input files (`read_batches`), or the
+/// recruitment cache that holds their sequences (`Replay::sequences`).
+pub type Batches = (
+    crossbeam_channel::Receiver<Vec<Rec>>,
+    std::thread::JoinHandle<Result<()>>,
+);
+
+fn build_sketch(batches: Batches, p: &DiscoverParams, threshold: u64) -> Result<Sketch> {
+    let (rx, reader) = batches;
     let mut sketch = Sketch {
         counts: FxHashMap::default(),
         bases: 0,
@@ -129,12 +136,12 @@ fn context_supported_keys(keys: Vec<u64>, counts: &FxHashMap<u64, u32>) -> Vec<u
 }
 
 fn read_context_histogram(
-    inputs: &[PathBuf],
+    batches: Batches,
     sketch: &Sketch,
     p: &DiscoverParams,
     threshold: u64,
 ) -> Result<FxHashMap<u32, u64>> {
-    let (rx, reader) = read_batches(inputs);
+    let (rx, reader) = batches;
     let mut supported = rustc_hash::FxHashSet::default();
     let mut bases = 0;
     for batch in rx.iter() {
@@ -260,11 +267,44 @@ pub struct DepthGate {
     threshold: u64,
     pub nuclear_peak_depth: u32,
     pub organelle_min_depth: f64,
+    pub report: GateReport,
+}
+
+/// How the gate's nuclear peak came about, for `recruit.json`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GateReport {
+    /// "inputs" or "recruitment cache": what the two sketch passes read.
+    pub source: &'static str,
+    pub sketch_bases: u64,
+    pub sampled_kmers: usize,
+    pub nuclear_peak_depth: u32,
+    pub organelle_min_depth: f64,
+    /// Distinct sampled k-mers from half to twice the peak depth, times the sampling scale:
+    /// about the size of the genome the peak belongs to.
+    pub peak_window_bases: u64,
+    /// The read-context histogram up to four times the peak: (count, distinct sampled k-mers).
+    pub histogram: Vec<(u32, u64)>,
+    pub seconds: f64,
+}
+
+/// The gate's view of one read.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadDepth {
+    /// Deep and uniformly deep along the read (`organelle_like`).
+    pub organelle_like: bool,
+    /// Median sampled k-mer depth (sketch depth; about the read depth for HiFi reads).
+    pub median: f64,
 }
 
 impl DepthGate {
     /// Sketch the inputs with `discover`'s long-read defaults (scale 64, the whole input).
     pub fn long_reads(inputs: &[PathBuf]) -> Result<Self> {
+        Self::long_reads_from(|| read_batches(inputs), "inputs")
+    }
+
+    /// `long_reads` over the batches `source` gives; it is called once per sketch pass.
+    pub fn long_reads_from(source: impl Fn() -> Batches, label: &'static str) -> Result<Self> {
+        let start = Instant::now();
         let params = DiscoverParams {
             k: 21,
             scale: 64,
@@ -280,33 +320,53 @@ impl DepthGate {
             dump_profiles: false,
         };
         let threshold = u64::MAX / params.scale;
-        let sketch = build_sketch(inputs, &params, threshold)?;
-        let nuclear = histogram_peak(&read_context_histogram(
-            inputs, &sketch, &params, threshold,
-        )?);
+        let sketch = build_sketch(source(), &params, threshold)?;
+        let histogram = read_context_histogram(source(), &sketch, &params, threshold)?;
+        let nuclear = histogram_peak(&histogram);
+        let organelle_min = nuclear as f64 * params.depth_fold;
+        let mut shown: Vec<(u32, u64)> = histogram
+            .iter()
+            .filter(|&(&c, _)| c <= nuclear.saturating_mul(4))
+            .map(|(&c, &n)| (c, n))
+            .collect();
+        shown.sort_unstable();
+        let window: u64 = histogram
+            .iter()
+            .filter(|&(&c, _)| 2 * c >= nuclear && c <= 2 * nuclear)
+            .map(|(_, &n)| n)
+            .sum();
+        let report = GateReport {
+            source: label,
+            sketch_bases: sketch.bases,
+            sampled_kmers: sketch.counts.len(),
+            nuclear_peak_depth: nuclear,
+            organelle_min_depth: organelle_min,
+            peak_window_bases: window * params.scale,
+            histogram: shown,
+            seconds: start.elapsed().as_secs_f64(),
+        };
         Ok(Self {
             sketch,
             threshold,
             nuclear_peak_depth: nuclear,
-            organelle_min_depth: nuclear as f64 * params.depth_fold,
+            organelle_min_depth: organelle_min,
             params,
+            report,
         })
     }
 
     /// Deep and uniformly deep along the whole read: organelle, not a nuclear insertion.
     pub fn organelle_like(&self, seq: &[u8]) -> bool {
-        features(
-            seq,
-            &self.sketch,
-            &self.params,
-            self.threshold,
-            self.organelle_min_depth,
-        )
-        .is_some_and(|f| passes(&f, &self.params))
+        self.profile(seq).is_some_and(|d| d.organelle_like)
     }
 
     /// Median sampled k-mer depth along the read (sketch depth), if any k-mer was sampled.
     pub fn median_depth(&self, seq: &[u8]) -> Option<f64> {
+        self.profile(seq).map(|d| d.median)
+    }
+
+    /// Both of the above from one look at the read's sampled k-mers.
+    pub fn profile(&self, seq: &[u8]) -> Option<ReadDepth> {
         features(
             seq,
             &self.sketch,
@@ -314,7 +374,10 @@ impl DepthGate {
             self.threshold,
             self.organelle_min_depth,
         )
-        .map(|f| f.median)
+        .map(|f| ReadDepth {
+            organelle_like: passes(&f, &self.params),
+            median: f.median,
+        })
     }
 }
 
@@ -357,8 +420,13 @@ pub fn run(inputs: Vec<PathBuf>, p: DiscoverParams, out_dir: PathBuf) -> Result<
         bail!("--scale must be positive");
     }
     let threshold = u64::MAX / p.scale;
-    let sketch = build_sketch(&inputs, &p, threshold)?;
-    let nuclear = histogram_peak(&read_context_histogram(&inputs, &sketch, &p, threshold)?);
+    let sketch = build_sketch(read_batches(&inputs), &p, threshold)?;
+    let nuclear = histogram_peak(&read_context_histogram(
+        read_batches(&inputs),
+        &sketch,
+        &p,
+        threshold,
+    )?);
     let organelle_min = nuclear as f64 * p.depth_fold;
     eprintln!(
         "[ovasm] sketch: {:.2} Gbp, {} sampled k-mers, nuclear peak {}x, organelle threshold {:.0}x (sketch depth)",

@@ -55,10 +55,29 @@ fn pack(seq: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The four bases of every packed byte (`pack` puts base i at bits 2(i % 4) of byte i / 4).
+const UNPACKED: [[u8; 4]; 256] = {
+    let mut table = [[0u8; 4]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut i = 0;
+        while i < 4 {
+            table[byte][i] = b"ACGT"[(byte >> (2 * i)) & 3];
+            i += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
+/// Four bases per lookup: the cache is read and unpacked on one thread.
 fn unpack(bytes: &[u8], len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| b"ACGT"[((bytes[i / 4] >> (2 * (i % 4))) & 3) as usize])
-        .collect()
+    let mut seq = Vec::with_capacity(bytes.len() * 4);
+    for &b in bytes {
+        seq.extend_from_slice(&UNPACKED[b as usize]);
+    }
+    seq.truncate(len);
+    seq
 }
 
 impl Replay {
@@ -157,6 +176,24 @@ impl Replay {
         (rx, thread)
     }
 
+    /// The cached reads as plain records without qualities, as the depth sketch reads them.
+    pub fn sequences(&self) -> crate::seedfree::Batches {
+        let (cached, reader) = self.batches();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let thread = std::thread::spawn(move || -> Result<()> {
+            for batch in cached {
+                if tx
+                    .send(batch.into_iter().map(|entry| entry.rec).collect())
+                    .is_err()
+                {
+                    break; // the consumer stopped; dropping `cached` stops the reader
+                }
+            }
+            reader.join().expect("cache reader panicked")
+        });
+        (rx, thread)
+    }
+
     pub fn stats(&self, passes: usize) -> Result<ReplayStats> {
         Ok(ReplayStats {
             source_classification_passes: 1,
@@ -218,6 +255,13 @@ mod tests {
         cache.store(&entries[..2]).unwrap();
         cache.store(&entries[2..]).unwrap();
         cache.finish().unwrap();
+        let (rx, thread) = cache.sequences();
+        let plain: Vec<Rec> = rx.iter().flatten().collect();
+        thread.join().unwrap().unwrap();
+        assert_eq!(plain.len(), entries.len());
+        for (r, e) in plain.iter().zip(&entries) {
+            assert_eq!((&r.id, &r.seq, &r.qual), (&e.rec.id, &e.rec.seq, &None));
+        }
         let (rx, thread) = cache.batches();
         let mut index = 0;
         for batch in rx {
@@ -233,6 +277,14 @@ mod tests {
         cache.remove().unwrap();
         assert!(!dir.exists());
     }
+    #[test]
+    fn packing_round_trips_every_length() {
+        for len in 0..40 {
+            let seq: Vec<u8> = (0..len).map(|i| b"ACGT"[(i * 7 + len / 3) % 4]).collect();
+            assert_eq!(unpack(&pack(&seq).unwrap(), len), seq);
+        }
+    }
+
     #[test]
     fn truncated_cache_fails_without_reopening_original_input() {
         let dir =

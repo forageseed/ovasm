@@ -258,8 +258,28 @@ struct RunArgs {
     #[arg(long)]
     recruit_depth: Option<f64>,
     /// New scratch directory for lossless recruitment input replay (disk space required).
+    /// Without it, HiFi recruitment caches the reads in <out>/recruit/input-cache when that
+    /// disk has room (a quarter of a byte per base and the read names), so that passes after the
+    /// first, and the depth sketch, read the cache instead of decompressing the input again.
     #[arg(long)]
     recruit_cache: Option<PathBuf>,
+    /// Never cache the reads for recruitment (see --recruit-cache).
+    #[arg(long, conflicts_with = "recruit_cache")]
+    no_recruit_cache: bool,
+    /// HiFi recruitment as up to 0.2.1: without `ovasm recruit --extend-gate --bootstrap`, which
+    /// `run` uses for HiFi reads. Ungated, iterative baiting from the built-in seed library ran
+    /// into the nuclear genome on species far from it (Carex echinata: 686,022 "plastid" reads,
+    /// 8.5 Gb, then 309 GB of memory in assembly).
+    #[arg(long)]
+    ungated_recruit: bool,
+    /// HiFi: downsample each organelle's recruited reads to about this read depth before
+    /// assembly (their median depth in the depth sketch); 0 keeps every read.
+    #[arg(long, default_value_t = 250.0)]
+    recruit_max_depth: f64,
+    /// HiFi: keep at most about this many recruited bases per organelle, which bounds the memory
+    /// of assembly whatever recruitment found; 0 for no cap.
+    #[arg(long, default_value_t = 1_500_000_000)]
+    recruit_max_bases: u64,
     /// Checked complete original-read nuclear alignments (ovasm.whole-read-context.v1).
     #[arg(long)]
     read_context: Option<PathBuf>,
@@ -303,6 +323,9 @@ fn run(args: RunArgs) -> Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n as usize)
             .build_global()?;
+    }
+    if args.recruit_max_depth.is_nan() || args.recruit_max_depth < 0.0 {
+        bail!("--recruit-max-depth must be 0 (no cap) or positive");
     }
     let single = match args.organelle {
         pipeline::OrganelleChoice::Mitochondrion => Some("mitochondrion"),
@@ -352,6 +375,10 @@ fn run(args: RunArgs) -> Result<()> {
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
         recruit_cache: args.recruit_cache,
+        auto_recruit_cache: !args.no_recruit_cache,
+        gated_recruit: !args.ungated_recruit,
+        recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
+        recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
         read_context: args.read_context,
         single_seed: args.single_seed,
         mode: args.mode,
@@ -1343,6 +1370,14 @@ struct RecruitArgs {
     /// Downsample each target to about this depth (recruited bases / seed length).
     #[arg(long)]
     target_depth: Option<f64>,
+    /// Downsample each target to about this read depth: the median depth of its reads in the
+    /// depth sketch, so it needs no genome size (a multi-species seed library has none, and
+    /// --target-depth divides by its summed length). Hifi preset only; builds the sketch.
+    #[arg(long)]
+    max_read_depth: Option<f64>,
+    /// Downsample each target to at most about this many bases.
+    #[arg(long)]
+    max_bases: Option<u64>,
     /// New scratch directory: classify original inputs once, replay sequences, then restore original qualities in one final input pass.
     #[arg(long)]
     recruit_cache: Option<PathBuf>,
@@ -1361,8 +1396,11 @@ struct RecruitArgs {
     #[arg(long)]
     bootstrap: bool,
     /// Extend each target's bait only from reads that are organelle-deep along their whole
-    /// length (the `discover` test), so a stray seed sequence cannot lead extension into the
-    /// nucleus; use with `--saturation 0` to extend until no bait grows. Long reads (hifi) only.
+    /// length (the `discover` test) and not shallower than a quarter of the target's own reads,
+    /// so a stray seed sequence cannot lead extension into the nucleus (nor a plastid into the
+    /// mitochondrion); a plastid or mitochondrion whose reads come to stand for more sequence
+    /// than any such genome (1 and 20 Mb) stops extending. Use with `--saturation 0` to extend
+    /// until no bait grows. Long reads (hifi) only.
     #[arg(long)]
     extend_gate: bool,
 }
@@ -1443,6 +1481,13 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     if args.extend_gate && !matches!(args.preset, Preset::Hifi) {
         bail!("--extend-gate needs the hifi preset: its depth gate judges whole long reads");
     }
+    if args.max_read_depth.is_some() && !matches!(args.preset, Preset::Hifi) {
+        bail!("--max-read-depth needs the hifi preset: its depth sketch judges whole long reads");
+    }
+    if args.max_read_depth.is_some_and(|d| d.is_nan() || d <= 0.0) || args.max_bases == Some(0)
+    {
+        bail!("--max-read-depth and --max-bases must be positive");
+    }
     let mut bait = bait::BaitSet::new(k);
     if args.seeds.is_empty() && args.seed_reads.is_empty() {
         bail!("give --seed NAME=PATH or --seed-reads NAME=PATH");
@@ -1491,13 +1536,19 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             out_dir: args.out,
             bootstrap: args.bootstrap,
             extend_gate: args.extend_gate,
+            max_read_depth: args.max_read_depth,
+            max_bases: args.max_bases,
         },
     )?;
     for o in &report.outputs {
+        let depth = match (o.read_depth, o.implied_size) {
+            (Some(d), Some(s)) => format!(" (read depth {d:.0}x, standing for {:.0} kb)", s as f64 / 1e3),
+            _ => String::new(),
+        };
         eprintln!(
-            "[ovasm] {}: recruited {} reads ({:.1} Mb, ~{:.0}x); kept {} reads (fraction {:.3}) -> {}",
+            "[ovasm] {}: recruited {} reads ({:.1} Mb, ~{:.0}x){depth}; {}; kept {} reads (fraction {:.3}) -> {}",
             o.name, o.recruited_reads, o.recruited_bases as f64 / 1e6, o.estimated_depth,
-            o.kept_reads, o.sampling_fraction, o.output
+            o.stop_reason, o.kept_reads, o.sampling_fraction, o.output
         );
     }
     eprintln!(

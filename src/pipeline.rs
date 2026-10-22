@@ -112,6 +112,14 @@ pub struct RunConfig {
     /// `ovasm recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
     pub recruit_cache: Option<PathBuf>,
+    /// HiFi seed recruitment without a `recruit_cache` caches the reads beside its outputs when
+    /// that disk has room (`default_recruit_cache`).
+    pub auto_recruit_cache: bool,
+    /// HiFi seed recruitment with `recruit --extend-gate --bootstrap`.
+    pub gated_recruit: bool,
+    /// HiFi seed recruitment: `recruit --max-read-depth` and `--max-bases`.
+    pub recruit_max_depth: Option<f64>,
+    pub recruit_max_bases: Option<u64>,
     pub read_context: Option<PathBuf>,
     /// Recruit one organelle without seeding the other.
     pub single_seed: bool,
@@ -531,6 +539,120 @@ struct Recruited {
     /// The reads include depth clusters (`--recruit discover|both`): their graph is run
     /// through the component filter.
     discovered: bool,
+    /// How seed recruitment ended for this organelle (its `recruit.json` output, the depth
+    /// gate and the warnings that concern it); null without seed recruitment.
+    recruitment: Value,
+}
+
+/// Room the recruitment cache may take, at most, per byte of input: two bits a base plus the
+/// read name, against a gzip FASTQ of up to about three bases a byte (Revio HiFi with binned
+/// qualities: 2.8) or a plain FASTA/FASTQ of at most a base a byte.
+fn cache_estimate(reads: &[PathBuf]) -> Result<u64> {
+    let mut bytes = 0u64;
+    for r in reads {
+        let size = fs::metadata(r)
+            .with_context(|| format!("cannot read {}", r.display()))?
+            .len();
+        let gz = r.extension().is_some_and(|e| e.eq_ignore_ascii_case("gz"));
+        bytes += if gz { size } else { size / 2 };
+    }
+    Ok(bytes)
+}
+
+/// Bytes free to an ordinary user on the filesystem that holds `path`, where it can be asked.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    extern "C" {
+        fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> std::ffi::c_int;
+    }
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // struct statvfs of 64-bit Linux (glibc and musl alike): 112 bytes of 8-byte fields that
+    // begin f_bsize, f_frsize, f_blocks, f_bfree, f_bavail.
+    let mut buf = [0u64; 16];
+    // SAFETY: `path` is NUL-terminated and `buf` is larger than the struct statvfs written to it.
+    if unsafe { statvfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    Some(buf[4].saturating_mul(buf[1]))
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn free_bytes(_: &Path) -> Option<u64> {
+    None
+}
+
+/// Where `run` caches the reads for recruitment when no --recruit-cache is given: in
+/// `<recruit_dir>/input-cache`, when the disk of `out` keeps at least as much again (and 20 GB)
+/// free besides it; `None` otherwise, and the passes read the input files instead. The cache
+/// saves every pass after the first, and the depth sketch's two, a decompression of the input
+/// (Nipponbare's 28.6 GB, read from a busy disk: 5,462 s for the first pass and the sketch).
+fn default_recruit_cache(reads: &[PathBuf], out: &Path, recruit_dir: &Path) -> Result<Option<PathBuf>> {
+    let need = cache_estimate(reads)?;
+    let free = free_bytes(out);
+    let gb = |b: u64| b as f64 / 1e9;
+    if !free.is_some_and(|f| f >= need + need.max(20_000_000_000)) {
+        log(&format!(
+            "not caching the reads for recruitment ({} free, up to {:.1} GB needed); \
+             every pass reads the input files",
+            free.map_or("unknown space".to_string(), |f| format!("{:.1} GB", gb(f))),
+            gb(need)
+        ));
+        return Ok(None);
+    }
+    let dir = recruit_dir.join("input-cache");
+    if dir.exists() {
+        // only ever ours: a run that failed in this output directory left it
+        log(&format!("removing the recruitment cache of an earlier run: {}", dir.display()));
+        fs::remove_dir_all(&dir)?;
+    }
+    fs::create_dir_all(recruit_dir)?;
+    log(&format!(
+        "caching the reads for recruitment in {} (up to {:.1} GB, removed when it is done)",
+        dir.display(),
+        gb(need)
+    ));
+    Ok(Some(dir))
+}
+
+/// What `summary.json` says about the organelle's seed recruitment: its `recruit.json`
+/// output without the file path, the depth gate, the core depth and its warnings.
+fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: bool) -> Value {
+    let mut out = report["outputs"][index]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    out.remove("output");
+    out.insert("extend_gate".into(), report["extend_gate"].clone());
+    out.insert("bootstrap".into(), report["bootstrap"].clone());
+    out.insert("gated_by_default".into(), gated.into());
+    out.insert("iterations_run".into(), report["iterations_run"].clone());
+    out.insert("core_depth".into(), report["core_depth"][index].clone());
+    let gate = &report["depth_gate"];
+    out.insert(
+        "depth_gate".into(),
+        if gate.is_null() {
+            Value::Null
+        } else {
+            json!({
+                "nuclear_peak_depth": gate["nuclear_peak_depth"],
+                "organelle_min_depth": gate["organelle_min_depth"],
+                "peak_window_bases": gate["peak_window_bases"],
+                "source": gate["source"],
+            })
+        },
+    );
+    // warnings about this organelle, or about none in particular (the depth gate)
+    let other = format!("{}:", other_organelle(organelle));
+    let warnings: Vec<Value> = report["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w.as_str().is_some_and(|w| !w.starts_with(&other)))
+        .cloned()
+        .collect();
+    out.insert("warnings".into(), warnings.into());
+    Value::Object(out)
 }
 
 /// Stop before assembly when recruitment left too little to assemble anything.
@@ -708,20 +830,46 @@ fn recruit_all(
                 argv = argv.opt("--seed", spec);
             }
         }
-        // A multi-species marker database's summed length is not a sample genome size, so the
-        if let Some(dir) = &cfg.recruit_cache {
+        let cache = match &cfg.recruit_cache {
+            Some(dir) => Some(dir.clone()),
+            None if cfg.auto_recruit_cache && cfg.read_type == ReadType::Hifi => {
+                default_recruit_cache(&cfg.reads, &cfg.out, &recruit_dir)?
+            }
+            None => None,
+        };
+        if let Some(dir) = &cache {
             argv = argv.opt("--recruit-cache", dir);
         }
-        // depth is only capped when the caller says the seed is one (--recruit-depth).
+        // A multi-species marker database's summed length is not a sample genome size, so the
+        // depth is only capped by it when the caller says the seed is one (--recruit-depth).
         if let Some(d) = cfg.recruit_depth {
             argv = argv.opt("--target-depth", d.to_string());
+        }
+        // HiFi reads carry whole-read depth profiles: the gate keeps extension in the
+        // organelle, and the read depth caps what goes on to assembly without a genome size
+        // (Carex echinata, ungated: 686,022 "plastid" reads, 8.5 Gb, nine tenths nuclear, and
+        // 309 GB of memory in assembly until earlyoom ended it).
+        if cfg.read_type == ReadType::Hifi {
+            if cfg.gated_recruit {
+                argv = argv.arg("--extend-gate").arg("--bootstrap");
+            }
+            if let Some(d) = cfg.recruit_max_depth {
+                argv = argv.opt("--max-read-depth", d.to_string());
+            }
+            if let Some(b) = cfg.recruit_max_bases {
+                argv = argv.opt("--max-bases", b.to_string());
+            }
         }
         argv.run()?;
         files.insert(
             "recruitment".into(),
             path_str(&recruit_dir.join("recruit.json")),
         );
-        report = Some(read_json(&recruit_dir.join("recruit.json"))?);
+        let recruitment = read_json(&recruit_dir.join("recruit.json"))?;
+        for w in recruitment["warnings"].as_array().into_iter().flatten() {
+            log(&format!("recruitment warning: {}", w.as_str().unwrap_or_default()));
+        }
+        report = Some(recruitment);
     }
     let called = if by_depth {
         let called = called_clusters(cfg)?;
@@ -746,6 +894,7 @@ fn recruit_all(
             let mut seed_info = Map::new();
             let mut source = String::from("discovery");
             let mut seeded: Option<(PathBuf, u64, u64)> = None;
+            let mut recruitment = Value::Null;
             if let Some(report) = &report {
                 let seed_files = |o: &str| -> Vec<String> {
                     cfg.seeds
@@ -798,6 +947,12 @@ fn recruit_all(
                     o["kept_reads"].as_u64().unwrap_or(0),
                     o["kept_bases"].as_u64().unwrap_or(0),
                 ));
+                recruitment = recruitment_summary(
+                    report,
+                    index,
+                    organelle,
+                    cfg.gated_recruit && cfg.read_type == ReadType::Hifi,
+                );
             } else {
                 seed_info.insert("source".into(), "discover".into());
             }
@@ -864,6 +1019,7 @@ fn recruit_all(
                 kept: Some((n_reads, n_bases)),
                 seed_info: Value::Object(seed_info),
                 discovered: called.is_some(),
+                recruitment,
             })
         };
         out.insert(organelle, one());
@@ -1360,6 +1516,7 @@ fn assemble_organelle(
         "seed_database": recruited.seed_info,
         "recruited_reads": recruited.kept.map(|k| k.0),
         "recruited_bases": recruited.kept.map(|k| k.1),
+        "recruitment": recruited.recruitment,
         "k": ladder.result().k,
         "k_tried": ladder
             .tried
@@ -1574,6 +1731,7 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
                             kept: None,
                             seed_info: json!({"source": "none"}),
                             discovered: false,
+                            recruitment: Value::Null,
                         }),
                     )
                 })
@@ -1956,6 +2114,11 @@ mod tests {
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
+            // `ovasm run`'s defaults
+            auto_recruit_cache: true,
+            gated_recruit: true,
+            recruit_max_depth: Some(250.0),
+            recruit_max_bases: Some(1_500_000_000),
             read_context: None,
             single_seed: false,
             mode: Mode::Fast,
@@ -2052,8 +2215,17 @@ mod tests {
             assert!(is_rotation(&molecule(&d), genome), "{organelle}");
             let unified = fs::read_to_string(d.join("organelle.gfa")).unwrap();
             assert!(unified.contains("\nP\tdesktop#1#"), "a PanSN path");
+            // HiFi defaults: gated recruitment, below the read-depth cap (80x and 234x)
+            let r = &s["recruitment"];
+            assert_eq!(r["extend_gate"], json!(true), "{organelle}");
+            assert_eq!(r["bootstrap"], json!(true), "{organelle}");
+            assert_eq!(r["converged"], json!(true), "{organelle}");
+            assert_eq!(r["sampled_by"], Value::Null, "{organelle}");
+            assert!(r["read_depth"].as_f64().unwrap() < 250.0, "{organelle}");
         }
-        assert!(cfg.out.join("recruit/recruit.json").is_file());
+        let recruitment = read_json(&cfg.out.join("recruit/recruit.json")).unwrap();
+        assert!(recruitment["input_replay"].is_object(), "the reads were cached");
+        assert!(!cfg.out.join("recruit/input-cache").exists(), "and the cache removed");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2300,6 +2472,7 @@ mod tests {
             kept: None,
             seed_info: json!({"source": "discover"}),
             discovered: true,
+            recruitment: Value::Null,
         };
         let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new())
             .unwrap();
