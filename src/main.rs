@@ -283,6 +283,12 @@ struct RunArgs {
     /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
     #[arg(long, default_value_t = 1_000_000_000)]
     recruit_max_bases: u64,
+    /// Seed recruitment: most scanning passes (`ovasm recruit --iterations`). Default: 60 for
+    /// HiFi reads, whose gated recruitment grows a large mitochondrion by a few tens of kilobases
+    /// a pass (see pipeline::GATED_RECRUIT_PASSES); `recruit`'s own default otherwise. A target
+    /// stops as soon as it stops growing, so the limit only costs time where one is incomplete.
+    #[arg(long)]
+    recruit_iterations: Option<usize>,
     /// Checked complete original-read nuclear alignments (ovasm.whole-read-context.v1).
     #[arg(long)]
     read_context: Option<PathBuf>,
@@ -329,6 +335,9 @@ fn run(args: RunArgs) -> Result<()> {
     }
     if args.recruit_max_depth.is_nan() || args.recruit_max_depth < 0.0 {
         bail!("--recruit-max-depth must be 0 (no cap) or positive");
+    }
+    if args.recruit_iterations == Some(0) {
+        bail!("--recruit-iterations must be at least 1");
     }
     let single = match args.organelle {
         pipeline::OrganelleChoice::Mitochondrion => Some("mitochondrion"),
@@ -382,6 +391,7 @@ fn run(args: RunArgs) -> Result<()> {
         gated_recruit: !args.ungated_recruit,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
+        recruit_iterations: args.recruit_iterations,
         read_context: args.read_context,
         single_seed: args.single_seed,
         mode: args.mode,
