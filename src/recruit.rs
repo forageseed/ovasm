@@ -715,10 +715,6 @@ const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
 pub const EXTEND_CORE_FLOOR: f64 = 0.25;
 /// Fewest reads with a depth that set a target's core depth.
 const CORE_MIN_READS: usize = 20;
-/// A peak whose k-mers stand for less sequence than this is no nuclear genome's (the smallest
-/// land-plant nuclear genomes are ~60 Mb, mitochondria at most ~12 Mb): the gate's organelle
-/// threshold is then doubtful, and the run says so.
-const MIN_NUCLEAR_PEAK_BASES: u64 = 20_000_000;
 
 /// Most sequence a target named for an organelle can stand for (recruited bases over read
 /// depth) before its extension stops: four times the largest land-plant plastome (Pelargonium,
@@ -802,7 +798,8 @@ fn build_gate(
         gate.report.source,
         gate.report.seconds
     );
-    if gate.report.peak_window_bases < MIN_NUCLEAR_PEAK_BASES {
+    // the nuclear peak stands for no nuclear genome: the organelle threshold is doubtful
+    if gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME {
         warnings.push(format!(
             "the depth sketch's nuclear peak ({}x) stands for {:.1} Mb of sequence, too little \
              for a nuclear genome: the library may be too shallow for the nucleus to show, and \

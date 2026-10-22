@@ -184,7 +184,11 @@ fn features(
     threshold: u64,
     organelle_min: f64,
 ) -> Option<Features> {
-    let kmers: Vec<u64> = sampled(seq, p.k, threshold).collect();
+    features_of(&sampled(seq, p.k, threshold).collect::<Vec<u64>>(), sketch, organelle_min)
+}
+
+/// `features` of a read's sampled k-mers.
+fn features_of(kmers: &[u64], sketch: &Sketch, organelle_min: f64) -> Option<Features> {
     if kmers.is_empty() {
         return None;
     }
@@ -279,12 +283,126 @@ pub struct GateReport {
     pub sampled_kmers: usize,
     pub nuclear_peak_depth: u32,
     pub organelle_min_depth: f64,
-    /// Distinct sampled k-mers from half to twice the peak depth, times the sampling scale:
-    /// about the size of the genome the peak belongs to.
+    /// "reads" (`nuclear_read_depth`), or "kmers" where no read-depth peak stands for a nuclear
+    /// genome (the mode of the read-context k-mer histogram).
+    pub nuclear_source: &'static str,
+    /// Reads whose median depth could be judged (see `nuclear_read_depth`).
+    pub judged_reads: u64,
+    /// The genome size the peak stands for: the bases of the reads within half a log2 unit of it
+    /// over its depth (for "kmers", the peak's distinct k-mers times the sampling scale).
     pub peak_window_bases: u64,
-    /// The read-context histogram up to four times the peak: (count, distinct sampled k-mers).
-    pub histogram: Vec<(u32, u64)>,
+    /// The mode of the read-context k-mer histogram, the nuclear peak up to 0.2.1.
+    pub kmer_peak_depth: u32,
+    /// Judged reads per quarter-log2 bin of their median depth: (bin centre, reads).
+    pub read_depth_histogram: Vec<(f64, u64)>,
     pub seconds: f64,
+}
+
+/// Width of the read-depth bins, in log2 units: 19% of the depth, so a bin holds the same share of
+/// a Poisson-spread depth peak whatever its depth.
+const DEPTH_BIN: f64 = 0.25;
+/// Reads with a lower median depth are not judged: their recurrent k-mers are mostly at count 2,
+/// recurrent errors or sequence present once or twice.
+const MIN_JUDGED_DEPTH: u32 = 3;
+/// A depth peak whose reads stand for less sequence than this is no nuclear genome's (the smallest
+/// land-plant nuclear genomes are ~60 Mb, mitochondria at most ~12 Mb).
+pub const MIN_NUCLEAR_GENOME: u64 = 20_000_000;
+
+/// The nuclear depth and the genome size its reads stand for: of the `DEPTH_BIN` bins of the
+/// judged reads' median depths (each summed with its neighbours, to smooth), the fullest whose
+/// reads stand for `min_genome` (`MIN_NUCLEAR_GENOME`), as the median depth of the reads within
+/// two bins of it; none in a library too shallow for the nucleus to be judged (below 3x), or one of
+/// organelle reads alone. Also the binned histogram.
+///
+/// Reads, not k-mers. The k-mer estimate (the mode of `read_context_histogram`) counts distinct
+/// k-mers, and a few percent of shallow reads (contaminants, sequence at 1-3x) bring more distinct
+/// k-mers at count 2 than any single count of the nuclear peak holds: on the 2026-10-21 benchmark
+/// libraries 176,546 against at most 140,853 (Carex echinata, at 57x), 211,677 against 187,296
+/// (Medicago polymorpha) and 4.2 M against a peak spread over 15-30x (Lophophora williamsii). The
+/// peak came out at 2x, the organelle threshold at 6x, and about 62% of all Carex reads passed the
+/// gate. Most reads of a library are nuclear, so their depth mode is the nuclear depth however few
+/// distinct k-mers it has; integer bins would favour the shallow end, where a Poisson peak is
+/// narrow (Lophophora: 186,439 reads at median 2, 85-90 thousand at each of 19-24x). The read
+/// estimate gives 61x for Carex, 55x for Medicago, 22x for Lophophora and 87x for Nipponbare,
+/// where the k-mer estimate was right (84x).
+fn nuclear_read_depth(
+    medians: &FxHashMap<u32, (u64, u64)>,
+    min_genome: u64,
+) -> (Option<(u32, u64)>, Vec<(f64, u64)>) {
+    let bin = |d: u32| ((d as f64).log2() / DEPTH_BIN).floor() as i64;
+    let mut bins: FxHashMap<i64, u64> = FxHashMap::default();
+    for (&d, &(reads, _)) in medians.iter().filter(|(&d, _)| d >= MIN_JUDGED_DEPTH) {
+        *bins.entry(bin(d)).or_insert(0) += reads;
+    }
+    let mut histogram: Vec<(f64, u64)> = bins
+        .iter()
+        .map(|(&b, &n)| (2f64.powf((b as f64 + 0.5) * DEPTH_BIN), n))
+        .collect();
+    histogram.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let raw = |b: i64| bins.get(&b).copied().unwrap_or(0);
+    let mut fullest: Vec<i64> = bins.keys().copied().collect();
+    fullest.sort_by_key(|&b| {
+        std::cmp::Reverse((raw(b - 1) + raw(b) + raw(b + 1), raw(b), std::cmp::Reverse(b)))
+    });
+    for peak in fullest {
+        let mut window: Vec<(u32, u64, u64)> = medians
+            .iter()
+            .filter(|(&d, _)| d >= MIN_JUDGED_DEPTH && (bin(d) - peak).abs() <= 2)
+            .map(|(&d, &(reads, bases))| (d, reads, bases))
+            .collect();
+        window.sort_unstable();
+        let total: u64 = window.iter().map(|w| w.1).sum();
+        let (mut seen, mut depth) = (0, window[0].0);
+        for &(d, reads, _) in &window {
+            seen += reads;
+            depth = d;
+            if 2 * seen >= total {
+                break;
+            }
+        }
+        let size = window.iter().map(|w| w.2).sum::<u64>() / u64::from(depth);
+        if size >= min_genome {
+            return (Some((depth, size)), histogram);
+        }
+    }
+    (None, histogram)
+}
+
+/// One pass for the nuclear depth: the read-context k-mer histogram (the estimate up to 0.2.1,
+/// kept for the report), and the reads and bases at each integer median depth among the reads
+/// that can be judged (`min_sampled` sampled k-mers).
+type NuclearPass = (FxHashMap<u32, u64>, FxHashMap<u32, (u64, u64)>);
+
+fn nuclear_pass(batches: Batches, sketch: &Sketch, p: &DiscoverParams, threshold: u64) -> Result<NuclearPass> {
+    let (rx, reader) = batches;
+    let mut supported = rustc_hash::FxHashSet::default();
+    let mut medians: FxHashMap<u32, (u64, u64)> = FxHashMap::default();
+    for batch in rx.iter() {
+        let per_read: Vec<(Vec<u64>, Option<u32>, u64)> = batch
+            .par_iter()
+            .map(|r| {
+                let keys: Vec<u64> = sampled(&r.seq, p.k, threshold).collect();
+                let median = features_of(&keys, sketch, 0.0)
+                    .filter(|f| f.sampled >= p.min_sampled)
+                    .map(|f| f.median as u32);
+                (context_supported_keys(keys, &sketch.counts), median, r.seq.len() as u64)
+            })
+            .collect();
+        for (keys, median, len) in per_read {
+            supported.extend(keys);
+            if let Some(m) = median {
+                let e = medians.entry(m).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += len;
+            }
+        }
+    }
+    reader.join().expect("reader thread panicked")?;
+    let mut histogram = FxHashMap::default();
+    for key in supported {
+        *histogram.entry(sketch.counts[&key]).or_insert(0) += 1;
+    }
+    Ok((histogram, medians))
 }
 
 /// The gate's view of one read.
@@ -304,6 +422,14 @@ impl DepthGate {
 
     /// `long_reads` over the batches `source` gives; it is called once per sketch pass.
     pub fn long_reads_from(source: impl Fn() -> Batches, label: &'static str) -> Result<Self> {
+        Self::long_reads_with(source, label, MIN_NUCLEAR_GENOME)
+    }
+
+    fn long_reads_with(
+        source: impl Fn() -> Batches,
+        label: &'static str,
+        min_genome: u64,
+    ) -> Result<Self> {
         let start = Instant::now();
         let params = DiscoverParams {
             k: 21,
@@ -321,28 +447,34 @@ impl DepthGate {
         };
         let threshold = u64::MAX / params.scale;
         let sketch = build_sketch(source(), &params, threshold)?;
-        let histogram = read_context_histogram(source(), &sketch, &params, threshold)?;
-        let nuclear = histogram_peak(&histogram);
+        let (kmers, medians) = nuclear_pass(source(), &sketch, &params, threshold)?;
+        let kmer_peak = histogram_peak(&kmers);
+        let (by_reads, read_depth_histogram) = nuclear_read_depth(&medians, min_genome);
+        // No judged depth peak stands for a nuclear genome: the nucleus is below 3x (the k-mer
+        // estimate is then right), or the reads are organelle reads only.
+        let (nuclear, window_bases, nuclear_source) = match by_reads {
+            Some((depth, size)) => (depth, size, "reads"),
+            None => {
+                let window: u64 = kmers
+                    .iter()
+                    .filter(|&(&c, _)| 2 * c >= kmer_peak && c <= 2 * kmer_peak)
+                    .map(|(_, &n)| n)
+                    .sum();
+                (kmer_peak, window * params.scale, "kmers")
+            }
+        };
         let organelle_min = nuclear as f64 * params.depth_fold;
-        let mut shown: Vec<(u32, u64)> = histogram
-            .iter()
-            .filter(|&(&c, _)| c <= nuclear.saturating_mul(4))
-            .map(|(&c, &n)| (c, n))
-            .collect();
-        shown.sort_unstable();
-        let window: u64 = histogram
-            .iter()
-            .filter(|&(&c, _)| 2 * c >= nuclear && c <= 2 * nuclear)
-            .map(|(_, &n)| n)
-            .sum();
         let report = GateReport {
             source: label,
             sketch_bases: sketch.bases,
             sampled_kmers: sketch.counts.len(),
             nuclear_peak_depth: nuclear,
             organelle_min_depth: organelle_min,
-            peak_window_bases: window * params.scale,
-            histogram: shown,
+            nuclear_source,
+            judged_reads: read_depth_histogram.iter().map(|h| h.1).sum(),
+            peak_window_bases: window_bases,
+            kmer_peak_depth: kmer_peak,
+            read_depth_histogram,
             seconds: start.elapsed().as_secs_f64(),
         };
         Ok(Self {
@@ -649,6 +781,80 @@ mod tests {
         let shallow = context_supported_keys((100..400).collect(), &counts);
         assert_eq!(shallow.len(), 300);
         assert!(context_supported_keys(Vec::new(), &counts).is_empty());
+    }
+
+    #[test]
+    fn the_nuclear_depth_is_the_mode_of_read_depths_in_log_bins() {
+        // As in Lophophora williamsii: shallow reads at 2-3x, more of them than at any single
+        // depth of a broad nuclear peak at 15-30x, and the organelles far deeper.
+        let mut medians: FxHashMap<u32, (u64, u64)> = FxHashMap::default();
+        medians.insert(2, (186_000, 186_000 * 12_000));
+        medians.insert(3, (91_000, 91_000 * 12_000));
+        for d in 15..=30u32 {
+            let n = 85_000 - 3_000 * u64::from(d.abs_diff(22));
+            medians.insert(d, (n, n * 12_000));
+        }
+        medians.insert(114, (6_700, 6_700 * 12_000));
+        medians.insert(442, (10_000, 10_000 * 12_000));
+        let (found, histogram) = nuclear_read_depth(&medians, MIN_NUCLEAR_GENOME);
+        let (depth, size) = found.unwrap();
+        assert_eq!(depth, 22);
+        // the window's reads over that depth: a genome of hundreds of megabases
+        assert!(size > 500_000_000, "{size}");
+        assert!(histogram.iter().all(|&(centre, _)| centre >= 3.0));
+        // nothing judged, or organelle reads alone (a 20 kb plastid at 300x): no nuclear peak
+        let none = |m: &[(u32, (u64, u64))]| {
+            nuclear_read_depth(&FxHashMap::from_iter(m.iter().copied()), MIN_NUCLEAR_GENOME).0
+        };
+        assert_eq!(none(&[(2, (10, 10))]), None);
+        assert_eq!(none(&[(300, (2000, 2000 * 3000)), (100, (400, 400 * 3000))]), None);
+    }
+
+    #[test]
+    fn shallow_reads_no_longer_make_the_nuclear_peak() {
+        // A 300 kb nuclear genome at 20x beside 3 Mb of a contaminant at 2x: the contaminant holds
+        // ten times the distinct k-mers, all at count 2, and so the read-context k-mer peak; the
+        // reads are mostly nuclear.
+        let genome = |n: usize, seed: u64| -> Vec<u8> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"ACGT"[(x % 4) as usize]
+                })
+                .collect()
+        };
+        let (nuclear, other) = (genome(300_000, 5), genome(3_000_000, 6));
+        let mut text = String::new();
+        for (tag, g, step) in [("n", &nuclear, 150), ("c", &other, 1500)] {
+            for (i, st) in (0..g.len() - 3000).step_by(step).enumerate() {
+                text.push_str(&format!(">{tag}{i}\n{}\n", std::str::from_utf8(&g[st..st + 3000]).unwrap()));
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ovasm-gate-depth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, text).unwrap();
+        // a 300 kb genome stands in for a nuclear one here
+        let gate = DepthGate::long_reads_with(|| read_batches(&[fa.clone()]), "inputs", 200_000)
+            .unwrap();
+        assert_eq!(gate.report.kmer_peak_depth, 2, "the k-mer estimate");
+        assert_eq!(gate.report.nuclear_source, "reads");
+        assert!(
+            (17..=21).contains(&gate.nuclear_peak_depth),
+            "{}",
+            gate.nuclear_peak_depth
+        );
+        assert!(gate.organelle_min_depth >= 51.0);
+        // at the real size floor the 300 kb genome is no nucleus, and the k-mer estimate stands
+        let small = DepthGate::long_reads(&[fa]).unwrap();
+        assert_eq!(
+            (small.nuclear_peak_depth, small.report.nuclear_source),
+            (2, "kmers")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
