@@ -1377,7 +1377,9 @@ struct RecruitArgs {
     /// New reads of a target are subsampled to this depth before bait extension.
     #[arg(long, default_value_t = 200.0)]
     extend_depth: f64,
-    /// Stop extending a target whose recruited reads grew by less than this fraction.
+    /// Stop extending a target whose recruited reads grew by less than this fraction (with
+    /// --extend-gate, unless they grew by at least half as much as in the pass before: a large
+    /// genome grows by about as many reads every pass, a smaller share each time).
     #[arg(long, default_value_t = 0.05)]
     saturation: f64,
     /// Downsample each target to about this depth (recruited bases / seed length).

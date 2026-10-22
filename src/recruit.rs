@@ -255,6 +255,15 @@ fn sample_depth(gate: &DepthGate, sample: &Sample) -> (Option<f64>, usize) {
 /// depth leaves them out (`target_depth`), and so does its extension (`run`).
 const HIGH_COPY_FOLD: f64 = 10.0;
 
+/// With the gate, a target that gained at least this share of the reads it gained the pass before
+/// is still extending along its edges, not saturating, however small that is beside what it has:
+/// a pass extends the bait by about a tenth of a read length past each edge, so a large genome
+/// grows by about as many reads every pass. The Lophophora williamsii mitochondrion (2.2 Mb by
+/// whole-library HiMT) gained 250-330 reads a pass and the 5% rule stopped it at pass 23, at
+/// 418 kb. A target converging gains less every pass: on the four benchmark libraries every other
+/// target stopped at the same pass with this rule as without it.
+const STEADY_GROWTH: f64 = 0.5;
+
 /// A target's depth from its reads' (sketch depth, length): their median, unless that is more
 /// than `HIGH_COPY_FOLD` times the depth most of the target's sequence has, which is then taken.
 /// A read stands for its length over its depth, so the reads of a high-copy repeat stand for
@@ -934,6 +943,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         .map(|t| t.from_reads.then_some("seeded_from_reads"))
         .collect();
     let mut previous = vec![0u64; n_targets];
+    // Reads each target gained in the last pass (`STEADY_GROWTH`).
+    let mut last_growth = vec![0u64; n_targets];
     // Depth sketch, built after the first pass when the gate or the downsampling needs it, or
     // the first time a target needs bootstrapping.
     let mut gate: Option<DepthGate> = None;
@@ -1029,14 +1040,17 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // ends when its bait stops growing, not by `saturation`.
                 let recount = !boot_used[t].is_empty();
                 let now = res.recruited[t].reads;
+                let grown = now.saturating_sub(previous[t]);
+                let steady = cfg.extend_gate && grown as f64 >= STEADY_GROWTH * last_growth[t] as f64;
                 if !recount
                     && previous[t] > 0
-                    && (now.saturating_sub(previous[t]) as f64)
-                        < cfg.saturation * previous[t] as f64
+                    && (grown as f64) < cfg.saturation * previous[t] as f64
+                    && !steady
                 {
                     saturated[t] = true;
                     stopped[t] = Some("saturated");
                 }
+                last_growth[t] = grown;
                 previous[t] = now;
                 if saturated[t] {
                     continue;
@@ -2143,6 +2157,38 @@ mod tests {
         let core = gated.core_depth[0].unwrap();
         assert!((core - 119.0).abs() < 5.0, "core depth {core}");
         assert!(gated.iterations[0].extension_deep_out[0] > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gated_target_growing_steadily_is_not_saturated() {
+        // A 24 kb mitochondrion at 120x seeded with 4 kb of itself grows by the same 32 reads
+        // every pass, a smaller share each time: under a 20% saturation the ungated target stops
+        // after a few passes; the gated one keeps going until it closes the circle. (The first
+        // pass's reads count as its growth, so a close seed still stops at its second pass.)
+        let mito = pseudo_random(24_000, 9);
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-steady-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, circle_reads(&mito, 25, "m") + &linear_reads(&nuclear, 600, "n")).unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &mito[..4000]);
+        let config = |name: &str, gate: bool| {
+            let mut c = test_config(&fa, dir.join(name), 40, gate);
+            c.saturation = 0.2;
+            c
+        };
+        let plain = run(bait.clone(), config("plain", false)).unwrap();
+        let gated = run(bait, config("gated", true)).unwrap();
+        let mito_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'm');
+        assert_eq!(plain.outputs[0].stop_reason, "saturated");
+        assert!(mito_reads(&plain) < 480, "{}", mito_reads(&plain));
+        assert_eq!(mito_reads(&gated), 960);
+        assert!(gated.outputs[0].converged);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
