@@ -120,6 +120,9 @@ pub struct RunConfig {
     /// HiFi seed recruitment: `recruit --max-read-depth` and `--max-bases`.
     pub recruit_max_depth: Option<f64>,
     pub recruit_max_bases: Option<u64>,
+    /// Seed recruitment: `recruit --iterations` (None: `GATED_RECRUIT_PASSES` for gated HiFi
+    /// recruitment, else `recruit`'s default).
+    pub recruit_iterations: Option<usize>,
     pub read_context: Option<PathBuf>,
     /// Recruit one organelle without seeding the other.
     pub single_seed: bool,
@@ -794,6 +797,13 @@ fn other_organelle(organelle: &str) -> &'static str {
     }
 }
 
+/// Most passes of the gated HiFi recruitment. A read joins a target only when its bait covers
+/// 80% of the read, so a pass extends the bait by at most a fifth of a read length past its edges
+/// (about a tenth, with extension's k-mer floor), and a large mitochondrion grows linearly: Carex
+/// echinata's (1.33 Mb, whole-library PMAT2 and HiMT) stood at 830 kb after 20 passes, 27 kb a
+/// pass, still growing. A target stops as soon as it stops growing.
+pub const GATED_RECRUIT_PASSES: usize = 60;
+
 /// Recruit the reads of every requested organelle from whole-genome reads: one `recruit` pass
 /// for all seeded organelles and one `discover` + `panel` for all, whichever are asked for.
 /// Per organelle, the reads or why there are none.
@@ -860,6 +870,13 @@ fn recruit_all(
             if let Some(b) = cfg.recruit_max_bases {
                 argv = argv.opt("--max-bases", b.to_string());
             }
+        }
+        let gated = cfg.read_type == ReadType::Hifi && cfg.gated_recruit;
+        if let Some(n) = cfg
+            .recruit_iterations
+            .or(gated.then_some(GATED_RECRUIT_PASSES))
+        {
+            argv = argv.opt("--iterations", n.to_string());
         }
         argv.run()?;
         files.insert(
@@ -2120,6 +2137,7 @@ mod tests {
             gated_recruit: true,
             recruit_max_depth: Some(250.0),
             recruit_max_bases: Some(1_000_000_000),
+            recruit_iterations: None,
             read_context: None,
             single_seed: false,
             mode: Mode::Fast,
@@ -2227,6 +2245,8 @@ mod tests {
         let recruitment = read_json(&cfg.out.join("recruit/recruit.json")).unwrap();
         assert!(recruitment["input_replay"].is_object(), "the reads were cached");
         assert!(!cfg.out.join("recruit/input-cache").exists(), "and the cache removed");
+        assert_eq!(recruitment["iterations_requested"], json!(GATED_RECRUIT_PASSES));
+        assert!(recruitment["iterations_run"].as_u64().unwrap() < 10, "both stopped growing");
         fs::remove_dir_all(&dir).ok();
     }
 

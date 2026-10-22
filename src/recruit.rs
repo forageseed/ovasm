@@ -1164,7 +1164,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             );
             warnings.push(format!(
                 "{}: still growing after the last of {} passes ({} reads, +{:.1}% in the last \
-                 pass): it may be incomplete; more --iterations would extend it further",
+                 pass): it may be incomplete; more passes would extend it further \
+                 (--iterations; `run --recruit-iterations`)",
                 bait.targets[t].name,
                 n,
                 b,

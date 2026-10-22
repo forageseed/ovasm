@@ -906,6 +906,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             gated_recruit: false,
             recruit_max_depth: None,
             recruit_max_bases: None,
+            recruit_iterations: None,
             read_context: None,
             single_seed: false,
             mode: pipeline::Mode::Fast,
