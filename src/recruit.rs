@@ -176,8 +176,10 @@ pub struct IterationStats {
     /// Organelle-like reads left out of each target's extension for being shallower than
     /// `EXTEND_CORE_FLOOR` of its core depth (`extend_gate`).
     pub extension_shallow_out: Vec<u64>,
-    /// Median sketch depth of each target's reads of this pass (a sample of `DEPTH_SAMPLE`),
-    /// when the depth sketch exists.
+    /// And for being deeper than `HIGH_COPY_FOLD` times its core depth: a high-copy repeat.
+    pub extension_deep_out: Vec<u64>,
+    /// Sketch depth of each target's reads of this pass (`target_depth` of a sample of
+    /// `DEPTH_SAMPLE`), when the depth sketch exists.
     pub read_depth: Vec<Option<f64>>,
     /// The same for the reads new to the target in this pass.
     pub fresh_read_depth: Vec<Option<f64>>,
@@ -235,18 +237,51 @@ impl Sample {
     }
 }
 
-/// Median sketch depth of the sampled reads and how many had one.
+/// Sketch depth of the sampled reads (`target_depth`) and how many had one.
 fn sample_depth(gate: &DepthGate, sample: &Sample) -> (Option<f64>, usize) {
-    let mut depths: Vec<f64> = sample
+    let mut reads: Vec<(f64, usize)> = sample
         .reads()
         .into_par_iter()
-        .filter_map(|s| gate.median_depth(s))
+        .filter_map(|s| gate.median_depth(s).map(|d| (d, s.len())))
         .collect();
-    if depths.is_empty() {
+    if reads.is_empty() {
         return (None, 0);
     }
-    depths.sort_by(f64::total_cmp);
-    (Some(depths[depths.len() / 2]), depths.len())
+    let n = reads.len();
+    (Some(target_depth(&mut reads, gate.organelle_min_depth)), n)
+}
+
+/// Reads this many times deeper than a target's own are a high-copy repeat, not the target: its
+/// depth leaves them out (`target_depth`), and so does its extension (`run`).
+const HIGH_COPY_FOLD: f64 = 10.0;
+
+/// A target's depth from its reads' (sketch depth, length): their median, unless that is more
+/// than `HIGH_COPY_FOLD` times the depth most of the target's sequence has, which is then taken.
+/// A read stands for its length over its depth, so the reads of a high-copy repeat stand for
+/// almost none: the first pass of the Lophophora williamsii plastid recruited 2,899 reads, most of
+/// them a repeat at ~700,000x beside the plastid's own at ~440x; their median gave a 24 bp
+/// "genome", extension took one read in 3,000 (none) and the output kept one read of 3,199 bp.
+/// The sequence's depth is the span-weighted median of the organelle-deep reads (from
+/// `organelle_min`), not of all: shallow reads stand for much sequence each. A mitochondrion with
+/// plastid-deep reads among its own keeps its median (Medicago polymorpha: 3,212x, its sequence at
+/// 1,045x), as does a plastid with its inverted repeat.
+fn target_depth(reads: &mut [(f64, usize)], organelle_min: f64) -> f64 {
+    reads.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let median = reads[reads.len() / 2].0;
+    let deep: Vec<(f64, f64)> = reads
+        .iter()
+        .filter(|r| r.0 > 0.0 && r.0 >= organelle_min)
+        .map(|&(d, len)| (d, len as f64 / d))
+        .collect();
+    let total: f64 = deep.iter().map(|r| r.1).sum();
+    let mut acc = 0.0;
+    for &(d, span) in &deep {
+        acc += span;
+        if 2.0 * acc >= total {
+            return if median > HIGH_COPY_FOLD * d { d } else { median };
+        }
+    }
+    median
 }
 
 /// Which of a target's recruited reads a pass writes to its pass file.
@@ -684,8 +719,8 @@ pub struct RecruitConfig {
     /// 100% organelle-like. Long reads only.
     ///
     /// The gate also keeps out reads much shallower than the target's own (`EXTEND_CORE_FLOOR`)
-    /// and stops a target whose reads stand for more sequence than any such genome has
-    /// (`size_cap`).
+    /// or far deeper (`HIGH_COPY_FOLD`), and stops a target whose reads stand for more sequence
+    /// than any such genome has (`size_cap`).
     pub extend_gate: bool,
     /// Downsample each target's output to about this read depth: the median sketch depth of
     /// its reads, so the recruited bases over it are the genome size they stand for. Long reads
@@ -980,6 +1015,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let mut extended_from = vec![0u64; n_targets];
         let mut gated_out = vec![0u64; n_targets];
         let mut shallow_out = vec![0u64; n_targets];
+        let mut deep_out = vec![0u64; n_targets];
         if !last {
             for t in 0..n_targets {
                 if saturated[t] {
@@ -1028,6 +1064,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 };
                 let extend_gate = gate.as_ref().filter(|_| cfg.extend_gate);
                 let floor = core_depth[t].map(|c| EXTEND_CORE_FLOOR * c);
+                let ceiling = core_depth[t].map(|c| HIGH_COPY_FOLD * c);
                 let (mut fresh, mut picked) = (Vec::new(), Vec::<Vec<u8>>::new());
                 for_each_rec(&path, |r| {
                     let key = name_key(&r.id);
@@ -1043,6 +1080,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         Some(Some(d)) if d.organelle_like => {
                             if floor.is_some_and(|f| d.median < f) {
                                 shallow_out[t] += 1;
+                            } else if ceiling.is_some_and(|c| d.median > c) {
+                                deep_out[t] += 1;
                             } else {
                                 picked.push(r.seq);
                             }
@@ -1132,6 +1171,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             bootstrapped_from_reads: bootstrapped,
             extension_gated_out: gated_out,
             extension_shallow_out: shallow_out,
+            extension_deep_out: deep_out,
             read_depth: depths.read,
             fresh_read_depth: depths.fresh,
             implied_size: depths.implied_size,
@@ -2071,6 +2111,68 @@ mod tests {
         assert_eq!(first.extension_shallow_out[0], stray as u64);
         assert!(gated.outputs[0].converged);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_keeps_extension_off_a_high_copy_repeat_far_deeper_than_the_target() {
+        // A 12 kb mitochondrion at 120x seeded with 3 kb of a 6 kb repeat at 1,500x, beside a
+        // nuclear genome at 5x. The first pass recruits more repeat reads than mitochondrial
+        // ones, yet the target's depth is the mitochondrion's (`target_depth`), and the repeat,
+        // over ten times deeper, does not extend it.
+        let mito = pseudo_random(12_000, 7);
+        let repeat = pseudo_random(6_000, 43);
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        let text = circle_reads(&mito, 25, "m")
+            + &linear_reads(&repeat, 2, "r")
+            + &linear_reads(&nuclear, 600, "n");
+        std::fs::write(&fa, text).unwrap();
+        let mut bait = bait_from(&mito, 21);
+        bait.add_sequence(0, &repeat[1500..4500]);
+        let plain = run(bait.clone(), test_config(&fa, dir.join("plain"), 30, false)).unwrap();
+        let gated = run(bait, test_config(&fa, dir.join("gated"), 30, true)).unwrap();
+        let repeat_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'r');
+        // the repeat's reads that the seeded stretch covers by 80%: starts 900 to 2100
+        let seeded = (0..3000).step_by(2).filter(|&st| (900..=2100).contains(&st)).count();
+        assert_eq!(repeat_reads(&plain), 1500, "ungated, extension walks the whole repeat");
+        assert_eq!(repeat_reads(&gated), seeded);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'm'), 480);
+        let core = gated.core_depth[0].unwrap();
+        assert!((core - 119.0).abs() < 5.0, "core depth {core}");
+        assert!(gated.iterations[0].extension_deep_out[0] > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_high_copy_repeat_does_not_set_a_targets_depth() {
+        // the first pass of the Lophophora williamsii plastid: most reads a repeat at ~700,000x,
+        // the plastid's own at ~440x, some nuclear reads at 22x below the organelle threshold
+        let mut reads: Vec<(f64, usize)> = (0..1800)
+            .map(|i| (650_000.0 + 100.0 * i as f64, 10_000))
+            .collect();
+        reads.extend((0..900).map(|i| (400.0 + (i % 80) as f64, 10_000)));
+        reads.extend((0..100).map(|_| (22.0, 10_000)));
+        let d = target_depth(&mut reads, 66.0);
+        assert!((400.0..480.0).contains(&d), "{d}");
+        // a mitochondrion with plastid-deep reads among its own keeps its median, as Medicago
+        // polymorpha's did (3,212x, its sequence at 1,045x)
+        let mut mito: Vec<(f64, usize)> = (0..2000)
+            .map(|i| (900.0 + (i % 200) as f64, 10_000))
+            .collect();
+        mito.extend((0..2500).map(|i| (2_000.0 + 11.2 * i as f64, 10_000)));
+        let mut sorted = mito.clone();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let median = sorted[sorted.len() / 2].0;
+        assert!(median > 4.0 * 1100.0, "{median}");
+        assert_eq!(target_depth(&mut mito, 165.0), median);
+        // no organelle-deep read: the median
+        assert_eq!(
+            target_depth(&mut [(20.0, 5000), (22.0, 5000), (25.0, 5000)], 66.0),
+            22.0
+        );
     }
 
     #[test]
