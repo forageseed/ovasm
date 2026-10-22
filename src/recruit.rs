@@ -173,16 +173,91 @@ pub struct IterationStats {
     pub bootstrapped_from_reads: Vec<u64>,
     /// Reads left out of each target's extension by the depth gate (`extend_gate`).
     pub extension_gated_out: Vec<u64>,
+    /// Organelle-like reads left out of each target's extension for being shallower than
+    /// `EXTEND_CORE_FLOOR` of its core depth (`extend_gate`).
+    pub extension_shallow_out: Vec<u64>,
+    /// Median sketch depth of each target's reads of this pass (a sample of `DEPTH_SAMPLE`),
+    /// when the depth sketch exists.
+    pub read_depth: Vec<Option<f64>>,
+    /// The same for the reads new to the target in this pass.
+    pub fresh_read_depth: Vec<Option<f64>>,
+    /// Recruited bases over the read depth: the genome size the target's reads stand for.
+    pub implied_size: Vec<Option<u64>>,
 }
 
 /// Counts of one pass; its recruited reads went to the pass files (see `scan`).
 struct ScanResult {
     recruited: Vec<TargetCounts>,
+    /// Recruited reads not yet used to extend the target (`used` in `run`).
+    fresh: Vec<TargetCounts>,
+    /// Depth samples of each target's reads: all of them, and the fresh ones.
+    all_sample: Vec<Sample>,
+    fresh_sample: Vec<Sample>,
     numt: TargetCounts,
     reads: u64,
     bases: u64,
     multi_target: u64,
     reclassified: u64,
+}
+
+/// Reads per depth estimate. A median of 2,000 read depths is within a few percent, and the
+/// sample costs one pass's memory for about 2,000 reads per target.
+const DEPTH_SAMPLE: usize = 2000;
+
+/// The `DEPTH_SAMPLE` reads with the smallest name hashes among those offered: the same reads
+/// whatever the input order, in memory for 2 x `DEPTH_SAMPLE` reads at most.
+#[derive(Default)]
+struct Sample {
+    kept: Vec<(u64, Vec<u8>)>,
+    /// Hashes from here on cannot be among the smallest any more.
+    bound: Option<u64>,
+}
+
+impl Sample {
+    fn offer(&mut self, key: u64, seq: &[u8]) {
+        if self.bound.is_some_and(|b| key >= b) {
+            return;
+        }
+        self.kept.push((key, seq.to_vec()));
+        if self.kept.len() == 2 * DEPTH_SAMPLE {
+            self.kept.select_nth_unstable_by_key(DEPTH_SAMPLE, |&(k, _)| k);
+            self.bound = Some(self.kept[DEPTH_SAMPLE].0);
+            self.kept.truncate(DEPTH_SAMPLE);
+        }
+    }
+
+    /// The sampled reads, smallest hash first.
+    fn reads(&self) -> Vec<&[u8]> {
+        let mut kept: Vec<&(u64, Vec<u8>)> = self.kept.iter().collect();
+        kept.sort_unstable_by_key(|&&(k, _)| k);
+        kept.truncate(DEPTH_SAMPLE);
+        kept.into_iter().map(|(_, s)| s.as_slice()).collect()
+    }
+}
+
+/// Median sketch depth of the sampled reads and how many had one.
+fn sample_depth(gate: &DepthGate, sample: &Sample) -> (Option<f64>, usize) {
+    let mut depths: Vec<f64> = sample
+        .reads()
+        .into_par_iter()
+        .filter_map(|s| gate.median_depth(s))
+        .collect();
+    if depths.is_empty() {
+        return (None, 0);
+    }
+    depths.sort_by(f64::total_cmp);
+    (Some(depths[depths.len() / 2]), depths.len())
+}
+
+/// Which of a target's recruited reads a pass writes to its pass file.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Keep {
+    /// None: the target no longer extends.
+    Nothing,
+    /// The reads new to it, the only ones extension reads.
+    Fresh,
+    /// All of them (a bootstrapped target recounts all its reads every pass).
+    All,
 }
 
 /// A target's recruited reads of the current pass, in input order.
@@ -291,6 +366,21 @@ fn read_file(path: &Path, tx: &crossbeam_channel::Sender<Vec<Rec>>) -> Result<()
     Ok(())
 }
 
+/// What a pass writes besides its counts and depth samples.
+struct Writes<'a> {
+    out_dir: &'a Path,
+    numt_path: &'a Path,
+    /// Reads already used to extend each target: the others are fresh.
+    used: &'a [FxHashSet<u64>],
+    /// `None`: every recruited read and every NUMT candidate, as a pass whose files may be the
+    /// last. A replayed pass is never the last (one original-input pass follows for the
+    /// qualities), so it writes per target only what extension reads, and no NUMT candidates:
+    /// the cache gives those when a bootstrap needs them. A deep plastid saturates early and
+    /// its gigabases are then no longer rewritten every pass, nor are the NUMT candidates
+    /// (Nipponbare: 3 Gb a pass).
+    keep: Option<&'a [Keep]>,
+}
+
 /// One pass over the inputs. Recruited reads are written, in input order, to each target's
 /// pass file and NUMT candidates to `numt_path`, not kept: a plastid at 20,000x recruits
 /// gigabases (Col-0 HiFi: 3.2 Gb, 14 GB of memory when held), more than a laptop has.
@@ -298,12 +388,12 @@ fn scan(
     inputs: &[PathBuf],
     bait: &BaitSet,
     p: &ClassifyParams,
-    out_dir: &Path,
-    numt_path: &Path,
+    w: &Writes,
     mut replay: Option<&mut crate::replay::Replay>,
     delta: Option<&BaitSet>,
     final_outputs: bool,
 ) -> Result<ScanResult> {
+    let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
     let (rx, reader) = if replaying && !final_outputs {
         replay.as_ref().unwrap().batches()
@@ -326,8 +416,12 @@ fn scan(
     } else {
         None
     };
+    let n_targets = bait.targets.len();
     let mut out = ScanResult {
-        recruited: vec![TargetCounts::default(); bait.targets.len()],
+        recruited: vec![TargetCounts::default(); n_targets],
+        fresh: vec![TargetCounts::default(); n_targets],
+        all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
+        fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         numt: TargetCounts::default(),
         reads: 0,
         bases: 0,
@@ -403,14 +497,31 @@ fn scan(
                     if mask.count_ones() > 1 {
                         out.multi_target += 1;
                     }
+                    let key = name_key(&rec.id);
                     for t in (0..8).filter(|t| mask & (1 << t) != 0) {
-                        write_rec(&mut writers[t], &rec)?;
+                        let fresh = !w.used[t].contains(&key);
+                        let write = match w.keep.map(|k| k[t]) {
+                            None | Some(Keep::All) => true,
+                            Some(Keep::Fresh) => fresh,
+                            Some(Keep::Nothing) => false,
+                        };
+                        if write {
+                            write_rec(&mut writers[t], &rec)?;
+                        }
                         out.recruited[t].reads += 1;
                         out.recruited[t].bases += len;
+                        out.all_sample[t].offer(key, &rec.seq);
+                        if fresh {
+                            out.fresh[t].reads += 1;
+                            out.fresh[t].bases += len;
+                            out.fresh_sample[t].offer(key, &rec.seq);
+                        }
                     }
                 }
                 Call::NumtCandidate(_) => {
-                    write_rec(&mut numt_w, &rec)?;
+                    if w.keep.is_none() {
+                        write_rec(&mut numt_w, &rec)?;
+                    }
                     out.numt.reads += 1;
                     out.numt.bases += len;
                 }
@@ -489,7 +600,20 @@ pub struct TargetOutput {
     pub seed_length: u64,
     /// recruited bases / seed length; approximate when seeds come from a related species.
     pub estimated_depth: f64,
+    /// Median sketch depth of the recruited reads (with the depth sketch): the organelle's
+    /// read depth, whatever the seeds.
+    pub read_depth: Option<f64>,
+    /// Recruited bases / read depth: the genome size the reads stand for.
+    pub implied_size: Option<u64>,
+    /// Why the target stopped extending: seeded_from_reads, saturated (grew by less than
+    /// --saturation), bait_complete (extension added nothing), size_cap (stood for more than
+    /// `size_cap`), iteration_limit (still growing when the passes ran out) or single_pass.
+    pub stop_reason: &'static str,
+    /// False for iteration_limit and size_cap: the reads may be incomplete or hold others.
+    pub converged: bool,
     pub sampling_fraction: f64,
+    /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
+    pub sampled_by: Option<&'static str>,
     pub kept_reads: u64,
     pub kept_bases: u64,
     pub output: String,
@@ -510,6 +634,8 @@ pub struct RecruitReport {
     pub extend_depth: f64,
     pub saturation: f64,
     pub target_depth: Option<f64>,
+    pub max_read_depth: Option<f64>,
+    pub max_bases: Option<u64>,
     pub salt: u64,
     pub inputs: Vec<String>,
     pub targets: Vec<crate::bait::Target>,
@@ -523,6 +649,12 @@ pub struct RecruitReport {
     /// Depth sketch of the bootstrap or extension gate, when one was built.
     pub bootstrap_nuclear_peak_depth: Option<u32>,
     pub bootstrap_organelle_min_depth: Option<f64>,
+    pub depth_gate: Option<crate::seedfree::GateReport>,
+    /// Each target's core depth (see `EXTEND_CORE_FLOOR`), once set.
+    pub core_depth: Vec<Option<f64>>,
+    /// What a caller should know about the result: a doubtful depth gate, a target stopped by
+    /// `size_cap`, or one still growing when the passes ran out.
+    pub warnings: Vec<String>,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
 }
@@ -550,7 +682,17 @@ pub struct RecruitConfig {
     /// Carex holdout library, extension to the fixed point added 75,858 reads to the plastid,
     /// 3% of them organelle-like; the 1,141 reads it added to the Buddleja mitochondrion were
     /// 100% organelle-like. Long reads only.
+    ///
+    /// The gate also keeps out reads much shallower than the target's own (`EXTEND_CORE_FLOOR`)
+    /// and stops a target whose reads stand for more sequence than any such genome has
+    /// (`size_cap`).
     pub extend_gate: bool,
+    /// Downsample each target's output to about this read depth: the median sketch depth of
+    /// its reads, so the recruited bases over it are the genome size they stand for. Long reads
+    /// only (the depth sketch judges whole long reads).
+    pub max_read_depth: Option<f64>,
+    /// Downsample each target's output to about this many bases at most.
+    pub max_bases: Option<u64>,
 }
 
 /// A bootstrap read must not be this much shallower than the target's own reads (when the
@@ -558,12 +700,43 @@ pub struct RecruitConfig {
 /// than plastid reads, so it cannot bootstrap the plastid, and the reverse needs the other
 /// target to be complete (see `bootstrap_candidates`).
 const BOOTSTRAP_DEPTH_FLOOR: f64 = 0.5;
-/// Own reads whose depth sets that floor (a sample is enough).
-const BOOTSTRAP_DEPTH_SAMPLE: usize = 2000;
 /// Fewest own reads for a depth floor.
 const BOOTSTRAP_DEPTH_MIN_READS: usize = 10;
 /// A bootstrap read must not be covered this much by another target's bait.
 const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
+
+/// With the extension gate, a read extends a target only from this share of the target's core
+/// depth up: the median depth of its reads in the first pass that recruited `CORE_MIN_READS`.
+/// The gate's own threshold is relative to the nuclear depth, and that estimate can fail: on
+/// three of the four 2026-10-21 benchmark libraries (Carex echinata, Lophophora williamsii,
+/// Medicago polymorpha) it came out at 2x, the threshold at 6x, and every nuclear read
+/// passed. A plastid at thousands of x walking into mitochondrial reads (tens to hundreds of
+/// x, through a shared MTPT) is kept out the same way.
+pub const EXTEND_CORE_FLOOR: f64 = 0.25;
+/// Fewest reads with a depth that set a target's core depth.
+const CORE_MIN_READS: usize = 20;
+/// A peak whose k-mers stand for less sequence than this is no nuclear genome's (the smallest
+/// land-plant nuclear genomes are ~60 Mb, mitochondria at most ~12 Mb): the gate's organelle
+/// threshold is then doubtful, and the run says so.
+const MIN_NUCLEAR_PEAK_BASES: u64 = 20_000_000;
+
+/// Most sequence a target named for an organelle can stand for (recruited bases over read
+/// depth) before its extension stops: four times the largest land-plant plastome (Pelargonium,
+/// 242 kb), and nearly twice the largest mitochondrial genome (Silene conica, 11.3 Mb). The
+/// unguarded Carex echinata plastid stood for tens of megabases of nuclear reads.
+pub fn size_cap(name: &str) -> Option<u64> {
+    match name {
+        "plastid" => Some(1_000_000),
+        "mitochondrion" => Some(20_000_000),
+        _ => None,
+    }
+}
+
+/// The size a target's reads stand for and its cap, when the size is over it.
+fn over_size_cap(name: &str, implied_size: Option<u64>) -> Option<(u64, u64)> {
+    let (size, cap) = (implied_size?, size_cap(name)?);
+    (size > cap).then_some((size, cap))
+}
 
 /// NUMT candidates of the last pass that bootstrap target `t`.
 ///
@@ -575,29 +748,18 @@ const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
 /// is deep along its whole length, a nuclear one only at its organellar block. On the three
 /// frozen holdout samples, `discover`'s organelle-like test passed 979 of 989 mitochondrial
 /// candidates and 16 of 351 others. A candidate must also fit `t` better than any other target
-/// and not be mostly covered by another target; and it is only used once every other target's
-/// bait has stopped growing, so their own reads are recruited, not left as candidates.
+/// and not be mostly covered by another target, and be at least `floor` deep; and it is only
+/// used once every other target's bait has stopped growing, so their own reads are recruited,
+/// not left as candidates.
 fn bootstrap_candidates(
     numt_path: &Path,
-    own_path: &Path,
+    floor: f64,
     t: usize,
     bait: &BaitSet,
     p: &ClassifyParams,
     gate: &DepthGate,
     used: &FxHashSet<u64>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
-    let mut own: Vec<f64> = Vec::new();
-    for_each_rec(own_path, |r| {
-        if own.len() < BOOTSTRAP_DEPTH_SAMPLE {
-            own.extend(gate.median_depth(&r.seq));
-        }
-    })?;
-    own.sort_by(f64::total_cmp);
-    let floor = if own.len() >= BOOTSTRAP_DEPTH_MIN_READS {
-        BOOTSTRAP_DEPTH_FLOOR * own[own.len() / 2]
-    } else {
-        0.0
-    };
     let n = bait.targets.len();
     let (mut picked, mut keys) = (Vec::new(), Vec::new());
     for_each_rec(numt_path, |r| {
@@ -620,6 +782,84 @@ fn bootstrap_candidates(
         picked.push(r.seq);
     })?;
     Ok((picked, keys))
+}
+
+/// The depth sketch: from the recruitment cache when there is one, which saves its two passes
+/// over the original input (each a full decompression).
+fn build_gate(
+    inputs: &[PathBuf],
+    replay: Option<&crate::replay::Replay>,
+    warnings: &mut Vec<String>,
+) -> Result<DepthGate> {
+    let gate = match replay.filter(|r| r.ready) {
+        Some(cache) => DepthGate::long_reads_from(|| cache.sequences(), "recruitment cache")?,
+        None => DepthGate::long_reads(inputs)?,
+    };
+    eprintln!(
+        "[ovasm] depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth), from the {} in {:.0}s",
+        gate.nuclear_peak_depth,
+        gate.organelle_min_depth,
+        gate.report.source,
+        gate.report.seconds
+    );
+    if gate.report.peak_window_bases < MIN_NUCLEAR_PEAK_BASES {
+        warnings.push(format!(
+            "the depth sketch's nuclear peak ({}x) stands for {:.1} Mb of sequence, too little \
+             for a nuclear genome: the library may be too shallow for the nucleus to show, and \
+             the organelle threshold ({:.0}x) is doubtful",
+            gate.nuclear_peak_depth,
+            gate.report.peak_window_bases as f64 / 1e6,
+            gate.organelle_min_depth
+        ));
+    }
+    Ok(gate)
+}
+
+/// The NUMT candidates of the last pass, from the cache: a replayed pass does not write them.
+fn numt_from_cache(cache: &crate::replay::Replay, path: &Path) -> Result<()> {
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    let (rx, reader) = cache.batches();
+    let mut i = 0;
+    for batch in rx {
+        for entry in batch {
+            if matches!(cache.calls[i], Call::NumtCandidate(_)) {
+                write_rec(&mut w, &entry.rec)?;
+            }
+            i += 1;
+        }
+    }
+    reader.join().expect("cache reader panicked")?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Depths of one pass's targets (`None` without the depth sketch).
+struct PassDepths {
+    read: Vec<Option<f64>>,
+    fresh: Vec<Option<f64>>,
+    /// Reads of the target that had a depth.
+    measured: Vec<usize>,
+    implied_size: Vec<Option<u64>>,
+}
+
+fn pass_depths(gate: Option<&DepthGate>, res: &ScanResult) -> PassDepths {
+    let n = res.recruited.len();
+    let mut d = PassDepths {
+        read: vec![None; n],
+        fresh: vec![None; n],
+        measured: vec![0; n],
+        implied_size: vec![None; n],
+    };
+    if let Some(g) = gate {
+        for t in 0..n {
+            (d.read[t], d.measured[t]) = sample_depth(g, &res.all_sample[t]);
+            d.fresh[t] = sample_depth(g, &res.fresh_sample[t]).0;
+            d.implied_size[t] = d.read[t]
+                .filter(|&x| x > 0.0)
+                .map(|x| (res.recruited[t].bases as f64 / x) as u64);
+        }
+    }
+    d
 }
 
 pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
@@ -655,35 +895,94 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // A target seeded from reads of the sample holds its whole genome already: extending it
     // only adds passes over the input (each a full decompression) for nothing.
     let mut saturated: Vec<bool> = bait.targets.iter().map(|t| t.from_reads).collect();
+    // Why each target no longer extends, once it does not.
+    let mut stopped: Vec<Option<&'static str>> = bait
+        .targets
+        .iter()
+        .map(|t| t.from_reads.then_some("seeded_from_reads"))
+        .collect();
     let mut previous = vec![0u64; n_targets];
-    // Bootstrap depth sketch, built the first time a target needs it.
+    // Depth sketch, built after the first pass when the gate or the downsampling needs it, or
+    // the first time a target needs bootstrapping.
     let mut gate: Option<DepthGate> = None;
+    let wants_gate = cfg.extend_gate || cfg.max_read_depth.is_some();
+    let mut core_depth: Vec<Option<f64>> = vec![None; n_targets];
+    let mut warnings: Vec<String> = Vec::new();
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
         bait.prepare_lookup();
+        let replaying = replay.as_ref().is_some_and(|r| r.ready);
         let delta = replay
             .as_ref()
             .filter(|r| r.ready)
             .map(|_| bait.take_changes());
+        let keep: Vec<Keep> = (0..n_targets)
+            .map(|t| {
+                if saturated[t] {
+                    Keep::Nothing
+                } else if !boot_used[t].is_empty() {
+                    Keep::All
+                } else {
+                    Keep::Fresh
+                }
+            })
+            .collect();
         let res = scan(
             &cfg.inputs,
             &bait,
             &cfg.params,
-            &cfg.out_dir,
-            &numt_path,
+            &Writes {
+                out_dir: &cfg.out_dir,
+                numt_path: &numt_path,
+                used: &used,
+                keep: replaying.then_some(keep.as_slice()),
+            },
             replay.as_mut(),
             delta.as_ref(),
             false,
         )?;
         let last = it + 1 == cfg.iterations.max(1);
+        if gate.is_none() && wants_gate && (!last || cfg.max_read_depth.is_some()) {
+            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), &mut warnings)?);
+        }
+        let mut depths = pass_depths(gate.as_ref(), &res);
+        for t in 0..n_targets {
+            if core_depth[t].is_none() && depths.measured[t] >= CORE_MIN_READS {
+                core_depth[t] = depths.read[t];
+            }
+        }
+        if cfg.extend_gate && !last {
+            for t in 0..n_targets {
+                let Some((size, cap)) =
+                    over_size_cap(&bait.targets[t].name, depths.implied_size[t])
+                else {
+                    continue;
+                };
+                if saturated[t] {
+                    continue;
+                }
+                saturated[t] = true;
+                stopped[t] = Some("size_cap");
+                warnings.push(format!(
+                    "{}: after pass {} its {} reads ({:.1} Mb at {:.0}x) stand for {:.1} Mb, more \
+                     than any {} ({:.1} Mb); extension stopped there",
+                    bait.targets[t].name,
+                    it + 1,
+                    res.recruited[t].reads,
+                    res.recruited[t].bases as f64 / 1e6,
+                    depths.read[t].unwrap_or(0.0),
+                    size as f64 / 1e6,
+                    bait.targets[t].name,
+                    cap as f64 / 1e6
+                ));
+            }
+        }
         let mut added = vec![0; n_targets];
         let mut extended_from = vec![0u64; n_targets];
         let mut gated_out = vec![0u64; n_targets];
-        if cfg.extend_gate && !last && gate.is_none() {
-            gate = Some(DepthGate::long_reads(&cfg.inputs)?);
-        }
+        let mut shallow_out = vec![0u64; n_targets];
         if !last {
             for t in 0..n_targets {
                 if saturated[t] {
@@ -703,40 +1002,49 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         < cfg.saturation * previous[t] as f64
                 {
                     saturated[t] = true;
+                    stopped[t] = Some("saturated");
                 }
                 previous[t] = now;
                 if saturated[t] {
                     continue;
                 }
                 // New reads of this pass, from its file: their depth sets the subsample
-                // fraction, then the subsample is read back (at most `extend_depth`).
+                // fraction (at most `extend_depth`).
                 let path = pass_path(&cfg.out_dir, &bait.targets[t].name);
-                let (mut fresh, mut fresh_bases) = (Vec::new(), 0u64);
-                for_each_rec(&path, |r| {
-                    let key = name_key(&r.id);
-                    if recount || !used[t].contains(&key) {
-                        fresh.push(key);
-                        fresh_bases += r.seq.len() as u64;
-                    }
-                })?;
+                let considered = if recount {
+                    &res.recruited[t]
+                } else {
+                    &res.fresh[t]
+                };
                 let seed_len = bait.targets[t].seed_length.max(1) as f64;
-                let depth = fresh_bases as f64 / seed_len;
+                let depth = considered.bases as f64 / seed_len;
                 let fraction = if depth > cfg.extend_depth {
                     cfg.extend_depth / depth
                 } else {
                     1.0
                 };
-                let mut picked: Vec<Vec<u8>> = Vec::new();
                 let extend_gate = gate.as_ref().filter(|_| cfg.extend_gate);
+                let floor = core_depth[t].map(|c| EXTEND_CORE_FLOOR * c);
+                let (mut fresh, mut picked) = (Vec::new(), Vec::<Vec<u8>>::new());
                 for_each_rec(&path, |r| {
-                    if (recount || !used[t].contains(&name_key(&r.id)))
-                        && (fraction >= 1.0 || unit_hash(&r.id, EXTEND_SALT) < fraction)
-                    {
-                        if extend_gate.is_some_and(|g| !g.organelle_like(&r.seq)) {
-                            gated_out[t] += 1;
-                        } else {
-                            picked.push(r.seq);
+                    let key = name_key(&r.id);
+                    if !recount && used[t].contains(&key) {
+                        return;
+                    }
+                    fresh.push(key);
+                    if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
+                        return;
+                    }
+                    match extend_gate.map(|g| g.profile(&r.seq)) {
+                        None => picked.push(r.seq),
+                        Some(Some(d)) if d.organelle_like => {
+                            if floor.is_some_and(|f| d.median < f) {
+                                shallow_out[t] += 1;
+                            } else {
+                                picked.push(r.seq);
+                            }
                         }
+                        Some(_) => gated_out[t] += 1,
                     }
                 })?;
                 extended_from[t] = picked.len() as u64;
@@ -749,6 +1057,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             }
         }
         let mut bootstrapped = vec![0u64; n_targets];
+        let mut numt_ready = !replaying;
         if cfg.bootstrap && !last {
             for t in 0..n_targets {
                 // complete: saturated, or its bait gained nothing from this pass
@@ -759,24 +1068,31 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     || added[t] > 0
                     || !others_complete
                     || !boot_used[t].is_empty()
+                    || stopped[t] == Some("size_cap")
                 {
                     continue;
                 }
                 if gate.is_none() {
-                    let g = DepthGate::long_reads(&cfg.inputs)?;
-                    eprintln!(
-                        "[ovasm] bootstrap depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth)",
-                        g.nuclear_peak_depth, g.organelle_min_depth
-                    );
-                    gate = Some(g);
+                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), &mut warnings)?);
+                    depths = pass_depths(gate.as_ref(), &res);
                 }
+                if !numt_ready {
+                    numt_from_cache(replay.as_ref().expect("a replayed pass"), &numt_path)?;
+                    numt_ready = true;
+                }
+                let g = gate.as_ref().expect("built above");
+                let floor = if depths.measured[t] >= BOOTSTRAP_DEPTH_MIN_READS {
+                    BOOTSTRAP_DEPTH_FLOOR * depths.read[t].unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 let (picked, keys) = bootstrap_candidates(
                     &numt_path,
-                    &pass_path(&cfg.out_dir, &bait.targets[t].name),
+                    floor,
                     t,
                     &bait,
                     &cfg.params,
-                    gate.as_ref().expect("built above"),
+                    g,
                     &boot_used[t],
                 )?;
                 // Only a seed that failed is bootstrapped: one that recruits more reads than are
@@ -791,8 +1107,11 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 }
                 bootstrapped[t] = picked.len() as u64;
                 boot_used[t].extend(keys);
-                // its bait changed: extend it again from what the next pass recruits
+                // its bait changed: extend it again from what the next pass recruits, and its
+                // core depth is that of the reads it now recruits
                 saturated[t] = false;
+                stopped[t] = None;
+                core_depth[t] = None;
             }
         }
         iterations.push(IterationStats {
@@ -809,11 +1128,45 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             saturated: saturated.clone(),
             bootstrapped_from_reads: bootstrapped,
             extension_gated_out: gated_out,
+            extension_shallow_out: shallow_out,
+            read_depth: depths.read,
+            fresh_read_depth: depths.fresh,
+            implied_size: depths.implied_size,
         });
         result = Some(res);
         // Nothing new to bait with: this pass already used the final bait set.
         if !last && added.iter().all(|&a| a == 0) {
             break;
+        }
+    }
+    // Targets still extending when the passes ran out had not converged.
+    let ran_out = iterations.len() == cfg.iterations.max(1) && cfg.iterations > 1;
+    for t in 0..n_targets {
+        if stopped[t].is_some() {
+            continue;
+        }
+        let grew = iterations.len() >= 2 && iterations[iterations.len() - 2].bait_kmers_added[t] > 0;
+        stopped[t] = Some(if cfg.iterations <= 1 {
+            "single_pass"
+        } else if ran_out && grew {
+            "iteration_limit"
+        } else {
+            "bait_complete"
+        });
+        if stopped[t] == Some("iteration_limit") {
+            let n = iterations.len();
+            let (a, b) = (
+                iterations[n - 2].recruited[t].reads,
+                iterations[n - 1].recruited[t].reads,
+            );
+            warnings.push(format!(
+                "{}: still growing after the last of {} passes ({} reads, +{:.1}% in the last \
+                 pass): it may be incomplete; more --iterations would extend it further",
+                bait.targets[t].name,
+                n,
+                b,
+                100.0 * b.saturating_sub(a) as f64 / a.max(1) as f64
+            ));
         }
     }
     let mut res = result.expect("at least one iteration");
@@ -832,8 +1185,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             &cfg.inputs,
             &bait,
             &cfg.params,
-            &cfg.out_dir,
-            &numt_path,
+            &Writes {
+                out_dir: &cfg.out_dir,
+                numt_path: &numt_path,
+                used: &used,
+                keep: None,
+            },
             replay.as_mut(),
             None,
             true,
@@ -847,7 +1204,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
 
     let source_candidates =
         crate::retained::recruitment(&cfg.out_dir, &numt_path, &bait, &cfg.params)?;
-    // Final outputs from the last pass's files, downsampled to `target_depth`.
+    let final_depths = pass_depths(gate.as_ref(), &res);
+    // Final outputs from the last pass's files, downsampled to `target_depth`, `max_read_depth`
+    // and `max_bases`, whichever keeps fewest.
     let mut outputs = Vec::new();
     for (t, counts) in res.recruited.iter().enumerate() {
         let target = &bait.targets[t];
@@ -856,10 +1215,25 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         } else {
             0.0
         };
-        let fraction = match cfg.target_depth {
-            Some(d) if depth > d => d / depth,
-            _ => 1.0,
+        let mut fraction = 1.0;
+        let mut sampled_by = None;
+        let mut cap = |f: f64, rule: &'static str| {
+            if f < fraction {
+                fraction = f;
+                sampled_by = Some(rule);
+            }
         };
+        if let Some(d) = cfg.target_depth.filter(|&d| depth > d) {
+            cap(d / depth, "target_depth");
+        }
+        if let (Some(max), Some(d)) = (cfg.max_read_depth, final_depths.read[t]) {
+            if d > max {
+                cap(max / d, "max_read_depth");
+            }
+        }
+        if let Some(max) = cfg.max_bases.filter(|&m| counts.bases > m) {
+            cap(max as f64 / counts.bases as f64, "max_bases");
+        }
         let path = cfg.out_dir.join(format!("{}.fastq", target.name));
         let pass = pass_path(&cfg.out_dir, &target.name);
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
@@ -875,17 +1249,26 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         failed?;
         w.flush()?;
         std::fs::remove_file(&pass)?;
+        let stop_reason = stopped[t].unwrap_or("bait_complete");
         outputs.push(TargetOutput {
             name: target.name.clone(),
             recruited_reads: counts.reads,
             recruited_bases: counts.bases,
             seed_length: target.seed_length,
             estimated_depth: depth,
+            read_depth: final_depths.read[t],
+            implied_size: final_depths.implied_size[t],
+            stop_reason,
+            converged: !matches!(stop_reason, "iteration_limit" | "size_cap"),
             sampling_fraction: fraction,
+            sampled_by,
             kept_reads,
             kept_bases,
             output: path.display().to_string(),
         });
+    }
+    for w in &warnings {
+        eprintln!("[ovasm] recruit warning: {w}");
     }
 
     let report = RecruitReport {
@@ -903,6 +1286,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         extend_depth: cfg.extend_depth,
         saturation: cfg.saturation,
         target_depth: cfg.target_depth,
+        max_read_depth: cfg.max_read_depth,
+        max_bases: cfg.max_bases,
         salt: cfg.salt,
         inputs: cfg.inputs.iter().map(|p| p.display().to_string()).collect(),
         targets: bait.targets.clone(),
@@ -915,6 +1300,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         extend_gate: cfg.extend_gate,
         bootstrap_nuclear_peak_depth: gate.as_ref().map(|g| g.nuclear_peak_depth),
         bootstrap_organelle_min_depth: gate.as_ref().map(|g| g.organelle_min_depth),
+        depth_gate: gate.as_ref().map(|g| g.report.clone()),
+        core_depth,
+        warnings,
         elapsed_seconds: start.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
     };
@@ -1225,6 +1613,8 @@ mod tests {
             out_dir: dir.join(format!("boot{bootstrap}")),
             bootstrap,
             extend_gate: false,
+            max_read_depth: None,
+            max_bases: None,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -1239,7 +1629,13 @@ mod tests {
             plain.outputs[m].recruited_reads, 0,
             "the gene alone recruits nothing"
         );
+        // replayed passes write no NUMT candidates: the bootstrap takes them from the cache
+        let mut replayed = cfg(true);
+        replayed.out_dir = dir.join("boot-replayed");
+        replayed.replay_dir = Some(dir.join("boot-cache"));
+        let cached = run(bait.clone(), replayed).unwrap();
         let boot = run(bait, cfg(true)).unwrap();
+        assert_same_recruitment(&boot, &cached);
         let got = ids(&boot.outputs[m].output);
         assert_eq!(got.len(), 400, "every mitochondrial read");
         assert!(got.iter().all(|id| id.starts_with('m')), "{got:?}");
@@ -1304,6 +1700,8 @@ mod tests {
             out_dir: dir.join(format!("gate{extend_gate}")),
             bootstrap: false,
             extend_gate,
+            max_read_depth: None,
+            max_bases: None,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -1314,7 +1712,18 @@ mod tests {
             n
         };
         let plain = run(bait.clone(), cfg(false)).unwrap();
+        // the depth sketch from the cache is the one from the input
+        let mut replayed = cfg(true);
+        replayed.out_dir = dir.join("gate-replayed");
+        replayed.replay_dir = Some(dir.join("gate-cache"));
+        let cached = run(bait.clone(), replayed).unwrap();
         let gated = run(bait, cfg(true)).unwrap();
+        assert_same_recruitment(&gated, &cached);
+        assert_eq!(gated.depth_gate.as_ref().unwrap().source, "inputs");
+        assert_eq!(
+            cached.depth_gate.as_ref().unwrap().source,
+            "recruitment cache"
+        );
         assert!(
             nuclear_reads(&plain) > nuclear_reads(&gated) + 100,
             "extension walks into the nucleus: {}",
@@ -1449,6 +1858,8 @@ mod tests {
             out_dir: dir.join(format!("out{iterations}")),
             bootstrap: false,
             extend_gate: false,
+            max_read_depth: None,
+            max_bases: None,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -1524,5 +1935,217 @@ mod tests {
             used <= genome_reads,
             "each read extends the bait at most once: {used}"
         );
+    }
+
+    /// The same biological result, pass by pass and file by file (timings aside).
+    fn assert_same_recruitment(a: &RecruitReport, b: &RecruitReport) {
+        assert_eq!(a.iterations_run, b.iterations_run);
+        for (x, y) in a.iterations.iter().zip(&b.iterations) {
+            let mut x = serde_json::to_value(x).unwrap();
+            let mut y = serde_json::to_value(y).unwrap();
+            x.as_object_mut().unwrap().remove("seconds");
+            y.as_object_mut().unwrap().remove("seconds");
+            assert_eq!(x, y);
+        }
+        for (x, y) in a.outputs.iter().zip(&b.outputs) {
+            assert_eq!(
+                std::fs::read(&x.output).unwrap(),
+                std::fs::read(&y.output).unwrap()
+            );
+            assert_eq!(
+                (x.stop_reason, x.kept_reads),
+                (y.stop_reason, y.kept_reads)
+            );
+        }
+        assert_eq!(
+            std::fs::read(&a.numt_output).unwrap(),
+            std::fs::read(&b.numt_output).unwrap()
+        );
+        assert_eq!(a.core_depth, b.core_depth);
+    }
+
+    /// FASTA of 3 kb reads every `step` bp around the circular `genome`, named `tag<i>`.
+    fn circle_reads(genome: &[u8], step: usize, tag: &str) -> String {
+        let circ = [genome, &genome[..3000]].concat();
+        (0..genome.len())
+            .step_by(step)
+            .enumerate()
+            .map(|(i, st)| {
+                format!(
+                    ">{tag}{i}\n{}\n",
+                    std::str::from_utf8(&circ[st..st + 3000]).unwrap()
+                )
+            })
+            .collect()
+    }
+
+    /// 3 kb reads every `step` bp along a linear genome.
+    fn linear_reads(genome: &[u8], step: usize, tag: &str) -> String {
+        (0..genome.len() - 3000)
+            .step_by(step)
+            .enumerate()
+            .map(|(i, st)| {
+                format!(
+                    ">{tag}{i}\n{}\n",
+                    std::str::from_utf8(&genome[st..st + 3000]).unwrap()
+                )
+            })
+            .collect()
+    }
+
+    fn count_reads(path: &str, tag: u8) -> usize {
+        let mut n = 0;
+        for_each_rec(Path::new(path), |r| n += usize::from(r.id[0] == tag)).unwrap();
+        n
+    }
+
+    fn test_config(fa: &Path, out: PathBuf, iterations: usize, extend_gate: bool) -> RecruitConfig {
+        RecruitConfig {
+            replay_dir: None,
+            inputs: vec![fa.to_path_buf()],
+            params: ClassifyParams {
+                min_cover: 0.8,
+                min_hit_frac: 0.2,
+                numt_min_block: 1000,
+                block_gap: 50,
+            },
+            iterations,
+            extend_min_count: 3,
+            // no subsampling: every new read extends
+            extend_depth: 1e9,
+            saturation: 0.0,
+            target_depth: None,
+            salt: 0,
+            out_dir: out,
+            bootstrap: false,
+            extend_gate,
+            max_read_depth: None,
+            max_bases: None,
+        }
+    }
+
+    #[test]
+    fn the_gate_keeps_extension_off_organelle_like_reads_far_shallower_than_the_target() {
+        // As in `the_extension_gate_keeps_a_stray_seed_out_of_the_nucleus` (a 12 kb
+        // mitochondrion at 120x seeded with 20 kb of another genome at 25x), but beside a nuclear
+        // genome at 5x: the other genome is then five times the nuclear depth and passes the
+        // nuclear-relative test, as everything did where the nuclear peak came out at 2x. A
+        // quarter of the mitochondrion's own depth (30x) it does not reach.
+        let mito = pseudo_random(12_000, 7);
+        let other = pseudo_random(200_000, 41);
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        let text = circle_reads(&mito, 25, "m")
+            + &linear_reads(&other, 120, "o")
+            + &linear_reads(&nuclear, 600, "n");
+        std::fs::write(&fa, text).unwrap();
+        let mut bait = bait_from(&mito, 21);
+        bait.add_sequence(0, &other[100_000..120_000]);
+        let plain = run(bait.clone(), test_config(&fa, dir.join("plain"), 30, false)).unwrap();
+        let gated = run(bait, test_config(&fa, dir.join("gated"), 30, true)).unwrap();
+        // the reads of the other genome that the stray stretch covers by 80%
+        let stray = (0..other.len() - 3000)
+            .step_by(120)
+            .filter(|&st| (99_400..=117_600).contains(&st))
+            .count();
+        let other_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'o');
+        assert!(
+            other_reads(&plain) > stray + 100,
+            "ungated, extension walks along the other genome: {} of {stray}",
+            other_reads(&plain)
+        );
+        assert_eq!(other_reads(&gated), stray);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'm'), 480);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
+        let core = gated.core_depth[0].unwrap();
+        assert!((core - 119.0).abs() < 3.0, "core depth {core}");
+        let first = &gated.iterations[0];
+        assert_eq!(first.extension_gated_out[0], 0, "organelle-like by depth");
+        assert_eq!(first.extension_shallow_out[0], stray as u64);
+        assert!(gated.outputs[0].converged);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn outputs_are_downsampled_to_the_read_depth_and_to_the_base_cap() {
+        // a 20 kb plastid at 600x (4,000 reads of 3 kb, 12 Mb) beside a nuclear genome at 10x
+        let plastid = pseudo_random(20_000, 21);
+        let nuclear = pseudo_random(200_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(
+            &fa,
+            circle_reads(&plastid, 5, "p") + &linear_reads(&nuclear, 300, "n"),
+        )
+        .unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("plastid").unwrap();
+        bait.add_sequence(t, &plastid);
+        bait.targets[t].seed_length = plastid.len() as u64;
+        let mut by_depth = test_config(&fa, dir.join("depth"), 1, false);
+        by_depth.max_read_depth = Some(150.0);
+        let d = run(bait.clone(), by_depth).unwrap();
+        let o = &d.outputs[t];
+        assert_eq!(o.recruited_reads, 4000);
+        let depth = o.read_depth.unwrap();
+        assert!((depth - 596.0).abs() < 5.0, "read depth {depth}");
+        assert!((o.implied_size.unwrap() as f64 - 20_000.0).abs() < 500.0);
+        assert_eq!(o.sampled_by, Some("max_read_depth"));
+        assert!(
+            (o.kept_reads as f64 - 4000.0 * 150.0 / depth).abs() < 100.0,
+            "{}",
+            o.kept_reads
+        );
+        assert_eq!(o.stop_reason, "single_pass");
+
+        let mut by_bases = test_config(&fa, dir.join("bases"), 1, false);
+        by_bases.max_read_depth = Some(1000.0);
+        by_bases.max_bases = Some(3_000_000);
+        let b = run(bait, by_bases).unwrap();
+        let o = &b.outputs[t];
+        assert_eq!(o.sampled_by, Some("max_bases"));
+        assert!((o.kept_bases as f64 - 3e6).abs() < 2e5, "{}", o.kept_bases);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_plastids_and_mitochondria_have_a_size_cap() {
+        assert_eq!(over_size_cap("plastid", Some(1_000_000)), None);
+        assert_eq!(
+            over_size_cap("plastid", Some(1_000_001)),
+            Some((1_000_001, 1_000_000))
+        );
+        assert_eq!(over_size_cap("mitochondrion", Some(19_000_000)), None);
+        assert!(over_size_cap("mitochondrion", Some(21_000_000)).is_some());
+        assert_eq!(over_size_cap("mito", Some(u64::MAX)), None);
+        assert_eq!(over_size_cap("plastid", None), None);
+    }
+
+    #[test]
+    fn a_depth_sample_is_the_same_whatever_the_order() {
+        let reads: Vec<(u64, Vec<u8>)> = (0..10_000u64)
+            .map(|i| (name_key(format!("r{i}").as_bytes()), pseudo_random(50, i)))
+            .collect();
+        let mut forward = Sample::default();
+        let mut backward = Sample::default();
+        for (k, s) in &reads {
+            forward.offer(*k, s);
+        }
+        for (k, s) in reads.iter().rev() {
+            backward.offer(*k, s);
+        }
+        assert_eq!(forward.reads(), backward.reads());
+        let mut smallest: Vec<&(u64, Vec<u8>)> = reads.iter().collect();
+        smallest.sort_unstable_by_key(|r| r.0);
+        let expected: Vec<&[u8]> = smallest[..DEPTH_SAMPLE]
+            .iter()
+            .map(|r| r.1.as_slice())
+            .collect();
+        assert_eq!(forward.reads(), expected);
     }
 }

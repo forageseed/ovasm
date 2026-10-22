@@ -871,6 +871,8 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 out_dir: cfg.out.join("recruit"),
                 bootstrap: false,
                 extend_gate: false,
+                max_read_depth: None,
+                max_bases: None,
             },
         )?)?
     };
@@ -900,6 +902,10 @@ pub fn run(cfg: &Config) -> Result<Value> {
             recruit: pipeline::RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
+            auto_recruit_cache: false,
+            gated_recruit: false,
+            recruit_max_depth: None,
+            recruit_max_bases: None,
             read_context: None,
             single_seed: false,
             mode: pipeline::Mode::Fast,
