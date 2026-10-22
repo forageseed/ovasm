@@ -638,6 +638,7 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
                 "nuclear_peak_depth": gate["nuclear_peak_depth"],
                 "organelle_min_depth": gate["organelle_min_depth"],
                 "peak_window_bases": gate["peak_window_bases"],
+                "kmer_peak_depth": gate["kmer_peak_depth"],
                 "source": gate["source"],
             })
         },
