@@ -277,8 +277,11 @@ struct RunArgs {
     #[arg(long, default_value_t = 250.0)]
     recruit_max_depth: f64,
     /// HiFi: keep at most about this many recruited bases per organelle, which bounds the memory
-    /// of assembly whatever recruitment found; 0 for no cap.
-    #[arg(long, default_value_t = 1_500_000_000)]
+    /// of assembly whatever recruitment found; 0 for no cap. Assembly memory follows the nuclear
+    /// sequence among the reads, not their bases: 4.3 Gb of Medicago polymorpha plastid reads
+    /// took 2.5 GB, 8.5 Gb of mostly nuclear Carex echinata "plastid" reads 309 GB. A billion
+    /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
+    #[arg(long, default_value_t = 1_000_000_000)]
     recruit_max_bases: u64,
     /// Checked complete original-read nuclear alignments (ovasm.whole-read-context.v1).
     #[arg(long)]

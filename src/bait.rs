@@ -264,7 +264,11 @@ where
     let valley = (3..4097)
         .find(|&c| hist[c] <= hist[c - 1] && hist[c] < hist[c + 1])
         .unwrap_or(3);
-    let peak = (valley..4097).max_by_key(|&c| hist[c]).unwrap_or(valley);
+    // The last bin holds every k-mer seen in more than 4,096 reads, and it is the peak of a
+    // target deeper than that: left out, the peak fell in the error tail and recurrent errors
+    // joined the bait (Medicago polymorpha plastid at ~10,000x: 1.15 M k-mers added to a
+    // 125 kb genome in one pass).
+    let peak = (valley..=4097).max_by_key(|&c| hist[c]).unwrap_or(valley);
     let threshold = min_count.max((peak_fraction * peak as f64) as u32);
     let mut out: Vec<u64> = counts
         .into_iter()
@@ -336,6 +340,22 @@ mod tests {
         bait.prepare_lookup();
         bait.extend_from_reads(1, [added.as_slice(), added.as_slice(), added.as_slice()], 3);
         assert!(CanonicalKmers::new(&added, bait.k).all(|(_, key)| bait.get(key) & 3 == 3));
+    }
+
+    #[test]
+    fn errors_stay_out_of_a_target_deeper_than_the_histogram() {
+        // 5,000 copies of a 2 kb genome; one error recurs in 20 of them
+        let g = genome(2000, 11);
+        let mut bad = g.clone();
+        bad[1000] = if bad[1000] == b'A' { b'C' } else { b'A' };
+        let mut reads: Vec<&[u8]> = vec![g.as_slice(); 5000];
+        reads.extend(std::iter::repeat(bad.as_slice()).take(20));
+        let solid: FxHashSet<u64> = solid_kmers(21, reads, 3, 0.1).into_iter().collect();
+        let error: Vec<u64> = CanonicalKmers::new(&bad[980..1021], 21)
+            .map(|(_, k)| k)
+            .collect();
+        assert!(error.iter().all(|k| !solid.contains(k)), "the error's k-mers");
+        assert!(CanonicalKmers::new(&g, 21).all(|(_, k)| solid.contains(&k)));
     }
 
     #[test]
