@@ -1469,9 +1469,14 @@ pub fn run_phased(
         } else {
             p.max_molecules
         };
-        rep.searched_max_molecules = envelope.min(comp.len());
-        rep.cover_size_limited = rep.searched_max_molecules < comp.len();
-        for m in rep.min_molecules..=rep.searched_max_molecules {
+        // An automatic envelope that holds no cover widens one size at a time until one does:
+        // a branched component of an incomplete large mitochondrion (Lophophora williamsii,
+        // 996 kb in 15 segments, four molecules at least by its path ends) needed six, and all
+        // of it went to the partial paths. Components with a cover inside the envelope are
+        // searched as before; explicit limits stay authoritative.
+        let mut last = envelope.min(comp.len());
+        let mut m = rep.min_molecules;
+        while m <= last {
             let (found, truncated) = search_phased(
                 g.names.len(),
                 &comp,
@@ -1494,7 +1499,13 @@ pub fn run_phased(
                     ranked.push((walks, report, cover));
                 }
             }
+            if m == last && ranked.is_empty() && p.max_molecules == 0 && last < comp.len() {
+                last += 1;
+            }
+            m += 1;
         }
+        rep.searched_max_molecules = last;
+        rep.cover_size_limited = rep.searched_max_molecules < comp.len();
         if ranked.is_empty() {
             let paths = partial_paths_phased(g.names.len(), &comp, &optional, &br, &frac, &phases);
             let (walks, report) = cover_report(&paths)?;
@@ -2156,6 +2167,39 @@ mod tests {
         assert_eq!(automatic.unsolved_components, 0);
         assert_eq!(automatic.molecules, 5);
         assert!(automatic.cover_size_limited && !automatic.decisive);
+    }
+
+    #[test]
+    fn an_automatic_envelope_without_a_cover_widens_until_one_holds() {
+        // Three leaves into H1, H1 to H2, three leaves out of H2: six path ends make three
+        // molecules at least and an automatic envelope of four, but a cover needs five (one
+        // leaf-H1-H2-leaf molecule, the four other leaves alone).
+        let mut gfa = String::from("H\tVN:Z:1.0\n");
+        let mut links = vec![json!({"from":"H1+","to":"H2+","reads":50})];
+        gfa.push_str(&format!(
+            "S\tH1\t{}\nS\tH2\t{}\nL\tH1\t+\tH2\t+\t0M\n",
+            String::from_utf8(seq(100, 31)).unwrap(),
+            String::from_utf8(seq(100, 32)).unwrap()
+        ));
+        for (i, leaf) in ["A", "B", "C"].iter().enumerate() {
+            gfa.push_str(&format!(
+                "S\t{leaf}1\t{}\nS\t{leaf}2\t{}\nL\t{leaf}1\t+\tH1\t+\t0M\nL\tH2\t+\t{leaf}2\t+\t0M\n",
+                String::from_utf8(seq(100, 40 + i as u8)).unwrap(),
+                String::from_utf8(seq(100, 50 + i as u8)).unwrap()
+            ));
+            links.push(json!({"from":format!("{leaf}1+"),"to":"H1+","reads":50}));
+            links.push(json!({"from":"H2+","to":format!("{leaf}2+"),"reads":50}));
+        }
+        let ev = json!({"repeat_segments":[],"links":links,"phased_paths":[]});
+        let explicit = run_files(&gfa, &ev, "ovasm-explicit-cover-widen", 4).0;
+        assert_eq!(explicit.components[0].min_molecules, 3);
+        assert_eq!(explicit.unsolved_components, 1, "an explicit limit stays");
+        let automatic = run_files(&gfa, &ev, "ovasm-auto-cover-widen", 0).0;
+        assert_eq!(automatic.unsolved_components, 0);
+        assert_eq!(automatic.molecules, 5);
+        assert_eq!(automatic.components[0].searched_max_molecules, 5);
+        assert!(automatic.cover_size_limited && !automatic.decisive);
+        assert!(automatic.partial_paths.is_empty());
     }
 
     /// As `run_on`, with the molecule FASTA and the partial FASTA as written (`None`: no such
