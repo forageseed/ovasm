@@ -12,18 +12,18 @@ OVASM 招募细胞器读段、构建组装图，并保留有读段支持的替�
 
 ## 安装
 
-**0.2.1 预编译版，无需编译。**
+**0.3.0 预编译版，无需编译。**
 
-- **Windows x86_64：**[下载 ZIP](https://github.com/forageseed/ovasm/releases/download/v0.2.1/ovasm-v0.2.1-windows-x86_64.zip)，解压后双击 `install.cmd`，重开终端。
+- **Windows x86_64：**[下载 ZIP](https://github.com/forageseed/ovasm/releases/download/v0.3.0/ovasm-v0.3.0-windows-x86_64.zip)，解压后双击 `install.cmd`，重开终端。
 - **Linux x86_64，glibc 2.34+：**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.1/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.3.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
 
-[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.2.1) · [离线安装](docs/installation.md)
+[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.3.0) · [离线安装](docs/installation.md)
 
 ## 使用
 
@@ -42,7 +42,7 @@ Illumina 数据添加 `--read-type sr`。结果包含代表序列、GFA、连接
 | OVASM | 210.20 分钟 | 1.983 GiB |
 | OATK，包含注释 | 942.35 分钟 | 310.416 GiB |
 
-OVASM 输出线粒体代表序列 160,953 和 146,073 bp，叶绿体代表序列 125,509 bp。代表序列条数不等于已认证的物理染色体数。表中是已有完整输入基准记录，不是 0.2.1 的新测速。
+OVASM 输出线粒体代表序列 160,953 和 146,073 bp，叶绿体代表序列 125,509 bp。代表序列条数不等于已认证的物理染色体数。表中是已有完整输入基准记录，不是 0.3.0 的新测速。
 
 20 个 WGS 首轮任务中，14 个命令执行完成，6 个达到资源限制；命令完成不代表线粒体完整组装。
 
