@@ -178,6 +178,11 @@ pub struct IterationStats {
     pub extension_shallow_out: Vec<u64>,
     /// And for being deeper than `HIGH_COPY_FOLD` times its core depth: a high-copy repeat.
     pub extension_deep_out: Vec<u64>,
+    /// Partial reads at each target's edges that its grown bait came to cover by `min_cover`
+    /// within the pass, and extended it again (`FRONTIER_STEPS`); the next pass recruits them.
+    pub frontier_reads: Vec<u64>,
+    /// Steps of that within-pass extension.
+    pub frontier_steps: Vec<u64>,
     /// Sketch depth of each target's reads of this pass (`target_depth` of a sample of
     /// `DEPTH_SAMPLE`), when the depth sketch exists.
     pub read_depth: Vec<Option<f64>>,
@@ -195,6 +200,9 @@ struct ScanResult {
     /// Depth samples of each target's reads: all of them, and the fresh ones.
     all_sample: Vec<Sample>,
     fresh_sample: Vec<Sample>,
+    /// Each extending target's NUMT candidates that this pass classified anew: the partial reads
+    /// at the edges its bait last grew to (`FRONTIER_STEPS`).
+    frontier: Vec<Sample<FRONTIER_READS>>,
     numt: TargetCounts,
     reads: u64,
     bases: u64,
@@ -206,25 +214,29 @@ struct ScanResult {
 /// sample costs one pass's memory for about 2,000 reads per target.
 const DEPTH_SAMPLE: usize = 2000;
 
-/// The `DEPTH_SAMPLE` reads with the smallest name hashes among those offered: the same reads
-/// whatever the input order, in memory for 2 x `DEPTH_SAMPLE` reads at most.
+/// Most frontier reads a pass keeps per target (`ScanResult::frontier`): about 150 Mb of HiFi
+/// reads, a few hundred at each of dozens of edges; a deep target's are a uniform subsample.
+const FRONTIER_READS: usize = 10_000;
+
+/// The `N` reads with the smallest name hashes among those offered: the same reads whatever the
+/// input order, in memory for 2 x `N` reads at most.
 #[derive(Default)]
-struct Sample {
+struct Sample<const N: usize = DEPTH_SAMPLE> {
     kept: Vec<(u64, Vec<u8>)>,
     /// Hashes from here on cannot be among the smallest any more.
     bound: Option<u64>,
 }
 
-impl Sample {
+impl<const N: usize> Sample<N> {
     fn offer(&mut self, key: u64, seq: &[u8]) {
         if self.bound.is_some_and(|b| key >= b) {
             return;
         }
         self.kept.push((key, seq.to_vec()));
-        if self.kept.len() == 2 * DEPTH_SAMPLE {
-            self.kept.select_nth_unstable_by_key(DEPTH_SAMPLE, |&(k, _)| k);
-            self.bound = Some(self.kept[DEPTH_SAMPLE].0);
-            self.kept.truncate(DEPTH_SAMPLE);
+        if self.kept.len() == 2 * N {
+            self.kept.select_nth_unstable_by_key(N, |&(k, _)| k);
+            self.bound = Some(self.kept[N].0);
+            self.kept.truncate(N);
         }
     }
 
@@ -232,7 +244,7 @@ impl Sample {
     fn reads(&self) -> Vec<&[u8]> {
         let mut kept: Vec<&(u64, Vec<u8>)> = self.kept.iter().collect();
         kept.sort_unstable_by_key(|&&(k, _)| k);
-        kept.truncate(DEPTH_SAMPLE);
+        kept.truncate(N);
         kept.into_iter().map(|(_, s)| s.as_slice()).collect()
     }
 }
@@ -263,6 +275,42 @@ const HIGH_COPY_FOLD: f64 = 10.0;
 /// 418 kb. A target converging gains less every pass: on the four benchmark libraries every other
 /// target stopped at the same pass with this rule as without it.
 const STEADY_GROWTH: f64 = 0.5;
+
+/// Whether one measure of a target has settled over a pass: it grew by less than `saturation`
+/// of what it had and, with the gate, by less than `STEADY_GROWTH` of its growth the pass before.
+fn settled(now: u64, previous: u64, last_growth: u64, saturation: f64, gated: bool) -> bool {
+    let grown = now.saturating_sub(previous);
+    let steady = gated && grown > 0 && grown as f64 >= STEADY_GROWTH * last_growth as f64;
+    previous > 0 && (grown as f64) < saturation * previous as f64 && !steady
+}
+
+/// Fewest reads a target's extension is subsampled to. A distant seed recruits only a few of the
+/// reads at each place in the first passes, so its reads' depth over the genome they stand for
+/// overstates how deep they cover any place: the Schoenoplectus lacustris plastid (5,355x, seed
+/// containment 0.061) recruited 289 reads in its first pass, extension took 9 of them and 4-34 a
+/// pass after, and the plastid stopped at 9 kb (0.2.1, extending from every read: 169 kb).
+const MIN_EXTEND_READS: f64 = 5000.0;
+
+/// Share of a target's reads its extension takes: down to `extend_depth` over the genome they
+/// stand for, but not below `MIN_EXTEND_READS` reads.
+fn extension_fraction(reads: u64, bases: u64, genome: f64, extend_depth: f64) -> f64 {
+    let depth = bases as f64 / genome;
+    if depth <= extend_depth {
+        return 1.0;
+    }
+    (extend_depth / depth)
+        .max(MIN_EXTEND_READS / reads.max(1) as f64)
+        .min(1.0)
+}
+
+/// Most steps of within-pass extension from a target's frontier reads (`ScanResult::frontier`).
+/// A read joins a target only when its bait covers 80% of it, so one pass moves an edge by a tenth
+/// of a read length or so and a large mitochondrion takes a pass, a full scan of the input, for
+/// every step: Lophophora williamsii's (2.2 Mb) stood at 1.1 Mb after 60 passes. The pass's
+/// partial reads at the edges reach most of a read length past them; reclassified against the
+/// grown bait, those it covers by 80% are what the next pass would recruit, and the bait grows
+/// from them again under the same rules, until no more qualify.
+const FRONTIER_STEPS: usize = 10;
 
 /// A target's depth from its reads' (sketch depth, length): their median, unless that is more
 /// than `HIGH_COPY_FOLD` times the depth most of the target's sequence has, which is then taken.
@@ -466,6 +514,7 @@ fn scan(
         fresh: vec![TargetCounts::default(); n_targets],
         all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
+        frontier: (0..n_targets).map(|_| Sample::default()).collect(),
         numt: TargetCounts::default(),
         reads: 0,
         bases: 0,
@@ -562,12 +611,15 @@ fn scan(
                         }
                     }
                 }
-                Call::NumtCandidate(_) => {
+                Call::NumtCandidate(t) => {
                     if w.keep.is_none() {
                         write_rec(&mut numt_w, &rec)?;
                     }
                     out.numt.reads += 1;
                     out.numt.bases += len;
+                    if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
+                        out.frontier[t].offer(name_key(&rec.id), &rec.seq);
+                    }
                 }
                 Call::Other => {}
             }
@@ -945,6 +997,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let mut previous = vec![0u64; n_targets];
     // Reads each target gained in the last pass (`STEADY_GROWTH`).
     let mut last_growth = vec![0u64; n_targets];
+    // The same for the genome each target's reads stand for (with the depth sketch).
+    let mut previous_size = vec![0u64; n_targets];
+    let mut last_size_growth = vec![0u64; n_targets];
     // Depth sketch, built after the first pass when the gate or the downsampling needs it, or
     // the first time a target needs bootstrapping.
     let mut gate: Option<DepthGate> = None;
@@ -1027,6 +1082,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let mut gated_out = vec![0u64; n_targets];
         let mut shallow_out = vec![0u64; n_targets];
         let mut deep_out = vec![0u64; n_targets];
+        let mut frontier_reads = vec![0u64; n_targets];
+        let mut frontier_steps = vec![0u64; n_targets];
         if !last {
             for t in 0..n_targets {
                 if saturated[t] {
@@ -1040,18 +1097,27 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // ends when its bait stops growing, not by `saturation`.
                 let recount = !boot_used[t].is_empty();
                 let now = res.recruited[t].reads;
-                let grown = now.saturating_sub(previous[t]);
-                let steady = cfg.extend_gate && grown as f64 >= STEADY_GROWTH * last_growth[t] as f64;
-                if !recount
-                    && previous[t] > 0
-                    && (grown as f64) < cfg.saturation * previous[t] as f64
-                    && !steady
-                {
+                let reads_settled =
+                    settled(now, previous[t], last_growth[t], cfg.saturation, cfg.extend_gate);
+                // With the depth sketch, the genome the reads stand for must have settled too: a
+                // target that took in many deep reads grows by a small share of its reads while
+                // its genome still grows (Medicago polymorpha's mitochondrion: 31,212 reads at
+                // ~6,500x in its second pass; at its sixth, +1,755 reads, 3.6%, its genome 131 to
+                // 169 kb, and 61 kb of it never recruited).
+                let size = depths.implied_size[t].filter(|_| cfg.extend_gate);
+                let size_settled = size.map_or(true, |s| {
+                    settled(s, previous_size[t], last_size_growth[t], cfg.saturation, true)
+                });
+                if !recount && reads_settled && size_settled {
                     saturated[t] = true;
                     stopped[t] = Some("saturated");
                 }
-                last_growth[t] = grown;
+                last_growth[t] = now.saturating_sub(previous[t]);
                 previous[t] = now;
+                if let Some(s) = size {
+                    last_size_growth[t] = s.saturating_sub(previous_size[t]);
+                    previous_size[t] = s;
+                }
                 if saturated[t] {
                     continue;
                 }
@@ -1070,12 +1136,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     .filter(|_| cfg.extend_gate)
                     .unwrap_or(bait.targets[t].seed_length)
                     .max(1) as f64;
-                let depth = considered.bases as f64 / genome;
-                let fraction = if depth > cfg.extend_depth {
-                    cfg.extend_depth / depth
-                } else {
-                    1.0
-                };
+                let fraction = extension_fraction(
+                    considered.reads,
+                    considered.bases,
+                    genome,
+                    cfg.extend_depth,
+                );
                 let extend_gate = gate.as_ref().filter(|_| cfg.extend_gate);
                 let floor = core_depth[t].map(|c| EXTEND_CORE_FLOOR * c);
                 let ceiling = core_depth[t].map(|c| HIGH_COPY_FOLD * c);
@@ -1110,6 +1176,49 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     cfg.extend_min_count,
                 );
                 used[t].extend(fresh);
+                // Within-pass extension from the partial reads at its edges (`FRONTIER_STEPS`),
+                // gated as extension is.
+                let Some(g) = extend_gate.filter(|_| added[t] > 0) else {
+                    continue;
+                };
+                let extends = |seq: &[u8]| {
+                    g.profile(seq).is_some_and(|d| {
+                        d.organelle_like
+                            && !floor.is_some_and(|f| d.median < f)
+                            && !ceiling.is_some_and(|c| d.median > c)
+                    })
+                };
+                let mut pending = res.frontier[t].reads();
+                for _ in 0..FRONTIER_STEPS {
+                    bait.prepare_lookup();
+                    let covered: Vec<bool> = pending
+                        .par_iter()
+                        .map(|s| {
+                            matches!(classify(s, &bait, &cfg.params).0,
+                                Call::Organelle(mask) if mask & (1 << t) != 0)
+                        })
+                        .collect();
+                    let (mut ready, mut rest) = (Vec::new(), Vec::new());
+                    for (s, c) in pending.into_iter().zip(covered) {
+                        if c {
+                            ready.push(s);
+                        } else {
+                            rest.push(s);
+                        }
+                    }
+                    pending = rest;
+                    let picked: Vec<&[u8]> = ready.into_par_iter().filter(|&s| extends(s)).collect();
+                    if picked.is_empty() {
+                        break;
+                    }
+                    frontier_reads[t] += picked.len() as u64;
+                    frontier_steps[t] += 1;
+                    let more = bait.extend_from_reads(t, picked, cfg.extend_min_count);
+                    added[t] += more;
+                    if more == 0 {
+                        break;
+                    }
+                }
             }
         }
         let mut bootstrapped = vec![0u64; n_targets];
@@ -1186,6 +1295,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             extension_gated_out: gated_out,
             extension_shallow_out: shallow_out,
             extension_deep_out: deep_out,
+            frontier_reads,
+            frontier_steps,
             read_depth: depths.read,
             fresh_read_depth: depths.fresh,
             implied_size: depths.implied_size,
@@ -2193,6 +2304,71 @@ mod tests {
     }
 
     #[test]
+    fn a_target_settles_when_its_reads_and_its_genome_have() {
+        // Medicago polymorpha's mitochondrion at its sixth pass: +1,755 reads after +4,382
+        // (settled), its genome 131,310 to 169,392 bp after +39,696 (still growing)
+        assert!(settled(50_356, 48_601, 4_382, 0.05, true));
+        assert!(!settled(169_392, 131_310, 39_696, 0.05, true));
+        // a close seed still stops at its second pass: the first pass's reads count as growth
+        assert!(settled(10_300, 10_000, 10_000, 0.05, true));
+        // no growth is not steady growth; ungated, only the 5% rule
+        assert!(settled(10_000, 10_000, 0, 0.05, true));
+        assert!(settled(10_300, 10_000, 300, 0.05, false));
+        assert!(!settled(10_300, 10_000, 300, 0.05, true));
+    }
+
+    #[test]
+    fn extension_takes_at_least_min_extend_reads() {
+        // the Schoenoplectus lacustris plastid's first pass: 289 reads at 5,355x for a "genome"
+        // of 214 bp; all of them extend
+        assert_eq!(extension_fraction(289, 4_380_000, 214.0, 200.0), 1.0);
+        // its sixth: 9,115 reads, 139 Mb over 8,923 bp
+        let f = extension_fraction(9_115, 139_255_348, 8_923.0, 200.0);
+        assert!((f - 5000.0 / 9115.0).abs() < 1e-9, "{f}");
+        // a deep plastid with many reads is still subsampled to about extend_depth
+        let f = extension_fraction(391_044, 4_052_425_282, 120_971.0, 200.0);
+        assert!((f - 5000.0 / 391_044.0).abs() < 1e-9, "{f}");
+        // and to extend_depth when that keeps more than MIN_EXTEND_READS (20,000x of 2 Mb)
+        let f = extension_fraction(4_000_000, 40_000_000_000, 2_000_000.0, 200.0);
+        assert!((f - 0.01).abs() < 1e-9, "{f}");
+        // shallow enough: everything
+        assert_eq!(extension_fraction(100_000, 1_000_000_000, 10_000_000.0, 200.0), 1.0);
+    }
+
+    #[test]
+    fn frontier_reads_extend_a_gated_target_within_a_pass() {
+        // A 30 kb mitochondrion at 120x seeded with 4 kb of itself: one pass moves each edge by a
+        // fraction of a read; from the pass's partial reads at the edges the gated target moves
+        // them further within the pass, and recruits the same reads in far fewer passes.
+        let mito = pseudo_random(30_000, 11);
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-frontier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, circle_reads(&mito, 25, "m") + &linear_reads(&nuclear, 600, "n")).unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &mito[..4000]);
+        let plain = run(bait.clone(), test_config(&fa, dir.join("plain"), 60, false)).unwrap();
+        let gated = run(bait, test_config(&fa, dir.join("gated"), 60, true)).unwrap();
+        let mito_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'm');
+        assert_eq!(mito_reads(&plain), 1200);
+        assert_eq!(mito_reads(&gated), 1200);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
+        assert!(gated.outputs[0].converged && plain.outputs[0].converged);
+        let frontier: u64 = gated.iterations.iter().map(|it| it.frontier_reads[0]).sum();
+        assert!(frontier > 0);
+        assert!(
+            3 * gated.iterations.len() < plain.iterations.len(),
+            "passes: gated {}, plain {}",
+            gated.iterations.len(),
+            plain.iterations.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_high_copy_repeat_does_not_set_a_targets_depth() {
         // the first pass of the Lophophora williamsii plastid: most reads a repeat at ~700,000x,
         // the plastid's own at ~440x, some nuclear reads at 22x below the organelle threshold
@@ -2283,8 +2459,8 @@ mod tests {
         let reads: Vec<(u64, Vec<u8>)> = (0..10_000u64)
             .map(|i| (name_key(format!("r{i}").as_bytes()), pseudo_random(50, i)))
             .collect();
-        let mut forward = Sample::default();
-        let mut backward = Sample::default();
+        let mut forward = Sample::<DEPTH_SAMPLE>::default();
+        let mut backward = Sample::<DEPTH_SAMPLE>::default();
         for (k, s) in &reads {
             forward.offer(*k, s);
         }
