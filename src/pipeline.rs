@@ -276,10 +276,11 @@ impl Ladder {
 /// the first k that is accepted is the result. When none is, the attempt whose molecules explain
 /// the largest share of its graph is the result (the earliest of equals), and `accepted` is
 /// false. `retry` is false for dense (short-read) assembly, whose k comes from the read length.
-pub fn k_ladder(a: &mut impl Attempts, retry: bool) -> Result<Ladder> {
+/// `start` is the first attempt's k (`start_k`); None leaves it to the assembler.
+pub fn k_ladder(a: &mut impl Attempts, retry: bool, start: Option<usize>) -> Result<Ladder> {
     let mut tried: Vec<Outcome> = Vec::new();
     let (mut best, mut stashed) = (0usize, false);
-    let mut k = None;
+    let mut k = start;
     loop {
         let o = a.attempt(k)?;
         let i = tried.len();
@@ -616,6 +617,23 @@ fn default_recruit_cache(reads: &[PathBuf], out: &Path, recruit_dir: &Path) -> R
         gb(need)
     ));
     Ok(Some(dir))
+}
+
+/// Kept read depth from which an organelle's assembly starts at the largest k of `K_LADDER`. The
+/// node depth there is about a third of the read depth (`assemble::run_auto_k`), but automatic k
+/// reads it over every node, and the nodes of other sequence among the reads can pull it under
+/// its target: Medicago polymorpha's recruited mitochondrion, about 250x of kept reads, gave a node
+/// depth of 16 at k = 1001 for the many shallow nodes of tandem repeats beside it, so k fell to
+/// 251 and the graph into 1,974 unitigs; at 1001 the mitochondrion is one circle of 287,741 bp.
+pub const START_K_READ_DEPTH: f64 = 3.0 * crate::assemble::AUTO_K_NODE_DEPTH;
+
+/// The k an organelle's assembly starts at: the largest of `K_LADDER` when recruitment kept its
+/// reads at `START_K_READ_DEPTH` or deeper (their median sketch depth times the share kept),
+/// else None, the assembler's own.
+fn start_k(recruitment: &Value) -> Option<usize> {
+    let depth = recruitment["read_depth"].as_f64()?
+        * recruitment["sampling_fraction"].as_f64().unwrap_or(1.0);
+    (depth >= START_K_READ_DEPTH).then_some(K_LADDER[0])
 }
 
 /// What `summary.json` says about the organelle's seed recruitment: its `recruit.json`
@@ -1429,6 +1447,10 @@ fn assemble_organelle(
     } else {
         None
     };
+    let start = match cfg.read_type {
+        ReadType::Hifi => start_k(&recruited.recruitment),
+        ReadType::Sr => None,
+    };
     let ladder = k_ladder(
         &mut GraphAttempts {
             reads: &recruited.reads,
@@ -1439,6 +1461,7 @@ fn assemble_organelle(
         },
         // dense (short-read) assembly takes k from the read length, so it is not retried
         cfg.read_type == ReadType::Hifi,
+        start,
     )?;
     let assembly = read_json(&dir.join("assembly.json"))?;
     let evidence = read_json(&dir.join("evidence.json"))?;
@@ -1470,14 +1493,15 @@ fn assemble_organelle(
     let replicates = match cfg.mode {
         Mode::Fast => Value::Null,
         Mode::Standard => {
-            // the result came from below the automatic k: start the replicates there
+            // the result came from below the automatic k, or from a given start: start the
+            // replicates there
             let k = ladder.result().k;
             run_replicates(
                 cfg,
                 &recruited.reads,
                 dir,
                 &assembly,
-                (ladder.chosen > 0).then_some(k),
+                (ladder.chosen > 0 || start.is_some()).then_some(k),
                 &graph,
                 filter.as_ref(),
             )?
@@ -1894,9 +1918,28 @@ mod tests {
     }
 
     #[test]
+    fn a_ladder_can_start_at_a_given_k_and_still_step_down() {
+        let mut a = Scripted::new(251, &[(1001, 0, 0), (701, 1, 1000)]);
+        let l = k_ladder(&mut a, true, Some(1001)).unwrap();
+        assert_eq!(a.asked, [Some(1001), Some(701)]);
+        assert_eq!(ks(&l), [1001, 701]);
+        assert!(l.accepted);
+    }
+
+    #[test]
+    fn recruited_reads_deep_enough_start_at_the_largest_k() {
+        let r = |depth: f64, fraction: f64| json!({"read_depth": depth, "sampling_fraction": fraction});
+        // Medicago polymorpha's mitochondrion: 3,014x, 8.3% kept, about 250x
+        assert_eq!(start_k(&r(3014.0, 0.083)), Some(1001));
+        assert_eq!(start_k(&r(111.0, 1.0)), Some(1001));
+        assert_eq!(start_k(&r(40.0, 1.0)), None, "shallow reads: automatic k");
+        assert_eq!(start_k(&Value::Null), None, "no recruitment: automatic k");
+    }
+
+    #[test]
     fn a_first_attempt_that_is_accepted_is_not_retried() {
         let mut a = Scripted::new(1001, &[(1001, 1, 1000), (701, 1, 1000)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [1001]);
         assert_eq!((l.chosen, l.accepted), (0, true));
         assert_eq!(
@@ -1911,7 +1954,7 @@ mod tests {
     fn no_molecule_goes_to_the_next_smaller_k_and_stops_at_the_first_accepted() {
         // the Zou AT101 plastid: nothing at 1001, one circle at 701
         let mut a = Scripted::new(1001, &[(701, 1, 900), (501, 1, 900)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [1001, 701]);
         assert_eq!((l.result().k, l.accepted), (701, true));
         assert_eq!(a.asked, [None, Some(701)]);
@@ -1924,7 +1967,7 @@ mod tests {
         // Carex: nothing at 1001..351, two small molecules at 251 (349 + 11,560 bp of a
         // 2.76 Mb graph, here scaled to 1000), the real ones at 201
         let mut a = Scripted::new(1001, &[(251, 2, 40), (201, 1, 950)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [1001, 701, 501, 351, 251, 201]);
         assert_eq!(
             l.tried.iter().map(|o| o.accepted()).collect::<Vec<_>>(),
@@ -1943,7 +1986,7 @@ mod tests {
     fn the_ladder_continues_from_the_automatic_k_not_from_the_top() {
         // low depth: automatic k was 351; only 201 works
         let mut a = Scripted::new(351, &[(201, 1, 900)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [351, 251, 201]);
         assert_eq!(l.result().k, 201);
         assert_eq!(a.asked, [None, Some(251), Some(201)]);
@@ -1962,7 +2005,7 @@ mod tests {
                 (251, 0, 0),
             ],
         );
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [801, 701, 501, 351, 251, 201, 151, 101]);
         assert!(l.tried.iter().all(|o| !o.accepted()));
         assert_eq!((l.chosen, l.result().k, l.accepted), (2, 501, false));
@@ -1978,7 +2021,7 @@ mod tests {
             251,
             &[(251, 1, 100), (201, 1, 200), (151, 1, 300), (101, 1, 400)],
         );
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [251, 201, 151, 101]);
         assert_eq!((l.result().k, l.accepted), (101, false));
         assert_eq!(a.events.last(), Some(&"drop"), "nothing to put back");
@@ -1987,7 +2030,7 @@ mod tests {
     #[test]
     fn equal_explained_shares_keep_the_earliest_attempt() {
         let mut a = Scripted::new(351, &[(351, 1, 200), (251, 1, 200), (201, 1, 200)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!((l.chosen, l.result().k, l.accepted), (0, 351, false));
         assert_eq!(a.events.last(), Some(&"restore"));
         assert_eq!(a.events.iter().filter(|e| **e == "stash").count(), 1);
@@ -1996,7 +2039,7 @@ mod tests {
     #[test]
     fn nothing_at_all_keeps_the_first_attempt() {
         let mut a = Scripted::new(1001, &[]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), K_LADDER);
         assert_eq!((l.chosen, l.accepted), (0, false));
         assert_eq!(a.events.last(), Some(&"restore"));
@@ -2005,7 +2048,7 @@ mod tests {
     #[test]
     fn the_smallest_k_has_nothing_to_fall_back_to() {
         let mut a = Scripted::new(101, &[]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [101]);
         assert_eq!((l.chosen, l.accepted), (0, false));
         assert_eq!(a.events, ["attempt"]);
@@ -2015,7 +2058,7 @@ mod tests {
     fn dense_assembly_is_not_retried() {
         // short reads: k comes from the read length (here 127), smaller ladder values exist
         let mut a = Scripted::new(127, &[(101, 1, 900)]);
-        let l = k_ladder(&mut a, false).unwrap();
+        let l = k_ladder(&mut a, false, None).unwrap();
         assert_eq!(ks(&l), [127]);
         assert_eq!((l.chosen, l.accepted), (0, false));
         assert_eq!(a.events, ["attempt"]);
@@ -2024,7 +2067,7 @@ mod tests {
     #[test]
     fn a_k_between_ladder_values_continues_below_it() {
         let mut a = Scripted::new(801, &[(501, 1, 900)]);
-        let l = k_ladder(&mut a, true).unwrap();
+        let l = k_ladder(&mut a, true, None).unwrap();
         assert_eq!(ks(&l), [801, 701, 501]);
     }
 
