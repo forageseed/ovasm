@@ -857,6 +857,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 replay_dir: None,
                 inputs: cfg.reads.clone(),
                 params: recruit::ClassifyParams {
+                    min_distinct: 0.0,
                     min_cover: 0.8,
                     min_hit_frac: 0.2,
                     numt_min_block: usize::MAX,

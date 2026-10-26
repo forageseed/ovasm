@@ -1363,6 +1363,11 @@ struct RecruitArgs {
     /// Largest gap (bp) between bait hits still bridged into one block. Overrides the preset.
     #[arg(long)]
     block_gap: Option<usize>,
+    /// A read the bait covers but with fewer of its own k-mers distinct than this share is a
+    /// tandem array and is not recruited. Default: 0.5 for hifi (see recruit::HIFI_MIN_DISTINCT),
+    /// 0 (off) for sr and ont.
+    #[arg(long)]
+    min_distinct: Option<f64>,
     /// Most scanning passes; passes after the first add k-mers from recruited reads (iterative
     /// baiting). Iteration stops as soon as no target grows by --saturation, so a close seed
     /// costs one extra pass while a distant one keeps extending until complete. Default: 20 for
@@ -1534,6 +1539,10 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             replay_dir: args.recruit_cache,
             inputs: args.reads,
             params: recruit::ClassifyParams {
+                min_distinct: args.min_distinct.unwrap_or(match args.preset {
+                    Preset::Hifi => recruit::HIFI_MIN_DISTINCT,
+                    Preset::Ont | Preset::Sr => 0.0,
+                }),
                 min_cover: args.min_cover,
                 min_hit_frac: args.min_hit_frac.unwrap_or(phit),
                 numt_min_block: args.numt_min_block.unwrap_or(pnumt),

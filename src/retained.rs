@@ -325,6 +325,7 @@ mod tests {
         );
         fs::write(&pool, &data).unwrap();
         let params = ClassifyParams {
+            min_distinct: 0.0,
             min_cover: 0.8,
             min_hit_frac: 0.8,
             numt_min_block: 15,

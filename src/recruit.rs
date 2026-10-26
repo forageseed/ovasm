@@ -29,6 +29,36 @@ pub struct ClassifyParams {
     pub numt_min_block: usize,
     /// Hits closer than this many bases still extend the same block (tolerates SNPs/indels).
     pub block_gap: usize,
+    /// A read the bait covers whose own k-mers are mostly repeats of one another (a smaller share
+    /// distinct) is a tandem array, not organelle sequence, and is not recruited
+    /// (`HIFI_MIN_DISTINCT`); 0 recruits it.
+    pub min_distinct: f64,
+}
+
+/// `ClassifyParams::min_distinct` for HiFi reads. Once a satellite's unit is in a target's bait,
+/// every read of its arrays is covered: Medicago truncatula A17's mitochondrion recruited 115,110
+/// reads in its second pass, nine tenths of them a nuclear tandem repeat at about its own depth
+/// (21-mers of a read 6-16% distinct; organelle reads near 100%), and assembling them took 365 GB.
+/// A read across two tandem copies of an organelle segment is still about two thirds distinct.
+pub const HIFI_MIN_DISTINCT: f64 = 0.5;
+
+/// Share of a read's k-mers that are distinct, over an eighth of them chosen by hash (a repeated
+/// k-mer is chosen every time); 1 for a read too short to judge.
+pub fn distinct_share(seq: &[u8], k: usize) -> f64 {
+    let mut seen = FxHashSet::default();
+    let mut n = 0usize;
+    for (_, kmer) in CanonicalKmers::new(seq, k) {
+        if kmer.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61 != 0 {
+            continue;
+        }
+        n += 1;
+        seen.insert(kmer);
+    }
+    if n < 20 {
+        1.0
+    } else {
+        seen.len() as f64 / n as f64
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +75,8 @@ pub struct ReadScore {
     pub cover_frac: f64,
     pub hit_frac: f64,
     pub longest_block: usize,
+    /// Covered, but a tandem array (`ClassifyParams::min_distinct`): called `Other`.
+    pub tandem: bool,
 }
 
 /// Bait hits of one read, per target.
@@ -122,13 +154,19 @@ pub fn classify(seq: &[u8], bait: &BaitSet, p: &ClassifyParams) -> (Call, ReadSc
     if n == 0 || total == 0 || hits[best] == 0 {
         return (Call::Other, ReadScore::default());
     }
-    let score = ReadScore {
+    let mut score = ReadScore {
         cover_frac: block_cover[best] as f64 / seq.len() as f64,
         hit_frac: hits[best] as f64 / total as f64,
         longest_block: longest[best],
+        tandem: false,
     };
     let call = if score.cover_frac >= p.min_cover && score.hit_frac >= p.min_hit_frac {
-        Call::Organelle(tied)
+        if p.min_distinct > 0.0 && distinct_share(seq, bait.k) < p.min_distinct {
+            score.tandem = true;
+            Call::Other
+        } else {
+            Call::Organelle(tied)
+        }
     } else if score.longest_block >= p.numt_min_block {
         Call::NumtCandidate(best)
     } else {
@@ -183,6 +221,10 @@ pub struct IterationStats {
     pub frontier_reads: Vec<u64>,
     /// Steps of that within-pass extension.
     pub frontier_steps: Vec<u64>,
+    /// Reads the bait covered but that are tandem arrays (`ClassifyParams::min_distinct`), not
+    /// recruited; among the reads this pass classified (a replayed pass reclassifies only those
+    /// the bait's changes touch).
+    pub tandem_reads: u64,
     /// Sketch depth of each target's reads of this pass (`target_depth` of a sample of
     /// `DEPTH_SAMPLE`), when the depth sketch exists.
     pub read_depth: Vec<Option<f64>>,
@@ -208,6 +250,8 @@ struct ScanResult {
     bases: u64,
     multi_target: u64,
     reclassified: u64,
+    /// Reads classified in this pass that the bait covered but are tandem arrays.
+    tandem: u64,
 }
 
 /// Reads per depth estimate. A median of 2,000 read depths is within a few percent, and the
@@ -520,6 +564,7 @@ fn scan(
         bases: 0,
         multi_target: 0,
         reclassified: 0,
+        tandem: 0,
     };
     for batch in rx {
         if let Some((expected, _)) = &expected_input {
@@ -555,7 +600,7 @@ fn scan(
         };
         out.reads += batch.len() as u64;
         out.bases += batch.iter().map(|r| r.rec.seq.len() as u64).sum::<u64>();
-        let calls: Vec<(Call, crate::replay::Entry, bool)> = batch
+        let calls: Vec<(Call, crate::replay::Entry, bool, bool)> = batch
             .into_par_iter()
             .enumerate()
             .map(|(i, rec)| {
@@ -563,16 +608,18 @@ fn scan(
                     || (!final_outputs
                         && CanonicalKmers::new(&rec.rec.seq, bait.k)
                             .any(|(_, key)| delta.expect("replay has change set").get(key) != 0));
-                let call = if changed {
-                    classify(&rec.rec.seq, bait, p).0
+                let (call, tandem) = if changed {
+                    let (call, score) = classify(&rec.rec.seq, bait, p);
+                    (call, score.tandem)
                 } else {
-                    previous.unwrap()[i]
+                    (previous.unwrap()[i], false)
                 };
-                (call, rec, changed)
+                (call, rec, changed, tandem)
             })
             .collect();
-        for (i, (call, entry, changed)) in calls.into_iter().enumerate() {
+        for (i, (call, entry, changed, tandem)) in calls.into_iter().enumerate() {
             out.reclassified += u64::from(changed);
+            out.tandem += u64::from(tandem);
             if let Some(cache) = replay.as_mut() {
                 if replaying {
                     cache.calls[offset + i] = call;
@@ -1288,6 +1335,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             recruited: res.recruited.clone(),
             numt_candidates: res.numt.clone(),
             multi_target_reads: res.multi_target,
+            tandem_reads: res.tandem,
             bait_kmers_added: added.clone(),
             extended_from_reads: extended_from,
             saturated: saturated.clone(),
@@ -1537,6 +1585,7 @@ mod tests {
 
     fn params() -> ClassifyParams {
         ClassifyParams {
+            min_distinct: 0.0,
             min_cover: 0.8,
             min_hit_frac: 0.2,
             numt_min_block: 40,
@@ -1610,6 +1659,7 @@ mod tests {
             let mut indexed = exact.clone();
             indexed.prepare_lookup();
             let p = ClassifyParams {
+                min_distinct: 0.0,
                 min_cover: 0.8,
                 min_hit_frac: hit,
                 numt_min_block: numt,
@@ -1662,6 +1712,7 @@ mod tests {
             }
         }
         let bridged = ClassifyParams {
+            min_distinct: 0.0,
             min_cover: 0.8,
             min_hit_frac: 0.05,
             numt_min_block: 5000,
@@ -1669,6 +1720,7 @@ mod tests {
         };
         assert_eq!(classify(&noisy, &bait, &bridged).0, Call::Organelle(1));
         let strict = ClassifyParams {
+            min_distinct: 0.0,
             block_gap: 0,
             ..bridged
         };
@@ -1690,6 +1742,7 @@ mod tests {
         bait.add_sequence(m, &mito);
         bait.add_sequence(c, &plastid);
         let p = ClassifyParams {
+            min_distinct: 0.0,
             min_cover: 0.8,
             min_hit_frac: 0.2,
             numt_min_block: 5000,
@@ -1768,6 +1821,7 @@ mod tests {
             replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
+                min_distinct: 0.0,
                 min_cover: 0.8,
                 min_hit_frac: 0.2,
                 numt_min_block: 1000,
@@ -1855,6 +1909,7 @@ mod tests {
             replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
+                min_distinct: 0.0,
                 min_cover: 0.8,
                 min_hit_frac: 0.2,
                 numt_min_block: 1000,
@@ -2013,6 +2068,7 @@ mod tests {
             replay_dir: None,
             inputs: vec![reads.clone()],
             params: ClassifyParams {
+                min_distinct: 0.0,
                 min_cover: 0.8,
                 min_hit_frac: 0.2,
                 numt_min_block: 1000,
@@ -2173,6 +2229,7 @@ mod tests {
             replay_dir: None,
             inputs: vec![fa.to_path_buf()],
             params: ClassifyParams {
+                min_distinct: 0.0,
                 min_cover: 0.8,
                 min_hit_frac: 0.2,
                 numt_min_block: 1000,
@@ -2301,6 +2358,31 @@ mod tests {
         assert!(gated.outputs[0].converged);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tandem_array_the_bait_covers_is_not_recruited() {
+        // a satellite: one 1 kb unit along a whole 17 kb read
+        let unit = pseudo_random(1000, 61);
+        let array: Vec<u8> = unit.iter().cycle().take(17_000).copied().collect();
+        assert!(distinct_share(&pseudo_random(17_000, 62), 21) > 0.95);
+        let d = distinct_share(&array, 21);
+        assert!(d < 0.1, "{d}");
+        // two tandem copies of a 5 kb organelle segment in a 15 kb read stay above the cutoff
+        let segment = pseudo_random(5000, 63);
+        let duplication = [&segment[..], &segment[..], &pseudo_random(5000, 64)[..]].concat();
+        let d = distinct_share(&duplication, 21);
+        assert!(d > HIFI_MIN_DISTINCT && d < 0.8, "{d}");
+        // a bait holding the unit (and its junction) covers the whole array
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &[&unit[..], &unit[..]].concat());
+        let mut p = params();
+        assert_eq!(classify(&array, &bait, &p).0, Call::Organelle(1));
+        p.min_distinct = HIFI_MIN_DISTINCT;
+        let (call, score) = classify(&array, &bait, &p);
+        assert_eq!(call, Call::Other);
+        assert!(score.tandem);
     }
 
     #[test]
