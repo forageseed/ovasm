@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::bait::BaitSet;
 use crate::kmer::CanonicalKmers;
-use crate::seedfree::DepthGate;
+use crate::seedfree::{DepthGate, ReadDepth};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassifyParams {
@@ -221,6 +221,9 @@ pub struct IterationStats {
     pub frontier_reads: Vec<u64>,
     /// Steps of that within-pass extension.
     pub frontier_steps: Vec<u64>,
+    /// Reads of this pass's extension (and its frontier) the gate turned down as a whole but took
+    /// by the sequence they add, the k-mers the bait lacked (`extends`).
+    pub extension_new_part: Vec<u64>,
     /// Reads the bait covered but that are tandem arrays (`ClassifyParams::min_distinct`), not
     /// recruited; among the reads this pass classified (a replayed pass reclassifies only those
     /// the bait's changes touch).
@@ -859,6 +862,78 @@ pub const EXTEND_CORE_FLOOR: f64 = 0.25;
 /// Fewest reads with a depth that set a target's core depth.
 const CORE_MIN_READS: usize = 20;
 
+/// How the extension gate takes a read, by its depth `profile`.
+#[derive(Clone, Copy, PartialEq)]
+enum Gauge {
+    Extends,
+    /// Not organelle-like (`DepthGate::profile`).
+    Gated,
+    /// Shallower than `EXTEND_CORE_FLOOR` of the target's core depth.
+    Shallow,
+    /// Deeper than `HIGH_COPY_FOLD` times it.
+    Deep,
+}
+
+fn gauge(d: Option<ReadDepth>, floor: Option<f64>, ceiling: Option<f64>) -> Gauge {
+    match d {
+        Some(d) if d.organelle_like => {
+            if floor.is_some_and(|f| d.median < f) {
+                Gauge::Shallow
+            } else if ceiling.is_some_and(|c| d.median > c) {
+                Gauge::Deep
+            } else {
+                Gauge::Extends
+            }
+        }
+        _ => Gauge::Gated,
+    }
+}
+
+/// Depth from which a sampled k-mer of a read counts as deep for extending a target with core
+/// depth `core`: the gate's organelle threshold, three times the nuclear depth, or halfway
+/// between the nuclear depth and the core depth (log scale) when that is lower, for a target
+/// less than nine times as deep as the nucleus. A nuclear k-mer stays far below either, while a
+/// target's own sequence a little shallower than the rest of it keeps clear of the threshold:
+/// the Lophophora williamsii mitochondrion (core 104x, nucleus 22x, threshold 66x) has 236 kb
+/// at its depth between two stretches at 66-90x; reads there kept a tenth of their k-mers below
+/// 66x, the gate turned them down, and recruitment stopped on both sides of the 236 kb.
+fn extension_deep(g: &DepthGate, core: Option<f64>) -> f64 {
+    let organelle = g.organelle_min_depth;
+    core.map_or(organelle, |c| {
+        organelle.min((f64::from(g.nuclear_peak_depth) * c).sqrt())
+    })
+}
+
+/// The extension gate on a read (deep k-mers from `deep`, `extension_deep`): on the whole of it,
+/// and when that fails, on the sequence it would add to target `t`, its k-mers the bait lacks.
+/// The bait holds the rest of the read already, and it may be the organelle's own repeat: the
+/// Schoenoplectus lacustris plastid's inverted repeat holds tandem arrays, 30-40 times as deep
+/// as the rest of it, between its outer part and the part that leads to the small single-copy
+/// region; reads across them repeat k-mers and vary in depth along their length, the gate turned
+/// down most of them (and 30% of the reads its second pass drew for extension), and the plastid
+/// stopped there, a 165 kb molecule without its 10.8 kb SSC. Returns the verdict and whether it
+/// was the added sequence that passed.
+fn extends(
+    g: &DepthGate,
+    bait: &BaitSet,
+    t: usize,
+    seq: &[u8],
+    deep: f64,
+    (floor, ceiling): (Option<f64>, Option<f64>),
+) -> (Gauge, bool) {
+    let whole = gauge(g.profile_of(seq, deep, |_| true), floor, ceiling);
+    if whole == Gauge::Extends || g.k() != bait.k {
+        return (whole, false);
+    }
+    let bit = 1u8 << t;
+    let new = gauge(g.profile_of(seq, deep, |km| bait.get(km) & bit == 0), floor, ceiling);
+    if new == Gauge::Extends {
+        (Gauge::Extends, true)
+    } else {
+        (whole, false)
+    }
+}
+
 /// Most sequence a target named for an organelle can stand for (recruited bases over read
 /// depth) before its extension stops: four times the largest land-plant plastome (Pelargonium,
 /// 242 kb), and nearly twice the largest mitochondrial genome (Silene conica, 11.3 Mb). The
@@ -1131,6 +1206,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let mut deep_out = vec![0u64; n_targets];
         let mut frontier_reads = vec![0u64; n_targets];
         let mut frontier_steps = vec![0u64; n_targets];
+        let mut new_part = vec![0u64; n_targets];
         if !last {
             for t in 0..n_targets {
                 if saturated[t] {
@@ -1192,6 +1268,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 let extend_gate = gate.as_ref().filter(|_| cfg.extend_gate);
                 let floor = core_depth[t].map(|c| EXTEND_CORE_FLOOR * c);
                 let ceiling = core_depth[t].map(|c| HIGH_COPY_FOLD * c);
+                let bounds = (floor, ceiling);
                 let (mut fresh, mut picked) = (Vec::new(), Vec::<Vec<u8>>::new());
                 for_each_rec(&path, |r| {
                     let key = name_key(&r.id);
@@ -1202,18 +1279,18 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
                         return;
                     }
-                    match extend_gate.map(|g| g.profile(&r.seq)) {
-                        None => picked.push(r.seq),
-                        Some(Some(d)) if d.organelle_like => {
-                            if floor.is_some_and(|f| d.median < f) {
-                                shallow_out[t] += 1;
-                            } else if ceiling.is_some_and(|c| d.median > c) {
-                                deep_out[t] += 1;
-                            } else {
-                                picked.push(r.seq);
-                            }
+                    let Some(g) = extend_gate else {
+                        picked.push(r.seq);
+                        return;
+                    };
+                    match extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds) {
+                        (Gauge::Extends, by_new) => {
+                            new_part[t] += u64::from(by_new);
+                            picked.push(r.seq);
                         }
-                        Some(_) => gated_out[t] += 1,
+                        (Gauge::Shallow, _) => shallow_out[t] += 1,
+                        (Gauge::Deep, _) => deep_out[t] += 1,
+                        (Gauge::Gated, _) => gated_out[t] += 1,
                     }
                 })?;
                 extended_from[t] = picked.len() as u64;
@@ -1228,13 +1305,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 let Some(g) = extend_gate.filter(|_| added[t] > 0) else {
                     continue;
                 };
-                let extends = |seq: &[u8]| {
-                    g.profile(seq).is_some_and(|d| {
-                        d.organelle_like
-                            && !floor.is_some_and(|f| d.median < f)
-                            && !ceiling.is_some_and(|c| d.median > c)
-                    })
-                };
+                let deep = extension_deep(g, core_depth[t]);
                 let mut pending = res.frontier[t].reads();
                 for _ in 0..FRONTIER_STEPS {
                     bait.prepare_lookup();
@@ -1254,7 +1325,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         }
                     }
                     pending = rest;
-                    let picked: Vec<&[u8]> = ready.into_par_iter().filter(|&s| extends(s)).collect();
+                    let judged: Vec<(&[u8], bool)> = ready
+                        .into_par_iter()
+                        .filter_map(|s| match extends(g, &bait, t, s, deep, bounds) {
+                            (Gauge::Extends, by_new) => Some((s, by_new)),
+                            _ => None,
+                        })
+                        .collect();
+                    new_part[t] += judged.iter().filter(|j| j.1).count() as u64;
+                    let picked: Vec<&[u8]> = judged.into_iter().map(|j| j.0).collect();
                     if picked.is_empty() {
                         break;
                     }
@@ -1345,6 +1424,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             extension_deep_out: deep_out,
             frontier_reads,
             frontier_steps,
+            extension_new_part: new_part,
             read_depth: depths.read,
             fresh_read_depth: depths.fresh,
             implied_size: depths.implied_size,
@@ -2447,6 +2527,84 @@ mod tests {
             gated.iterations.len(),
             plain.iterations.len()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `len` bp reads every `step` bp along `genome` (around it when `circular`), named `tag<i>`.
+    fn tiled(genome: &[u8], step: usize, len: usize, circular: bool, tag: &str) -> String {
+        let (seq, last) = match circular {
+            true => ([genome, &genome[..len]].concat(), genome.len()),
+            false => (genome.to_vec(), genome.len() - len),
+        };
+        (0..last)
+            .step_by(step)
+            .enumerate()
+            .map(|(i, st)| {
+                let read = std::str::from_utf8(&seq[st..st + len]).unwrap();
+                format!(">{tag}{i}\n{read}\n")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extension_gets_past_a_tandem_array_its_bait_holds() {
+        // A 52 kb mitochondrion at 200x in 20 kb reads: 20 kb, a 6 kb tandem array (40 copies of
+        // 150 bp), 20 kb, the array again; seeded with the first 20 kb and the arrays, as the
+        // Schoenoplectus lacustris plastid's bait held its inverted repeat's arrays. Every read
+        // into the second 20 kb that the bait covers by 80% holds a whole array: 30% of its
+        // k-mers, 80 times as deep as the rest and few distinct. Only the sequence it adds is
+        // organelle-like, and from that the bait closes the circle.
+        let unit = pseudo_random(150, 71);
+        let array: Vec<u8> = unit.iter().cycle().take(6000).copied().collect();
+        let (a, b) = (pseudo_random(20_000, 72), pseudo_random(20_000, 73));
+        let mito = [&a[..], &array, &b, &array].concat();
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-array-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        let text =
+            tiled(&mito, 100, 20_000, true, "m") + &tiled(&nuclear, 4000, 20_000, false, "n");
+        std::fs::write(&fa, text).unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &mito[..26_000]);
+        bait.add_sequence(t, &mito[46_000..]);
+        let mut config = test_config(&fa, dir.join("gated"), 60, true);
+        config.params.min_distinct = HIFI_MIN_DISTINCT;
+        let gated = run(bait, config).unwrap();
+        assert_eq!(count_reads(&gated.outputs[0].output, b'm'), 520);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
+        let by_new: u64 = gated.iterations.iter().map(|it| it.extension_new_part[0]).sum();
+        assert!(by_new > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extension_gets_through_a_stretch_of_its_target_near_the_organelle_threshold() {
+        // A 30 kb mitochondrion at 120x beside a nucleus at 24x (organelle threshold 72x), 3 kb of
+        // it missing from half of its molecules and so at 60x, as Lophophora williamsii's had two
+        // stretches at 66-90x (threshold 66x); seeded away from that stretch. Its k-mers count as
+        // deep from halfway between the nucleus and the target (54x), and the reads across it
+        // extend the bait; the nuclear reads stay out.
+        let full = pseudo_random(30_000, 74);
+        let short = [&full[..15_000], &full[18_000..]].concat();
+        let nuclear = pseudo_random(300_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-near-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        let text = circle_reads(&full, 50, "f")
+            + &circle_reads(&short, 50, "s")
+            + &linear_reads(&nuclear, 125, "n");
+        std::fs::write(&fa, text).unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &full[..6000]);
+        let gated = run(bait, test_config(&fa, dir.join("gated"), 60, true)).unwrap();
+        assert_eq!(count_reads(&gated.outputs[0].output, b'f'), 600);
+        assert_eq!(count_reads(&gated.outputs[0].output, b's'), 540);
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
