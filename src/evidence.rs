@@ -411,6 +411,9 @@ pub(crate) struct Crossing {
     from_end: i64,
     /// Collinear k-mer hits supporting this crossing (both sides).
     score: u32,
+    /// Hits over the k-mers the read spans, on its sparser side: near 1 for a copy of the junction
+    /// (a HiFi error costs k of them), far less for a read that only resembles it.
+    share: f32,
 }
 
 pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
@@ -439,6 +442,9 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
         let joint = junction.left_len as i64;
         let unique_left_end = joint - junction.overlap as i64;
         let (mut best_left, mut best_right, mut best_diag) = (0usize, 0usize, 0i64);
+        let mut best_share = 0f32;
+        // k-mers between two junction positions
+        let spanned = |from: i64, to: i64| (to - from - k + 1).max(1) as f32;
         let mut start = 0;
         while start < h.len() {
             let mut end = start + 1;
@@ -462,6 +468,8 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
                 best_left = left;
                 best_right = right;
                 best_diag = chain[chain.len() / 2].0;
+                best_share = (left as f32 / spanned(min_j, unique_left_end))
+                    .min(right as f32 / spanned(joint, max_j));
             }
             start = end;
         }
@@ -480,6 +488,7 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
                 to_start,
                 from_end,
                 score: (best_left + best_right) as u32,
+                share: best_share,
             });
         }
     }
@@ -600,8 +609,17 @@ pub(crate) struct JunctionSupport {
     pub ambiguous_reads: Vec<u64>,
 }
 
+/// Least `Crossing::share` of a junction witness. The candidate junctions are all the graph
+/// there is, so nothing outscores a read from elsewhere that resembles one of them: in the
+/// Schoenoplectus lacustris plastid, 21 sub-k inverted repeats of the large single-copy region
+/// gained 8-512 alternative reads each, all from the inverted repeat or through the normal
+/// junction, with 26-1,170 collinear hits where a read through both windows has ~3,900; restored,
+/// they cut the region into 43 pieces and 11 molecules of 0.4-2.2 kb.
+const JUNCTION_MIN_SHARE: f32 = 0.5;
+
 /// The same collinear-hit and competitive-assignment rules as `evidence`, without
-/// bootstrap or topology inference. `nuclear_flanked` evaluates the complete input
+/// bootstrap or topology inference, from reads that are copies of a junction's context
+/// (`JUNCTION_MIN_SHARE`). `nuclear_flanked` evaluates the complete input
 /// record; it must not infer origin from a recruitment label or short shared match.
 pub(crate) fn junction_support<F>(
     g: &Graph,
@@ -634,7 +652,11 @@ where
                 let name = std::str::from_utf8(id)?.to_string();
                 let mut hash = rustc_hash::FxHasher::default();
                 hash.write(&r.seq.to_ascii_uppercase());
-                let (cs, ambiguous) = assign(g, crossings(&r.seq, &idx, p), p.spacing_tol);
+                let close = crossings(&r.seq, &idx, p)
+                    .into_iter()
+                    .filter(|c| c.share >= JUNCTION_MIN_SHARE)
+                    .collect();
+                let (cs, ambiguous) = assign(g, close, p.spacing_tol);
                 let mut rows = Vec::new();
                 for c in cs {
                     let source = nuclear_flanked(r, c.to_start, c.from_end)?;

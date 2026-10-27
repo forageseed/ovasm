@@ -676,6 +676,41 @@ mod tests {
         assert!(gfa.with_extension("backbone.gfa").is_file());
         fs::remove_dir_all(dir).unwrap();
     }
+    /// A substitution at every `every`th base.
+    fn diverged(s: &[u8], every: usize) -> Vec<u8> {
+        s.iter()
+            .enumerate()
+            .map(|(i, &b)| match (i % every == every / 2, b) {
+                (false, _) => b,
+                (true, b'A') => b'C',
+                (true, b'C') => b'G',
+                (true, b'G') => b'T',
+                (true, _) => b'A',
+            })
+            .collect()
+    }
+    #[test]
+    fn reads_that_only_resemble_a_junction_do_not_vote() {
+        // A substitution every 30 bp leaves about a third of the k-mers (hundreds of collinear
+        // hits a side, far more than evidence needs); every 100 bp, a HiFi read at Q20, about
+        // four fifths.
+        for (every, retained) in [(30, 0), (100, 2)] {
+            let dir = workspace("resemble");
+            let (gfa, reads) = fixture(&dir);
+            let text: String = fs::read_to_string(&reads)
+                .unwrap()
+                .lines()
+                .map(|l| match l.starts_with('>') {
+                    true => format!("{l}\n"),
+                    false => String::from_utf8(diverged(l.as_bytes(), every)).unwrap() + "\n",
+                })
+                .collect();
+            fs::write(&reads, text).unwrap();
+            let report = restore(&gfa, &[reads], 1001, 31, 3, false, |_, _, _| Ok(false)).unwrap();
+            assert_eq!(report.retained_junctions, retained, "a substitution every {every} bp");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
     #[test]
     fn duplicate_records_cannot_inflate_support() {
         let dir = workspace("duplicate");
