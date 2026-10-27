@@ -299,22 +299,90 @@ fn forward_is_canonical(kmer_seq: &[u8], canon: u64) -> bool {
     v == canon
 }
 
+/// Bp without a shared k-mer after which a common beginning has ended (a substitution breaks k
+/// k-mers, a small indel a few more).
+const SHARED_GAP: usize = 100;
+
+/// Near-identical beginning of `x` and `y`: exact k-mer matches along one diagonal, which may
+/// drift by `tol` bp (small indels), until none for `SHARED_GAP` bp. Returns where it ends in
+/// `x` and in `y` (0 when they begin differently).
+fn shared_beginning(x: &[u8], y: &[u8], k: usize, tol: i64) -> (usize, usize) {
+    let (mut diag, mut end, mut i) = (0i64, 0usize, 0usize);
+    while i + k <= x.len() && i <= end + SHARED_GAP {
+        let word = &x[i..i + k];
+        let hit = (0..=tol).flat_map(|t| [t, -t]).find(|&t| {
+            let q = i as i64 + diag + t;
+            q >= 0 && q as usize + k <= y.len() && &y[q as usize..q as usize + k] == word
+        });
+        if let Some(t) = hit {
+            diag += t;
+            end = i + k;
+        }
+        i += 1;
+    }
+    (end, (end as i64 + diag).max(0) as usize)
+}
+
+/// Junction window (bp beyond the overlap) on the [left, right] side of every link: `flank`, or
+/// further where links at the same segment end only diverge after a long shared stretch. Their
+/// hits there count for both, so a read must outscore the rival exit on the rest of the window
+/// (`pick_winner`); when even a read through all of it cannot, both windows reach `flank` past
+/// the shared stretch. A17's mitochondrion: a 2.7 kb branch began with the main exit's first
+/// 2,155 bp but for 3 substitutions, and all 152 reads across the circle's join were ambiguous.
+fn windows(g: &Graph, p: &EvidenceParams, flank: usize) -> Vec<[usize; 2]> {
+    let mut win = vec![[flank; 2]; g.links.len()];
+    // segment end -> (link, its side beyond that end, that side read away from the joint)
+    let mut ends: FxHashMap<(usize, bool), Vec<(usize, usize, Vec<u8>)>> = FxHashMap::default();
+    for (li, &(a, b)) in g.links.iter().enumerate() {
+        let ov = g.overlaps[li];
+        // leaves a's right end if a is forward; enters b's left end if b is forward
+        ends.entry((a.0, a.1))
+            .or_default()
+            .push((li, 1, g.oriented_seq(b)[ov..].to_vec()));
+        ends.entry((b.0, !b.1))
+            .or_default()
+            .push((li, 0, g.oriented_seq(flip(a))[ov..].to_vec()));
+    }
+    // a read through the whole window: `flank` hits on each side of its own exit, the shared
+    // ones on the other's far side
+    let decided = |shared: usize| {
+        let w = flank as u32;
+        pick_winner(&[2 * w, w + shared.min(flank) as u32]).is_some()
+    };
+    for rivals in ends.values() {
+        for (i, (li, si, x)) in rivals.iter().enumerate() {
+            for (lj, sj, y) in &rivals[i + 1..] {
+                if li == lj {
+                    continue;
+                }
+                let (ex, ey) = shared_beginning(x, y, p.k, p.diag_tol);
+                if !decided(ex.min(ey)) {
+                    win[*li][*si] = win[*li][*si].max(ex + flank);
+                    win[*lj][*sj] = win[*lj][*sj].max(ey + flank);
+                }
+            }
+        }
+    }
+    win
+}
+
 pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
     let mut idx = Index {
         k: p.k,
         junctions: Vec::new(),
         map: FxHashMap::default(),
     };
+    // keep room beyond the anchor so one error at the flank edge cannot veto support
+    let win = windows(g, p, p.flank.max(p.min_anchor + 500));
     for (li, &(a, b)) in g.links.iter().enumerate() {
         let sa = g.oriented_seq(a);
         let sb = g.oriented_seq(b);
-        // keep room beyond the anchor so one error at the flank edge cannot veto support
-        let flank = p.flank.max(p.min_anchor + 500);
         // Left keeps the overlap at its end; right starts after it. Support must reach the
         // unique sequence on both sides of the overlap.
         let ov = g.overlaps[li];
-        let left = &sa[sa.len().saturating_sub(flank + ov)..];
-        let right = &sb[ov..sb.len().min(ov + flank)];
+        let [wl, wr] = win[li];
+        let left = &sa[sa.len().saturating_sub(wl + ov)..];
+        let right = &sb[ov..sb.len().min(ov + wr)];
         let mut j = left.to_vec();
         j.extend_from_slice(right);
         let ji = idx.junctions.len() as u32;
@@ -1948,15 +2016,79 @@ mod tests {
     }
 
     #[test]
-    fn exits_identical_across_the_flank_are_ambiguous() {
-        // shared 2000 bp > flank: nothing in the indexed window separates U1 from U2.
+    fn exits_identical_across_the_flank_are_told_apart_past_it() {
+        // shared 2000 bp > flank: the windows reach past the shared part, where U1 and U2 differ.
         let (g, s, u1) = twin_exits(2000);
         let idx = build_index(&g, &params());
         let read = cat(&[&s[1500..], &u1[..2500]]);
-        let (kept, mut ambiguous) = assign(&g, crossings(&read, &idx, &params()), 0.05);
+        let (kept, ambiguous) = assign(&g, crossings(&read, &idx, &params()), 0.05);
+        assert_eq!(kept.iter().map(|c| c.link).collect::<Vec<_>>(), vec![0]);
+        assert!(ambiguous.is_empty());
+        // A read that ends inside the shared part cannot tell them apart.
+        let short = cat(&[&s[1500..], &u1[..1900]]);
+        let (kept, mut ambiguous) = assign(&g, crossings(&short, &idx, &params()), 0.05);
         assert!(kept.is_empty());
         ambiguous.sort();
         assert_eq!(ambiguous, vec![0, 1]);
+    }
+
+    #[test]
+    fn exits_alike_but_for_substitutions_past_the_flank_are_told_apart() {
+        // A17's mitochondrion: a branch begins with the main exit's first 2,155 bp but for 3
+        // substitutions, then turns elsewhere. Reads across the joint go to the exit they follow.
+        let s = rng_seq(3000, 61);
+        let main = rng_seq(5000, 62);
+        let mut branch = main[..2155].to_vec();
+        for i in [400, 1200, 2000] {
+            branch[i] = if branch[i] == b'A' { b'C' } else { b'A' };
+        }
+        branch.extend(rng_seq(600, 63));
+        let g = Graph {
+            names: ["S", "MAIN", "BRANCH"].map(String::from).to_vec(),
+            seqs: vec![s.clone(), main.clone(), branch.clone()],
+            links: vec![((0, true), (1, true)), ((0, true), (2, true))],
+            overlaps: vec![0, 0],
+        };
+        let p = EvidenceParams {
+            flank: 2000,
+            min_anchor: 500,
+            ..params()
+        };
+        assert_eq!(windows(&g, &p, 2000), vec![[2000, 4155], [2000, 4155]]);
+        let idx = build_index(&g, &p);
+        for (read, link) in [
+            (cat(&[&s[1000..], &main[..4000]]), 0),
+            (cat(&[&s[1000..], &branch]), 1),
+        ] {
+            for read in [read.clone(), revcomp(&read)] {
+                let (kept, ambiguous) = assign(&g, crossings(&read, &idx, &p), p.spacing_tol);
+                assert_eq!(kept.iter().map(|c| c.link).collect::<Vec<_>>(), vec![link]);
+                assert!(ambiguous.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn exits_whose_shared_part_leaves_the_window_decisive_keep_it() {
+        // 300 bp shared of a 700 bp window: a read through the rest is told apart already.
+        let (g, _, _) = twin_exits(300);
+        assert_eq!(windows(&g, &params(), 700), vec![[700, 700]; 2]);
+        let (g, _, _) = twin_exits(2000);
+        assert_eq!(windows(&g, &params(), 700), vec![[700, 2700]; 2]);
+    }
+
+    #[test]
+    fn shared_beginning_spans_substitutions_and_small_indels() {
+        let x = rng_seq(3000, 71);
+        assert_eq!(shared_beginning(&x, &x, 21, 30), (3000, 3000));
+        // a substitution at 500, 5 bp inserted at 1000, then unrelated after 2000
+        let mut y = x[..1000].to_vec();
+        y[500] = if y[500] == b'A' { b'C' } else { b'A' };
+        y.extend_from_slice(b"ACGTA");
+        y.extend_from_slice(&x[1000..2000]);
+        y.extend(rng_seq(1000, 72));
+        assert_eq!(shared_beginning(&x, &y, 21, 30), (2000, 2005));
+        assert_eq!(shared_beginning(&x, &rng_seq(3000, 73), 21, 30), (0, 0));
     }
 
     #[test]
