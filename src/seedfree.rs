@@ -511,6 +511,28 @@ impl DepthGate {
             median: f.median,
         })
     }
+
+    /// `profile` of the read's sampled k-mers that `keep` selects, its deep ones counted from
+    /// `deep` up (`organelle_min_depth` in `profile`).
+    pub fn profile_of(
+        &self,
+        seq: &[u8],
+        deep: f64,
+        keep: impl Fn(u64) -> bool,
+    ) -> Option<ReadDepth> {
+        let kmers: Vec<u64> = sampled(seq, self.params.k, self.threshold)
+            .filter(|&km| keep(km))
+            .collect();
+        features_of(&kmers, &self.sketch, deep).map(|f| ReadDepth {
+            organelle_like: passes(&f, &self.params),
+            median: f.median,
+        })
+    }
+
+    /// Word length of the sketch.
+    pub fn k(&self) -> usize {
+        self.params.k
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
