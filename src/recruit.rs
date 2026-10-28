@@ -932,17 +932,6 @@ fn extension_deep(g: &DepthGate, core: Option<f64>) -> f64 {
 /// down most of them (and 30% of the reads its second pass drew for extension), and the plastid
 /// stopped there, a 165 kb molecule without its 10.8 kb SSC. Returns the verdict and whether it
 /// was the added sequence that passed.
-///
-/// The added sequence must also be no more than `NEW_PART_MAX_FOLD` times as deep as the part of
-/// the read the bait holds. A read from the organelle into a nuclear high-copy repeat fails as a
-/// whole (its depth jumps at the junction and along the repeat) while its added sequence, the
-/// repeat, can be uniformly deep enough: at its first pass with this rule's first form (d06c6fe)
-/// the Medicago truncatula A17 mitochondrion took 11 reads by their added sequence, and its graph
-/// grew a 4,732 bp branch off the middle of a 43 kb segment, ending in a dead end, like neither
-/// its reference (NC_029641) nor its plastid; along the whole library that branch's k-mers are at
-/// 1,240-3,065x and uneven (spread 0.66-2.58) beside a mitochondrion at 623x and a nucleus at 84x.
-/// The reads into the Schoenoplectus plastid's single-copy region add sequence no deeper than the
-/// inverted repeat and arrays they hold.
 fn extends(
     g: &DepthGate,
     bait: &BaitSet,
@@ -956,19 +945,13 @@ fn extends(
         return (whole, false);
     }
     let bit = 1u8 << t;
-    let added = g.profile_of(seq, deep, |km| bait.get(km) & bit == 0);
-    let held = g.profile_of(seq, deep, |km| bait.get(km) & bit != 0);
-    let in_step = matches!((added, held), (Some(a), Some(h)) if a.median <= NEW_PART_MAX_FOLD * h.median);
-    if in_step && gauge(added, floor, ceiling) == Gauge::Extends {
+    let new = gauge(g.profile_of(seq, deep, |km| bait.get(km) & bit == 0), floor, ceiling);
+    if new == Gauge::Extends {
         (Gauge::Extends, true)
     } else {
         (whole, false)
     }
 }
-
-/// How much deeper than the part of a read the bait holds the sequence it adds may be, for the
-/// read to extend a target by that added sequence alone (`extends`).
-const NEW_PART_MAX_FOLD: f64 = 1.5;
 
 /// Most sequence a target named for an organelle can stand for (recruited bases over read
 /// depth) before its extension stops: four times the largest land-plant plastome (Pelargonium,
@@ -2622,45 +2605,6 @@ mod tests {
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         let by_new: u64 = gated.iterations.iter().map(|it| it.extension_new_part[0]).sum();
         assert!(by_new > 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn added_sequence_far_deeper_than_the_held_part_does_not_extend() {
-        // A 30 kb mitochondrion at 120x beside a nucleus at 24x and a 4 kb high-copy repeat at
-        // 1,000x; a read of 3.6 kb of the mitochondrion (held by the bait) and 2.4 kb of the
-        // repeat (enough for the sketch to sample), as the reads that grew the Medicago truncatula A17 mitochondrion's dead-end
-        // branch. The read fails as a whole; its added sequence alone is uniformly deep, but
-        // eight times as deep as the part the bait holds, so it does not extend the target. A read
-        // whose added sequence is the mitochondrion's own still does.
-        let mito = pseudo_random(30_000, 81);
-        let repeat = pseudo_random(4_000, 82);
-        let nuclear = pseudo_random(300_000, 83);
-        let dir = std::env::temp_dir().join(format!("ovasm-added-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let fa = dir.join("reads.fa");
-        let junction = [&mito[10_000..13_600], &repeat[..2_400]].concat();
-        let text = circle_reads(&mito, 25, "m")
-            + &circle_reads(&repeat, 3, "r")
-            + &linear_reads(&nuclear, 125, "n")
-            + &format!(">j0\n{}\n", std::str::from_utf8(&junction).unwrap());
-        std::fs::write(&fa, text).unwrap();
-        let g = DepthGate::long_reads(&[fa]).unwrap();
-        let mut bait = BaitSet::new(21);
-        let t = bait.target("mitochondrion").unwrap();
-        bait.add_sequence(t, &mito[..20_000]);
-        let core = Some(120.0);
-        let deep = extension_deep(&g, core);
-        let bounds = (core.map(|c| EXTEND_CORE_FLOOR * c), core.map(|c| HIGH_COPY_FOLD * c));
-        let added = g.profile_of(&junction, deep, |km| bait.get(km) & 1 == 0).unwrap();
-        let held = g.profile_of(&junction, deep, |km| bait.get(km) & 1 != 0).unwrap();
-        assert!(added.organelle_like && added.median > 5.0 * held.median, "{added:?} {held:?}");
-        assert!(gauge(g.profile_of(&junction, deep, |_| true), bounds.0, bounds.1) != Gauge::Extends);
-        let (gauge_of, by_added) = extends(&g, &bait, t, &junction, deep, bounds);
-        assert!(gauge_of != Gauge::Extends && !by_added);
-        // the mitochondrion's own edge: 1.8 kb held, 1.2 kb added, both at its depth
-        assert!(extends(&g, &bait, t, &mito[18_200..21_200], deep, bounds).0 == Gauge::Extends);
         std::fs::remove_dir_all(&dir).ok();
     }
 
