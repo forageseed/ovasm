@@ -612,6 +612,11 @@ struct AssembleArgs {
     /// 4 of 17 gained low-depth fragments or extra sequence, so it is opt-in.
     #[arg(long)]
     min_count_fraction: Option<f64>,
+    /// Nuclear depth over the organelle's own depth in the whole library (`ovasm run` passes
+    /// recruitment's): a dead-end branch off a junction no deeper than 1.5 times that share of
+    /// the node depth is a NUMT's nuclear flank and is removed. Not given: no such removal.
+    #[arg(long)]
+    nuclear_share: Option<f64>,
     /// Complete original-read nuclear context; shared local matches do not establish source.
     #[arg(long)]
     read_context: Option<PathBuf>,
@@ -655,6 +660,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
             s: args.s,
             min_count: args.min_count,
             min_count_fraction: args.min_count_fraction,
+            nuclear_share: args.nuclear_share,
             auto_k_depth: args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
             context: args.read_context.as_deref(),
         },

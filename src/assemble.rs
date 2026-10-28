@@ -46,6 +46,10 @@ pub struct AssembleParams {
     /// Fraction of the typical node depth used when `min_count` is `None` (default 0.1, floor 3).
     /// Ignored when `min_count` is given. Must be in (0, 1].
     pub min_count_fraction: Option<f64>,
+    /// Nuclear depth over the organelle's own depth in the whole library (recruitment's depth
+    /// gate and core depth), when known: a dead-end branch no deeper than `NUMT_BRANCH_FOLD`
+    /// times that share of the node depth is a NUMT's nuclear flank and is removed (`clean`).
+    pub nuclear_share: Option<f64>,
 }
 
 #[inline]
@@ -1003,6 +1007,9 @@ pub struct CleanStats {
     pub variant_arms_removed: usize,
     /// Bases of those arms beyond their shared overlap.
     pub variant_arm_bp: usize,
+    /// Dead-end branches no deeper than a NUMT's reads (see `clean`), and their bases.
+    pub numt_branches_removed: usize,
+    pub numt_branch_bp: usize,
     /// Isolated circles shorter than k: tandem arrays whose length the graph cannot tell
     /// (e.g. a 62 bp nuclear satellite), removed (see `clean`).
     pub tandem_circles: Vec<TandemCircle>,
@@ -1020,6 +1027,10 @@ pub struct TandemCircle {
 /// to be a near copy of that way (see `clean`): one difference per 100 bp still leaves ~85%.
 const VARIANT_W: usize = 15;
 const VARIANT_SHARE: f64 = 0.8;
+
+/// A dead-end branch no deeper than this many times the nuclear share of the node depth is the
+/// nuclear flank of a NUMT (see `clean`).
+pub const NUMT_BRANCH_FOLD: f64 = 1.5;
 
 /// The first `want` bases (or all) of an oriented unitig, spelled from its k-mers.
 fn unitig_prefix(t: &Unitig, kmers: &[&[u8]], k: usize, forward: bool, want: usize) -> Vec<u8> {
@@ -1084,6 +1095,17 @@ fn shared_share(a: &[u8], b: &[u8]) -> f64 {
 /// of these shapes. Near copies of the organelle sequence (NUMTs, minor alleles) leave arms of any
 /// length that spell what the deeper way beside them spells; recombination leads into different
 /// sequence, so the comparison tells them apart.
+///
+/// A NUMT longer than a read also leaves a dead end: reads of the nuclear copy run from sequence
+/// that is the organelle's into the nuclear flank beside it, at the nuclear depth. Given the
+/// nuclear share of the organelle's depth (`numt_depth`, that share of the node depth times
+/// `NUMT_BRANCH_FOLD`), a dead-end branch off a junction where a deeper way goes on, no deeper
+/// than that, goes whatever its length. The Medicago truncatula A17 mitochondrion (623x, nucleus
+/// 84x: 13.5%) kept a 4,732 bp dead end at 12% of its depth off a junction whose other way had
+/// 166 reads against its 19; its reads run from the mitochondrion into sequence like neither its
+/// reference (NC_029641) nor its plastid, uneven and 2-5 times the mitochondrion's depth along
+/// the whole library, as a nuclear repeat is. A molecule's end where recruitment stopped is no
+/// branch, and stays.
 #[allow(clippy::too_many_arguments)]
 fn clean(
     unitigs: &[Unitig],
@@ -1096,6 +1118,7 @@ fn clean(
     stats: &mut CleanStats,
     audit: &mut Vec<CleanEvent>,
     keep_short_isolated: bool,
+    numt_depth: Option<f64>,
 ) -> usize {
     let n = unitigs.len();
     let len: Vec<usize> = unitigs
@@ -1204,6 +1227,17 @@ fn clean(
                     remove[u] = true;
                     why[u] = "tip";
                     stats.tips_removed += 1;
+                } else if numt_depth.is_some_and(|d| dp[u] <= d)
+                    && !strongest_at[u]
+                    && !unitigs[u].circular
+                    && out.values().any(|s| s.len() > 1 && s.iter().any(|&(v, _)| v == u))
+                {
+                    // one of several ways on from a junction, the others deeper (it is not the
+                    // strongest there), and as shallow as a nuclear copy's reads
+                    remove[u] = true;
+                    why[u] = "numt_branch";
+                    stats.numt_branches_removed += 1;
+                    stats.numt_branch_bp += len[u];
                 }
             }
             (false, false) => {
@@ -1459,6 +1493,7 @@ pub fn run_auto_k_with_context(
         out_json,
         context,
         false,
+        None,
     )
 }
 
@@ -1472,6 +1507,7 @@ fn run_auto_k_cleaning(
     out_json: &Path,
     context: Option<&Path>,
     cleaning_audit_only: bool,
+    nuclear_share: Option<f64>,
 ) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
@@ -1484,6 +1520,7 @@ fn run_auto_k_cleaning(
                     s,
                     min_count,
                     min_count_fraction,
+                    nuclear_share,
                 },
                 out_gfa,
                 out_json,
@@ -1699,6 +1736,7 @@ pub struct EngineParams<'a> {
     pub s: usize,
     pub min_count: Option<u32>,
     pub min_count_fraction: Option<f64>,
+    pub nuclear_share: Option<f64>,
     pub auto_k_depth: f64,
     pub context: Option<&'a Path>,
 }
@@ -1730,6 +1768,7 @@ pub fn run_engine(
                     s: p.s,
                     min_count: p.min_count,
                     min_count_fraction: p.min_count_fraction,
+                    nuclear_share: p.nuclear_share,
                 },
                 out_gfa,
                 out_json,
@@ -1748,6 +1787,7 @@ pub fn run_engine(
                 out_json,
                 p.context,
                 p.cleaning_audit_only,
+                p.nuclear_share,
             )
             .map(EngineReport::Bases),
             k => {
@@ -1767,6 +1807,7 @@ pub fn run_engine(
                         s: p.s,
                         min_count: p.min_count,
                         min_count_fraction: p.min_count_fraction,
+                        nuclear_share: p.nuclear_share,
                     },
                     out_gfa,
                     out_json,
@@ -1936,6 +1977,7 @@ pub(crate) fn run_backbone_layout(
                 &mut cleaning,
                 &mut audit,
                 deferring,
+                p.nuclear_share.map(|s| NUMT_BRANCH_FOLD * s * node_depth),
             );
             cleaning.rounds += 1;
             if let Some(saved) = saved_alive {
@@ -2230,6 +2272,7 @@ mod tests {
             s: 15,
             min_count: Some(3),
             min_count_fraction: None,
+            nuclear_share: None,
         }
     }
 
@@ -2344,6 +2387,7 @@ mod tests {
                 s: 15,
                 min_count: None,
                 min_count_fraction: None,
+                nuclear_share: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2364,6 +2408,40 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(rep.circular_unitigs, 1);
+    }
+
+    #[test]
+    fn a_dead_end_branch_as_shallow_as_a_numt_goes_with_the_nuclear_share() {
+        // A 20 kb circle at 60x and eight reads of a NUMT: 1.5 kb of the circle and then 1.5-2.2
+        // kb of nuclear sequence, a dead end of ~1.8 kb at ~8x off the circle, past the length a
+        // tip may have. With the nuclear share of A17 (13.5%) it goes and the circle closes;
+        // without one, or with a far smaller one, it stays.
+        let g = seq(20_000, 41);
+        let nuclear = seq(4_000, 42);
+        let mut reads = tile(&g, 3000, 50);
+        for i in 0..8 {
+            reads.push([&g[8_000 + 100 * i..9_500], &nuclear[..1_500 + 100 * i]].concat());
+        }
+        let dir = tmpdir("numt-branch");
+        let input = fastq(&dir, &reads);
+        let assemble = |share: Option<f64>, name: &str| {
+            run(
+                vec![input.clone()],
+                AssembleParams { nuclear_share: share, ..params() },
+                &dir.join(format!("{name}.gfa")),
+                &dir.join(format!("{name}.json")),
+            )
+            .unwrap()
+        };
+        let with = assemble(Some(84.0 / 623.0), "with");
+        assert!(with.cleaning.numt_branches_removed > 0);
+        assert_eq!((with.unitigs, with.circular_unitigs), (1, 1));
+        for (share, name) in [(None, "without"), (Some(0.01), "small")] {
+            let r = assemble(share, name);
+            assert_eq!(r.cleaning.numt_branches_removed, 0, "{name}");
+            assert!(r.unitigs > 1, "{name}: the branch stays");
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2389,6 +2467,7 @@ mod tests {
             s: 15,
             min_count: None,
             min_count_fraction: None,
+            nuclear_share: None,
         };
         let report = run_backbone(
             vec![input],
@@ -2658,6 +2737,7 @@ mod tests {
                 s: 15,
                 min_count: Some(3),
                 min_count_fraction: None,
+                nuclear_share: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2741,6 +2821,7 @@ mod tests {
                     s: 15,
                     min_count: None,
                     min_count_fraction: fraction,
+                    nuclear_share: None,
                 },
                 &dir.join(format!("{name}.gfa")),
                 &dir.join(format!("{name}.json")),
@@ -2770,6 +2851,7 @@ mod tests {
                 s: 15,
                 min_count: Some(4),
                 min_count_fraction: Some(0.5),
+                nuclear_share: None,
             },
             &dir.join("explicit.gfa"),
             &dir.join("explicit.json"),
