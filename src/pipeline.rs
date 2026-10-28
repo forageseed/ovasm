@@ -386,6 +386,8 @@ struct GraphAttempts<'a> {
     read_type: ReadType,
     /// Reads found by depth: each graph goes through the component filter first.
     filter: Option<&'a ComponentFilter>,
+    /// `assemble --nuclear-share` (`nuclear_share`).
+    nuclear_share: Option<f64>,
 }
 
 fn molecules_of(linearization: &Value) -> Vec<&Value> {
@@ -444,6 +446,9 @@ impl Attempts for GraphAttempts<'_> {
             .each("--reads", self.reads);
         if let Some(context) = self.read_context {
             asm = asm.opt("--read-context", context);
+        }
+        if let Some(share) = self.nuclear_share {
+            asm = asm.opt("--nuclear-share", format!("{share}"));
         }
         if let Some(k) = k {
             asm = asm.opt("--k", k.to_string());
@@ -634,6 +639,15 @@ fn start_k(recruitment: &Value) -> Option<usize> {
     let depth = recruitment["read_depth"].as_f64()?
         * recruitment["sampling_fraction"].as_f64().unwrap_or(1.0);
     (depth >= START_K_READ_DEPTH).then_some(K_LADDER[0])
+}
+
+/// Nuclear depth over the organelle's core depth in the whole library, from the recruitment
+/// summary (its depth gate and core depth), for `assemble --nuclear-share`; none when recruitment
+/// did not gate or set no core depth.
+fn nuclear_share(recruitment: &Value) -> Option<f64> {
+    let nuclear = recruitment["depth_gate"]["nuclear_peak_depth"].as_f64()?;
+    let core = recruitment["core_depth"].as_f64()?;
+    (nuclear > 0.0 && core > 0.0).then(|| nuclear / core)
 }
 
 /// What `summary.json` says about the organelle's seed recruitment: its `recruit.json`
@@ -1458,6 +1472,7 @@ fn assemble_organelle(
             dir,
             read_type: cfg.read_type,
             filter: filter.as_ref(),
+            nuclear_share: nuclear_share(&recruited.recruitment),
         },
         // dense (short-read) assembly takes k from the read length, so it is not retried
         cfg.read_type == ReadType::Hifi,
@@ -1951,6 +1966,11 @@ mod tests {
         assert_eq!(start_k(&r(111.0, 1.0)), Some(1001));
         assert_eq!(start_k(&r(40.0, 1.0)), None, "shallow reads: automatic k");
         assert_eq!(start_k(&Value::Null), None, "no recruitment: automatic k");
+        // the nuclear share: Medicago truncatula A17's mitochondrion, 84x against 623x
+        let gated = json!({"depth_gate": {"nuclear_peak_depth": 84}, "core_depth": 623.0});
+        assert!((nuclear_share(&gated).unwrap() - 84.0 / 623.0).abs() < 1e-12);
+        assert_eq!(nuclear_share(&json!({"depth_gate": null, "core_depth": 623.0})), None);
+        assert_eq!(nuclear_share(&json!({"depth_gate": {"nuclear_peak_depth": 84}, "core_depth": null})), None);
     }
 
     #[test]
