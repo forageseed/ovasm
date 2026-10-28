@@ -331,6 +331,25 @@ fn settled(now: u64, previous: u64, last_growth: u64, saturation: f64, gated: bo
     previous > 0 && (grown as f64) < saturation * previous as f64 && !steady
 }
 
+/// Whether the genome a gated target's reads stand for has settled over a pass: `settled`, and
+/// grown by less than a read length (`read_len`, its reads' mean). Growth falls by half or more
+/// from one pass to the next when edges meet or reach the end of a linear piece, and a genome
+/// still growing by more than a read is still extending at its other edges: the Lophophora
+/// williamsii mitochondrion gained 1,917 reads in a pass and 833 (3.6%) in the next, under half,
+/// while its genome grew by 65 kb (eight of its 8.1 kb reads), and recruitment stopped there with
+/// 358 kb of the whole-library graph never recruited. Every other target of the benchmark pilots
+/// settled having grown by at most 7.4 kb.
+fn genome_settled(
+    now: u64,
+    previous: u64,
+    last_growth: u64,
+    saturation: f64,
+    read_len: u64,
+) -> bool {
+    let grown = now.saturating_sub(previous);
+    settled(now, previous, last_growth, saturation, true) && grown < read_len
+}
+
 /// Fewest reads a target's extension is subsampled to. A distant seed recruits only a few of the
 /// reads at each place in the first passes, so its reads' depth over the genome they stand for
 /// overstates how deep they cover any place: the Schoenoplectus lacustris plastid (5,355x, seed
@@ -1226,10 +1245,13 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // target that took in many deep reads grows by a small share of its reads while
                 // its genome still grows (Medicago polymorpha's mitochondrion: 31,212 reads at
                 // ~6,500x in its second pass; at its sixth, +1,755 reads, 3.6%, its genome 131 to
-                // 169 kb, and 61 kb of it never recruited).
+                // 169 kb, and 61 kb of it never recruited), and by less than a read length
+                // (`genome_settled`).
                 let size = depths.implied_size[t].filter(|_| cfg.extend_gate);
+                let read_len = res.recruited[t].bases / res.recruited[t].reads.max(1);
                 let size_settled = size.map_or(true, |s| {
-                    settled(s, previous_size[t], last_size_growth[t], cfg.saturation, true)
+                    let (before, grew) = (previous_size[t], last_size_growth[t]);
+                    genome_settled(s, before, grew, cfg.saturation, read_len)
                 });
                 if !recount && reads_settled && size_settled {
                     saturated[t] = true;
@@ -2477,6 +2499,12 @@ mod tests {
         assert!(settled(10_000, 10_000, 0, 0.05, true));
         assert!(settled(10_300, 10_000, 300, 0.05, false));
         assert!(!settled(10_300, 10_000, 300, 0.05, true));
+        // the Lophophora williamsii mitochondrion at its 14th pass with the extension of d06c6fe:
+        // its genome 1,691,974 to 1,756,606 bp after +150,009, under half and under 5%, but eight
+        // of its 8.1 kb reads; at the 26th of 0.3.2, +7,391 bp after +46,115
+        assert!(settled(1_756_606, 1_691_974, 150_009, 0.05, true));
+        assert!(!genome_settled(1_756_606, 1_691_974, 150_009, 0.05, 8_137));
+        assert!(genome_settled(1_906_388, 1_898_997, 46_115, 0.05, 8_140));
     }
 
     #[test]
