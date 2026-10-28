@@ -3,6 +3,7 @@
 
 mod assemble;
 mod bait;
+mod chromosomes;
 mod components;
 mod correct;
 mod evidence;
@@ -83,6 +84,87 @@ enum Command {
     Components(ComponentsArgs),
     /// Retain exact MT/PT sharing evidence from an existing both-organelle assembly.
     Sharing(SharingArgs),
+    /// How many chromosomes the molecules are, and which are conformations of one (recombination
+    /// across a repeat with reads for both pairings): a JSON report; annotates the molecules'
+    /// FASTA headers and the organelle GFA's paths, sequences unchanged.
+    Chromosomes(ChromosomesArgs),
+}
+
+#[derive(clap::Args)]
+struct ChromosomesArgs {
+    /// The assembly graph the evidence and linearization are about.
+    #[arg(long)]
+    gfa: PathBuf,
+    #[arg(long)]
+    evidence: PathBuf,
+    #[arg(long)]
+    linearization: PathBuf,
+    /// molecules.fasta: its headers get chromosome=, conformation= and share= (in place).
+    #[arg(long)]
+    molecules: Option<PathBuf>,
+    /// organelle.gfa: its representative paths get CH:i: and CF:i: tags (in place).
+    #[arg(long = "organelle-gfa")]
+    organelle_gfa: Option<PathBuf>,
+    /// The organelle's seed FASTA files: a component without their sequence that is far
+    /// shallower than the main one is possibly nuclear or contamination.
+    #[arg(long = "seeds")]
+    seeds: Vec<PathBuf>,
+    /// Whole-library k-mer depth of each segment (segment<TAB>depth); without it, the kept
+    /// reads' depth (dp), and a shallow component is only to be checked.
+    #[arg(long)]
+    depths: Option<PathBuf>,
+    #[arg(long = "out-json")]
+    out_json: PathBuf,
+}
+
+fn chromosomes(args: ChromosomesArgs) -> Result<()> {
+    let read = |p: &PathBuf| -> Result<serde_json::Value> {
+        Ok(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| {
+            format!("cannot read {}", p.display())
+        })?)?)
+    };
+    let depths = match &args.depths {
+        Some(p) => {
+            let mut d = std::collections::BTreeMap::new();
+            for line in std::fs::read_to_string(p)?.lines() {
+                let mut f = line.split_whitespace();
+                if let (Some(s), Some(v)) = (f.next(), f.next().and_then(|v| v.parse::<f64>().ok())) {
+                    d.insert(s.to_string(), v);
+                }
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let seeds = if args.seeds.is_empty() {
+        None
+    } else {
+        Some(chromosomes::seed_kmers(&args.seeds)?)
+    };
+    let report = chromosomes::call(
+        &args.gfa,
+        &read(&args.evidence)?,
+        &read(&args.linearization)?,
+        depths.as_ref(),
+        seeds.as_ref(),
+    )?;
+    if let Some(p) = args.molecules.as_ref().filter(|p| p.exists()) {
+        chromosomes::annotate_fasta(p, &report)?;
+    }
+    if let Some(p) = args.organelle_gfa.as_ref().filter(|p| p.exists()) {
+        chromosomes::annotate_gfa(p, &report)?;
+    }
+    std::fs::write(&args.out_json, serde_json::to_string_pretty(&report)? + "\n")?;
+    match report.count {
+        Some(n) => eprintln!("[ovasm] chromosomes: {n}"),
+        None => eprintln!(
+            "[ovasm] chromosomes: {} to {} ({})",
+            report.range.0,
+            report.range.1,
+            report.reasons.join("; ")
+        ),
+    }
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -1605,6 +1687,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Panel(args) => panel(args),
         Command::Label(args) => label(args),
         Command::Components(args) => components(args),
+        Command::Chromosomes(args) => chromosomes(args),
         Command::Sharing(args) => {
             if !(1..=kmer::MAX_K).contains(&args.k) {
                 bail!("--k must be between 1 and {}", kmer::MAX_K);
