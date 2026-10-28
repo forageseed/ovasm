@@ -110,7 +110,8 @@ struct ChromosomesArgs {
     #[arg(long = "seeds")]
     seeds: Vec<PathBuf>,
     /// Whole-library k-mer depth of each segment (segment<TAB>depth); without it, the kept
-    /// reads' depth (dp), and a shallow component is only to be checked.
+    /// reads' depth (dp). Either way a component at twice or half the main one's depth is
+    /// source_pending (counted only in the range's maximum).
     #[arg(long)]
     depths: Option<PathBuf>,
     #[arg(long = "out-json")]

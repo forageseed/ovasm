@@ -14,11 +14,15 @@
 //!    the other pairing's share to be below `MAX_MISSING_SHARE` at 95%;
 //! 4. a repeat they share that no read crosses, or too few, leaves a range of counts;
 //! 5. a component far shallower than the main one (`SHALLOW`) without sequence of the organelle's
-//!    seeds is possibly nuclear or contamination: not counted when its depth is the whole
-//!    library's (`--depths`), and only to be checked (counted in the range's maximum) when it is
-//!    the depth of the kept reads, which an incomplete recruitment lowers (Glycine max: a component
-//!    at 37% of the main one's depth in the kept reads is at 1,000-1,500x in the library, against
-//!    the main one's 480x).
+//!    seeds is possibly nuclear or contamination, and not counted, when its depth is the whole
+//!    library's (`--depths`);
+//! 6. any other component (none is joined to the main one) at `SOURCE_FOLD` times the main one's
+//!    depth or more, or at that share of it or less, is of a source still to be found
+//!    (`source_pending`: another mitochondrial type, a high-copy molecule of its own, or
+//!    contamination): not counted, only in the range's maximum. In the kept reads' depth this also
+//!    takes a component an incomplete recruitment left shallow: Glycine max's 59.5 kb component is
+//!    at 37% of the main one's depth in the kept reads, and at 1,253x against 536x in the whole
+//!    library; its 62,661 bp circle (442x) is counted.
 //!
 //! The molecules and the graph do not change; their FASTA headers and GFA paths are annotated.
 
@@ -41,6 +45,9 @@ const MIN_LINK_READS: u64 = 2;
 pub const MAX_MISSING_SHARE: f64 = 0.05;
 /// A component under this share of the main component's depth (rule 5).
 pub const SHALLOW: f64 = 0.5;
+/// A component unjoined to the main one at this many times its depth, or this share of it, is of
+/// a source still to be found (rule 6).
+pub const SOURCE_FOLD: f64 = 2.0;
 /// Seed sequence a component must hold, in bp of reads-free seed k-mer blocks, to count as the
 /// organelle's own (rule 5): a gene or two of the land-plant seeds.
 const MIN_SEED_BP: usize = 300;
@@ -90,8 +97,10 @@ pub struct Chromosome {
     pub bp: usize,
     pub depth: f64,
     pub seed_bp: Option<usize>,
-    /// counted, or origin_to_check (rule 5 on the kept reads' depth)
+    /// counted, or source_pending (rule 6)
     pub status: &'static str,
+    /// Why it is source_pending.
+    pub reason: Option<String>,
     pub repeats: Vec<RepeatCall>,
 }
 
@@ -110,11 +119,14 @@ pub struct ChromosomeReport {
     /// The count when the evidence decides it, else none and `range` holds the bounds.
     pub count: Option<usize>,
     pub range: (usize, usize),
+    /// Components of a source still to be found (rule 6), in `range`'s maximum only.
+    pub source_pending: usize,
     pub reasons: Vec<String>,
     /// "library" (`--depths`, whole-library k-mer depth) or "kept_reads" (assembly dp)
     pub depth_source: &'static str,
     pub max_missing_share: f64,
     pub shallow: f64,
+    pub source_fold: f64,
     pub chromosomes: Vec<Chromosome>,
     pub excluded: Vec<Excluded>,
 }
@@ -276,14 +288,17 @@ pub fn call(
     let mut report = ChromosomeReport {
         count: None,
         range: (0, 0),
+        source_pending: 0,
         reasons: Vec::new(),
         depth_source: if depths.is_some() { "library" } else { "kept_reads" },
         max_missing_share: MAX_MISSING_SHARE,
         shallow: SHALLOW,
+        source_fold: SOURCE_FOLD,
         chromosomes: Vec::new(),
         excluded: Vec::new(),
     };
     let (mut lo, mut hi) = (0usize, 0usize);
+    let mut main_seen = false;
     for c in &comps {
         let set: BTreeSet<&str> = c.iter().map(String::as_str).collect();
         let bp: usize = c.iter().map(|s| length[s]).sum();
@@ -300,6 +315,8 @@ pub fn call(
             });
             continue;
         }
+        let is_main = !main_seen;
+        main_seen = true;
         let shallow = main_depth.is_some_and(|m| depth < SHALLOW * m);
         let no_seed = seed.is_some_and(|b| b < MIN_SEED_BP);
         if shallow && no_seed && depths.is_some() {
@@ -411,16 +428,26 @@ pub fn call(
         };
         let at_least = groups(&mut joined_or_open);
         let at_most = groups(&mut joined);
-        let status = if shallow && depths.is_none() { "origin_to_check" } else { "counted" };
-        if status == "counted" {
-            lo += at_least;
+        // rule 6: how far its depth is from the main one's, either way
+        let fold = main_depth
+            .filter(|&m| m > 0.0 && depth > 0.0)
+            .map(|m| (depth / m).max(m / depth));
+        let (status, reason) = if !is_main && fold.is_some_and(|f| f >= SOURCE_FOLD) {
+            let main = main_depth.unwrap_or(0.0);
+            let why = format!(
+                "a component of {bp} bp unjoined to the main one is at {depth:.1} against its {main:.1} \
+                 ({} depth, {:.2} times): its source is to be found (another mitochondrial type, a \
+                 high-copy molecule of its own, or contamination)",
+                report.depth_source,
+                depth / main,
+            );
+            report.reasons.push(why.clone());
+            report.source_pending += 1;
+            ("source_pending", Some(why))
         } else {
-            report.reasons.push(format!(
-                "a component of {bp} bp is at {depth:.1} against {:.1}, in the kept reads' depth: \
-                 its origin is to be checked against the whole library",
-                main_depth.unwrap_or(0.0)
-            ));
-        }
+            lo += at_least;
+            ("counted", None)
+        };
         hi += at_most;
         if at_most > at_least {
             report.reasons.push(format!(
@@ -446,6 +473,7 @@ pub fn call(
             depth,
             seed_bp: seed,
             status,
+            reason,
             repeats: calls,
         });
     }
@@ -633,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shallow_component_is_excluded_only_on_whole_library_depth() {
+    fn a_component_far_from_the_main_ones_depth_is_excluded_or_its_source_pending() {
         let d = dir("shallow");
         let g = gfa(&d, &[("m", 2000, 130.0), ("x", 800, 40.0)]);
         let ev = json!({"links": [link("m+", "m+", 50), link("x+", "x+", 20)], "repeats": [], "repeat_segments": []});
@@ -641,19 +669,26 @@ mod tests {
             {"best": {"molecules": [{"path": "m+", "circular": true, "length": 2000}]}},
             {"best": {"molecules": [{"path": "x+", "circular": true, "length": 800}]}}]});
         let seeds = FxHashSet::default();
-        // the kept reads' depth: to be checked, a range
+        // the kept reads' depth (31% of the main one's): its source is pending, a range
         let r = call(&g, &ev, &lin, None, Some(&seeds)).unwrap();
-        assert_eq!((r.count, r.range), (None, (1, 2)));
-        assert_eq!(r.chromosomes[1].status, "origin_to_check");
+        assert_eq!((r.count, r.range, r.source_pending), (None, (1, 2), 1));
+        assert_eq!(r.chromosomes[1].status, "source_pending");
+        assert!(r.chromosomes[1].reason.as_deref().is_some_and(|w| w.contains("kept_reads")));
+        assert_eq!((r.chromosomes[0].status, r.chromosomes[0].reason.as_deref()), ("counted", None));
         // the whole library's, no seed sequence: not counted
         let lib: BTreeMap<String, f64> = [("m".into(), 480.0), ("x".into(), 60.0)].into();
         let r = call(&g, &ev, &lin, Some(&lib), Some(&seeds)).unwrap();
         assert_eq!(r.count, Some(1));
         assert_eq!(r.excluded[0].reason, "possibly_nuclear_or_contamination");
-        // as deep in the library as Glycine max's (1,250x against 480x): counted
-        let lib: BTreeMap<String, f64> = [("m".into(), 480.0), ("x".into(), 1250.0)].into();
+        // as Glycine max's 59.5 kb component in the library (1,253x against 536x): pending
+        let lib: BTreeMap<String, f64> = [("m".into(), 536.0), ("x".into(), 1253.0)].into();
         let r = call(&g, &ev, &lin, Some(&lib), Some(&seeds)).unwrap();
-        assert_eq!(r.count, Some(2));
+        assert_eq!((r.count, r.range, r.source_pending), (None, (1, 2), 1));
+        assert_eq!(r.chromosomes[1].status, "source_pending");
+        // as its 62,661 bp circle (442x against 536x): within twice, counted
+        let lib: BTreeMap<String, f64> = [("m".into(), 536.0), ("x".into(), 442.0)].into();
+        let r = call(&g, &ev, &lin, Some(&lib), Some(&seeds)).unwrap();
+        assert_eq!((r.count, r.source_pending), (Some(2), 0));
         fs::remove_dir_all(&d).ok();
     }
 }
