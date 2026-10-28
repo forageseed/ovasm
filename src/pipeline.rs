@@ -1490,6 +1490,19 @@ fn assemble_organelle(
         .opt("--evidence", dir.join("evidence.json"))
         .opt("--linearization", dir.join("linearization.json"))
         .run()?;
+    // chromosomes and their conformations among the molecules (`ovasm chromosomes`); the
+    // depth is that of the kept reads, so a shallow component is only to be checked
+    log("calling chromosomes and conformations");
+    Argv::new("chromosomes")
+        .opt("--gfa", &graph)
+        .opt("--evidence", dir.join("evidence.json"))
+        .opt("--linearization", dir.join("linearization.json"))
+        .opt("--molecules", dir.join("molecules.fasta"))
+        .opt("--organelle-gfa", dir.join("organelle.gfa"))
+        .each("--seeds", cfg.seeds.get(organelle).map_or(&[][..], Vec::as_slice))
+        .opt("--out-json", dir.join("chromosomes.json"))
+        .run()?;
+    let chromosomes = read_json(&dir.join("chromosomes.json"))?;
     let replicates = match cfg.mode {
         Mode::Fast => Value::Null,
         Mode::Standard => {
@@ -1520,6 +1533,7 @@ fn assemble_organelle(
         ("graph_metadata", "organelle.json"),
         ("evidence", "evidence.json"),
         ("linearization", "linearization.json"),
+        ("chromosomes", "chromosomes.json"),
         ("summary", "summary.json"),
     ] {
         files.insert(key.into(), path_str(&dir.join(name)));
@@ -1592,6 +1606,9 @@ fn assemble_organelle(
         "unbridged_anchors": linear["unbridged_anchors"],
         "skipped_anchors": linear["skipped_anchors"],
         "search_truncated": linear["search_truncated"],
+        // how many chromosomes the molecules are (a range when the reads cannot tell), each with
+        // its conformations and their shares, and the evidence (`ovasm chromosomes`)
+        "chromosomes": chromosomes,
         "scope": SCOPE,
         "mode_requested": match cfg.mode {
             Mode::Fast => "fast",
