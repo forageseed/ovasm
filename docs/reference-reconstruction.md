@@ -184,3 +184,17 @@ over its pairings; configuration 1 is the one most like the reference runs. Each
 are listed, and the FASTA headers and P walks (`rp:f`) carry the score. This is a prior from
 other individuals: a repeat that recombines differs between individuals, and the reads of this
 one still decide nothing between the configurations.
+
+## Genotypes against the reference graph
+
+Each organelle's reads are also genotyped at every known variant site of its reference graph
+(`<organelle>/genotypes.tsv`, `<organelle>/presence.tsv`, `genotypes` in
+`reconstruction.json`). A site is a simple bubble: two oriented segments with two or more ways
+between them, each through one segment or straight across (an allele lacking that sequence).
+Each allele is spelled with 30 bases of either flank, and its depth is the median read count
+of its 31-mers that occur nowhere else in the graph. The allele with the most depth is
+`major`; another with at least 10% of the site's depth is `minor` (heteroplasmy); a site whose
+alleles together have less than a fifth of the organelle's depth (the median of its segments'
+own 31-mer depths) is `no_call`. Each allele lists the reference runs whose walks take it.
+A segment is `present` from a quarter of the organelle's depth and `absent` below 2%; short
+variant segments without 31-mers of their own are judged by their sites instead.

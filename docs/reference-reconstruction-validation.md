@@ -278,3 +278,22 @@ and the runs do not choose between the two. The 837 bp repeat's pairings are in 
 So the reference prior halves the candidates here and keeps the HiFi configuration among the
 remaining 16, but does not pick it. With a 200 bp distance tolerance both pairings of the 135
 and 360 bp repeats were "held by 8 of 8"; the tolerance is now 5% (at least 20 bp).
+
+### Genotypes at the reference graph's sites
+
+With the same reads (`--target-reads`, 4:38, 1.24 GB for the whole run), against the held-out
+HiFi assembly (an allele is its truth when the HiFi sequence holds that allele's spelling and
+no other's):
+
+| | Mitochondrion | Plastid |
+|---|---|---|
+| Sites (simple bubbles) | 660 | 247 |
+| Called | 584 | 231 |
+| Major allele = HiFi allele | 569 of 570 (99.8%) | 229 of 229 |
+| Sites with a minor allele (>= 10%) | 6 | 0 |
+| Segments called present / of them in HiFi | 786 / 777 | 338 / 337 |
+| Segments called absent / of them not in HiFi | 170 / 169 | 45 / 45 |
+
+The one discordant mitochondrial site is split 46:54 between its alleles (218 and 253): a
+minor allele by the reads, and the HiFi assembly holds the other. Sites where HiFi held
+neither allele (14 and 2) or both were not scored.
