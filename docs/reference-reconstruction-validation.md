@@ -315,3 +315,16 @@ about a tenth of the sites the reads call: the reads' own calls are right where 
 run's are not, and imputation from the runs is right about nine times in ten there. Its plastid
 is all but predicted by two near-identical runs. 4:06, 1.29 GB for the whole `--target-reads`
 run.
+
+### Circular representative, VCF and write-back
+
+Same reads (`--target-reads`, 11:03, 1.38 GB). The mitochondrion's representative is now
+configuration 3 of 32: one circle of 307,026 bp, the fewest circular molecules; it aligns to the
+held-out HiFi assembly in four blocks covering both its molecules, every base identical (HiFi
+`linear.1` 0-45,952 and 45,769-160,953, `linear.2` 0-97,673 and 97,490-146,073), i.e. the two HiFi
+molecules joined through the 8.3 kb repeat; the 453 bp tip piece is listed unplaced. All 32
+configuration walks of the GFA spell their FASTA lengths (the first version took a repeat's
+pieces by name and missed the one its overlapping neighbour owns; `pan` refused the walk). The
+VCF has 154 mitochondrial and 181 plastid records. Written back, the mitochondrial graph grows
+from 350,586 to 374,365 bp (23,779 bp of ZM4 sequence no reference run holds, the 15 kb in
+two pieces among it) and the plastid graph from 128,321 to 133,668 bp.

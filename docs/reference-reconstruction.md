@@ -210,3 +210,21 @@ record gives each run's weight, the stretches of the backbone each run is closes
 the called sites measures how far the reference runs predict this individual. Sites the reads
 could not call are imputed with the predicted allele and its probability, marked `imputed`.
 Imputed alleles are the runs', not the reads'.
+
+When the reads leave an organelle's repeat pairings open and some configuration's molecules
+of at least 1 kb are all circular, the one with the fewest of them (a master circle when there
+is one), the best ranked of those, is the representative: `<organelle>.fasta` holds its
+molecules (`chosen_by=fewest_circular_molecules reads_decide=false`; pieces under 1 kb,
+the graph's short dead-end tips, are marked `unplaced=true`), and the status is
+`circular_configuration_chosen`, with the choice in `representative`. The configuration walks
+of `<organelle>.gfa` follow the organelle graph's pieces exactly as `unify` makes them blunt
+(a repeat's bases shared with an overlapping neighbour are the neighbour's piece).
+
+The genotypes are also written as `<organelle>/genotypes.vcf` on the backbone walk, haploid:
+each site where the individual's allele (called, else imputed: `IMP`, `PP`) or a minor allele
+differs from the walk's, with the alleles' read shares (`AF`).
+
+Finally the individual is written back into the species graph: `<organelle>.pan.gfa` is the
+reference graph and the individual's representative molecules (their walks renamed to the
+sample, `<sample>#1#<mt|pt>.<n>`) merged by `ovasm pan` (k 63). Sequence the reference holds is
+shared; the rest becomes new segments (`pan.individual_new_bases`).
