@@ -192,6 +192,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
     // each site: the major allele when called, and the runs taking each allele (`mosaic`)
     let mut observed: Vec<Option<usize>> = Vec::new();
     let mut allele_runs: Vec<Vec<BTreeSet<String>>> = Vec::new();
+    let mut site_calls: Vec<Vec<(&'static str, Option<f64>)>> = Vec::new();
     for (i, (s, ks)) in sites.iter().zip(&allele_kmers).enumerate() {
         let depths: Vec<Option<u32>> = ks.iter().map(|k| depth_of(k)).collect();
         if depths.iter().any(Option::is_none) {
@@ -203,6 +204,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         let mut minors = 0;
         observed.push(major.filter(|_| enough));
         allele_runs.push(Vec::new());
+        site_calls.push(Vec::new());
         for (j, &allele) in s.alleles.iter().enumerate() {
             let share = depths[j].map(|d| d as f64 / total.max(1) as f64);
             let call = if !enough {
@@ -217,6 +219,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
             };
             let runs = taken.get(&(s.left, allele, s.right)).cloned().unwrap_or_default();
             allele_runs[i].push(runs.clone());
+            site_calls[i].push((call, share));
             if call == "major" && runs.is_empty() {
                 absent_from_runs += 1;
             }
@@ -244,7 +247,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         }
     }
     fs::write(out.join("genotypes.tsv"), tsv)?;
-    let mosaic_summary = write_mosaic(g, &sites, walks, &observed, &allele_runs, out)?;
+    let mosaic_summary = write_mosaic(g, &sites, walks, &observed, &allele_runs, &site_calls, out)?;
     let mut presence = String::from("segment\tlength\tkmers\tdepth\trelative\tcall\n");
     let (mut present, mut absent, mut low, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     for (i, (d, ks)) in node_depth.iter().zip(&node_kmers).enumerate() {
@@ -410,6 +413,7 @@ fn write_mosaic(
     walks: &[(String, Vec<Oriented>)],
     observed: &[Option<usize>],
     allele_runs: &[Vec<BTreeSet<String>>],
+    calls: &[Vec<(&'static str, Option<f64>)>],
     out: &Path,
 ) -> Result<Value> {
     let runs: Vec<String> = allele_runs
@@ -435,34 +439,39 @@ fn write_mosaic(
         })
         .collect();
     // the backbone: the walk passing most sites, and each site's place on it
-    let mut keys: BTreeMap<(Oriented, Allele, Oriented), usize> = BTreeMap::new();
+    // (site, allele, read reversed?) of each way through a site
+    let mut keys: BTreeMap<(Oriented, Allele, Oriented), (usize, usize, bool)> = BTreeMap::new();
     for (i, s) in sites.iter().enumerate() {
-        for &a in &s.alleles {
-            keys.insert((s.left, a, s.right), i);
-            keys.insert((flip(s.right), a.map(flip), flip(s.left)), i);
+        for (j, &a) in s.alleles.iter().enumerate() {
+            keys.insert((s.left, a, s.right), (i, j, false));
+            keys.insert((flip(s.right), a.map(flip), flip(s.left)), (i, j, true));
         }
     }
-    let places = |steps: &[Oriented]| -> BTreeMap<usize, usize> {
+    // each site a walk passes: (its step before the site, the allele it takes, reversed?)
+    let places = |steps: &[Oriented]| -> BTreeMap<usize, (usize, usize, bool)> {
         let mut at = BTreeMap::new();
         for (p, w) in steps.windows(2).enumerate() {
-            if let Some(&i) = keys.get(&(w[0], None, w[1])) {
-                at.entry(i).or_insert(p);
+            if let Some(&(i, j, rev)) = keys.get(&(w[0], None, w[1])) {
+                at.entry(i).or_insert((p, j, rev));
             }
         }
         for (p, w) in steps.windows(3).enumerate() {
-            if let Some(&i) = keys.get(&(w[0], Some(w[1]), w[2])) {
-                at.entry(i).or_insert(p);
+            if let Some(&(i, j, rev)) = keys.get(&(w[0], Some(w[1]), w[2])) {
+                at.entry(i).or_insert((p, j, rev));
             }
         }
         at
     };
-    let (backbone, at) = walks
+    // the first of the walks passing most sites (the VCF's coordinates do not change with the
+    // order equal walks come in)
+    let (_, backbone, at) = walks
         .iter()
-        .map(|(name, steps)| (name.clone(), places(steps)))
-        .max_by_key(|(_, at)| at.len())
+        .enumerate()
+        .map(|(k, (name, steps))| (k, name.clone(), places(steps)))
+        .max_by_key(|(k, _, at)| (at.len(), std::cmp::Reverse(*k)))
         .unwrap_or_default();
     let mut chain: Vec<usize> = at.keys().copied().collect();
-    chain.sort_by_key(|i| at[i]);
+    chain.sort_by_key(|i| at[i].0);
     let chain_hap: Vec<Vec<Vec<usize>>> = chain.iter().map(|&i| hap[i].clone()).collect();
     let chain_obs: Vec<Option<usize>> = chain.iter().map(|&i| observed[i]).collect();
     let (without, path) = mosaic(&chain_hap, &chain_obs, runs.len());
@@ -478,6 +487,8 @@ fn write_mosaic(
         "site\tbackbone_step\tcalled\tpredicted\tprobability\tclosest_run\timputed\tagrees\n",
     );
     let (mut scored, mut agree, mut imputed, mut imputed_p) = (0usize, 0usize, 0usize, 0.0);
+    // each site's allele for the VCF: (allele, imputed?, probability when imputed)
+    let mut chosen: Vec<Option<(usize, bool, f64)>> = Vec::new();
     for (i, s) in sites.iter().enumerate() {
         let t = on_chain.get(&i).copied();
         let w = t.map_or(&weights, |t| &without[t]);
@@ -495,10 +506,15 @@ fn write_mosaic(
             imputed += 1;
             imputed_p += pred.unwrap().1;
         }
+        chosen.push(match (observed[i], pred) {
+            (Some(o), _) => Some((o, false, 1.0)),
+            (None, Some((a, p))) => Some((a, true, p)),
+            _ => None,
+        });
         writeln!(
             tsv,
             "{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{agrees}",
-            t.map_or("-".to_string(), |t| at[&chain[t]].to_string()),
+            t.map_or("-".to_string(), |t| at[&chain[t]].0.to_string()),
             observed[i].map_or("-".to_string(), |a| label(s, a)),
             pred.map_or("-".to_string(), |(a, _)| label(s, a)),
             pred.map_or("-".to_string(), |(_, p)| format!("{p:.3}")),
@@ -507,13 +523,14 @@ fn write_mosaic(
         )?;
     }
     fs::write(out.join("mosaic.tsv"), tsv)?;
+    let records = write_vcf(g, sites, walks, &backbone, &at, &chosen, calls, out)?;
     // the Viterbi stretches along the backbone
     let mut stretches = Vec::new();
     let mut start = 0;
     for t in 1..=path.len() {
         if t == path.len() || path[t] != path[start] {
-            stretches.push(json!({"run": runs[path[start]], "first_step": at[&chain[start]],
-                "last_step": at[&chain[t - 1]], "sites": t - start}));
+            stretches.push(json!({"run": runs[path[start]], "first_step": at[&chain[start]].0,
+                "last_step": at[&chain[t - 1]].0, "sites": t - start}));
             start = t;
         }
     }
@@ -524,8 +541,90 @@ fn write_mosaic(
         "called_sites_predicted_without_their_call": scored, "of_them_agreeing": agree,
         "agreement": if scored > 0 { agree as f64 / scored as f64 } else { 0.0 },
         "imputed_sites": imputed, "imputed_mean_probability": if imputed > 0 { imputed_p / imputed as f64 } else { 0.0 },
-        "mosaic": out.join("mosaic.tsv"),
+        "mosaic": out.join("mosaic.tsv"), "vcf": out.join("genotypes.vcf"), "vcf_records": records,
         "basis": "Li-Stephens mosaic over the reference runs (mismatch 0.01, switch 0.001 per site); imputed alleles are the runs', not the reads'"}))
+}
+
+/// The genotypes as a VCF on the backbone walk (`write_mosaic`), haploid: every site where the
+/// individual's allele (called, else imputed) or a minor allele differs from the walk's. Alleles
+/// are spelled in the walk's direction after its base before the site (POS); INFO gives the
+/// alleles' read shares (AF), IMP and PP for an imputed allele, and the site's index (SITE).
+#[allow(clippy::too_many_arguments)]
+fn write_vcf(
+    g: &Graph,
+    sites: &[Site],
+    walks: &[(String, Vec<Oriented>)],
+    backbone: &str,
+    at: &BTreeMap<usize, (usize, usize, bool)>,
+    chosen: &[Option<(usize, bool, f64)>],
+    calls: &[Vec<(&'static str, Option<f64>)>],
+    out: &Path,
+) -> Result<usize> {
+    let Some((_, steps)) = walks.iter().find(|(n, _)| n == backbone) else {
+        fs::write(out.join("genotypes.vcf"), "##fileformat=VCFv4.2\n")?;
+        return Ok(0);
+    };
+    // where each step ends on the walk
+    let mut end = Vec::with_capacity(steps.len());
+    let mut len = 0usize;
+    for &o in steps {
+        len += g.seqs[o.0].len();
+        end.push(len);
+    }
+    let mut records: Vec<(usize, String)> = Vec::new();
+    for (&i, &(p, b, rev)) in at {
+        let Some((a, imp, prob)) = chosen[i] else {
+            continue;
+        };
+        let s = &sites[i];
+        let alts: Vec<usize> = (0..s.alleles.len())
+            .filter(|&j| j != b && (j == a || calls[i][j].0 == "minor" || calls[i][j].0 == "major"))
+            .collect();
+        if alts.is_empty() {
+            continue;
+        }
+        let pad = *oseq(g, steps[p]).last().unwrap();
+        let spelled = |j: usize| -> String {
+            let x = if rev { s.alleles[j].map(flip) } else { s.alleles[j] };
+            let mut v = vec![pad];
+            if let Some(x) = x {
+                v.extend(oseq(g, x));
+            }
+            String::from_utf8_lossy(&v).to_ascii_uppercase()
+        };
+        let gt = if a == b { 0 } else { 1 + alts.iter().position(|&j| j == a).unwrap() };
+        let af: Vec<String> = alts
+            .iter()
+            .map(|&j| calls[i][j].1.map_or(".".to_string(), |f| format!("{f:.3}")))
+            .collect();
+        let mut info = format!("SITE={i};AF={}", af.join(","));
+        if imp {
+            write!(info, ";IMP;PP={prob:.3}")?;
+        }
+        records.push((
+            end[p],
+            format!(
+                "{backbone}\t{}\t.\t{}\t{}\t.\tPASS\t{info}\tGT\t{gt}",
+                end[p],
+                spelled(b),
+                alts.iter().map(|&j| spelled(j)).collect::<Vec<_>>().join(",")
+            ),
+        ));
+    }
+    records.sort();
+    let mut vcf = String::from("##fileformat=VCFv4.2\n");
+    writeln!(vcf, "##contig=<ID={backbone},length={len}>")?;
+    vcf.push_str("##INFO=<ID=SITE,Number=1,Type=Integer,Description=\"Site of genotypes.tsv\">\n");
+    vcf.push_str("##INFO=<ID=AF,Number=A,Type=Float,Description=\"Read share of each ALT allele\">\n");
+    vcf.push_str("##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Allele imputed from the reference runs, not called from reads\">\n");
+    vcf.push_str("##INFO=<ID=PP,Number=1,Type=Float,Description=\"Probability of the imputed allele\">\n");
+    vcf.push_str("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Haploid genotype: the individual's allele\">\n");
+    vcf.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n");
+    for (_, r) in &records {
+        writeln!(vcf, "{r}")?;
+    }
+    fs::write(out.join("genotypes.vcf"), vcf)?;
+    Ok(records.len())
 }
 
 #[cfg(test)]
@@ -618,6 +717,14 @@ mod tests {
         assert!(presence.lines().any(|l| l.starts_with("X\t") && l.ends_with("\tabsent")), "{presence}");
         assert!(presence.lines().any(|l| l.starts_with("M\t") && l.ends_with("\tpresent")), "{presence}");
         assert!(tsv.lines().any(|l| l.split('\t').nth(3) == Some("c+") && l.split('\t').nth(5) == Some("two")));
+        // on run one's walk (it passes both sites): the SNP differs (C for A); the insertion is one's
+        let vcf = fs::read_to_string(dir.join("genotypes.vcf")).unwrap();
+        let records: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(records.len(), 1, "{vcf}");
+        let f: Vec<&str> = records[0].split('\t').collect();
+        assert_eq!((f[0], f[1], f[9]), ("one#1#mt", "300", "1"), "{vcf}");
+        let last = l.as_bytes()[299] as char;
+        assert_eq!((f[3], f[4]), (format!("{last}A").as_str(), format!("{last}C").as_str()), "{vcf}");
         fs::remove_dir_all(dir).unwrap();
     }
 }

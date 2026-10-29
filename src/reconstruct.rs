@@ -920,7 +920,7 @@ fn configurations(
     gfa_out: &Path,
     ref_walks: &[(Vec<u8>, bool)],
     ref_names: &[String],
-) -> Result<Value> {
+) -> Result<(Value, Option<Representative>)> {
     let d = dir.join("de-novo");
     let rep = crate::linearize::run(
         &d.join("assembly.gfa"),
@@ -941,7 +941,7 @@ fn configurations(
     let Some(component) = rep.components.iter().max_by_key(|c| {
         c.best.as_ref().map_or(0, |b| b.molecules.iter().map(|m| m.length).sum::<usize>())
     }) else {
-        return Ok(json!({"configurations": 0, "reason": "no component"}));
+        return Ok((json!({"configurations": 0, "reason": "no component"}), None));
     };
     let covers: Vec<_> = component.best.iter().chain(&component.alternatives).collect();
     // segments of the organelle graph by the assembly segment they came from, in order
@@ -952,24 +952,6 @@ fn configurations(
         .and_then(|h| h.split('\t').find_map(|t| t.strip_prefix("sn:Z:")))
         .unwrap_or("")
         .to_string();
-    let mut pieces: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-    let mut seqs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    for line in text.lines() {
-        let f: Vec<_> = line.split('\t').collect();
-        if f[0] != "S" || f.len() < 3 {
-            continue;
-        }
-        let rest = f[1].strip_prefix(&format!("{sample}.")).unwrap_or(f[1]);
-        let (base, part) = match rest.split_once('.') {
-            Some((b, p)) => (b, p.parse().unwrap_or(0)),
-            None => (rest, 0),
-        };
-        pieces.entry(base.to_string()).or_default().push((part, f[1].to_string()));
-        seqs.insert(f[1].to_string(), f[2].as_bytes().to_vec());
-    }
-    for v in pieces.values_mut() {
-        v.sort();
-    }
     // The molecules are spelled on the assembly graph, each link's overlap taken off once. The
     // organelle graph is blunt: a segment with an overlapping link loses those bases for every
     // walk, and ZM4's 360 bp repeat (126 bp overlaps to two short tips) came out 126 bp short in
@@ -981,6 +963,25 @@ fn configurations(
         overlap.insert((a, b), o);
         overlap.insert((flip(b), flip(a)), o);
     }
+    // The organelle graph is the assembly graph made blunt by `unify`: a walk over assembly
+    // segments is one over its pieces (`unify::piece_walk`), named as unify names them. A
+    // repeat's bases shared with an overlapping neighbour are a piece owned by the neighbour:
+    // ZM4's 360 bp repeat is `u13.1`, `u13.2` and `u12.2`.
+    let blunt = crate::unify::blunt_with(&asm, |_, _| Ok(()))?;
+    let mut owned = vec![0usize; asm.seqs.len()];
+    let mut rank = Vec::with_capacity(blunt.pieces.len());
+    for pc in &blunt.pieces {
+        owned[pc.owner] += 1;
+        rank.push(owned[pc.owner]);
+    }
+    let piece_name = |piece: usize| -> String {
+        let o = blunt.pieces[piece].owner;
+        if owned[o] == 1 {
+            format!("{sample}.{}", asm.names[o])
+        } else {
+            format!("{sample}.{}.{}", asm.names[o], rank[piece])
+        }
+    };
     let spell = |steps: &[(String, bool)], circular: bool| -> Option<Vec<u8>> {
         let walk: Vec<Oriented> = steps
             .iter()
@@ -1015,18 +1016,19 @@ fn configurations(
                 .collect();
             key.push(walk_key(&steps, m.circular));
             // the organelle graph's steps (and what they spell) for it
-            let (mut gsteps, mut gseq) = (Vec::new(), 0usize);
-            for (name, fwd) in &steps {
-                let Some(p) = pieces.get(name) else {
-                    skipped += 1;
-                    continue 'covers;
-                };
-                let order: Vec<&(usize, String)> = if *fwd { p.iter().collect() } else { p.iter().rev().collect() };
-                for (_, piece) in order {
-                    gsteps.push(format!("{piece}{}", if *fwd { '+' } else { '-' }));
-                    gseq += seqs[piece].len();
-                }
-            }
+            let walk: Option<Vec<Oriented>> = steps
+                .iter()
+                .map(|(n, o)| index.get(n.as_str()).map(|&i| (i, *o)))
+                .collect();
+            let Some(pw) = walk.and_then(|w| crate::unify::piece_walk(&asm, &blunt, &w, m.circular).ok()) else {
+                skipped += 1;
+                continue 'covers;
+            };
+            let gsteps: Vec<String> = pw
+                .iter()
+                .map(|&(p, f)| format!("{}{}", piece_name(p), if f { '+' } else { '-' }))
+                .collect();
+            let gseq: usize = pw.iter().map(|&(p, _)| blunt.piece_len(p)).sum();
             let Some(seq) = spell(&steps, m.circular) else {
                 skipped += 1;
                 continue 'covers;
@@ -1053,9 +1055,28 @@ fn configurations(
             .then(found[b].0.total_cmp(&found[a].0))
             .then(a.cmp(&b))
     });
+    // the circular representative: of the configurations whose molecules of at least
+    // `pipeline::MIN_PIECE` are all circular, the one with fewest of them (a master circle when
+    // there is one), the best ranked of those
+    let mut circular: Option<Representative> = None;
     for (rank, &c) in order.iter().enumerate() {
         let (score, molecules) = &found[c];
         let n = rank + 1;
+        let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
+        if !big.is_empty()
+            && big.iter().all(|m| m.0.circular)
+            && circular.as_ref().map_or(true, |r| big.len() < r.pieces)
+        {
+            circular = Some(Representative {
+                configuration: n,
+                pieces: big.len(),
+                molecules: molecules
+                    .iter()
+                    .enumerate()
+                    .map(|(j, m)| (format!("{sample}_configuration{n}#1#{short}.{}", j + 1), m.3.clone(), m.0.circular))
+                    .collect(),
+            });
+        }
         let runs = &prior.runs_with_all[c];
         let mut lengths = Vec::new();
         for (j, (m, _, gsteps, seq, gseq)) in molecules.iter().enumerate() {
@@ -1105,13 +1126,26 @@ fn configurations(
         listed.len(),
         prior.runs
     );
-    Ok(json!({"configurations": listed.len(), "as_well_supported_by_reads_as_the_best": tied,
+    Ok((
+        json!({"configurations": listed.len(), "as_well_supported_by_reads_as_the_best": tied,
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
         "cover_size_limited": component.cover_size_limited, "skipped_covers": skipped,
         "reference_runs": prior.runs, "fasta": path, "list": listed,
+        "circular_representative": circular.as_ref().map(|r| r.configuration),
         "basis": "every cover of the anchor graph linearize finds; the reads do not decide between \
                   them; ranked by how often the reference runs hold each repeat pairing (a prior \
-                  from other individuals, not evidence of this one)"}))
+                  from other individuals, not evidence of this one)"}),
+        circular,
+    ))
+}
+
+/// A configuration taken as the organelle's representative molecules (`configurations`):
+/// its number, molecules of at least `pipeline::MIN_PIECE`, and every molecule as
+/// (configuration walk name, sequence, circular).
+struct Representative {
+    configuration: usize,
+    pieces: usize,
+    molecules: Vec<(String, Vec<u8>, bool)>,
 }
 
 /// A repeat's copy entered from one step and left to another: (from, repeat, to), as the
@@ -1355,7 +1389,6 @@ fn final_outputs(
         }
         fs::write(&fasta_out, text)?;
     }
-    let lengths: Vec<usize> = molecules.iter().map(|m| m.1.len()).collect();
     let decisive = de_novo["decisive"].as_bool().unwrap_or(false);
     let loose = dead_ends(&parse_gfa(&gfa_out)?);
     let mut reasons = Vec::new();
@@ -1379,20 +1412,112 @@ fn final_outputs(
         (true, _) => "complete_with_reference_fill",
     };
     // the reads leave the configuration open: every one the graph allows
-    let configurations_found = if status == "incomplete" && !decisive && !pieces.is_empty() {
+    let (configurations_found, chosen) = if status == "incomplete" && !decisive && !pieces.is_empty() {
         configurations(dir, out, organelle, &gfa_out, walks, walk_names)?
     } else {
-        Value::Null
+        (Value::Null, None)
     };
+    let mut status = status.to_string();
+    let mut representative = Value::Null;
+    let (mut lengths, mut circular) = (molecules.iter().map(|m| m.1.len()).collect::<Vec<_>>(), circular);
+    // A configuration of circular molecules, when the reads leave one open, is the representative:
+    // as `run` gives a circle for a molecule of the graph, not the linear walk that ends on short
+    // tips beside a repeat (ZM4: two dead-end tips of 177 and 168 bp at its 360 bp repeat).
+    if let Some(r) = &chosen {
+        let total = configurations_found["configurations"].as_u64().unwrap_or(0);
+        let mut text = String::new();
+        for (name, seq, circ) in &r.molecules {
+            let unplaced = (seq.len() as u64) < pipeline::MIN_PIECE;
+            writeln!(
+                text,
+                ">{name} circular={circ} length={} configuration={} of={total} chosen_by=fewest_circular_molecules reads_decide=false{}",
+                seq.len(),
+                r.configuration,
+                if unplaced { " unplaced=true" } else { "" }
+            )?;
+            for chunk in seq.chunks(80) {
+                writeln!(text, "{}", std::str::from_utf8(chunk)?)?;
+            }
+        }
+        fs::write(&fasta_out, text)?;
+        lengths = r.molecules.iter().map(|m| m.1.len()).collect();
+        circular = r.molecules.iter().map(|m| m.2).collect();
+        let small = r.molecules.iter().filter(|m| (m.1.len() as u64) < pipeline::MIN_PIECE).count();
+        reasons = vec![format!(
+            "the reads leave the repeat pairings open: configuration {} of {total}, the fewest circular molecules ({}), is the representative; all are in {organelle}.configurations.fasta",
+            r.configuration, r.pieces
+        )];
+        if small > 0 {
+            reasons.push(format!("{small} piece(s) under {} bp not placed: the graph's short dead-end tips", pipeline::MIN_PIECE));
+        }
+        status = "circular_configuration_chosen".to_string();
+        representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces,
+            "chosen_by": "fewest circular molecules, then the reference runs' ranking"});
+    }
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
         "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
-        "configurations": configurations_found,
+        "configurations": configurations_found, "representative": representative,
         "graph_loose_ends": loose, "status": status,
         "reasons": reasons, "decisive": decisive,
         "repeats": if decisive {"every pairing decided by reads"} else {
             "some repeat pairings not decided by reads (a repeat longer than the fragments, or too few spanning reads): the molecule is one configuration the graph allows"}}))
+}
+
+/// The individual written back into the species graph: the reference graph and the
+/// individual's organelle graph (`<organelle>.gfa`, its segments and links with only its
+/// representative molecules' walks, PanSN haplotype 1, renamed to the sample; neither the
+/// unresolved configurations nor other conformations) merged by `pan` into
+/// `<organelle>.pan.gfa`. Bases the reference holds are shared; the rest is the individual's
+/// new sequence, added as segments of its own.
+fn write_back(
+    reference: &Path,
+    organelle_gfa: &Path,
+    sample: &str,
+    organelle: &str,
+    configuration: Option<u64>,
+    out: &Path,
+    dir: &Path,
+) -> Result<Value> {
+    let text = fs::read_to_string(organelle_gfa)?;
+    // the representative's walks: a chosen configuration's, else haplotype 1's
+    let from = match configuration {
+        Some(n) => format!("{sample}_denovo_configuration{n}#"),
+        None => format!("{sample}_denovo#"),
+    };
+    let mut kept = format!("H\tVN:Z:1.0\tov:Z:organelleverse.graph.v1\tsn:Z:{sample}\n");
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f[0] {
+            "S" | "L" => writeln!(kept, "{line}")?,
+            "P" if f.len() > 2 => {
+                if !f[1].starts_with(&from) || f[1].split('#').nth(1) != Some("1") {
+                    continue;
+                }
+                let name = f[1].replacen(&from, &format!("{sample}#"), 1);
+                writeln!(kept, "P\t{name}\t{}", f[2..].join("\t"))?;
+                paths.push(name);
+            }
+            _ => {}
+        }
+    }
+    let input = dir.join("individual.for-pan.gfa");
+    fs::write(&input, kept)?;
+    let pan_gfa = out.join(format!("{organelle}.pan.gfa"));
+    let rep = pan::run(
+        &[reference.to_path_buf(), input],
+        &pan::PanParams { k: 63 },
+        &pan_gfa,
+        &dir.join("pan.json"),
+    )?;
+    let reference_bases: usize = parse_gfa(reference)?.seqs.iter().map(Vec::len).sum();
+    Ok(json!({"pan_gfa": pan_gfa, "individual_paths": paths, "pan_bases": rep.pan_bases,
+        "reference_bases": reference_bases,
+        "individual_new_bases": rep.pan_bases.saturating_sub(reference_bases),
+        "pieces": rep.pieces, "links": rep.links,
+        "basis": "pan merge (k 63) of the reference graph and the individual's representative molecules"}))
 }
 
 pub struct Config {
@@ -1611,6 +1736,17 @@ pub fn run(cfg: &Config) -> Result<Value> {
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
+        let pan = if de_novo.get("error").is_none() {
+            let chosen = final_output["representative"]["configuration"].as_u64();
+            let p = write_back(&r.input, &cfg.out.join(format!("{o}.gfa")), &cfg.sample, o, chosen, &cfg.out, &dir)?;
+            eprintln!(
+                "[ovasm] reconstruct {o}: written back into the reference graph, {} new bases",
+                p["individual_new_bases"]
+            );
+            p
+        } else {
+            Value::Null
+        };
         eprintln!(
             "[ovasm] reconstruct {o}: {} ({})",
             final_output["status"].as_str().unwrap_or("?"),
@@ -1622,7 +1758,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         organelles.insert(
             o,
             json!({"reference":reference_info[o],"projection":projection,"individual":integration,
-            "de_novo":de_novo,"final":final_output,"genotypes":genotypes}),
+            "de_novo":de_novo,"final":final_output,"genotypes":genotypes,"pan":pan}),
         );
     }
     let workflow_completed = organelles
