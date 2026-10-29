@@ -174,3 +174,13 @@ reference or used to select paths during reconstruction.
 
 See [the eight-run validation record](reference-reconstruction-validation.md) for
 actual input scope, measured stages, first failures, graph results and remaining limits.
+
+The configurations are ranked by the reference runs: for each repeat pairing a configuration
+makes (the step before a repeat's copy, the copy, the step after), the reference walks of each
+run are searched for the entry's last 31 bases followed, at the distance the copy makes
+(within 5%, at least 20 bp), by the exit's first 31 bases, on either strand. A configuration's
+`reference_prior_ln` sums ln((runs holding the pairing + 0.5) / (runs holding its entry + 1))
+over its pairings; configuration 1 is the one most like the reference runs. Each pairing's runs
+are listed, and the FASTA headers and P walks (`rp:f`) carry the score. This is a prior from
+other individuals: a repeat that recombines differs between individuals, and the reads of this
+one still decide nothing between the configurations.

@@ -255,3 +255,26 @@ the GFA walks still name the blunt segments, and `gfa_walk_bp` gives what they s
 configuration 25 is the HiFi assembly exactly: 160,953 bp identical to `linear.1`, 146,073 bp
 identical to `linear.2` (two blocks split at the origin, 97,490 and 48,583 bp, no difference),
 beside the 453 bp tip piece; configuration 17's master circle is their sum, 307,026 bp.
+
+### Ranking the configurations by the reference runs
+
+Of the eight reference runs, the pairings of ZM4's repeats (runs holding each / runs holding
+its entry's flank):
+
+| Repeat | Pairings |
+|---|---|
+| 135 bp (u16) | u3-/u5+ 8 of 8; u3-/u4- 0 of 8; u1-/u4- 3 of 6; u1-/u5+ 0 of 3 |
+| 183 bp (u15) | u0+/u4+ 4 of 8; u0+/u5- 3 of 8; u2-/u4+ 2 of 8; u2-/u5- 0 of 7 |
+| 360 bp (u13) | all four pairings 8 of 8 (its flanks include the two short tips) |
+| 837 bp (u10) | all four pairings 0 of 7-8 |
+| 8,268 bp (u9) | u1+/u7+ 5 of 8; u0-/u1- 5 of 7; u0-/u3- 0 of 7; u3+/u7+ 0 of 8 |
+
+The held-out HiFi assembly's configuration (two circles, 160,953 and 146,073 bp) uses the
+135 bp repeat's pairings the runs hold (8 of 8 and 3 of 6) and ranks 9th-14th (four
+configurations give those two molecules); the 16 ranked 17th-32nd all use the 135 bp pairing
+no run holds and none is the HiFi one. At the 8.3 kb repeat the HiFi pairings (5 of 7 and
+0 of 8) score as the alternative's (5 of 8 and 0 of 7): no run holds ZM4's arrangement of it,
+and the runs do not choose between the two. The 837 bp repeat's pairings are in no run at all.
+So the reference prior halves the candidates here and keeps the HiFi configuration among the
+remaining 16, but does not pick it. With a 200 bp distance tolerance both pairings of the 135
+and 360 bp repeats were "held by 8 of 8"; the tolerance is now 5% (at least 20 bp).
