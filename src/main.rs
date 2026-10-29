@@ -9,6 +9,7 @@ mod components;
 mod correct;
 mod evidence;
 mod frontier;
+mod genotype;
 mod hpc;
 mod identify;
 mod junctions;

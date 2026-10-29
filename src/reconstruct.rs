@@ -1553,6 +1553,15 @@ pub fn run(cfg: &Config) -> Result<Value> {
         };
         eprintln!("[ovasm] reconstruct {o}: projecting exact target read contexts on all {} reference paths",r.walks.len());
         let projection = project(r, &reads, &cfg.sample, &dir)?;
+        // the individual's allele at every known site of the reference graph
+        eprintln!("[ovasm] reconstruct {o}: genotyping the reference graph's sites");
+        let walk_steps: Vec<(String, Vec<Oriented>)> =
+            r.walks.iter().map(|w| (w.name.clone(), w.steps.clone())).collect();
+        let genotypes = crate::genotype::run(&r.graph, &walk_steps, &reads, &dir)?;
+        eprintln!(
+            "[ovasm] reconstruct {o}: {} sites, {} called, {} heteroplasmic; segments {}",
+            genotypes["sites"], genotypes["called"], genotypes["heteroplasmic_sites"], genotypes["segments"]
+        );
         let assembly = pipeline::run(&pipeline::RunConfig {
             reads: reads.clone(),
             organelle: if o == "mitochondrion" {
@@ -1613,7 +1622,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         organelles.insert(
             o,
             json!({"reference":reference_info[o],"projection":projection,"individual":integration,
-            "de_novo":de_novo,"final":final_output}),
+            "de_novo":de_novo,"final":final_output,"genotypes":genotypes}),
         );
     }
     let workflow_completed = organelles
