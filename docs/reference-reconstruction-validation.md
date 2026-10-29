@@ -133,3 +133,42 @@ and none of the second. The original seed recruitment stopped after two of its
 was not a fixed-point test. No reads were rescued using held-out coordinates.
 The separate reference-free WGS novelty-channel pilot is still under evaluation;
 complete reconstruction has not been claimed.
+
+## Recruitment to a fixed point, and the frontier walk
+
+Recruitment was first rerun at f6d1745 with `--saturation 0 --iterations 60` and the
+same bait (as `recruit` with `--max-bases` 150 x 350,586). It never settled: the
+mitochondrial reads went from 856,248 (pass 2) to 940,026 (pass 4) and 4,630,842
+(pass 5), then to 28.8 M at pass 60, and the plastid's from 7.35 M to 48.4 M. The
+150x subsample was then mostly nuclear; the reconstructed mitochondrion fell apart
+(largest component 9,753 bp, 230 components, de novo molecules at most 1.8 kb) and
+neither interval was closed (4:37:36, 7.4 GB peak).
+
+A one-pass diagnostic recruitment on the held-out candidate's 20.6 kb around the two
+intervals (diagnostic only, never used by `reconstruct`) found them in the library at
+the depth of their flanks: 399 and 390x over all primary alignments, 368 and 357x for
+reads within 1% of the candidate along 90% of their length, against 369-370x for the
+2 kb on either side, with no 250 bp window below 293x and no base without such reads.
+
+The frontier walk (step 0 of the reference reconstruction workflow) was then run on the
+same inputs and command (`--target-depth 150`). Counting 155,554,892 records (23.3 Gb)
+took 646 s. The mitochondrion's depth came out at 271 (31-mer counts), its walk began at
+2,204 places, 86 found new k-mers, 2,109 steps rejoined the reference, and it added 15,501
+31-mers in 93 pieces (18,291 bp); the plastid (depth 6,932) added 66. Recruitment then
+took 891,167 mitochondrial reads (856,256 before) and stopped at the same pass.
+
+| | f6d1745 | frontier walk |
+|---|---|---|
+| Wall clock / peak RSS | 7:41 / 1.18 GB | 18:25 / 4.73 GB |
+| MT stored bases / components / largest | 301,574 / 43 / 290,784 | 314,620 / 41 / 305,875 |
+| MT de novo molecules (bp) | 94,370, 72,825, 72,733, 44,881, 6,022, 1,455 | 238,651, 66,913, 454 |
+| Interval 57245+8490 in the individual graph / molecules | 590 / 0 bp | 6,890 / 7,010 bp |
+| Interval 67190+6645 in the individual graph / molecules | 0 / 0 bp | 6,645 / 6,645 bp |
+| MT molecule bases matching neither the candidate nor the plastid | 95 | 95 |
+| Plastid graph and molecules | | identical |
+
+Interval coverage is exact matching to the held-out candidate (minimap2 `=` runs), a
+development comparison, not independent truth. Of the walked bait, 5,655 bp matched
+neither the candidate nor the plastid, in pieces under 500 bp; the individual graph's
+sequence matching neither stayed at 33,364 bp (33,365 before). 1,480 bp of the first
+interval are still missing from the molecules. `decisive=false` remains.

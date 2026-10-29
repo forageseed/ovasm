@@ -7,6 +7,7 @@ mod chromosomes;
 mod components;
 mod correct;
 mod evidence;
+mod frontier;
 mod hpc;
 mod identify;
 mod junctions;
@@ -207,9 +208,21 @@ struct ReconstructArgs {
     salt: u64,
     #[arg(long)]
     threads: Option<usize>,
+    /// Recruit from the reference graphs alone, without first walking the individual's
+    /// sequence that no reference path holds on the WGS k-mer counts.
+    #[arg(long)]
+    no_frontier: bool,
+    /// Memory of that walk's k-mer count table, in GiB (rounded down to a power of two).
+    #[arg(long, default_value_t = 4.0)]
+    frontier_memory_gib: f64,
 }
 
 fn reconstruct(args: ReconstructArgs) -> Result<()> {
+    if !(args.frontier_memory_gib >= 1.0 / 1024.0) {
+        bail!("frontier memory must be at least 1 MiB");
+    }
+    // two bytes a counter
+    let slots_log2 = ((args.frontier_memory_gib * (1u64 << 30) as f64 / 2.0).log2().floor() as u32).min(34);
     let mut references = std::collections::BTreeMap::new();
     for spec in args.references {
         let (o, p) = spec
@@ -250,6 +263,10 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
         out: args.out,
         target_depth: args.target_depth,
         salt: args.salt,
+        frontier: (!args.no_frontier).then(|| frontier::Params {
+            slots_log2,
+            ..Default::default()
+        }),
     })?;
     Ok(())
 }

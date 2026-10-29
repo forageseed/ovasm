@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::bait::BaitSet;
 use crate::evidence::{flip, parse_gfa, revcomp, Graph, Oriented};
 use crate::kmer::CanonicalKmers;
-use crate::{pan, pipeline, recruit};
+use crate::{frontier, pan, pipeline, recruit};
 
 const K: usize = 21; // The existing Illumina recruitment preset.
 type Edge = (Oriented, Oriented);
@@ -116,34 +116,37 @@ impl Reference {
         })
     }
 
-    fn add_bait(&self, bait: &mut BaitSet, name: &str, out: &Path) -> Result<Value> {
-        let t = bait.target(name)?;
-        let mut fasta = String::new();
+    /// The baited sequences: every P walk (a circular one with its boundary words of length
+    /// `k`) and every node, with their FASTA names.
+    fn bait_sequences(&self, k: usize) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
         for (i, w) in self.walks.iter().enumerate() {
             let mut seq = w.sequence.clone();
             if w.circular {
-                seq.extend(w.sequence.iter().cycle().take(K - 1));
+                seq.extend(w.sequence.iter().cycle().take(k - 1));
             }
-            bait.add_sequence(t, &seq);
-            writeln!(
-                fasta,
-                ">{i} source_path={}\n{}",
-                w.name,
-                std::str::from_utf8(&seq)?
-            )?;
+            out.push((format!("{i} source_path={}", w.name), seq));
         }
         // Also retain graph sequence not represented by the finite source paths.
         for (i, seq) in self.graph.seqs.iter().enumerate() {
-            bait.add_sequence(t, seq);
-            writeln!(
-                fasta,
-                ">node_{}\n{}",
-                self.graph.names[i],
-                std::str::from_utf8(seq)?
-            )?;
+            out.push((format!("node_{}", self.graph.names[i]), seq.clone()));
+        }
+        out
+    }
+
+    fn stored_bases(&self) -> u64 {
+        self.graph.seqs.iter().map(|s| s.len() as u64).sum()
+    }
+
+    fn add_bait(&self, bait: &mut BaitSet, name: &str, out: &Path) -> Result<Value> {
+        let t = bait.target(name)?;
+        let mut fasta = String::new();
+        for (name, seq) in self.bait_sequences(K) {
+            bait.add_sequence(t, &seq);
+            writeln!(fasta, ">{name}\n{}", std::str::from_utf8(&seq)?)?;
         }
         fs::write(out, fasta)?;
-        let basis: u64 = self.graph.seqs.iter().map(|s| s.len() as u64).sum();
+        let basis = self.stored_bases();
         if basis == 0 {
             bail!("empty reference graph");
         }
@@ -789,6 +792,9 @@ pub struct Config {
     pub out: PathBuf,
     pub target_depth: Option<f64>,
     pub salt: u64,
+    /// Walk the individual's sequence that no reference path holds before recruitment
+    /// (`frontier`); WGS input only.
+    pub frontier: Option<frontier::Params>,
 }
 
 pub fn run(cfg: &Config) -> Result<Value> {
@@ -847,6 +853,52 @@ pub fn run(cfg: &Config) -> Result<Value> {
         cfg.out.join("reference.json"),
         serde_json::to_string_pretty(&reference_info)?,
     )?;
+    // The individual's sequence that no reference path holds joins the bait: recruitment alone
+    // reaches only a fifth of a read past the reference each pass (`frontier`).
+    let frontier_info = match (&cfg.frontier, targeted) {
+        (Some(p), false) => {
+            eprintln!(
+                "[ovasm] reconstruct: counting {}-mers of the WGS reads ({} GiB table)",
+                frontier::K,
+                (2u64 << p.slots_log2) >> 30
+            );
+            let counts = frontier::KmerCounts::from_reads(&cfg.reads, p.slots_log2)?;
+            let mut targets = BTreeMap::new();
+            for (&o, r) in &references {
+                let sequences: Vec<Vec<u8>> = r
+                    .bait_sequences(frontier::K)
+                    .into_iter()
+                    .map(|(_, s)| s)
+                    .collect();
+                let ext = frontier::extend(&counts, &sequences, r.stored_bases(), p);
+                let t = bait.target(o)?;
+                for s in &ext.sequences {
+                    bait.add_sequence(t, s);
+                }
+                frontier::write_fasta(
+                    &cfg.out.join("reference").join(format!("{o}.frontier.fasta")),
+                    o,
+                    &ext,
+                )?;
+                eprintln!(
+                    "[ovasm] reconstruct {o}: depth {:.0}, {} ends, {} extended, {} new {}-mers in {} pieces{}",
+                    ext.depth,
+                    ext.ends,
+                    ext.ends_extended,
+                    ext.new_kmers,
+                    frontier::K,
+                    ext.unitigs,
+                    if ext.budget_reached { " (budget reached)" } else { "" }
+                );
+                targets.insert(o, ext);
+            }
+            json!({"status":"run","params":p,"counted_reads":counts.reads,"counted_bases":counts.bases,
+                "counting_seconds":counts.seconds,"table_bytes":2u64 << p.slots_log2,"targets":targets,
+                "role":"bait_only_never_emitted_as_sequence"})
+        }
+        (Some(_), true) => json!({"status":"not_run_explicit_target_inputs"}),
+        (None, _) => json!({"status":"disabled"}),
+    };
     let recruitment = if targeted {
         json!({"status":"not_run_explicit_target_inputs","inputs":cfg.target_reads,
             "upstream_recruitment_certified":false})
@@ -938,7 +990,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         "workflow_completed":workflow_completed,
         "inputs":cfg.reads,"target_read_inputs":cfg.target_reads,
         "input_scope":if targeted {"explicit_target_reads"} else {"whole_genome_recruitment"},
-        "reference_graphs":cfg.references,"recruitment":recruitment,"organelles":organelles,
+        "reference_graphs":cfg.references,"frontier":frontier_info,"recruitment":recruitment,"organelles":organelles,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,
         "physical_molecule_count":null,"physical_topology_identified":false});
