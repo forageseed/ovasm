@@ -225,3 +225,27 @@ reads of the earlier recruitment downsampled by read name to 1,000x; 5:59, 1.25 
 mitochondrion (307,479 bp) stays linear: 25 pairs join its ends but put them 569 bp into
 each other, without an exact overlap, which is the 8.3 kb repeat's two copies at its ends
 rather than missing sequence. No reference bases were filled in either organelle.
+
+### Every configuration of the mitochondrion
+
+With the same reads (`--target-reads`, 3:13, 1.20 GB), the mitochondrion's anchor graph has
+five repeats at twice its depth (8,268, 837, 360, 183 and 135 bp) and 32 covers, all with the
+same score: reads decide none of the pairings. All 32 are listed. Among them:
+
+| Configurations | Molecules (bp) |
+|---|---|
+| 1-8 | one linear molecule of 307,353 |
+| 9-10 | 160,953 circular + 146,400 linear |
+| 17-24 | one circle of 306,900 (a master circle) + 453 linear |
+| 25-26 | 160,953 circular + 145,947 circular + 453 linear |
+| 11-16, 27-32 | other pairs (94,352 / 127,083 / 128,222 circles with the rest) |
+
+Configuration 25 is the held-out HiFi assembly's two molecules: its 160,953 bp circle matches
+HiFi `linear.1` over its whole length base for base, and its 145,947 bp circle aligns to HiFi
+`linear.2` (146,073 bp) in two blocks with 126 bp between them missing. The 453 bp linear piece
+is the two short dead-end tips beside the 360 bp repeat with that repeat; it is the loose end
+that keeps every configuration's largest molecule from closing in all but the circular ones.
+Configuration 17 joins both HiFi molecules into one circle through the repeat. The lengths
+are spelled from the organelle graph's blunt segments and are 126 bp shorter than
+`linearize`'s representative (307,479 bp), which counts the bases of its two overlapping links
+on both sides.

@@ -883,6 +883,161 @@ fn close_gfa(
     Ok(Some(out))
 }
 
+/// Most covers `linearize` reports per component when every configuration is wanted.
+const MAX_CONFIGURATIONS: usize = 10_000;
+
+/// A walk of the assembly graph as a key equal for the same molecule however it is written: a
+/// linear walk or its reverse, a circular one from any step in either direction.
+fn walk_key(steps: &[(String, bool)], circular: bool) -> Vec<(String, bool)> {
+    let rev: Vec<(String, bool)> = steps.iter().rev().map(|(n, o)| (n.clone(), !o)).collect();
+    if !circular {
+        return steps.to_vec().min(rev);
+    }
+    let mut best: Option<Vec<(String, bool)>> = None;
+    for w in [steps.to_vec(), rev] {
+        for i in 0..w.len() {
+            let r: Vec<_> = w[i..].iter().chain(&w[..i]).cloned().collect();
+            if best.as_ref().map_or(true, |b| r < *b) {
+                best = Some(r);
+            }
+        }
+    }
+    best.unwrap_or_default()
+}
+
+/// Every configuration of the organelle's graph its reads allow, when they do not decide one:
+/// each cover of the anchor graph `linearize` finds (every pairing of every repeat's copies the
+/// copy numbers allow), as the molecules it makes. Short reads cannot say which: a plant
+/// mitochondrion's repeat longer than the fragments recombines, and its copies' pairings are
+/// all as well supported (ZM4: 32 covers of five repeats, among them the held-out HiFi
+/// assembly's two molecules). Written to `<organelle>.configurations.fasta` and as P walks of
+/// `<organelle>.gfa` (`<sample>_configuration<N>#1#<n>`), all labelled unresolved; the
+/// representative molecule stays one of them.
+fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Result<Value> {
+    let d = dir.join("de-novo");
+    let rep = crate::linearize::run(
+        &d.join("assembly.gfa"),
+        &d.join("evidence.json"),
+        crate::linearize::LinearizeParams {
+            min_reads: 2,
+            max_steps: 5_000_000,
+            max_molecules: 0,
+            max_alternatives: MAX_CONFIGURATIONS,
+            optional_below: 0.5,
+        },
+        &d.join("configurations.best.fasta"),
+        Some(&d.join("configurations.partial.fasta")),
+        &d.join("configurations.json"),
+    )?;
+    // the component holding most of the organelle
+    let Some(component) = rep.components.iter().max_by_key(|c| {
+        c.best.as_ref().map_or(0, |b| b.molecules.iter().map(|m| m.length).sum::<usize>())
+    }) else {
+        return Ok(json!({"configurations": 0, "reason": "no component"}));
+    };
+    let covers: Vec<_> = component.best.iter().chain(&component.alternatives).collect();
+    // segments of the organelle graph by the assembly segment they came from, in order
+    let text = fs::read_to_string(gfa_out)?;
+    let sample = text
+        .lines()
+        .next()
+        .and_then(|h| h.split('\t').find_map(|t| t.strip_prefix("sn:Z:")))
+        .unwrap_or("")
+        .to_string();
+    let mut pieces: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    let mut seqs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<_> = line.split('\t').collect();
+        if f[0] != "S" || f.len() < 3 {
+            continue;
+        }
+        let rest = f[1].strip_prefix(&format!("{sample}.")).unwrap_or(f[1]);
+        let (base, part) = match rest.split_once('.') {
+            Some((b, p)) => (b, p.parse().unwrap_or(0)),
+            None => (rest, 0),
+        };
+        pieces.entry(base.to_string()).or_default().push((part, f[1].to_string()));
+        seqs.insert(f[1].to_string(), f[2].as_bytes().to_vec());
+    }
+    for v in pieces.values_mut() {
+        v.sort();
+    }
+    let short = if organelle == "plastid" { "pt" } else { "mt" };
+    let (mut seen, mut fasta, mut walks, mut listed) = (BTreeSet::new(), String::new(), String::new(), Vec::new());
+    let mut skipped = 0usize;
+    'covers: for cover in covers {
+        let mut key = Vec::new();
+        let mut molecules = Vec::new();
+        for m in &cover.molecules {
+            let steps: Vec<(String, bool)> = m
+                .path
+                .split_whitespace()
+                .map(|t| (t[..t.len() - 1].to_string(), t.ends_with('+')))
+                .collect();
+            key.push(walk_key(&steps, m.circular));
+            // the organelle graph's steps and sequence for it
+            let (mut gsteps, mut seq) = (Vec::new(), Vec::new());
+            for (name, fwd) in &steps {
+                let Some(p) = pieces.get(name) else {
+                    skipped += 1;
+                    continue 'covers;
+                };
+                let order: Vec<&(usize, String)> = if *fwd { p.iter().collect() } else { p.iter().rev().collect() };
+                for (_, piece) in order {
+                    gsteps.push(format!("{piece}{}", if *fwd { '+' } else { '-' }));
+                    let s = &seqs[piece];
+                    seq.extend(if *fwd { s.clone() } else { revcomp(s) });
+                }
+            }
+            molecules.push((m, gsteps, seq));
+        }
+        key.sort();
+        if !seen.insert(key) {
+            continue;
+        }
+        let n = listed.len() + 1;
+        let mut lengths = Vec::new();
+        for (j, (m, gsteps, seq)) in molecules.iter().enumerate() {
+            let name = format!("{sample}_configuration{n}#1#{short}.{}", j + 1);
+            writeln!(
+                fasta,
+                ">{name} configuration={n} circular={} length={} path={} reads_decide=false",
+                m.circular,
+                seq.len(),
+                m.path.replace(' ', ",")
+            )?;
+            for chunk in seq.chunks(80) {
+                writeln!(fasta, "{}", std::str::from_utf8(chunk)?)?;
+            }
+            writeln!(
+                walks,
+                "P\t{name}\t{}\t*{}\tcf:i:{n}\tst:Z:unresolved_configuration",
+                gsteps.join(","),
+                if m.circular { "\tTP:Z:circular" } else { "" }
+            )?;
+            lengths.push(json!({"length": seq.len(), "circular": m.circular}));
+        }
+        listed.push(json!({"configuration": n, "score_ln": cover.score, "molecules": lengths}));
+    }
+    let path = out.join(format!("{organelle}.configurations.fasta"));
+    fs::write(&path, fasta)?;
+    fs::write(gfa_out, text + &walks)?;
+    let best = listed.first().and_then(|c| c["score_ln"].as_f64()).unwrap_or(0.0);
+    let tied = listed
+        .iter()
+        .filter(|c| c["score_ln"].as_f64().is_some_and(|s| best - s < 1e-9))
+        .count();
+    eprintln!(
+        "[ovasm] reconstruct {organelle}: {} configurations ({tied} as well supported as the best)",
+        listed.len()
+    );
+    Ok(json!({"configurations": listed.len(), "as_well_supported_as_the_best": tied,
+        "covers_searched": component.candidates, "search_truncated": component.search_truncated,
+        "cover_size_limited": component.cover_size_limited, "skipped_covers": skipped,
+        "fasta": path, "list": listed,
+        "basis": "every cover of the anchor graph linearize finds; reads do not decide between them"}))
+}
+
 /// The organelle's result as `ovasm run` gives it, at the top of the output: `<organelle>.gfa`
 /// (the de novo organelle graph with its molecule paths) and `<organelle>.fasta` (its
 /// molecules). A single linear molecule of the genome is first closed with read pairs (`close`)
@@ -1024,10 +1179,17 @@ fn final_outputs(
         // closed, but with bases a reference walk holds, not the reads
         (true, _) => "complete_with_reference_fill",
     };
+    // the reads leave the configuration open: every one the graph allows
+    let configurations_found = if status == "incomplete" && !decisive && !pieces.is_empty() {
+        configurations(dir, out, organelle, &gfa_out)?
+    } else {
+        Value::Null
+    };
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
         "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
+        "configurations": configurations_found,
         "graph_loose_ends": loose, "status": status,
         "reasons": reasons, "decisive": decisive,
         "repeats": if decisive {"every pairing decided by reads"} else {
@@ -1431,6 +1593,19 @@ mod tests {
         fs::remove_file(p).unwrap();
         // no walk spells another sequence
         assert!(close_gfa(gfa, b"AAAACCCC", b"T", "read_pairs", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_molecule_has_one_key_however_it_is_written() {
+        let s = |v: &[(&str, bool)]| v.iter().map(|(n, o)| (n.to_string(), *o)).collect::<Vec<_>>();
+        let a = s(&[("u0", true), ("u9", true), ("u1", false)]);
+        let rotated = s(&[("u9", true), ("u1", false), ("u0", true)]);
+        let reversed = s(&[("u1", true), ("u9", false), ("u0", false)]);
+        assert_eq!(walk_key(&a, true), walk_key(&rotated, true));
+        assert_eq!(walk_key(&a, true), walk_key(&reversed, true));
+        // a linear walk is the same backwards, not from another step
+        assert_eq!(walk_key(&a, false), walk_key(&reversed, false));
+        assert_ne!(walk_key(&a, false), walk_key(&rotated, false));
     }
 
     #[test]

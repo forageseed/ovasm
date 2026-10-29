@@ -100,6 +100,17 @@ Short reads cannot decide a repeat longer than their fragments: the pairings of 
 then a configuration the graph allows, not one the reads choose, and a plant mitochondrion with
 such a repeat stays linear here however much of it the graph holds.
 
+When an organelle is incomplete and its reads leave repeat pairings open, every
+configuration its graph allows is listed: each cover of the anchor graph `linearize` finds
+(every pairing of every repeat's copies the copy numbers allow), as the molecules it makes,
+duplicates removed (a circular walk from any step in either direction, a linear one either
+way). They go to `<organelle>.configurations.fasta` (`configuration=<N>`,
+`reads_decide=false`) and to `<organelle>.gfa` as P walks
+`<sample>_configuration<N>#1#<mt|pt>.<M>` tagged `st:Z:unresolved_configuration`, spelled from
+the organelle graph's segments. `reconstruction.json` lists each with its score and how many
+are as well supported as the best. The representative molecule in `<organelle>.fasta` is one
+of them, not a choice the reads made.
+
 Important outputs for each organelle are:
 
 | File | Meaning |
