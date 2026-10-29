@@ -214,6 +214,8 @@ pub struct Outcome {
     pub molecules: usize,
     /// Sum of the molecules' lengths.
     pub molecule_bases: u64,
+    /// Molecules of at least `MIN_PIECE` bases: what a genome is in (`sr_ladder`).
+    pub pieces: usize,
     /// Total length of the assembly graph's unitigs (`assembly.json`); with the component
     /// filter, of the components it kept (the molecules are the target organelle's, and the
     /// nuclear repeats beside it are not what they should explain).
@@ -312,6 +314,51 @@ pub fn k_ladder(a: &mut impl Attempts, retry: bool, start: Option<usize>) -> Res
     Ok(Ladder {
         tried,
         chosen,
+        accepted,
+    })
+}
+
+/// Smaller k values a short-read assembly tries below the one its read length gives.
+pub const SR_K_LADDER: [usize; 3] = [99, 77, 55];
+
+/// Shortest molecule that counts as a piece of the genome (`Outcome::pieces`).
+pub const MIN_PIECE: u64 = 1000;
+
+/// The k ladder of dense (short-read) assembly, after GetOrganelle's several k: the read-length
+/// k (127 for 150 bp reads) is longest past repeats but needs 127 bp of a read to agree, and
+/// sequence that reads cover thinly or across a hairpin breaks there. ZM4's plastid (no inverted
+/// repeat, 125 kb) came out in four pieces at k 127 and at most 1,000x of reads, and as one
+/// molecule of 125.1 kb at 99, 77 and 55; its mitochondrion was one 305.6 kb piece at 127, 99 and
+/// 77. Every k of `SR_K_LADDER` below the first is tried until one gives a single molecule; the
+/// result is the accepted attempt with the fewest pieces, then the most molecule bases (a smaller
+/// k collapses repeats it no longer spans), then the larger k.
+pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
+    let better = |o: &Outcome, b: &Outcome| {
+        (o.accepted(), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
+            > (b.accepted(), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
+    };
+    let mut tried: Vec<Outcome> = Vec::new();
+    let mut best = 0usize;
+    let mut k = None;
+    loop {
+        let o = a.attempt(k)?;
+        let i = tried.len();
+        let single = o.accepted() && o.molecules == 1;
+        if i == 0 || better(&o, &tried[best]) {
+            best = i;
+            a.stash()?;
+        }
+        tried.push(o);
+        match SR_K_LADDER.iter().copied().find(|&x| x < o.k) {
+            Some(next) if !single => k = Some(next),
+            _ => break,
+        }
+    }
+    a.restore()?;
+    let accepted = tried[best].accepted();
+    Ok(Ladder {
+        tried,
+        chosen: best,
         accepted,
     })
 }
@@ -482,6 +529,10 @@ impl Attempts for GraphAttempts<'_> {
             k: assembly["k"].as_u64().context("assembly.json has no k")? as usize,
             molecules: molecules.len(),
             molecule_bases: molecules.iter().filter_map(|m| m["length"].as_u64()).sum(),
+            pieces: molecules
+                .iter()
+                .filter(|m| m["length"].as_u64().unwrap_or(0) >= MIN_PIECE)
+                .count(),
             total_length,
         };
         if !o.accepted() {
@@ -513,7 +564,7 @@ impl Attempts for GraphAttempts<'_> {
     }
 
     fn restore(&mut self) -> Result<()> {
-        log("no k was accepted; keeping the attempt whose molecules explain most of its graph");
+        log("keeping the files of the best attempt");
         let stash = self.dir.join(BEST_ATTEMPT_DIR);
         for f in ATTEMPT_FILES {
             let to = self.dir.join(f);
@@ -1465,19 +1516,18 @@ fn assemble_organelle(
         ReadType::Hifi => start_k(&recruited.recruitment),
         ReadType::Sr => None,
     };
-    let ladder = k_ladder(
-        &mut GraphAttempts {
-            reads: &recruited.reads,
-            read_context: cfg.read_context.as_deref(),
-            dir,
-            read_type: cfg.read_type,
-            filter: filter.as_ref(),
-            nuclear_share: nuclear_share(&recruited.recruitment),
-        },
-        // dense (short-read) assembly takes k from the read length, so it is not retried
-        cfg.read_type == ReadType::Hifi,
-        start,
-    )?;
+    let mut attempts = GraphAttempts {
+        reads: &recruited.reads,
+        read_context: cfg.read_context.as_deref(),
+        dir,
+        read_type: cfg.read_type,
+        filter: filter.as_ref(),
+        nuclear_share: nuclear_share(&recruited.recruitment),
+    };
+    let ladder = match cfg.read_type {
+        ReadType::Hifi => k_ladder(&mut attempts, true, start)?,
+        ReadType::Sr => sr_ladder(&mut attempts)?,
+    };
     let assembly = read_json(&dir.join("assembly.json"))?;
     let evidence = read_json(&dir.join("evidence.json"))?;
     let linear = read_json(&dir.join("linearization.json"))?;
@@ -1907,6 +1957,7 @@ mod tests {
                 k: used,
                 molecules,
                 molecule_bases,
+                pieces: molecules,
                 total_length: GRAPH,
             })
         }
@@ -1934,6 +1985,7 @@ mod tests {
             k: 701,
             molecules,
             molecule_bases,
+            pieces: molecules,
             total_length,
         };
         assert!(o(1, 500, 1000).accepted(), "exactly half is enough");
@@ -2099,6 +2151,30 @@ mod tests {
         assert_eq!(ks(&l), [127]);
         assert_eq!((l.chosen, l.accepted), (0, false));
         assert_eq!(a.events, ["attempt"]);
+    }
+
+    #[test]
+    fn short_reads_go_down_their_ladder_and_keep_the_fewest_pieces() {
+        // (k, molecules, bases): GRAPH is 1,000, so 500 bases explain half of it
+        let mut a = Scripted::new(127, &[(127, 4, 990), (99, 2, 1000), (77, 2, 998), (55, 1, 980)]);
+        let l = sr_ladder(&mut a).unwrap();
+        assert_eq!(ks(&l), [127, 99, 77, 55]);
+        // Scripted counts every molecule a piece: 55 has the fewest
+        assert_eq!((l.chosen, l.accepted), (3, true));
+        assert_eq!(a.events.last(), Some(&"restore"));
+    }
+
+    #[test]
+    fn short_reads_stop_at_a_single_molecule() {
+        let mut a = Scripted::new(127, &[(127, 2, 900), (99, 1, 950), (77, 1, 990)]);
+        let l = sr_ladder(&mut a).unwrap();
+        assert_eq!(ks(&l), [127, 99]);
+        assert_eq!(l.chosen, 1);
+        // equal pieces: the most bases, then the larger k
+        let mut a = Scripted::new(127, &[(127, 2, 900), (99, 2, 900), (77, 2, 800), (55, 0, 0)]);
+        let l = sr_ladder(&mut a).unwrap();
+        assert_eq!((ks(&l).len(), l.chosen), (4, 0));
+        assert_eq!(a.events, ["attempt", "stash", "attempt", "attempt", "attempt", "restore"]);
     }
 
     #[test]

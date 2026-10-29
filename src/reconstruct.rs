@@ -784,6 +784,68 @@ fn export_individual(
     )
 }
 
+/// Ends of graph segments with no link: where the graph stops, not a molecule's chosen end.
+fn dead_ends(g: &Graph) -> usize {
+    let mut linked = BTreeSet::new();
+    for &(a, b) in &g.links {
+        // leaving `a` uses its end on the strand it is read; entering `b` its start
+        linked.insert((a.0, a.1));
+        linked.insert((b.0, !b.1));
+    }
+    (0..g.names.len())
+        .map(|i| usize::from(!linked.contains(&(i, true))) + usize::from(!linked.contains(&(i, false))))
+        .sum()
+}
+
+/// The organelle's result as `ovasm run` gives it, at the top of the output: `<organelle>.gfa`
+/// (the de novo organelle graph with its molecule paths) and `<organelle>.fasta` (its
+/// molecules), and whether they are complete: one molecule, circular, the only configuration the
+/// reads support (decisive), from a graph without loose ends. Otherwise every reason is named.
+/// `individual.gfa` stays the graph for a species pan graph (reference intervals and de novo).
+fn final_outputs(dir: &Path, out: &Path, organelle: &str, de_novo: &Value) -> Result<Value> {
+    let graph = dir.join("de-novo/organelle.gfa");
+    let fasta = dir.join("de-novo/molecules.fasta");
+    let (gfa_out, fasta_out) = (
+        out.join(format!("{organelle}.gfa")),
+        out.join(format!("{organelle}.fasta")),
+    );
+    fs::copy(&graph, &gfa_out)?;
+    if fasta.exists() {
+        fs::copy(&fasta, &fasta_out)?;
+    }
+    let lengths: Vec<u64> = de_novo["lengths"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let circular: Vec<bool> = de_novo["circular"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_bool).collect())
+        .unwrap_or_default();
+    let decisive = de_novo["decisive"].as_bool().unwrap_or(false);
+    let loose = dead_ends(&parse_gfa(&dir.join("de-novo/assembly.gfa"))?);
+    let mut reasons = Vec::new();
+    if lengths.len() != 1 {
+        reasons.push(format!("{} molecules", lengths.len()));
+    }
+    if circular.iter().any(|&c| !c) {
+        reasons.push("a molecule is linear".to_string());
+    }
+    if !decisive {
+        reasons.push(
+            "not decisive: reads support more than one pairing at a repeat (one longer than the \
+             reads, or with too few spanning reads)"
+                .to_string(),
+        );
+    }
+    if loose > 0 {
+        reasons.push(format!("{loose} loose segment ends in the assembly graph"));
+    }
+    Ok(json!({"gfa": gfa_out, "fasta": fasta.exists().then_some(fasta_out),
+        "molecules": lengths.len(), "lengths": lengths, "circular": circular, "decisive": decisive,
+        "graph_loose_ends": loose, "status": if reasons.is_empty() {"complete"} else {"incomplete"},
+        "reasons": reasons}))
+}
+
 pub struct Config {
     pub reads: Vec<PathBuf>,
     pub target_reads: BTreeMap<String, Vec<PathBuf>>,
@@ -977,10 +1039,27 @@ pub fn run(cfg: &Config) -> Result<Value> {
             &cfg.sample,
             &dir,
         )?;
+        let de_novo = match assembly {
+            Ok(s) => s,
+            Err(e) => json!({"error":format!("{e:#}")}),
+        };
+        let final_output = if de_novo.get("error").is_none() {
+            final_outputs(&dir, &cfg.out, o, &de_novo)?
+        } else {
+            json!({"status":"failed","reasons":["de novo assembly failed"]})
+        };
+        eprintln!(
+            "[ovasm] reconstruct {o}: {} ({})",
+            final_output["status"].as_str().unwrap_or("?"),
+            final_output["reasons"]
+                .as_array()
+                .map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; "))
+                .unwrap_or_default()
+        );
         organelles.insert(
             o,
             json!({"reference":reference_info[o],"projection":projection,"individual":integration,
-            "de_novo":match assembly {Ok(s)=>s,Err(e)=>json!({"error":format!("{e:#}")})} }),
+            "de_novo":de_novo,"final":final_output}),
         );
     }
     let workflow_completed = organelles
@@ -1136,6 +1215,16 @@ mod tests {
         assert_eq!(integrated["complete_assembly"], false);
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn loose_ends_are_segment_ends_without_a_link() {
+        let chain = reference("S\ta\tACGT\nS\tb\tGG\nL\ta\t+\tb\t-\t0M\nP\tone#1#pt\ta+,b-\t*\n");
+        assert_eq!(dead_ends(&chain.graph), 2);
+        let circle = reference(
+            "S\ta\tACGT\nS\tb\tGG\nL\ta\t+\tb\t-\t0M\nL\tb\t-\ta\t+\t0M\nP\tone#1#pt\ta+,b-\t*\tTP:Z:circular\n",
+        );
+        assert_eq!(dead_ends(&circle.graph), 0);
+    }
+
     #[test]
     fn compaction_keeps_branches_and_all_bases() {
         let r=reference("S\ta\tAAAA\nS\tb\tC\nS\tc\tG\nS\td\tTTTT\nL\ta\t+\tb\t+\t0M\nL\ta\t+\tc\t+\t0M\nL\tb\t+\td\t+\t0M\nL\tc\t+\td\t+\t0M\nP\tone#1#pt\ta+,b+,d+\t*\nP\ttwo#1#pt\ta+,c+,d+\t*\n");

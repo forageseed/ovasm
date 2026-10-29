@@ -42,13 +42,16 @@ const MASK: u64 = (1u64 << (2 * K)) - 1;
 pub struct Params {
     /// The count table holds 2^`slots_log2` 16-bit counters.
     pub slots_log2: u32,
-    /// A k-mer is the target's from this share of its depth up (`recruit::EXTEND_CORE_FLOOR`).
+    /// A k-mer is the target's from this share of its depth up. A quarter let the walk into the
+    /// nucleus: ZM4's nuclear k-mers at a NUMT's edge count ~30, a collision in the table adds
+    /// tens, and a quarter of the mitochondrion's 271 is 68.
     pub floor: f64,
     /// And up to this many times its depth (`recruit::HIGH_COPY_FOLD`): an organelle's own repeat
     /// is two or three times as deep, a plastid twenty times a mitochondrion.
     pub ceiling: f64,
     /// Of two next k-mers at depth, one less than this share of the other's count is taken for a
-    /// sequencing error or a collision in the table, not a branch.
+    /// sequencing error, a collision in the table or the nucleus at a NUMT's edge, not a branch:
+    /// a branch of the organelle's own (a repeat's two exits) has both at its depth.
     pub dominance: f64,
     /// Most new k-mers walked from one place.
     pub max_per_end: usize,
@@ -60,9 +63,9 @@ impl Default for Params {
     fn default() -> Self {
         Self {
             slots_log2: 31,
-            floor: 0.25,
+            floor: 0.4,
             ceiling: 10.0,
-            dominance: 0.25,
+            dominance: 0.5,
             max_per_end: 50_000,
             max_fold: 2.0,
         }
@@ -258,6 +261,8 @@ pub struct Extension {
     /// Walking stopped at the target's budget (`max_fold`).
     pub budget_reached: bool,
     pub new_kmers: usize,
+    /// Walked pieces left out as tips (`MIN_TIP`).
+    pub tips_removed: usize,
     pub unitigs: usize,
     pub unitig_bases: usize,
     /// None, or why the target was not walked.
@@ -269,6 +274,15 @@ pub struct Extension {
 /// Fewest median count for a target to be walked: below it, depth cannot tell it from the
 /// nucleus, and its reference is mostly absent from the individual.
 const MIN_DEPTH: f64 = 10.0;
+
+/// Reference k-mers in a row a walk takes before it counts as rejoined (about two reads). A
+/// short stretch the reference holds elsewhere does not end it: ZM4's walk into 8.5 kb no
+/// reference run has stopped 1,480 bp short at ~30 bp the reference holds, from both sides, and
+/// those reads were never recruited.
+const JOIN_RUN: usize = 300;
+
+/// Shortest walked piece kept when one of its ends leads nowhere (about a read).
+const MIN_TIP: usize = 150;
 
 /// Walk the frontier of a target whose reference is `reference` (its walk and node sequences,
 /// as baited) and holds `stored_bases` (for the budget).
@@ -331,8 +345,11 @@ pub fn extend(
     let budget = (p.max_fold * stored_bases as f64) as usize;
     let mut new: FxHashSet<u64> = FxHashSet::default();
     'ends: for &end in &ends {
-        let (mut stack, mut walked) = (vec![end], 0usize);
-        while let Some(word) = stack.pop() {
+        // (k-mer, how many reference k-mers in a row the walk has just taken to reach it)
+        let (mut stack, mut walked) = (vec![(end, 0usize)], 0usize);
+        // reference k-mers this end's walk went through (`JOIN_RUN`), each once
+        let mut through: FxHashSet<u64> = FxHashSet::default();
+        while let Some((word, run)) = stack.pop() {
             let next: Vec<(u64, u32)> = successors(word)
                 .into_iter()
                 .map(|x| (x, counts.get(canonical(x))))
@@ -353,7 +370,11 @@ pub fn extend(
             for x in taken {
                 let key = canonical(x);
                 if known.contains(&key) {
-                    ext.joins += 1;
+                    if run + 1 >= JOIN_RUN {
+                        ext.joins += 1;
+                    } else if through.insert(key) {
+                        stack.push((x, run + 1));
+                    }
                     continue;
                 }
                 if !new.insert(key) {
@@ -369,7 +390,7 @@ pub fn extend(
                     ext.capped_ends += 1;
                     break;
                 }
-                stack.push(x);
+                stack.push((x, 0));
             }
             if walked >= p.max_per_end {
                 break;
@@ -378,7 +399,18 @@ pub fn extend(
         ext.ends_extended += usize::from(walked > 0);
     }
     ext.new_kmers = new.len();
-    ext.sequences = unitigs(&new);
+    // A piece that leads nowhere at one end and is shorter than a read is a sequencing error or
+    // a collision in the table followed for a few steps, not sequence of the target.
+    let anchored = |x: u64| known.contains(&canonical(x)) || new.contains(&canonical(x));
+    let (kept, tips): (Vec<Vec<u8>>, Vec<Vec<u8>>) = unitigs(&new).into_iter().partition(|s| {
+        let words = forward_kmers(s);
+        let (first, last) = (words[0].1, words[words.len() - 1].1);
+        let left = predecessors(first).into_iter().any(anchored);
+        let right = successors(last).into_iter().any(anchored);
+        (left && right) || s.len() >= MIN_TIP
+    });
+    ext.tips_removed = tips.len();
+    ext.sequences = kept;
     ext.unitigs = ext.sequences.len();
     ext.unitig_bases = ext.sequences.iter().map(Vec::len).sum();
     ext
@@ -509,6 +541,54 @@ mod tests {
             });
         assert!(found, "{ext:?}");
         assert_eq!(ext.new_kmers, 800 + K - 1);
+    }
+
+    #[test]
+    fn a_short_stretch_the_reference_holds_elsewhere_does_not_stop_the_walk() {
+        let genome = random(4000, 13);
+        let table = KmerCounts::new(22);
+        tile(&table, &genome, 150, 3, 1);
+        // the reference lacks 1,000-2,000 but holds 1,400-1,440 elsewhere (another run's copy)
+        let reference = [
+            genome[..1000].to_vec(),
+            random(200, 6),
+            genome[1400..1440].to_vec(),
+            random(200, 8),
+            genome[2000..].to_vec(),
+        ]
+        .concat();
+        let ext = extend(&table, &[reference], 3500, &Params::default());
+        // every k-mer between the two pieces but those of the 40 bp the reference holds
+        assert_eq!(ext.new_kmers, 1000 + K - 1 - (40 - K + 1), "{ext:?}");
+    }
+
+    #[test]
+    fn a_short_dead_end_off_the_walk_is_left_out() {
+        let genome = random(4000, 17);
+        let table = KmerCounts::new(22);
+        tile(&table, &genome, 150, 3, 1);
+        // reads as deep as the genome's that leave it at 1,200 for 40 bases and stop
+        let spur = [genome[1080..1200].to_vec(), random(40, 9)].concat();
+        for _ in 0..40 {
+            table.add_seq(&spur);
+            table.add_seq(&revcomp(&spur));
+        }
+        // a reference of the first 1,000 bases only: the one walk passes the branch at 1,200
+        let ext = extend(&table, &[genome[..1000].to_vec()], 3400, &Params::default());
+        assert_eq!(ext.branches, 1, "{ext:?}");
+        assert!(ext.tips_removed >= 1, "{ext:?}");
+        let tail = &spur[120..];
+        assert!(ext.sequences.iter().all(|s| {
+            !s.windows(20).any(|w| w == &tail[..20]) && !revcomp(s).windows(20).any(|w| w == &tail[..20])
+        }));
+        // the walk on from 1,000 stays, in two pieces either side of the branch
+        let held: FxHashSet<u64> = ext
+            .sequences
+            .iter()
+            .flat_map(|s| forward_kmers(s).into_iter().map(|(_, x)| canonical(x)))
+            .collect();
+        let missing = &genome[1000 - K + 1..1600 + K - 1];
+        assert!(forward_kmers(missing).iter().all(|&(_, x)| held.contains(&canonical(x))));
     }
 
     #[test]
