@@ -198,3 +198,15 @@ alleles together have less than a fifth of the organelle's depth (the median of 
 own 31-mer depths) is `no_call`. Each allele lists the reference runs whose walks take it.
 A segment is `present` from a quarter of the organelle's depth and `absent` below 2%; short
 variant segments without 31-mers of their own are judged by their sites instead.
+
+The individual is then laid over the reference runs as a Li-Stephens mosaic
+(`<organelle>/mosaic.tsv`, `genotypes.mosaic` in `reconstruction.json`): the runs are the
+states, each run's allele at a site is the one its walks take, a run's allele differs from the
+call with probability 0.01 and the closest run changes between neighbouring sites with
+probability 0.001 (an organelle genome is inherited whole). Sites are ordered along the run
+walk that passes most of them; sites off it are predicted from the runs' overall weights. The
+record gives each run's weight, the stretches of the backbone each run is closest over
+(Viterbi), and every site predicted from the others without its own call: their agreement with
+the called sites measures how far the reference runs predict this individual. Sites the reads
+could not call are imputed with the predicted allele and its probability, marked `imputed`.
+Imputed alleles are the runs', not the reads'.
