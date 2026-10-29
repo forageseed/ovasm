@@ -4,6 +4,7 @@
 mod assemble;
 mod bait;
 mod chromosomes;
+mod close;
 mod components;
 mod correct;
 mod evidence;
@@ -1668,6 +1669,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             extend_gate: args.extend_gate,
             max_read_depth: args.max_read_depth,
             max_bases: args.max_bases,
+            mates_together: false,
         },
     )?;
     for o in &report.outputs {

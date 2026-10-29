@@ -208,3 +208,20 @@ whether the genome is one molecule or the candidate's two. The plastid (no inver
 repeat) stops at an AT-rich inverted repeat (hairpin) whose reads thin to about a tenth of
 the plastid's depth. `reconstruction.json` now reports each organelle's `final` status
 with these reasons, beside `<organelle>.gfa` and `<organelle>.fasta`.
+
+### Closing the plastid with read pairs
+
+The plastid's linear molecule (125,122 bp) ends at an AT-rich inverted repeat. With mates
+kept together, 28 read pairs at 1,000x join its end to its start (insert median 333 bp, the
+ends 185 bp apart by them); the reads anchored at either end and their mates spell 194 bp
+between them, and the plastid is one circle of 125,300 bp (`complete`, no loose ends, read
+pairs only). Against the held-out HiFi plastid (125,509 bp) it aligns over its whole length
+in two blocks split at the circle's origin, 114,017 of 114,127 and 11,283 of 11,382 bp
+matching. The first full run sampled reads by their whole names, so mates were kept apart:
+at the plastid's 11.6%, one joining pair remained and the molecule stayed linear.
+
+This check reused recruited reads (`--target-reads`: the v6 mitochondrial reads and plastid
+reads of the earlier recruitment downsampled by read name to 1,000x; 5:59, 1.25 GB). The
+mitochondrion (307,479 bp) stays linear: 25 pairs join its ends but put them 569 bp into
+each other, without an exact overlap, which is the 8.3 kb repeat's two copies at its ends
+rather than missing sequence. No reference bases were filled in either organelle.

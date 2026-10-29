@@ -71,11 +71,34 @@ the larger k is kept (`k_tried` in its summary).
 
 The result of each organelle is at the top of the output directory, as `ovasm run` gives it:
 `<organelle>.gfa` (the de novo organelle graph with its molecule paths) and
-`<organelle>.fasta` (its molecules). `reconstruction.json` gives it a `final` record:
-`complete` only for one circular molecule that the reads decide (`decisive`) from a graph
-without loose segment ends; otherwise `incomplete`, with every reason. Short reads cannot
-decide a repeat longer than they are, so a plant mitochondrion with such repeats is reported
-incomplete however much of it the graph holds.
+`<organelle>.fasta` (its molecules). A single linear molecule of at least 1 kb is first
+closed with read pairs, as GetOrganelle's assemblies close on paired reads: pairs with one
+mate forward in its last 600 bp and the other reverse in its first 600 bp join the ends, and
+their distance follows from the insert size of the pairs within one end. With at least five
+such pairs, the reads anchored at either end and their mates spell the bases between, one at a
+time by majority (at least three reads and 80% of them, after the longest context of 90, 70, 50
+or 31 bases they hold, so an inverted repeat around the join does not mislead them), until the
+molecule's first 31 bases are reached. The spelled bases become a segment of the GFA
+(`<sample>.read_pairs_join`) linked to the walk's last and first steps, and the walk is marked
+circular (`cj:Z:read_pairs`). Recruitment keeps mates together when it downsamples for
+reconstruction, or few pairs would remain at a deep plastid.
+
+When the reads do not reach the start but the pairs join the ends, a reference walk may supply
+the bases between: exact 31 bp anchors at the molecule's end and start (moved inwards up to
+200 bp, with the walk spelling the trimmed bases as the molecule does) at most 5 kb apart, and
+a length within 100 bp or 30% of the pairs' distance. Of the walks that agree, the one most like
+the individual (the share of the molecule's sampled 31-mers it holds) is taken; the record
+names it, its similarity and the most similar walk with a different fill. These bases are the
+reference's: the segment carries `rf:Z:<walk>`, the molecule's header `reference_fill_bp`, and
+the status is `complete_with_reference_fill`. No bases are filled otherwise, and N is never
+used.
+
+`reconstruction.json` gives each organelle a `final` record: `complete` for one circular
+molecule of at least 1 kb from a graph without loose segment ends; otherwise `incomplete`, with
+every reason. Whether reads decided every repeat pairing is reported beside it (`decisive`).
+Short reads cannot decide a repeat longer than their fragments: the pairings of its copies are
+then a configuration the graph allows, not one the reads choose, and a plant mitochondrion with
+such a repeat stays linear here however much of it the graph holds.
 
 Important outputs for each organelle are:
 

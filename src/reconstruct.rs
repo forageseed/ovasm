@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::bait::BaitSet;
 use crate::evidence::{flip, parse_gfa, revcomp, Graph, Oriented};
 use crate::kmer::CanonicalKmers;
-use crate::{frontier, pan, pipeline, recruit};
+use crate::{close, frontier, pan, pipeline, recruit};
 
 const K: usize = 21; // The existing Illumina recruitment preset.
 type Edge = (Oriented, Oriented);
@@ -797,53 +797,241 @@ fn dead_ends(g: &Graph) -> usize {
         .sum()
 }
 
+fn read_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in fs::read_to_string(path)?.lines() {
+        if let Some(h) = line.strip_prefix('>') {
+            out.push((h.to_string(), Vec::new()));
+        } else if let Some(last) = out.last_mut() {
+            last.1.extend_from_slice(line.trim().as_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// The organelle GFA with `molecule` closed: the P walk that spells it gets `fill` (a new
+/// segment, unless empty, with `segment_tags`) and the link back to its first step, and is
+/// marked circular, with `cj:Z:<how>`. None when no P walk spells the molecule.
+fn close_gfa(
+    text: &str,
+    molecule: &[u8],
+    fill: &[u8],
+    how: &str,
+    segment_tags: &str,
+) -> Result<Option<String>> {
+    let mut seqs: BTreeMap<&str, &[u8]> = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<_> = line.split('\t').collect();
+        if f[0] == "S" && f.len() > 2 {
+            seqs.insert(f[1], f[2].as_bytes());
+        }
+    }
+    let spell = |steps: &str| -> Option<Vec<u8>> {
+        let mut s = Vec::new();
+        for t in steps.split(',') {
+            let (name, o) = t.split_at(t.len().checked_sub(1)?);
+            let seq = seqs.get(name)?;
+            s.extend(if o == "+" { seq.to_vec() } else { revcomp(seq) });
+        }
+        Some(s)
+    };
+    let Some(walk) = text.lines().find(|l| {
+        let f: Vec<_> = l.split('\t').collect();
+        f[0] == "P" && f.len() > 2 && spell(f[2]).as_deref() == Some(molecule)
+    }) else {
+        return Ok(None);
+    };
+    let f: Vec<_> = walk.split('\t').collect();
+    let steps: Vec<&str> = f[2].split(',').collect();
+    fn split(t: &str) -> (&str, &str) {
+        t.split_at(t.len() - 1)
+    }
+    let ((first, fo), (last, lo)) = (split(steps[0]), split(steps[steps.len() - 1]));
+    let prefix = first.rsplit_once('.').map_or(first, |p| p.0);
+    let mut name = format!("{prefix}.{how}_join");
+    while seqs.contains_key(name.as_str()) {
+        name.push('_');
+    }
+    let mut new_steps: Vec<String> = steps.iter().map(|s| s.to_string()).collect();
+    let mut added = String::new();
+    if fill.is_empty() {
+        writeln!(added, "L\t{last}\t{lo}\t{first}\t{fo}\t0M")?;
+    } else {
+        writeln!(
+            added,
+            "S\t{name}\t{}\tLN:i:{}{segment_tags}\nL\t{last}\t{lo}\t{name}\t+\t0M\nL\t{name}\t+\t{first}\t{fo}\t0M",
+            std::str::from_utf8(fill)?,
+            fill.len()
+        )?;
+        new_steps.push(format!("{name}+"));
+    }
+    let overlaps = if f.len() > 3 && f[3] == "*" {
+        "*".to_string()
+    } else {
+        vec!["0M"; new_steps.len() - 1].join(",")
+    };
+    let mut closed = format!("P\t{}\t{}\t{overlaps}", f[1], new_steps.join(","));
+    for tag in f.iter().skip(4).filter(|t| !t.starts_with("TP:Z:")) {
+        write!(closed, "\t{tag}")?;
+    }
+    write!(closed, "\tTP:Z:circular\tcj:Z:{how}")?;
+    let mut out = String::new();
+    for line in text.lines() {
+        writeln!(out, "{}", if line == walk { closed.as_str() } else { line })?;
+    }
+    out.push_str(&added);
+    Ok(Some(out))
+}
+
 /// The organelle's result as `ovasm run` gives it, at the top of the output: `<organelle>.gfa`
 /// (the de novo organelle graph with its molecule paths) and `<organelle>.fasta` (its
-/// molecules), and whether they are complete: one molecule, circular, the only configuration the
-/// reads support (decisive), from a graph without loose ends. Otherwise every reason is named.
+/// molecules). A single linear molecule of the genome is first closed with read pairs (`close`)
+/// when reads spell its join. It is complete as one circular molecule of at least
+/// `pipeline::MIN_PIECE` from a graph without loose segment ends; otherwise every reason is
+/// named. Whether the reads decide every repeat pairing is reported beside it (`decisive`):
+/// short reads cannot decide a repeat longer than their fragments.
 /// `individual.gfa` stays the graph for a species pan graph (reference intervals and de novo).
-fn final_outputs(dir: &Path, out: &Path, organelle: &str, de_novo: &Value) -> Result<Value> {
+fn final_outputs(
+    dir: &Path,
+    out: &Path,
+    organelle: &str,
+    de_novo: &Value,
+    reads: &[PathBuf],
+    walks: &[(Vec<u8>, bool)],
+    walk_names: &[String],
+) -> Result<Value> {
     let graph = dir.join("de-novo/organelle.gfa");
     let fasta = dir.join("de-novo/molecules.fasta");
     let (gfa_out, fasta_out) = (
         out.join(format!("{organelle}.gfa")),
         out.join(format!("{organelle}.fasta")),
     );
-    fs::copy(&graph, &gfa_out)?;
-    if fasta.exists() {
-        fs::copy(&fasta, &fasta_out)?;
+    let mut gfa_text = fs::read_to_string(&graph)?;
+    let mut molecules = if fasta.exists() {
+        read_fasta(&fasta)?
+    } else {
+        Vec::new()
+    };
+    let mut circular: Vec<bool> = molecules
+        .iter()
+        .map(|(h, _)| h.contains("circular=true"))
+        .collect();
+    let pieces: Vec<usize> = (0..molecules.len())
+        .filter(|&i| molecules[i].1.len() as u64 >= pipeline::MIN_PIECE)
+        .collect();
+    let mut closure = Value::Null;
+    let mut reference_fill = Value::Null;
+    let mut reference_bp = 0usize;
+    if let [i] = pieces[..] {
+        if !circular[i] {
+            eprintln!("[ovasm] reconstruct {organelle}: closing the linear molecule with read pairs");
+            let mut c = close::close(&molecules[i].1, reads)?;
+            // the reads spell the join; else the pairs join the ends and a reference walk holds
+            // sequence of their distance between them
+            let mut join: Option<(Vec<u8>, &str, String, String)> = None;
+            if c.fill.is_some() {
+                join = Some((
+                    c.sequence.clone(),
+                    "read_pairs",
+                    String::new(),
+                    format!("closed_by=read_pairs join_bp={} joining_pairs={}", c.sequence.len(), c.joining_pairs),
+                ));
+            } else if let (true, Some(gap)) = (c.joining_pairs >= close::MIN_JOINING_PAIRS, c.gap_estimate) {
+                if let Some(f) = close::reference_fill(&molecules[i].1, walks, gap) {
+                    let source = &walk_names[f.walk];
+                    join = Some((
+                        f.sequence.clone(),
+                        "reference_fill",
+                        format!("\trf:Z:{source}"),
+                        format!(
+                            "closed_by=reference_fill reference_fill_bp={} reference_walk={source} reference_similarity={:.3} joining_pairs={} pair_gap_estimate={gap:.0}",
+                            f.length, f.similarity, c.joining_pairs
+                        ),
+                    ));
+                    reference_fill = json!({"walk": source, "reverse": f.reverse, "length": f.length,
+                        "similarity": f.similarity, "candidates": f.candidates,
+                        "runner_up": f.runner_up.map(|(w, s)| json!({"walk": walk_names[w], "similarity": s})),
+                        "pair_gap_estimate": gap,
+                        "basis": "the agreeing reference walk most like the individual (share of its sampled 31-mers); reference bases, not read evidence"});
+                }
+            }
+            if let Some((fill, how, tags, note)) = join {
+                match close_gfa(&gfa_text, &molecules[i].1, &fill, how, &tags)? {
+                    Some(t) => {
+                        gfa_text = t;
+                        if how == "reference_fill" {
+                            reference_bp = fill.len();
+                        }
+                        let (h, s) = &mut molecules[i];
+                        s.extend_from_slice(&fill);
+                        let renamed = h
+                            .split(' ')
+                            .map(|w| {
+                                if w == "circular=false" {
+                                    "circular=true".to_string()
+                                } else if w.starts_with("length=") {
+                                    format!("length={}", s.len())
+                                } else {
+                                    w.to_string()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        *h = format!("{renamed} {note}");
+                        circular[i] = true;
+                    }
+                    None => {
+                        c.fill = None;
+                        reference_fill = Value::Null;
+                        c.stopped = Some("no P walk of the organelle graph spells the molecule".into());
+                    }
+                }
+            }
+            closure = serde_json::to_value(&c)?;
+        }
     }
-    let lengths: Vec<u64> = de_novo["lengths"]
-        .as_array()
-        .map(|v| v.iter().filter_map(Value::as_u64).collect())
-        .unwrap_or_default();
-    let circular: Vec<bool> = de_novo["circular"]
-        .as_array()
-        .map(|v| v.iter().filter_map(Value::as_bool).collect())
-        .unwrap_or_default();
+    fs::write(&gfa_out, &gfa_text)?;
+    if !molecules.is_empty() {
+        let mut text = String::new();
+        for (h, s) in &molecules {
+            writeln!(text, ">{h}")?;
+            for chunk in s.chunks(80) {
+                writeln!(text, "{}", std::str::from_utf8(chunk)?)?;
+            }
+        }
+        fs::write(&fasta_out, text)?;
+    }
+    let lengths: Vec<usize> = molecules.iter().map(|m| m.1.len()).collect();
     let decisive = de_novo["decisive"].as_bool().unwrap_or(false);
-    let loose = dead_ends(&parse_gfa(&dir.join("de-novo/assembly.gfa"))?);
+    let loose = dead_ends(&parse_gfa(&gfa_out)?);
     let mut reasons = Vec::new();
-    if lengths.len() != 1 {
-        reasons.push(format!("{} molecules", lengths.len()));
+    if pieces.len() != 1 {
+        reasons.push(format!(
+            "{} molecules of at least {} bp",
+            pieces.len(),
+            pipeline::MIN_PIECE
+        ));
     }
-    if circular.iter().any(|&c| !c) {
-        reasons.push("a molecule is linear".to_string());
-    }
-    if !decisive {
-        reasons.push(
-            "not decisive: reads support more than one pairing at a repeat (one longer than the \
-             reads, or with too few spanning reads)"
-                .to_string(),
-        );
+    if pieces.iter().any(|&i| !circular[i]) {
+        reasons.push("the molecule is linear".to_string());
     }
     if loose > 0 {
-        reasons.push(format!("{loose} loose segment ends in the assembly graph"));
+        reasons.push(format!("{loose} loose segment ends in the organelle graph"));
     }
-    Ok(json!({"gfa": gfa_out, "fasta": fasta.exists().then_some(fasta_out),
-        "molecules": lengths.len(), "lengths": lengths, "circular": circular, "decisive": decisive,
-        "graph_loose_ends": loose, "status": if reasons.is_empty() {"complete"} else {"incomplete"},
-        "reasons": reasons}))
+    let status = match (reasons.is_empty(), reference_bp) {
+        (false, _) => "incomplete",
+        (true, 0) => "complete",
+        // closed, but with bases a reference walk holds, not the reads
+        (true, _) => "complete_with_reference_fill",
+    };
+    Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
+        "molecules": lengths.len(), "lengths": lengths, "circular": circular,
+        "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
+        "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
+        "graph_loose_ends": loose, "status": status,
+        "reasons": reasons, "decisive": decisive,
+        "repeats": if decisive {"every pairing decided by reads"} else {
+            "some repeat pairings not decided by reads (a repeat longer than the fragments, or too few spanning reads): the molecule is one configuration the graph allows"}}))
 }
 
 pub struct Config {
@@ -988,6 +1176,8 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 extend_gate: false,
                 max_read_depth: None,
                 max_bases: None,
+                // read pairs close the circles (`close`)
+                mates_together: true,
             },
         )?)?
     };
@@ -1003,7 +1193,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         eprintln!("[ovasm] reconstruct {o}: projecting exact target read contexts on all {} reference paths",r.walks.len());
         let projection = project(r, &reads, &cfg.sample, &dir)?;
         let assembly = pipeline::run(&pipeline::RunConfig {
-            reads,
+            reads: reads.clone(),
             organelle: if o == "mitochondrion" {
                 pipeline::OrganelleChoice::Mitochondrion
             } else {
@@ -1044,7 +1234,10 @@ pub fn run(cfg: &Config) -> Result<Value> {
             Err(e) => json!({"error":format!("{e:#}")}),
         };
         let final_output = if de_novo.get("error").is_none() {
-            final_outputs(&dir, &cfg.out, o, &de_novo)?
+            let walks: Vec<(Vec<u8>, bool)> =
+                r.walks.iter().map(|w| (w.sequence.clone(), w.circular)).collect();
+            let names: Vec<String> = r.walks.iter().map(|w| w.name.clone()).collect();
+            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names)?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
@@ -1223,6 +1416,21 @@ mod tests {
             "S\ta\tACGT\nS\tb\tGG\nL\ta\t+\tb\t-\t0M\nL\tb\t-\ta\t+\t0M\nP\tone#1#pt\ta+,b-\t*\tTP:Z:circular\n",
         );
         assert_eq!(dead_ends(&circle.graph), 0);
+    }
+
+    #[test]
+    fn a_closed_molecule_gets_its_join_segment_and_a_circular_walk() {
+        let gfa = "H\tVN:Z:1.0\nS\ts.u0\tAAAACCCC\nS\ts.u1\tGGGTT\nL\ts.u0\t+\ts.u1\t-\t0M\nP\ts#1#pt.1\ts.u0+,s.u1-\t0M\tCH:i:1\n";
+        let molecule = b"AAAACCCCAACCC";
+        let closed = close_gfa(gfa, molecule, b"TGT", "read_pairs", "").unwrap().unwrap();
+        assert!(closed.contains("S\ts.read_pairs_join\tTGT"));
+        assert!(closed.contains("P\ts#1#pt.1\ts.u0+,s.u1-,s.read_pairs_join+\t0M,0M\tCH:i:1\tTP:Z:circular\tcj:Z:read_pairs"));
+        let p = std::env::temp_dir().join(format!("ovasm-closed-{}.gfa", std::process::id()));
+        fs::write(&p, &closed).unwrap();
+        assert_eq!(dead_ends(&parse_gfa(&p).unwrap()), 0);
+        fs::remove_file(p).unwrap();
+        // no walk spells another sequence
+        assert!(close_gfa(gfa, b"AAAACCCC", b"T", "read_pairs", "").unwrap().is_none());
     }
 
     #[test]

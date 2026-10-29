@@ -731,6 +731,15 @@ fn name_key(id: &[u8]) -> u64 {
 /// Salt of the subsample used for bait extension (independent of the output downsampling).
 const EXTEND_SALT: u64 = 0xB417_E87E;
 
+/// What a read is downsampled by: its whole name, or with `mates_together` the name's first word.
+fn sample_name(id: &[u8], mates_together: bool) -> &[u8] {
+    if mates_together {
+        id.split(|b| b.is_ascii_whitespace()).next().unwrap_or(id)
+    } else {
+        id
+    }
+}
+
 pub fn unit_hash(id: &[u8], salt: u64) -> f64 {
     let mut h = FxHasher::default();
     h.write(id);
@@ -858,6 +867,11 @@ pub struct RecruitConfig {
     pub max_read_depth: Option<f64>,
     /// Downsample each target's output to about this many bases at most.
     pub max_bases: Option<u64>,
+    /// Downsample by the first word of each read's name, which a pair's mates share, so mates
+    /// are kept or left out together (`sample_name`). Reconstruction closes circles with read
+    /// pairs: sampled by whole names, ZM4's plastid at 11.6% kept both mates of 1.3% of its pairs,
+    /// and of 21 pairs across its join one was left.
+    pub mates_together: bool,
 }
 
 /// A bootstrap read must not be this much shallower than the target's own reads (when the
@@ -1559,7 +1573,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let (mut kept_reads, mut kept_bases) = (0u64, 0u64);
         let mut failed = Ok(());
         for_each_rec(&pass, |r| {
-            if failed.is_ok() && (fraction >= 1.0 || unit_hash(&r.id, cfg.salt) < fraction) {
+            if failed.is_ok() && (fraction >= 1.0 || unit_hash(sample_name(&r.id, cfg.mates_together), cfg.salt) < fraction) {
                 kept_reads += 1;
                 kept_bases += r.seq.len() as u64;
                 failed = write_rec(&mut w, &r);
@@ -1646,6 +1660,15 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mates_are_sampled_together_only_when_asked() {
+        let (a, b) = (b"SRR13333747.1 1/1".as_slice(), b"SRR13333747.1 1/2".as_slice());
+        assert_eq!(sample_name(a, true), sample_name(b, true));
+        assert_eq!(unit_hash(sample_name(a, true), 3), unit_hash(sample_name(b, true), 3));
+        assert_eq!(sample_name(a, false), a);
+        assert_ne!(unit_hash(sample_name(a, false), 3), unit_hash(sample_name(b, false), 3));
+    }
 
     #[test]
     fn unchanged_keys_preserve_calls_across_competing_target_growth() {
@@ -1940,6 +1963,7 @@ mod tests {
             extend_gate: false,
             max_read_depth: None,
             max_bases: None,
+            mates_together: false,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -2028,6 +2052,7 @@ mod tests {
             extend_gate,
             max_read_depth: None,
             max_bases: None,
+            mates_together: false,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -2187,6 +2212,7 @@ mod tests {
             extend_gate: false,
             max_read_depth: None,
             max_bases: None,
+            mates_together: false,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -2349,6 +2375,7 @@ mod tests {
             extend_gate,
             max_read_depth: None,
             max_bases: None,
+            mates_together: false,
         }
     }
 
