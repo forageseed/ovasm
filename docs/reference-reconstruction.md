@@ -23,6 +23,21 @@ preserved in the input files but insert-size constraints and mate phasing are no
 
 The workflow proceeds as follows:
 
+0. Walk the individual's sequence that no reference path holds (frontier walk; skipped
+   with `--no-frontier` and in explicit target-input mode). One pass counts every 31-mer
+   of the WGS reads in a count-min table (`--frontier-memory-gib`, default 4 GiB). A
+   target's depth is the median count of its reference 31-mers. From every place where a
+   reference k-mer at that depth is followed by one that is not, the walk takes next
+   k-mers from a quarter of the target's depth to ten times it, follows both of two
+   comparable ones, and stops where it rejoins a reference k-mer, where no next k-mer is
+   at depth, or at its budget (50,000 k-mers per place, twice the stored reference bases
+   per target). Nuclear sequence is far shallower than an organelle and a plastid far
+   deeper than a mitochondrion, so the walk does not step into either. The walked pieces
+   are written to `reference/<organelle>.frontier.fasta` and join the bait only: reads
+   still enter the target by the recruitment rules below, and no walked base is emitted.
+   Recruitment alone reaches only about a fifth of a read past the reference in each pass,
+   and its saturation rule stops after the second pass; extending to a fixed point instead
+   walked into the nucleus (see the validation record).
 1. Seed recruitment with all reference P walks (including circular-boundary words) and
    all graph node sequences. Both targets compete in the same recruitment call.
 2. Match complete retained reads, in either orientation, exactly against every source
@@ -61,7 +76,8 @@ Important outputs for each organelle are:
 | `de-novo/` | Independent target de novo graph, FASTA, evidence and acceptance report |
 | `integration.json` | Preservation checks for the two input graphs; input provenance is not sample count |
 
-`reconstruction.json` reports both organelles and actual recruitment counts. A de novo
+`reconstruction.json` reports both organelles, the frontier walk of each (depth, ends,
+new k-mers, joins, branches, budget) and actual recruitment counts. A de novo
 error is retained explicitly even if a reference projection is available. `complete_assembly`
 remains false: local read support alone does not identify complete chromosome paths.
 Strict and relaxed scores stay null until an independent compatible truth is supplied.
