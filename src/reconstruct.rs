@@ -913,7 +913,14 @@ fn walk_key(steps: &[(String, bool)], circular: bool) -> Vec<(String, bool)> {
 /// assembly's two molecules). Written to `<organelle>.configurations.fasta` and as P walks of
 /// `<organelle>.gfa` (`<sample>_configuration<N>#1#<n>`), all labelled unresolved; the
 /// representative molecule stays one of them.
-fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Result<Value> {
+fn configurations(
+    dir: &Path,
+    out: &Path,
+    organelle: &str,
+    gfa_out: &Path,
+    ref_walks: &[(Vec<u8>, bool)],
+    ref_names: &[String],
+) -> Result<Value> {
     let d = dir.join("de-novo");
     let rep = crate::linearize::run(
         &d.join("assembly.gfa"),
@@ -929,6 +936,7 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
         Some(&d.join("configurations.partial.fasta")),
         &d.join("configurations.json"),
     )?;
+    let repeats: BTreeSet<String> = rep.repeats.iter().cloned().collect();
     // the component holding most of the organelle
     let Some(component) = rep.components.iter().max_by_key(|c| {
         c.best.as_ref().map_or(0, |b| b.molecules.iter().map(|m| m.length).sum::<usize>())
@@ -992,6 +1000,10 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
     let short = if organelle == "plastid" { "pt" } else { "mt" };
     let (mut seen, mut fasta, mut walks, mut listed) = (BTreeSet::new(), String::new(), String::new(), Vec::new());
     let mut skipped = 0usize;
+    // (reads' score, molecules: (linearize molecule, steps, organelle-graph steps, sequence,
+    // what the GFA walk spells))
+    type Molecule<'a> = (&'a crate::linearize::Linearization, Vec<(String, bool)>, Vec<String>, Vec<u8>, usize);
+    let mut found: Vec<(f64, Vec<Molecule>)> = Vec::new();
     'covers: for cover in covers {
         let mut key = Vec::new();
         let mut molecules = Vec::new();
@@ -1019,55 +1031,210 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
                 skipped += 1;
                 continue 'covers;
             };
-            molecules.push((m, gsteps, seq, gseq));
+            molecules.push((m, steps, gsteps, seq, gseq));
         }
         key.sort();
-        if !seen.insert(key) {
-            continue;
+        if seen.insert(key) {
+            found.push((cover.score, molecules));
         }
-        let n = listed.len() + 1;
+    }
+    // The reads leave the pairings open; the reference runs' assemblies show which pairings
+    // individuals of the species have. Each configuration is ranked by how often the runs hold
+    // the pairings it makes (`reference_prior`), first the one most like them.
+    let pairings: Vec<Vec<Pairing>> = found
+        .iter()
+        .map(|(_, ms)| ms.iter().flat_map(|m| pairings_of(&m.1, m.0.circular, &repeats)).collect())
+        .collect();
+    let prior = reference_prior(&asm, &index, &overlap, &pairings, ref_walks, ref_names);
+    let mut order: Vec<usize> = (0..found.len()).collect();
+    order.sort_by(|&a, &b| {
+        prior.scores[b]
+            .total_cmp(&prior.scores[a])
+            .then(found[b].0.total_cmp(&found[a].0))
+            .then(a.cmp(&b))
+    });
+    for (rank, &c) in order.iter().enumerate() {
+        let (score, molecules) = &found[c];
+        let n = rank + 1;
+        let runs = &prior.runs_with_all[c];
         let mut lengths = Vec::new();
-        for (j, (m, gsteps, seq, gseq)) in molecules.iter().enumerate() {
+        for (j, (m, _, gsteps, seq, gseq)) in molecules.iter().enumerate() {
             let name = format!("{sample}_configuration{n}#1#{short}.{}", j + 1);
             writeln!(
                 fasta,
-                ">{name} configuration={n} circular={} length={} path={} reads_decide=false",
+                ">{name} configuration={n} circular={} length={} path={} reads_decide=false reference_prior_ln={:.3} reference_runs_with_all_pairings={}",
                 m.circular,
                 seq.len(),
-                m.path.replace(' ', ",")
+                m.path.replace(' ', ","),
+                prior.scores[c],
+                if runs.is_empty() { "none".to_string() } else { runs.join(",") }
             )?;
             for chunk in seq.chunks(80) {
                 writeln!(fasta, "{}", std::str::from_utf8(chunk)?)?;
             }
             writeln!(
                 walks,
-                "P\t{name}\t{}\t*{}\tcf:i:{n}\tst:Z:unresolved_configuration",
+                "P\t{name}\t{}\t*{}\tcf:i:{n}\tst:Z:unresolved_configuration\trp:f:{:.3}",
                 gsteps.join(","),
-                if m.circular { "\tTP:Z:circular" } else { "" }
+                if m.circular { "\tTP:Z:circular" } else { "" },
+                prior.scores[c]
             )?;
             // the GFA walk spells the blunt segments: shorter where a segment lost bases to an
             // overlapping link this molecule does not use
             lengths.push(json!({"length": seq.len(), "circular": m.circular, "gfa_walk_bp": gseq}));
         }
-        listed.push(json!({"configuration": n, "score_ln": cover.score, "molecules": lengths}));
+        let detail: Vec<Value> = pairings[c]
+            .iter()
+            .map(|p| {
+                let (seen_in, informative) = prior.observed.get(p).cloned().unwrap_or_default();
+                json!({"repeat": p.1 .0, "from": format!("{}{}", p.0 .0, if p.0 .1 {'+'} else {'-'}),
+                    "to": format!("{}{}", p.2 .0, if p.2 .1 {'+'} else {'-'}),
+                    "runs_with_it": seen_in.len(), "runs_with_its_flanks": informative.len(), "runs": seen_in})
+            })
+            .collect();
+        listed.push(json!({"configuration": n, "reads_score_ln": score, "reference_prior_ln": prior.scores[c],
+            "reference_runs_with_all_pairings": runs, "pairings": detail, "molecules": lengths}));
     }
     let path = out.join(format!("{organelle}.configurations.fasta"));
     fs::write(&path, fasta)?;
     fs::write(gfa_out, text + &walks)?;
-    let best = listed.first().and_then(|c| c["score_ln"].as_f64()).unwrap_or(0.0);
-    let tied = listed
-        .iter()
-        .filter(|c| c["score_ln"].as_f64().is_some_and(|s| best - s < 1e-9))
-        .count();
+    let best = found.iter().map(|f| f.0).fold(f64::NEG_INFINITY, f64::max);
+    let tied = found.iter().filter(|f| best - f.0 < 1e-9).count();
     eprintln!(
-        "[ovasm] reconstruct {organelle}: {} configurations ({tied} as well supported as the best)",
-        listed.len()
+        "[ovasm] reconstruct {organelle}: {} configurations ({tied} as well supported by the reads as the best), ranked by {} reference runs",
+        listed.len(),
+        prior.runs
     );
-    Ok(json!({"configurations": listed.len(), "as_well_supported_as_the_best": tied,
+    Ok(json!({"configurations": listed.len(), "as_well_supported_by_reads_as_the_best": tied,
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
         "cover_size_limited": component.cover_size_limited, "skipped_covers": skipped,
-        "fasta": path, "list": listed,
-        "basis": "every cover of the anchor graph linearize finds; reads do not decide between them"}))
+        "reference_runs": prior.runs, "fasta": path, "list": listed,
+        "basis": "every cover of the anchor graph linearize finds; the reads do not decide between \
+                  them; ranked by how often the reference runs hold each repeat pairing (a prior \
+                  from other individuals, not evidence of this one)"}))
+}
+
+/// A repeat's copy entered from one step and left to another: (from, repeat, to), as the
+/// lesser of it and its reverse.
+type Pairing = ((String, bool), (String, bool), (String, bool));
+
+fn pairings_of(steps: &[(String, bool)], circular: bool, repeats: &BTreeSet<String>) -> Vec<Pairing> {
+    let n = steps.len();
+    let flip = |s: &(String, bool)| (s.0.clone(), !s.1);
+    (0..n)
+        .filter(|&i| repeats.contains(&steps[i].0))
+        .filter_map(|i| {
+            let prev = if i > 0 { Some(&steps[i - 1]) } else { circular.then(|| &steps[n - 1]) }?;
+            let next = if i + 1 < n { Some(&steps[i + 1]) } else { circular.then(|| &steps[0]) }?;
+            let fwd = (prev.clone(), steps[i].clone(), next.clone());
+            let rev = (flip(next), flip(&steps[i]), flip(prev));
+            Some(fwd.min(rev))
+        })
+        .collect()
+}
+
+struct Prior {
+    /// Reference runs (the first PanSN field of the walks).
+    runs: usize,
+    /// Each pairing: the runs that hold it, and the runs that hold its entry's flank at all.
+    observed: BTreeMap<Pairing, (Vec<String>, Vec<String>)>,
+    /// Each configuration: the sum of ln((runs with the pairing + 0.5) / (runs with its flank + 1))
+    /// over its pairings.
+    scores: Vec<f64>,
+    /// Each configuration: the runs that hold every one of its pairings.
+    runs_with_all: Vec<Vec<String>>,
+}
+
+/// Bases either side of a repeat that place a pairing on a reference walk.
+const FLANK_K: usize = 31;
+
+/// How often the reference walks hold each pairing: the entry's last `FLANK_K` bases followed,
+/// at the distance the repeat's copy makes (within 5%, at least 20 bp: other individuals' copies differ
+/// a little; 200 bp made both pairings of ZM4's 135 and 360 bp repeats "held by 8 of 8"), by the
+/// exit's first `FLANK_K` bases, on either strand of any walk of a run.
+fn reference_prior(
+    asm: &Graph,
+    index: &BTreeMap<&str, usize>,
+    overlap: &BTreeMap<Edge, usize>,
+    pairings: &[Vec<Pairing>],
+    walks: &[(Vec<u8>, bool)],
+    names: &[String],
+) -> Prior {
+    let run_of = |w: usize| names[w].split('#').next().unwrap_or("").to_string();
+    let all_runs: BTreeSet<String> = (0..walks.len()).map(run_of).collect();
+    let oriented = |s: &(String, bool)| index.get(s.0.as_str()).map(|&i| (i, s.1));
+    // the probes: an entry's last bases and an exit's first, and the distance between them
+    let distinct: BTreeSet<&Pairing> = pairings.iter().flatten().collect();
+    let mut probes: BTreeMap<Vec<u8>, Vec<usize>> = BTreeMap::new();
+    let mut plans: Vec<(&Pairing, usize, usize, usize, usize)> = Vec::new();
+    for &p in &distinct {
+        let (Some(a), Some(r), Some(b)) = (oriented(&p.0), oriented(&p.1), oriented(&p.2)) else {
+            continue;
+        };
+        let (sa, sb) = (asm.oriented_seq(a), asm.oriented_seq(b));
+        if sa.len() < FLANK_K || sb.len() < FLANK_K {
+            continue;
+        }
+        let gap = asm.seqs[r.0].len() as i64
+            - *overlap.get(&(a, r)).unwrap_or(&0) as i64
+            - *overlap.get(&(r, b)).unwrap_or(&0) as i64;
+        let (ia, ib) = (probes.len(), probes.len() + 1);
+        probes.entry(sa[sa.len() - FLANK_K..].to_ascii_uppercase()).or_default().push(ia);
+        probes.entry(sb[..FLANK_K].to_ascii_uppercase()).or_default().push(ib);
+        plans.push((p, ia, ib, gap.max(0) as usize, asm.seqs[r.0].len()));
+    }
+    let longest = plans.iter().map(|p| p.3).max().unwrap_or(0) + 2 * FLANK_K + 400;
+    // where each probe lies: (walk, reverse strand?, position)
+    let mut at: BTreeMap<usize, Vec<(usize, bool, usize)>> = BTreeMap::new();
+    for (w, (seq, circular)) in walks.iter().enumerate() {
+        for reverse in [false, true] {
+            let mut s = if reverse { revcomp(seq) } else { seq.to_ascii_uppercase() };
+            if *circular {
+                let wrap: Vec<u8> = s.iter().cycle().take(longest.min(s.len())).copied().collect();
+                s.extend(wrap);
+            }
+            for (pos, x) in s.windows(FLANK_K).enumerate() {
+                for &id in probes.get(x).map(Vec::as_slice).unwrap_or(&[]) {
+                    at.entry(id).or_default().push((w, reverse, pos));
+                }
+            }
+        }
+    }
+    let mut observed: BTreeMap<Pairing, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    for &(p, ia, ib, gap, len) in &plans {
+        let tol = 20.max(len / 20) as i64;
+        let (ea, eb) = (at.get(&ia).cloned().unwrap_or_default(), at.get(&ib).cloned().unwrap_or_default());
+        let mut with: BTreeSet<String> = BTreeSet::new();
+        for &(w, rv, pa) in &ea {
+            if eb.iter().any(|&(w2, rv2, pb)| {
+                w2 == w && rv2 == rv && ((pb as i64 - (pa + FLANK_K) as i64) - gap as i64).abs() <= tol
+            }) {
+                with.insert(run_of(w));
+            }
+        }
+        let flanked: BTreeSet<String> = ea.iter().map(|&(w, _, _)| run_of(w)).collect();
+        observed.insert(p.clone(), (with.into_iter().collect(), flanked.into_iter().collect()));
+    }
+    let mut scores = Vec::new();
+    let mut runs_with_all = Vec::new();
+    for ps in pairings {
+        let mut s = 0.0;
+        let mut all: BTreeSet<String> = all_runs.clone();
+        for p in ps {
+            let (with, flanked) = observed.get(p).cloned().unwrap_or_default();
+            s += ((with.len() as f64 + 0.5) / (flanked.len() as f64 + 1.0)).ln();
+            let with: BTreeSet<String> = with.into_iter().collect();
+            all = all.intersection(&with).cloned().collect();
+        }
+        scores.push(s);
+        runs_with_all.push(if ps.is_empty() { Vec::new() } else { all.into_iter().collect() });
+    }
+    Prior {
+        runs: all_runs.len(),
+        observed,
+        scores,
+        runs_with_all,
+    }
 }
 
 /// The organelle's result as `ovasm run` gives it, at the top of the output: `<organelle>.gfa`
@@ -1213,7 +1380,7 @@ fn final_outputs(
     };
     // the reads leave the configuration open: every one the graph allows
     let configurations_found = if status == "incomplete" && !decisive && !pieces.is_empty() {
-        configurations(dir, out, organelle, &gfa_out)?
+        configurations(dir, out, organelle, &gfa_out, walks, walk_names)?
     } else {
         Value::Null
     };
@@ -1625,6 +1792,33 @@ mod tests {
         fs::remove_file(p).unwrap();
         // no walk spells another sequence
         assert!(close_gfa(gfa, b"AAAACCCC", b"T", "read_pairs", "").unwrap().is_none());
+    }
+
+    #[test]
+    fn reference_runs_rank_the_pairings_they_hold() {
+        let (a, r, b, c) = (random(200), &random(400)[300..], &random(700)[400..], &random(1000)[700..]);
+        let g = reference(&format!(
+            "S\tA\t{a}\nS\tR\t{r}\nS\tB\t{b}\nS\tC\t{c}\nL\tA\t+\tR\t+\t0M\nL\tR\t+\tB\t+\t0M\nL\tR\t+\tC\t+\t0M\nP\tx#1#mt\tA+,R+,B+\t*\n"
+        ));
+        let index: BTreeMap<&str, usize> = g.graph.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        let s = |n: &str| (n.to_string(), true);
+        let steps_b = vec![s("A"), s("R"), s("B")];
+        let steps_c = vec![s("A"), s("R"), s("C")];
+        let repeats: BTreeSet<String> = [String::from("R")].into();
+        let pairings = vec![pairings_of(&steps_b, false, &repeats), pairings_of(&steps_c, false, &repeats)];
+        assert_eq!(pairings[0].len(), 1);
+        // two runs: one holds A R B, one A R C reversed; a third holds A R B again
+        let walks = vec![
+            ([a.as_bytes(), r.as_bytes(), b.as_bytes()].concat(), false),
+            (revcomp(&[a.as_bytes(), r.as_bytes(), c.as_bytes()].concat()), false),
+            ([a.as_bytes(), r.as_bytes(), b.as_bytes()].concat(), false),
+        ];
+        let names = vec!["one#1#mt".to_string(), "two#1#mt".to_string(), "three#1#mt".to_string()];
+        let p = reference_prior(&g.graph, &index, &BTreeMap::new(), &pairings, &walks, &names);
+        assert_eq!(p.runs, 3);
+        assert_eq!(p.runs_with_all[0], vec!["one", "three"]);
+        assert_eq!(p.runs_with_all[1], vec!["two"]);
+        assert!(p.scores[0] > p.scores[1]);
     }
 
     #[test]
