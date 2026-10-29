@@ -28,10 +28,12 @@ The workflow proceeds as follows:
    of the WGS reads in a count-min table (`--frontier-memory-gib`, default 4 GiB). A
    target's depth is the median count of its reference 31-mers. From every place where a
    reference k-mer at that depth is followed by one that is not, the walk takes next
-   k-mers from a quarter of the target's depth to ten times it, follows both of two
-   comparable ones, and stops where it rejoins a reference k-mer, where no next k-mer is
-   at depth, or at its budget (50,000 k-mers per place, twice the stored reference bases
-   per target). Nuclear sequence is far shallower than an organelle and a plastid far
+   k-mers from 0.4 of the target's depth to ten times it, follows both of two only when
+   the lesser is at least half the greater, and stops after 300 reference k-mers in a row
+   (a short stretch the reference holds elsewhere does not end it), where no next k-mer
+   is at depth, or at its budget (50,000 k-mers per place, twice the stored reference
+   bases per target). Walked pieces shorter than 150 bp that lead nowhere at one end are
+   dropped. Nuclear sequence is far shallower than an organelle and a plastid far
    deeper than a mitochondrion, so the walk does not step into either. The walked pieces
    are written to `reference/<organelle>.frontier.fasta` and join the bait only: reads
    still enter the target by the recruitment rules below, and no walked base is emitted.
@@ -61,6 +63,19 @@ The workflow proceeds as follows:
 5. Write `individual.gfa` and `individual.fasta` for each organelle. FASTA records are
    maximal nonbranching graph walks. Branches remain in the GFA, and a graph cycle does
    not certify a physical circular chromosome.
+
+The de novo step assembles short reads at several k, as GetOrganelle does: the k the read
+length gives (127 for 150 bp reads), then 99, 77 and 55 until one gives a single molecule;
+the attempt with the fewest molecules of at least 1 kb, then the most molecule bases, then
+the larger k is kept (`k_tried` in its summary).
+
+The result of each organelle is at the top of the output directory, as `ovasm run` gives it:
+`<organelle>.gfa` (the de novo organelle graph with its molecule paths) and
+`<organelle>.fasta` (its molecules). `reconstruction.json` gives it a `final` record:
+`complete` only for one circular molecule that the reads decide (`decisive`) from a graph
+without loose segment ends; otherwise `incomplete`, with every reason. Short reads cannot
+decide a repeat longer than they are, so a plant mitochondrion with such repeats is reported
+incomplete however much of it the graph holds.
 
 Important outputs for each organelle are:
 

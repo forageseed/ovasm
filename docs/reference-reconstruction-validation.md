@@ -172,3 +172,39 @@ development comparison, not independent truth. Of the walked bait, 5,655 bp matc
 neither the candidate nor the plastid, in pieces under 500 bp; the individual graph's
 sequence matching neither stayed at 33,364 bp (33,365 before). 1,480 bp of the first
 interval are still missing from the molecules. `decisive=false` remains.
+
+### Walk past short shared stretches; several k; a final record
+
+The first frontier walk stopped 1,480 bp short inside the first interval: about 30 bp
+there are held elsewhere in the reference, and the walk took them for a rejoin from both
+sides. Those reads were then at the depth of their flank (381x against 386x for the 1.5 kb
+before them, one recruit pass each), not a nuclear repeat. A walk now counts as rejoined
+after 300 reference k-mers in a row. Letting it walk that far with the first thresholds
+(a quarter of the depth, comparable branches at a quarter) took it into the nucleus at
+NUMT edges (67,280 new k-mers in 4,221 pieces; 2.34 M mitochondrial reads recruited); with
+0.4 of the depth, branches at half and dead-end pieces under 150 bp dropped, it added
+17,177 k-mers in 91 pieces and recruitment kept 895,480 reads (saturated at pass 2).
+
+The short-read de novo assembly at k 127 left the plastid in four pieces at up to 1,000x
+of reads and in twelve at 150x (its 127-mers ~21x deep). At k 99, 77 and 55 it was one
+molecule of 124.9-125.1 kb (a 136 bp piece beside it at 99), so short reads now try those
+k as well (see the reconstruction workflow).
+
+| `--target-depth` | 1000 | 150 |
+|---|---|---|
+| Wall clock / peak RSS | 18:08 / 4.73 GB | 20:03 / 4.73 GB |
+| MT de novo molecules (bp) | 307,479 (k 127) | 307,113, 146 (k 99) |
+| Both intervals in the MT molecules | 8,490 + 6,645 of 15,135 bp | 8,490 + 6,645 |
+| Plastid molecules (bp) | 125,122, 136 (k 99) | 102,855, 22,001 |
+
+The held-out candidate's two molecules total 307,026 bp. The 150x mitochondrion's
+comparison first reported 42,754 bp matching neither candidate nor plastid; aligned on
+their own, those two stretches match the candidate exactly (38,284 of 38,284 and 4,459 of
+4,469 bp), so that figure was the whole-molecule alignment's, not the assembly's.
+
+Every molecule is linear and `decisive=false`. The mitochondrion has an 8,268 bp repeat at
+twice its depth (and repeats of 135-837 bp); no read spans it, so short reads cannot say
+whether the genome is one molecule or the candidate's two. The plastid (no inverted
+repeat) stops at an AT-rich inverted repeat (hairpin) whose reads thin to about a tenth of
+the plastid's depth. `reconstruction.json` now reports each organelle's `final` status
+with these reasons, beside `<organelle>.gfa` and `<organelle>.fasta`.
