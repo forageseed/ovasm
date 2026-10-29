@@ -962,6 +962,33 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
     for v in pieces.values_mut() {
         v.sort();
     }
+    // The molecules are spelled on the assembly graph, each link's overlap taken off once. The
+    // organelle graph is blunt: a segment with an overlapping link loses those bases for every
+    // walk, and ZM4's 360 bp repeat (126 bp overlaps to two short tips) came out 126 bp short in
+    // walks that pass it without the tips (145,947 bp against the HiFi molecule's 146,073).
+    let asm = parse_gfa(&d.join("assembly.gfa"))?;
+    let index: BTreeMap<&str, usize> = asm.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let mut overlap: BTreeMap<Edge, usize> = BTreeMap::new();
+    for (&(a, b), &o) in asm.links.iter().zip(&asm.overlaps) {
+        overlap.insert((a, b), o);
+        overlap.insert((flip(b), flip(a)), o);
+    }
+    let spell = |steps: &[(String, bool)], circular: bool| -> Option<Vec<u8>> {
+        let walk: Vec<Oriented> = steps
+            .iter()
+            .map(|(n, o)| index.get(n.as_str()).map(|&i| (i, *o)))
+            .collect::<Option<_>>()?;
+        let mut seq = asm.oriented_seq(walk[0]);
+        for w in walk.windows(2) {
+            let o = overlap.get(&(w[0], w[1])).copied().unwrap_or(0);
+            seq.extend_from_slice(&asm.oriented_seq(w[1])[o..]);
+        }
+        if circular {
+            let o = overlap.get(&(walk[walk.len() - 1], walk[0])).copied().unwrap_or(0);
+            seq.truncate(seq.len() - o);
+        }
+        Some(seq)
+    };
     let short = if organelle == "plastid" { "pt" } else { "mt" };
     let (mut seen, mut fasta, mut walks, mut listed) = (BTreeSet::new(), String::new(), String::new(), Vec::new());
     let mut skipped = 0usize;
@@ -975,8 +1002,8 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
                 .map(|t| (t[..t.len() - 1].to_string(), t.ends_with('+')))
                 .collect();
             key.push(walk_key(&steps, m.circular));
-            // the organelle graph's steps and sequence for it
-            let (mut gsteps, mut seq) = (Vec::new(), Vec::new());
+            // the organelle graph's steps (and what they spell) for it
+            let (mut gsteps, mut gseq) = (Vec::new(), 0usize);
             for (name, fwd) in &steps {
                 let Some(p) = pieces.get(name) else {
                     skipped += 1;
@@ -985,11 +1012,14 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
                 let order: Vec<&(usize, String)> = if *fwd { p.iter().collect() } else { p.iter().rev().collect() };
                 for (_, piece) in order {
                     gsteps.push(format!("{piece}{}", if *fwd { '+' } else { '-' }));
-                    let s = &seqs[piece];
-                    seq.extend(if *fwd { s.clone() } else { revcomp(s) });
+                    gseq += seqs[piece].len();
                 }
             }
-            molecules.push((m, gsteps, seq));
+            let Some(seq) = spell(&steps, m.circular) else {
+                skipped += 1;
+                continue 'covers;
+            };
+            molecules.push((m, gsteps, seq, gseq));
         }
         key.sort();
         if !seen.insert(key) {
@@ -997,7 +1027,7 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
         }
         let n = listed.len() + 1;
         let mut lengths = Vec::new();
-        for (j, (m, gsteps, seq)) in molecules.iter().enumerate() {
+        for (j, (m, gsteps, seq, gseq)) in molecules.iter().enumerate() {
             let name = format!("{sample}_configuration{n}#1#{short}.{}", j + 1);
             writeln!(
                 fasta,
@@ -1015,7 +1045,9 @@ fn configurations(dir: &Path, out: &Path, organelle: &str, gfa_out: &Path) -> Re
                 gsteps.join(","),
                 if m.circular { "\tTP:Z:circular" } else { "" }
             )?;
-            lengths.push(json!({"length": seq.len(), "circular": m.circular}));
+            // the GFA walk spells the blunt segments: shorter where a segment lost bases to an
+            // overlapping link this molecule does not use
+            lengths.push(json!({"length": seq.len(), "circular": m.circular, "gfa_walk_bp": gseq}));
         }
         listed.push(json!({"configuration": n, "score_ln": cover.score, "molecules": lengths}));
     }

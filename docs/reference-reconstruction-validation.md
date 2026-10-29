@@ -241,11 +241,17 @@ same score: reads decide none of the pairings. All 32 are listed. Among them:
 | 11-16, 27-32 | other pairs (94,352 / 127,083 / 128,222 circles with the rest) |
 
 Configuration 25 is the held-out HiFi assembly's two molecules: its 160,953 bp circle matches
-HiFi `linear.1` over its whole length base for base, and its 145,947 bp circle aligns to HiFi
-`linear.2` (146,073 bp) in two blocks with 126 bp between them missing. The 453 bp linear piece
-is the two short dead-end tips beside the 360 bp repeat with that repeat; it is the loose end
-that keeps every configuration's largest molecule from closing in all but the circular ones.
-Configuration 17 joins both HiFi molecules into one circle through the repeat. The lengths
-are spelled from the organelle graph's blunt segments and are 126 bp shorter than
-`linearize`'s representative (307,479 bp), which counts the bases of its two overlapping links
-on both sides.
+HiFi `linear.1` over its whole length base for base. The 453 bp linear piece is the two short
+dead-end tips beside the 360 bp repeat with that repeat; it is the loose end that keeps the
+largest molecule of the other configurations from closing. Configuration 17 joins both HiFi
+molecules into one circle through the repeat.
+
+These lengths were first spelled from the organelle graph's blunt segments, and its second
+circle came out 145,947 bp, aligning to HiFi `linear.2` (146,073 bp) with 126 bp missing. The
+360 bp repeat has two links with 126 bp overlaps, to the two tips; making the graph blunt takes
+those bases off the repeat's segment for every walk, also those that pass it without the tips.
+The molecules are now spelled on the assembly graph, each used link's overlap taken off once;
+the GFA walks still name the blunt segments, and `gfa_walk_bp` gives what they spell. Now
+configuration 25 is the HiFi assembly exactly: 160,953 bp identical to `linear.1`, 146,073 bp
+identical to `linear.2` (two blocks split at the origin, 97,490 and 48,583 bp, no difference),
+beside the 453 bp tip piece; configuration 17's master circle is their sum, 307,026 bp.
