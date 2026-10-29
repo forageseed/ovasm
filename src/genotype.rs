@@ -189,6 +189,9 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
     let (mut called, mut no_call, mut ungenotyped, mut heteroplasmic, mut absent_from_runs) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut minor_list = Vec::new();
+    // each site: the major allele when called, and the runs taking each allele (`mosaic`)
+    let mut observed: Vec<Option<usize>> = Vec::new();
+    let mut allele_runs: Vec<Vec<BTreeSet<String>>> = Vec::new();
     for (i, (s, ks)) in sites.iter().zip(&allele_kmers).enumerate() {
         let depths: Vec<Option<u32>> = ks.iter().map(|k| depth_of(k)).collect();
         if depths.iter().any(Option::is_none) {
@@ -198,6 +201,8 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         let enough = organelle > 0.0 && total as f64 >= MIN_SITE_SHARE * organelle && depths.iter().all(Option::is_some);
         let major = depths.iter().enumerate().max_by_key(|(_, d)| d.unwrap_or(0)).map(|(j, _)| j);
         let mut minors = 0;
+        observed.push(major.filter(|_| enough));
+        allele_runs.push(Vec::new());
         for (j, &allele) in s.alleles.iter().enumerate() {
             let share = depths[j].map(|d| d as f64 / total.max(1) as f64);
             let call = if !enough {
@@ -211,6 +216,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
                 "absent"
             };
             let runs = taken.get(&(s.left, allele, s.right)).cloned().unwrap_or_default();
+            allele_runs[i].push(runs.clone());
             if call == "major" && runs.is_empty() {
                 absent_from_runs += 1;
             }
@@ -238,6 +244,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         }
     }
     fs::write(out.join("genotypes.tsv"), tsv)?;
+    let mosaic_summary = write_mosaic(g, &sites, walks, &observed, &allele_runs, out)?;
     let mut presence = String::from("segment\tlength\tkmers\tdepth\trelative\tcall\n");
     let (mut present, mut absent, mut low, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     for (i, (d, ks)) in node_depth.iter().zip(&node_kmers).enumerate() {
@@ -275,15 +282,275 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         "sites": sites.len(), "called": called, "no_call": no_call,
         "sites_with_an_allele_without_own_kmers": ungenotyped,
         "heteroplasmic_sites": heteroplasmic, "heteroplasmic": minor_list,
-        "major_alleles_in_no_reference_run": absent_from_runs,
+        "major_alleles_in_no_reference_run": absent_from_runs, "mosaic": mosaic_summary,
         "segments": {"present": present, "low": low, "absent": absent, "no_own_kmers": unknown},
         "genotypes": out.join("genotypes.tsv"), "presence": out.join("presence.tsv"),
         "basis": "median read count of each allele's K-mers that occur once in the reference graph"}))
 }
 
+/// A run's allele differs from the reads' call with this probability (`mosaic`).
+const MISMATCH: f64 = 0.01;
+/// The individual's closest run changes between neighbouring sites with this probability: an
+/// organelle genome is inherited whole, so a mosaic of runs is rare.
+const SWITCH: f64 = 0.001;
+
+/// The Li-Stephens mosaic of an individual over its reference runs: at each site of a chain the
+/// runs are states, their alleles (`hap[t][r]`, empty where a run's walks do not pass the site)
+/// are matched with the call (`obs[t]`) at probability 1 - `MISMATCH`, and the state changes by
+/// `SWITCH` between sites. Returns, per site, the runs' posterior without the site's own call
+/// (to predict it), and the Viterbi run.
+fn mosaic(hap: &[Vec<Vec<usize>>], obs: &[Option<usize>], runs: usize) -> (Vec<Vec<f64>>, Vec<usize>) {
+    let n = hap.len();
+    if n == 0 || runs == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let r = runs as f64;
+    let e: Vec<Vec<f64>> = (0..n)
+        .map(|t| {
+            (0..runs)
+                .map(|s| match obs[t] {
+                    Some(a) if !hap[t][s].is_empty() => {
+                        if hap[t][s].contains(&a) {
+                            1.0 - MISMATCH
+                        } else {
+                            MISMATCH
+                        }
+                    }
+                    _ => 1.0,
+                })
+                .collect()
+        })
+        .collect();
+    let norm = |v: &mut Vec<f64>| {
+        let s: f64 = v.iter().sum();
+        v.iter_mut().for_each(|x| *x /= s);
+    };
+    let mut alpha = vec![vec![0.0; runs]; n];
+    for s in 0..runs {
+        alpha[0][s] = e[0][s] / r;
+    }
+    norm(&mut alpha[0]);
+    for t in 1..n {
+        for s in 0..runs {
+            alpha[t][s] = e[t][s] * ((1.0 - SWITCH) * alpha[t - 1][s] + SWITCH / r);
+        }
+        norm(&mut alpha[t]);
+    }
+    let mut beta = vec![vec![1.0; runs]; n];
+    for t in (0..n - 1).rev() {
+        let w: Vec<f64> = (0..runs).map(|s| e[t + 1][s] * beta[t + 1][s]).collect();
+        let sw: f64 = w.iter().sum();
+        for s in 0..runs {
+            beta[t][s] = (1.0 - SWITCH) * w[s] + SWITCH * sw / r;
+        }
+        norm(&mut beta[t]);
+    }
+    let without: Vec<Vec<f64>> = (0..n)
+        .map(|t| {
+            let mut p: Vec<f64> = (0..runs).map(|s| alpha[t][s] / e[t][s] * beta[t][s]).collect();
+            norm(&mut p);
+            p
+        })
+        .collect();
+    // Viterbi, in logs
+    let stay = ((1.0 - SWITCH) + SWITCH / r).ln();
+    let leave = (SWITCH / r).ln();
+    let mut v: Vec<f64> = (0..runs).map(|s| (1.0 / r).ln() + e[0][s].ln()).collect();
+    let mut back = vec![vec![0usize; runs]; n];
+    for t in 1..n {
+        let mut next = vec![0.0; runs];
+        for s in 0..runs {
+            let (from, best) = (0..runs)
+                .map(|q| (q, v[q] + if q == s { stay } else { leave }))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            back[t][s] = from;
+            next[s] = best + e[t][s].ln();
+        }
+        v = next;
+    }
+    let mut path = vec![0usize; n];
+    path[n - 1] = (0..runs).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap();
+    for t in (1..n).rev() {
+        path[t - 1] = back[t][path[t]];
+    }
+    (without, path)
+}
+
+/// The allele the runs predict at a site, from their weights, and its probability.
+fn predict(hap: &[Vec<usize>], weights: &[f64], alleles: usize) -> Option<(usize, f64)> {
+    let mut p = vec![0.0; alleles];
+    let mut informative = 0.0;
+    for (s, w) in weights.iter().enumerate() {
+        if hap[s].is_empty() {
+            continue;
+        }
+        informative += w;
+        for &a in &hap[s] {
+            p[a] += w / hap[s].len() as f64;
+        }
+    }
+    if informative <= 0.0 {
+        return None;
+    }
+    p.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(a, &x)| (a, x / informative))
+}
+
+/// The individual as a mosaic of the reference runs (`mosaic`), its sites in the order of the
+/// run walk that passes most of them (sites off it are predicted from the runs' overall
+/// weights): which run each stretch is most like, every site predicted without its own call
+/// (agreement with the called ones measures how far the runs predict this individual), and the
+/// uncalled sites imputed. Writes `mosaic.tsv`.
+fn write_mosaic(
+    g: &Graph,
+    sites: &[Site],
+    walks: &[(String, Vec<Oriented>)],
+    observed: &[Option<usize>],
+    allele_runs: &[Vec<BTreeSet<String>>],
+    out: &Path,
+) -> Result<Value> {
+    let runs: Vec<String> = allele_runs
+        .iter()
+        .flatten()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let run_index: BTreeMap<&str, usize> = runs.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
+    // hap[site][run]: the alleles the run takes there
+    let hap: Vec<Vec<Vec<usize>>> = allele_runs
+        .iter()
+        .map(|alleles| {
+            let mut h = vec![Vec::new(); runs.len()];
+            for (a, rs) in alleles.iter().enumerate() {
+                for r in rs {
+                    h[run_index[r.as_str()]].push(a);
+                }
+            }
+            h
+        })
+        .collect();
+    // the backbone: the walk passing most sites, and each site's place on it
+    let mut keys: BTreeMap<(Oriented, Allele, Oriented), usize> = BTreeMap::new();
+    for (i, s) in sites.iter().enumerate() {
+        for &a in &s.alleles {
+            keys.insert((s.left, a, s.right), i);
+            keys.insert((flip(s.right), a.map(flip), flip(s.left)), i);
+        }
+    }
+    let places = |steps: &[Oriented]| -> BTreeMap<usize, usize> {
+        let mut at = BTreeMap::new();
+        for (p, w) in steps.windows(2).enumerate() {
+            if let Some(&i) = keys.get(&(w[0], None, w[1])) {
+                at.entry(i).or_insert(p);
+            }
+        }
+        for (p, w) in steps.windows(3).enumerate() {
+            if let Some(&i) = keys.get(&(w[0], Some(w[1]), w[2])) {
+                at.entry(i).or_insert(p);
+            }
+        }
+        at
+    };
+    let (backbone, at) = walks
+        .iter()
+        .map(|(name, steps)| (name.clone(), places(steps)))
+        .max_by_key(|(_, at)| at.len())
+        .unwrap_or_default();
+    let mut chain: Vec<usize> = at.keys().copied().collect();
+    chain.sort_by_key(|i| at[i]);
+    let chain_hap: Vec<Vec<Vec<usize>>> = chain.iter().map(|&i| hap[i].clone()).collect();
+    let chain_obs: Vec<Option<usize>> = chain.iter().map(|&i| observed[i]).collect();
+    let (without, path) = mosaic(&chain_hap, &chain_obs, runs.len());
+    let mut weights = vec![0.0; runs.len()];
+    for p in &without {
+        for (s, x) in p.iter().enumerate() {
+            weights[s] += x / without.len() as f64;
+        }
+    }
+    let on_chain: BTreeMap<usize, usize> = chain.iter().enumerate().map(|(t, &i)| (i, t)).collect();
+    let label = |s: &Site, a: usize| s.alleles[a].map_or("-".to_string(), |o| g.label(o));
+    let mut tsv = String::from(
+        "site\tbackbone_step\tcalled\tpredicted\tprobability\tclosest_run\timputed\tagrees\n",
+    );
+    let (mut scored, mut agree, mut imputed, mut imputed_p) = (0usize, 0usize, 0usize, 0.0);
+    for (i, s) in sites.iter().enumerate() {
+        let t = on_chain.get(&i).copied();
+        let w = t.map_or(&weights, |t| &without[t]);
+        let pred = predict(&hap[i], w, s.alleles.len());
+        let agrees = match (observed[i], pred) {
+            (Some(o), Some((a, _))) => {
+                scored += 1;
+                agree += usize::from(o == a);
+                if o == a { "yes" } else { "no" }
+            }
+            _ => "-",
+        };
+        let is_imputed = observed[i].is_none() && pred.is_some();
+        if is_imputed {
+            imputed += 1;
+            imputed_p += pred.unwrap().1;
+        }
+        writeln!(
+            tsv,
+            "{i}\t{}\t{}\t{}\t{}\t{}\t{}\t{agrees}",
+            t.map_or("-".to_string(), |t| at[&chain[t]].to_string()),
+            observed[i].map_or("-".to_string(), |a| label(s, a)),
+            pred.map_or("-".to_string(), |(a, _)| label(s, a)),
+            pred.map_or("-".to_string(), |(_, p)| format!("{p:.3}")),
+            t.map_or("-".to_string(), |t| runs[path[t]].clone()),
+            if is_imputed { "yes" } else { "no" },
+        )?;
+    }
+    fs::write(out.join("mosaic.tsv"), tsv)?;
+    // the Viterbi stretches along the backbone
+    let mut stretches = Vec::new();
+    let mut start = 0;
+    for t in 1..=path.len() {
+        if t == path.len() || path[t] != path[start] {
+            stretches.push(json!({"run": runs[path[start]], "first_step": at[&chain[start]],
+                "last_step": at[&chain[t - 1]], "sites": t - start}));
+            start = t;
+        }
+    }
+    let mut ranked: Vec<(String, f64)> = runs.iter().cloned().zip(weights.iter().copied()).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    Ok(json!({"runs": ranked.iter().map(|(r, w)| json!({"run": r, "weight": w})).collect::<Vec<_>>(),
+        "backbone": backbone, "sites_on_backbone": chain.len(), "stretches": stretches,
+        "called_sites_predicted_without_their_call": scored, "of_them_agreeing": agree,
+        "agreement": if scored > 0 { agree as f64 / scored as f64 } else { 0.0 },
+        "imputed_sites": imputed, "imputed_mean_probability": if imputed > 0 { imputed_p / imputed as f64 } else { 0.0 },
+        "mosaic": out.join("mosaic.tsv"),
+        "basis": "Li-Stephens mosaic over the reference runs (mismatch 0.01, switch 0.001 per site); imputed alleles are the runs', not the reads'"}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mosaic_follows_the_closest_run_and_predicts_a_missing_call() {
+        // three runs over ten sites of two alleles; the individual is run 1 for the first half
+        // and run 2 after, and site 3 is not called
+        let runs_alleles = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 0, 1, 1, 0, 1, 0, 0, 1, 1],
+            [0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        ];
+        let hap: Vec<Vec<Vec<usize>>> = (0..10).map(|t| (0..3).map(|r| vec![runs_alleles[r][t]]).collect()).collect();
+        let truth: Vec<usize> = (0..10).map(|t| if t < 5 { runs_alleles[1][t] } else { runs_alleles[2][t] }).collect();
+        let obs: Vec<Option<usize>> = (0..10).map(|t| (t != 3).then_some(truth[t])).collect();
+        let (without, path) = mosaic(&hap, &obs, 3);
+        assert_eq!(&path[..3], &[1, 1, 1]);
+        assert_eq!(&path[7..], &[2, 2, 2]);
+        let (a, p) = predict(&hap[3], &without[3], 2).unwrap();
+        assert_eq!(a, truth[3]);
+        assert!(p > 0.9, "{p}");
+    }
 
     fn random(n: usize, seed: u64) -> String {
         let mut x = seed;

@@ -297,3 +297,21 @@ no other's):
 The one discordant mitochondrial site is split 46:54 between its alleles (218 and 253): a
 minor allele by the reads, and the HiFi assembly holds the other. Sites where HiFi held
 neither allele (14 and 2) or both were not scored.
+
+### The mosaic over the reference runs
+
+| | Mitochondrion | Plastid |
+|---|---|---|
+| Sites on the backbone walk | 627 of 660 | 243 of 247 |
+| Closest runs (weight) | SRR31693268 0.945 | SRR31693269 0.691, SRR31693276 0.309 |
+| Viterbi stretches | one (SRR31693268) | one (SRR31693269) |
+| Called sites predicted without their call, agreeing | 529 of 584 (90.6%) | 230 of 231 (99.6%) |
+| The same against the held-out HiFi | 513 of 564 (the reads' calls: 563 of 564) | 223 of 224 (224 of 224) |
+| Imputed sites (mean probability) | 76 (0.90) | 16 (0.84) |
+| Imputed sites the HiFi shows, right | 5 of 5 | 7 of 8 |
+
+ZM4's mitochondrion is closest to one run throughout, with no switch, but differs from it at
+about a tenth of the sites the reads call: the reads' own calls are right where the closest
+run's are not, and imputation from the runs is right about nine times in ten there. Its plastid
+is all but predicted by two near-identical runs. 4:06, 1.29 GB for the whole `--target-reads`
+run.
