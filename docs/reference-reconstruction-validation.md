@@ -328,3 +328,24 @@ pieces by name and missed the one its overlapping neighbour owns; `pan` refused 
 VCF has 154 mitochondrial and 181 plastid records. Written back, the mitochondrial graph grows
 from 350,586 to 374,365 bp (23,779 bp of ZM4 sequence no reference run holds, the 15 kb in
 two pieces among it) and the plastid graph from 128,321 to 133,668 bp.
+
+### End to end from the WGS reads (e4c7eec)
+
+`reconstruct` on ZM4's 155,554,892 WGS records with `--target-depth 1000`: 1:07:10, 4.73 GB
+peak (counting the 31-mers took 2,734 s on a slow disk; 646 s before). Recruitment kept every
+mitochondrial read (895,480) and 856,699 of 7,354,090 plastid reads, mates together.
+
+| | Mitochondrion | Plastid |
+|---|---|---|
+| Status | `circular_configuration_chosen` | `complete` |
+| Representative | one circle of 307,026 bp (configuration 3 of 32) + 453 bp tip piece | one circle of 125,243 bp (de novo at k 77) + 92 bp piece |
+| Against the held-out HiFi | four blocks covering both HiFi molecules, every base identical | two blocks, 120,227 of 120,373 and 5,016 of 5,079 bp matching (HiFi 125,509 bp) |
+| Sites called / major = HiFi | 584 / 569 of 570 | 232 / 230 of 230 |
+| Segments present in HiFi / absent not in HiFi | 777 of 786 / 169 of 170 | 336 of 337 / 45 of 45 |
+| Mosaic: agreement / imputed right where HiFi shows | 90.6% / 5 of 5 | 99.6% / 6 of 7 |
+| VCF records | 154 | 181 |
+| New bases written back into the species graph | 23,779 | 5,307 |
+
+The plastid closed in the de novo graph itself this time (the reads with mates kept together;
+no read-pair closure was needed) at k 77, 266 bp shorter than the HiFi plastid: the smaller k
+may have compressed its AT-rich inverted repeat. No reference bases were filled anywhere.
