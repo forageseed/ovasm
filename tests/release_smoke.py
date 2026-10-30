@@ -71,7 +71,7 @@ else:
 checks += ['Valid local installation succeeds', 'Corrupt package is rejected without replacing the installed executable']
 installed = out / 'installed' / exe
 assert digest(installed) == digest(package / 'bin' / exe)
-assert run([installed, '--version']).stdout.strip() == 'ovasm 0.5.0'
+assert run([installed, '--version']).stdout.strip() == 'ovasm 0.6.0'
 run([installed, '--help'])
 checks += ['Installed executable matches package hash', 'Version and help work without build tools']
 # A tiny synthetic junction verifies parsing and the actual evidence path. This
