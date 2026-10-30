@@ -1454,11 +1454,24 @@ fn final_outputs(
         representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces,
             "chosen_by": "fewest circular molecules, then the reference runs' ranking"});
     }
+    // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
+    let uncertain = if fasta_out.exists() {
+        let final_molecules: Vec<(String, Vec<u8>, bool)> = read_fasta(&fasta_out)?
+            .into_iter()
+            .map(|(h, s)| (h.split(' ').next().unwrap_or("").to_string(), s, h.contains("circular=true")))
+            .collect();
+        let u = crate::uncertain::run(&final_molecules, reads, pipeline::MIN_PIECE as usize, dir)?;
+        eprintln!("[ovasm] reconstruct {organelle}: {} stretch(es) of uncertain length", u["marked"]);
+        u
+    } else {
+        Value::Null
+    };
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
         "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
         "configurations": configurations_found, "representative": representative,
+        "uncertain_regions": uncertain,
         "graph_loose_ends": loose, "status": status,
         "reasons": reasons, "decisive": decisive,
         "repeats": if decisive {"every pairing decided by reads"} else {

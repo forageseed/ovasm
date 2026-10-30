@@ -29,6 +29,7 @@ mod replicate;
 mod retained;
 mod seeddb;
 mod seedfree;
+mod uncertain;
 mod unify;
 mod unzip;
 

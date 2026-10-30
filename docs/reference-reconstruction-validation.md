@@ -365,3 +365,13 @@ is some 20-30 bp short at three places and not short at the fourth, not the 57-7
 short reads do not measure these arrays' lengths; the pairs suggest ZM4's WGS DNA has somewhat
 more than our circle and less than the HiFi assembly there (plastid microsatellites vary in
 length between plants and within one).
+
+### Marking stretches of uncertain length
+
+On the end-to-end reads (`--target-reads` of that run, 2:23, 1.21 GB) the plastid circle has
+7 marked stretches, among them all four places where it differs from the HiFi plastid (circle
+20-187, 412-496, 107,981-108,116 and 108,541-108,800); the other three (176-298 bp) are as long
+as in HiFi but no read spans them. The mitochondrion has 3 (two inside the 8.3 kb repeat and a
+112 bp one). A first version also marked stretches whose spanning pairs had 15 bp longer inserts
+and those spanned at under a fifth of the expected rate: 15 plastid stretches, 11 of them as long
+as in HiFi.
