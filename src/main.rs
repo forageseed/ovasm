@@ -413,12 +413,6 @@ struct RunArgs {
     /// Never cache the reads for recruitment (see --recruit-cache).
     #[arg(long, conflicts_with = "recruit_cache")]
     no_recruit_cache: bool,
-    /// HiFi recruitment as up to 0.2.1: without `ovasm find recruit --extend-gate --bootstrap`, which
-    /// `run` uses for HiFi reads. Ungated, iterative baiting from the built-in seed library ran
-    /// into the nuclear genome on species far from it (Carex echinata: 686,022 "plastid" reads,
-    /// 8.5 Gb, then 309 GB of memory in assembly).
-    #[arg(long)]
-    ungated_recruit: bool,
     /// HiFi: downsample each organelle's recruited reads to about this read depth before
     /// assembly (their median depth in the depth sketch); 0 keeps every read.
     #[arg(long, default_value_t = 250.0)]
@@ -536,7 +530,10 @@ fn run(args: RunArgs) -> Result<()> {
         recruit_depth: args.recruit_depth,
         recruit_cache: args.recruit_cache,
         auto_recruit_cache: !args.no_recruit_cache,
-        gated_recruit: !args.ungated_recruit,
+        // HiFi recruitment in `run` is always gated (`find recruit --extend-gate --bootstrap`): the
+        // 0.2.1 ungated mode ran into the nucleus on species far from the seed library (see
+        // docs/release-0.3.0.md). `ovasm find recruit` without --extend-gate remains for other callers.
+        gated_recruit: true,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
         recruit_iterations: args.recruit_iterations,

@@ -638,7 +638,29 @@ fn free_bytes(path: &Path) -> Option<u64> {
     Some(buf[4].saturating_mul(buf[1]))
 }
 
-#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+/// Windows: bytes free to the caller on the volume that holds `path` (it must exist).
+#[cfg(windows)]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated; the two totals may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(not(any(all(target_os = "linux", target_pointer_width = "64"), windows)))]
 fn free_bytes(_: &Path) -> Option<u64> {
     None
 }

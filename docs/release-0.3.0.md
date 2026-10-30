@@ -5,10 +5,11 @@ nuclear genome on species far from the built-in seed library.
 
 ## Recruitment (`ovasm run`, HiFi reads)
 
-- Gated by default: `run` recruits HiFi reads with `ovasm recruit --extend-gate --bootstrap`;
-  `--ungated-recruit` restores 0.2.1. Ungated, iterative baiting from the built-in seed library
-  ran into the nucleus on Carex echinata (686,022 "plastid" reads, 8.5 Gb) and assembly took
-  301 GB before the run failed after 8 hours.
+- Always gated: `run` recruits HiFi reads with `ovasm recruit --extend-gate --bootstrap`. The
+  0.2.1 ungated mode is no longer offered by `run`: on Carex echinata, iterative baiting from the
+  built-in seed library ran into the nucleus (686,022 "plastid" reads, 8.5 Gb) and assembly took
+  301 GB before the run failed after 8 hours. To reproduce 0.2.1 results use the 0.2.1 release;
+  `ovasm recruit` without `--extend-gate` remains for callers that choose their own recruitment.
 - The depth gate reads the nuclear depth from per-read depths: the mode of the reads' median
   sketch depths in quarter-log2 bins, accepted when its reads stand for a nuclear-sized genome
   (20 Mb), else the k-mer estimate. The mode of distinct k-mers, used until now, fell to 2x on

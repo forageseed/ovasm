@@ -12,18 +12,18 @@ OVASM recruits organelle reads, builds graphs and retains read-supported alterna
 
 ## Install
 
-**Precompiled 0.2.1 — no compiler required.**
+**Precompiled 0.3.0 — no compiler required.**
 
-- **Windows x86_64:** [download ZIP](https://github.com/forageseed/ovasm/releases/download/v0.2.1/ovasm-v0.2.1-windows-x86_64.zip), extract and double-click `install.cmd`. Reopen the terminal.
+- **Windows x86_64:** [download ZIP](https://github.com/forageseed/ovasm/releases/download/v0.3.0/ovasm-v0.3.0-windows-x86_64.zip), extract and double-click `install.cmd`. Reopen the terminal.
 - **Linux x86_64, glibc 2.34+:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.2.1/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.3.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
 
-[Downloads](https://github.com/forageseed/ovasm/releases/tag/v0.2.1) · [Offline installation](docs/installation.md)
+[Downloads](https://github.com/forageseed/ovasm/releases/tag/v0.3.0) · [Offline installation](docs/installation.md)
 
 ## Use
 
@@ -53,7 +53,7 @@ Commands are `ovasm <module> <command>`; `-h` works at every level:
 | OVASM | 210.20 min | 1.983 GiB |
 | OATK, including annotation | 942.35 min | 310.416 GiB |
 
-OVASM produced MT representatives of 160,953 and 146,073 bp and a PT representative of 125,509 bp. These are sequence representatives, not certified physical chromosome counts. The table records the named full-input benchmark versions; it is not a new 0.2.1 speed measurement.
+OVASM produced MT representatives of 160,953 and 146,073 bp and a PT representative of 125,509 bp. These are sequence representatives, not certified physical chromosome counts. The table records the named full-input benchmark versions; it is not a new 0.3.0 speed measurement.
 
 The 20-WGS first-attempt panel completed 14 commands; six hit resource limits. Complete MT assembly was not established by those execution results.
 
