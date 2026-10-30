@@ -1,4 +1,4 @@
-//! Stage 2: read evidence on an assembly graph (`ovasm evidence`).
+//! Stage 2: read evidence on an assembly graph (`ovasm check evidence`).
 //!
 //! Every GFA link becomes a junction sequence (end of the left segment + start of the right
 //! segment, `flank` bp each side). A read supports a link when its exact k-mer hits on that
@@ -818,7 +818,7 @@ fn segment_depths(text: &str, g: &Graph) -> Option<Vec<f64>> {
         .collect()
 }
 
-/// Depths for calling repeats: ovasm assemble's median node depth (`dm`) where present, else
+/// Depths for calling repeats: ovasm assemble graph's median node depth (`dm`) where present, else
 /// the backend's depth. A stretch read far more often than the rest of a segment (plastid
 /// reads piling onto a plastid-derived insert) lifts the mean, not the median, while a real
 /// repeat is deep along its whole length. Only repeat calls use it; the reported depths and

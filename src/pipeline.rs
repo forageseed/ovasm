@@ -6,7 +6,7 @@
 //! the reads, unring it, go down the k ladder until the molecules explain half of the graph, and export the
 //! unified graph. Reads that came from depth clusters (`--recruit discover|both`) bring what
 //! shares the organelle's cluster, so each assembly graph first loses the components that are
-//! not the target organelle (`ovasm components`; the graph the later stages and the ladder's
+//! not the target organelle (`ovasm assemble filter`; the graph the later stages and the ladder's
 //! half-of-the-graph rule see is the kept one). The stages are the other subcommands, run in this process with the arguments
 //! the runner gives them (so their defaults are the subcommands' own), and each leaves its
 //! usual report.
@@ -76,7 +76,7 @@ pub enum ReadType {
 pub enum ReadSet {
     /// Whole-genome sequencing reads: the organelle's reads are recruited first.
     WholeGenome,
-    /// Reads of the target organelle already (e.g. from `ovasm recruit`): assembled as given.
+    /// Reads of the target organelle already (e.g. from `ovasm find recruit`): assembled as given.
     Target,
 }
 
@@ -84,7 +84,7 @@ pub enum ReadSet {
 pub enum RecruitBy {
     /// Seed sequences (--seeds), every seeded organelle competing for its own reads.
     Seeds,
-    /// No seeds: depth clusters (`discover`) called by their organelle proteins (`panel`).
+    /// No seeds: depth clusters (`find discover`) called by their organelle proteins (`find classify`).
     Discover,
     /// Seed-recruited reads plus the depth clusters called as the target organelle.
     Both,
@@ -109,19 +109,19 @@ pub struct RunConfig {
     /// The organelles whose `seeds` are the built-in library (`summary.json` says `builtin`).
     pub builtin_seeds: BTreeSet<String>,
     pub recruit: RecruitBy,
-    /// `ovasm recruit --target-depth` (None: keep every recruited read).
+    /// `ovasm find recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
     pub recruit_cache: Option<PathBuf>,
     /// HiFi seed recruitment without a `recruit_cache` caches the reads beside its outputs when
     /// that disk has room (`default_recruit_cache`).
     pub auto_recruit_cache: bool,
-    /// HiFi seed recruitment with `recruit --extend-gate --bootstrap`.
+    /// HiFi seed recruitment with `find recruit --extend-gate --bootstrap`.
     pub gated_recruit: bool,
-    /// HiFi seed recruitment: `recruit --max-read-depth` and `--max-bases`.
+    /// HiFi seed recruitment: `find recruit --max-read-depth` and `--max-bases`.
     pub recruit_max_depth: Option<f64>,
     pub recruit_max_bases: Option<u64>,
-    /// Seed recruitment: `recruit --iterations` (None: `GATED_RECRUIT_PASSES` for gated HiFi
-    /// recruitment, else `recruit`'s default).
+    /// Seed recruitment: `find recruit --iterations` (None: `GATED_RECRUIT_PASSES` for gated HiFi
+    /// recruitment, else `find recruit`'s default).
     pub recruit_iterations: Option<usize>,
     pub read_context: Option<PathBuf>,
     /// Recruit one organelle without seeding the other.
@@ -147,8 +147,9 @@ fn log(message: &str) {
 struct Argv(Vec<OsString>);
 
 impl Argv {
-    fn new(subcommand: &str) -> Self {
-        Argv(vec!["ovasm".into(), subcommand.into()])
+    /// `command` is the module and its command, e.g. "find recruit".
+    fn new(command: &str) -> Self {
+        Argv(std::iter::once("ovasm").chain(command.split_whitespace()).map(OsString::from).collect())
     }
 
     fn arg(mut self, a: impl Into<OsString>) -> Self {
@@ -169,7 +170,7 @@ impl Argv {
 
     /// Run the subcommand in this process. Its thread pool is the one `ovasm run` set up.
     fn run(self) -> Result<()> {
-        let name = self.0[1].to_string_lossy().into_owned();
+        let name = self.0[1..3].iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
         let cli = crate::Cli::try_parse_from(&self.0)
             .map_err(|e| anyhow!("internal: bad arguments for `ovasm {name}`: {e}"))?;
         crate::dispatch(cli.command).with_context(|| format!("`ovasm {name}` failed"))
@@ -433,7 +434,7 @@ struct GraphAttempts<'a> {
     read_type: ReadType,
     /// Reads found by depth: each graph goes through the component filter first.
     filter: Option<&'a ComponentFilter>,
-    /// `assemble --nuclear-share` (`nuclear_share`).
+    /// `assemble graph --nuclear-share` (`nuclear_share`).
     nuclear_share: Option<f64>,
 }
 
@@ -446,7 +447,7 @@ fn molecules_of(linearization: &Value) -> Vec<&Value> {
         .collect()
 }
 
-/// `ovasm evidence` as the runner calls it for this read type.
+/// `ovasm check evidence` as the runner calls it for this read type.
 fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType) -> Argv {
     // k, diagonal tolerance, hits per side, anchor: `_EVIDENCE_PRESETS` of `_ovasm.py`; short
     // reads of 100-150 bp can hold few hits per side and anchor 40 bp
@@ -454,7 +455,7 @@ fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType)
         ReadType::Hifi => ("10", "500"),
         ReadType::Sr => ("5", "40"),
     };
-    let argv = Argv::new("evidence")
+    let argv = Argv::new("check evidence")
         .opt("--gfa", gfa)
         .opt("--out", out)
         .opt("--k", "21")
@@ -487,7 +488,7 @@ impl Attempts for GraphAttempts<'_> {
             Some(k) => format!("assembling the read graph at k={k}"),
             None => "assembling the read graph".into(),
         });
-        let mut asm = Argv::new("assemble")
+        let mut asm = Argv::new("assemble graph")
             .opt("--out", &graph)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", self.reads);
@@ -516,7 +517,7 @@ impl Attempts for GraphAttempts<'_> {
         log("evaluating read support and repeat pairings");
         evidence_argv(&graph, self.reads, &d.join("evidence.json"), self.read_type).run()?;
         log("generating representative sequences and retaining configuration uncertainty");
-        Argv::new("linearize")
+        Argv::new("solve linearize")
             .opt("--gfa", &graph)
             .opt("--evidence", d.join("evidence.json"))
             .opt("--out-fasta", &fasta)
@@ -693,7 +694,7 @@ fn start_k(recruitment: &Value) -> Option<usize> {
 }
 
 /// Nuclear depth over the organelle's core depth in the whole library, from the recruitment
-/// summary (its depth gate and core depth), for `assemble --nuclear-share`; none when recruitment
+/// summary (its depth gate and core depth), for `assemble graph --nuclear-share`; none when recruitment
 /// did not gate or set no core depth.
 fn nuclear_share(recruitment: &Value) -> Option<f64> {
     let nuclear = recruitment["depth_gate"]["nuclear_peak_depth"].as_f64()?;
@@ -804,7 +805,7 @@ fn pool_fastq(sources: &[PathBuf], dest: &Path) -> Result<(u64, u64)> {
 fn called_clusters(cfg: &RunConfig) -> Result<Vec<Value>> {
     log("finding organelle reads by depth, without seeds");
     let dir = cfg.out.join("discover");
-    Argv::new("discover")
+    Argv::new("find discover")
         .opt("--out", &dir)
         .opt("--salt", cfg.salt.to_string())
         .each("--reads", &cfg.reads)
@@ -823,7 +824,7 @@ fn called_clusters(cfg: &RunConfig) -> Result<Vec<Value>> {
         .collect::<Option<_>>()
         .context("discover.json: a cluster has no output")?;
     log("telling the depth clusters apart by their conserved organelle proteins");
-    Argv::new("panel")
+    Argv::new("find classify")
         .opt("--out-json", dir.join("identify.json"))
         .each("--reads", &outputs)
         .run()?;
@@ -887,8 +888,8 @@ fn other_organelle(organelle: &str) -> &'static str {
 /// pass, still growing. A target stops as soon as it stops growing.
 pub const GATED_RECRUIT_PASSES: usize = 60;
 
-/// Recruit the reads of every requested organelle from whole-genome reads: one `recruit` pass
-/// for all seeded organelles and one `discover` + `panel` for all, whichever are asked for.
+/// Recruit the reads of every requested organelle from whole-genome reads: one `find recruit` pass
+/// for all seeded organelles and one `find discover` + `find classify` for all, whichever are asked for.
 /// Per organelle, the reads or why there are none.
 fn recruit_all(
     cfg: &RunConfig,
@@ -906,7 +907,7 @@ fn recruit_all(
             organelles.join(" and "),
             names
         ));
-        let mut argv = Argv::new("recruit")
+        let mut argv = Argv::new("find recruit")
             .opt("--out", &recruit_dir)
             .opt(
                 "--preset",
@@ -1252,7 +1253,7 @@ fn run_replicates(
         ));
         let assembled = d.join("assembly.gfa");
         let sub_reads = std::slice::from_ref(&sub);
-        let mut asm = Argv::new("assemble")
+        let mut asm = Argv::new("assemble graph")
             .opt("--out", &assembled)
             .opt("--out-json", d.join("assembly.json"))
             .each("--reads", sub_reads);
@@ -1553,7 +1554,7 @@ fn assemble_organelle(
         None => None,
     };
     log("exporting the unified organelle graph");
-    Argv::new("unify")
+    Argv::new("assemble unify")
         .opt("--gfa", &graph)
         .opt("--sample", &cfg.sample)
         .opt("--backend", "ovasm")
@@ -1564,10 +1565,10 @@ fn assemble_organelle(
         .opt("--evidence", dir.join("evidence.json"))
         .opt("--linearization", dir.join("linearization.json"))
         .run()?;
-    // chromosomes and their conformations among the molecules (`ovasm chromosomes`); the
+    // chromosomes and their conformations among the molecules (`ovasm solve chromosomes`); the
     // depth is that of the kept reads, so a shallow component is only to be checked
     log("calling chromosomes and conformations");
-    Argv::new("chromosomes")
+    Argv::new("solve chromosomes")
         .opt("--gfa", &graph)
         .opt("--evidence", dir.join("evidence.json"))
         .opt("--linearization", dir.join("linearization.json"))
@@ -1619,7 +1620,7 @@ fn assemble_organelle(
             path_str(&dir.join("components.json")),
         );
     }
-    // what no cover explains, as partial paths (not molecules: see `ovasm linearize`)
+    // what no cover explains, as partial paths (not molecules: see `ovasm solve linearize`)
     let partial_paths = linear["partial_paths"].as_array().map_or(0, Vec::len);
     if partial_paths > 0 {
         if let Some(f) = linear["partial_fasta"].as_str() {
@@ -1681,7 +1682,7 @@ fn assemble_organelle(
         "skipped_anchors": linear["skipped_anchors"],
         "search_truncated": linear["search_truncated"],
         // how many chromosomes the molecules are (a range when the reads cannot tell), each with
-        // its conformations and their shares, and the evidence (`ovasm chromosomes`)
+        // its conformations and their shares, and the evidence (`ovasm solve chromosomes`)
         "chromosomes": chromosomes,
         "scope": SCOPE,
         "mode_requested": match cfg.mode {

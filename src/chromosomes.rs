@@ -37,7 +37,7 @@ use serde_json::Value;
 
 use crate::kmer::CanonicalKmers;
 
-/// Fewest reads on a link for it to join sequences (`linearize --min-reads`).
+/// Fewest reads on a link for it to join sequences (`solve linearize --min-reads`).
 const MIN_LINK_READS: u64 = 2;
 /// A repeat whose reads all take one pairing keeps apart the molecules that pairing separates
 /// when the missing pairing's share is below this at 95%: 1 - 0.05^(1/n) for n reads, so from 59

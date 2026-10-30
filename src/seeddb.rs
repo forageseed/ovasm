@@ -1,7 +1,7 @@
 //! The built-in land-plant seed library (`seeddb/`), compiled into the binary.
 //!
 //! `ovasm run` uses it for every organelle whose `--seeds` were not given, so a plain
-//! `ovasm run --reads ... --organelle both --out ...` works without any reference file.
+//! `ovasm run hifi --reads ... --organelle both --out ...` works without any reference file.
 //! The files are written under `<out>/seeds/` (with their manifest) so a run records exactly
 //! which seeds it used.
 

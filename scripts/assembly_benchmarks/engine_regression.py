@@ -68,20 +68,20 @@ def route(binary: Path, reads: Path, out: Path, encoding: str, min_count: int | 
     gfa, report = out / 'graph.gfa', out / 'graph.json'
     steps = []
     if encoding == 'bases':
-        steps.append(run(binary, ['assemble', '--reads', reads, '--threads', threads,
+        steps.append(run(binary, ['assemble', 'graph', '--reads', reads, '--threads', threads,
                                   '--out', gfa, '--out-json', report], out, 'assemble', threads))
-        steps.append(run(binary, ['evidence', '--gfa', gfa, '--reads', reads, '--out', out / 'evidence.json',
+        steps.append(run(binary, ['check', 'evidence', '--gfa', gfa, '--reads', reads, '--out', out / 'evidence.json',
                                   '--k', 21, '--diag-tol', 30, '--min-side-hits', 10, '--min-anchor', 500,
                                   '--bootstrap', 0, '--threads', threads], out, 'evidence', threads))
-        steps.append(run(binary, ['linearize', '--gfa', gfa, '--evidence', out / 'evidence.json',
+        steps.append(run(binary, ['solve', 'linearize', '--gfa', gfa, '--evidence', out / 'evidence.json',
                                   '--out-fasta', out / 'sequences.fasta', '--out-json', out / 'linear.json',
                                   '--min-reads', 2], out, 'linearize', threads))
     else:
         cutoff = [] if auto_min_count else ['--min-count', min_count]
-        steps.append(run(binary, ['assemble', '--rust-hpc', '--reads', reads, '--k', 1001, '--s', 31,
+        steps.append(run(binary, ['assemble', 'graph', '--rust-hpc', '--reads', reads, '--k', 1001, '--s', 31,
                                   *cutoff, '--threads', threads,
                                   '--out', gfa, '--out-json', report], out, 'assemble', threads))
-        steps.append(run(binary, ['primary', '--gfa', gfa, '--out', out / 'sequences.fasta',
+        steps.append(run(binary, ['solve', 'primary', '--gfa', gfa, '--out', out / 'sequences.fasta',
                                   '--out-json', out / 'linear.json'], out, 'primary', threads))
     r = json.loads(report.read_text())
     return {'steps': steps, 'report': {k: r.get(k) for k in FIELDS},

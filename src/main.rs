@@ -1,5 +1,5 @@
-//! ovasm: OrganelleVerse organelle assembler (run, recruit, discover, assemble, components, evidence,
-//! linearize, unify, pan, identify).
+//! ovasm: OrganelleVerse organelle assembler. `ovasm <module> <command>`: run (short, hifi),
+//! find, assemble, check, solve, pan.
 
 mod assemble;
 mod bait;
@@ -47,51 +47,98 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Reads in, organelle graph and molecules out: recruit, assemble (automatic k, smaller k
-    /// until the molecules explain half of the graph), evidence, linearize, unify; --mode
-    /// standard adds downsampled replicates. The other subcommands are its stages.
-    Run(RunArgs),
-    /// Reconstruct one WGS sample using all paths of mitochondrial and plastid reference graphs.
-    Reconstruct(ReconstructArgs),
-    /// Recruit mitochondrial/plastid reads from whole-genome sequencing data in one pass.
+    /// One step: reads in, organelle graph and molecules out, by data type.
+    #[command(subcommand)]
+    Run(RunCommand),
+    /// Find the organelle's reads in sequencing data.
+    #[command(subcommand)]
+    Find(FindCommand),
+    /// Assemble organelle reads into a graph.
+    #[command(subcommand)]
+    Assemble(AssembleCommand),
+    /// Check an assembly graph against the reads.
+    #[command(subcommand)]
+    Check(CheckCommand),
+    /// Resolve sequences and chromosomes from a checked graph.
+    #[command(subcommand)]
+    Solve(SolveCommand),
+    /// Pangenome graphs of many samples, and samples reconstructed against them.
+    #[command(subcommand)]
+    Pan(PanCommand),
+}
+
+#[derive(Subcommand)]
+enum RunCommand {
+    /// Illumina short reads: find, assemble on a dense graph (every k-mer a node, k from the
+    /// read length, no retry), check, solve.
+    Short(RunArgs),
+    /// PacBio HiFi: find, assemble on a sparse graph at the automatic k, retried at the next
+    /// smaller k of 1001, 701, 501, 351, 251, 201, 151, 101 until the molecules add up to at
+    /// least half of the graph's length (when no k does, the attempt that comes closest is kept
+    /// and summary.json says k_accepted: false), check, solve; --mode standard adds downsampled
+    /// replicates.
+    Hifi(RunArgs),
+}
+
+#[derive(Subcommand)]
+enum FindCommand {
+    /// Recruit mitochondrial/plastid reads from whole-genome sequencing data by seeds.
     Recruit(RecruitArgs),
     /// Seed-free discovery: find organelle reads by k-mer depth, split them into depth clusters.
     Discover(DiscoverArgs),
+    /// Say which organelle each set of reads (e.g. a `find discover` cluster) comes from, by
+    /// conserved mitochondrial and plastid proteins; no reference genome needed.
+    Classify(PanelArgs),
+    /// Assemble each read cluster and label unitigs mitochondrion or plastid by gene content;
+    /// write the labelled unitigs as the sample's own seeds.
+    Label(LabelArgs),
+}
+
+#[derive(Subcommand)]
+enum AssembleCommand {
+    /// Self-correct noisy organelle reads (ONT, CLR) against their own solid k-mers.
+    Correct(CorrectArgs),
+    /// Assemble HiFi organelle reads on a closed-syncmer sparse de Bruijn graph (GFA out).
+    Graph(AssembleArgs),
+    /// Keep the connected components of an assembly graph that are the target organelle (by
+    /// conserved proteins and depth); for graphs of reads found by `find discover`.
+    Filter(ComponentsArgs),
+    /// Rewrite a backend's assembly graph as OV-GFA v1: blunt links, PanSN paths, common tags.
+    Unify(UnifyArgs),
+}
+
+#[derive(Subcommand)]
+enum CheckCommand {
     /// Read support for every link, branch and repeat pairing of an assembly graph (GFA).
     Evidence(EvidenceArgs),
     /// Count the complete reads that walk entry -> node -> exit through every repeat node of a
     /// graph. Diagnostic only: the graph is never changed.
     Unzip(UnzipArgs),
+}
+
+#[derive(Subcommand)]
+enum SolveCommand {
     /// Representative linear (or circular) sequence through read-supported phased paths.
     Linearize(LinearizeArgs),
     /// Export a depth-constrained primary path and unplaced graph segments per component.
     /// These assembly records are not certificates of physical chromosome count.
     Primary(PrimaryArgs),
-    /// Rewrite a backend's assembly graph as OV-GFA v1: blunt links, PanSN paths, common tags.
-    Unify(UnifyArgs),
-    /// Merge samples' OV-GFA graphs into one pangenome graph, keeping every configuration path.
-    Pan(PanArgs),
-    /// Say which organelle each set of reads (e.g. a `discover` cluster) comes from, by
-    /// conserved mitochondrial and plastid proteins; no reference genome needed.
-    Panel(PanelArgs),
-    /// Assemble HiFi organelle reads on a closed-syncmer sparse de Bruijn graph (GFA out).
-    Assemble(AssembleArgs),
-    /// Self-correct noisy organelle reads (ONT, CLR) against their own solid k-mers.
-    Correct(CorrectArgs),
-    /// Closest reference genomes of an assembly by k-mer containment (organelle and species).
-    Identify(IdentifyArgs),
-    /// Assemble each read cluster and label unitigs mitochondrion or plastid by gene content;
-    /// write the labelled unitigs as the sample's own seeds.
-    Label(LabelArgs),
-    /// Keep the connected components of an assembly graph that are the target organelle (by
-    /// conserved proteins and depth); for graphs of reads found by `discover`.
-    Components(ComponentsArgs),
-    /// Retain exact MT/PT sharing evidence from an existing both-organelle assembly.
-    Sharing(SharingArgs),
     /// How many chromosomes the molecules are, and which are conformations of one (recombination
     /// across a repeat with reads for both pairings): a JSON report; annotates the molecules'
     /// FASTA headers and the organelle GFA's paths, sequences unchanged.
     Chromosomes(ChromosomesArgs),
+}
+
+#[derive(Subcommand)]
+enum PanCommand {
+    /// Merge samples' OV-GFA graphs into one pangenome graph, keeping every configuration path.
+    Merge(PanArgs),
+    /// Reconstruct one WGS sample using all paths of mitochondrial and plastid reference graphs.
+    Reconstruct(ReconstructArgs),
+    /// Closest reference genomes of an assembly by k-mer containment (organelle and species).
+    Identify(IdentifyArgs),
+    /// Retain exact MT/PT sharing evidence from an existing both-organelle assembly.
+    Sharing(SharingArgs),
 }
 
 #[derive(clap::Args)]
@@ -276,7 +323,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct IdentifyArgs {
-    /// Assembled sequences (FASTA), e.g. `molecules.fasta` from `ovasm linearize`.
+    /// Assembled sequences (FASTA), e.g. `molecules.fasta` from `ovasm solve linearize`.
     #[arg(long)]
     query: PathBuf,
     /// Reference set as NAME=PATH (one genome per record); repeat for several sets.
@@ -331,11 +378,8 @@ struct RunArgs {
     /// discover/ for whole-genome reads; replicates/ in standard mode.
     #[arg(long)]
     out: PathBuf,
-    /// hifi: sparse graph at the automatic k, retried at the next smaller k of 1001, 701, 501,
-    /// 351, 251, 201, 151, 101 until the molecules add up to at least half of the graph's
-    /// length (when no k does, the attempt that comes closest is kept and summary.json says
-    /// k_accepted: false). sr (Illumina): dense graph, k from the read length, no retry.
-    #[arg(long, value_enum, default_value_t = pipeline::ReadType::Hifi)]
+    /// Set by the subcommand: `run hifi` or `run short`.
+    #[arg(skip = pipeline::ReadType::Hifi)]
     read_type: pipeline::ReadType,
     /// whole-genome: recruit the organelle's reads first (stops when fewer than 100 kb are
     /// found). target: the reads are the organelle's already and are assembled as given.
@@ -351,7 +395,7 @@ struct RunArgs {
     /// How whole-genome reads are recruited: seeds; discover (no seeds: depth clusters called
     /// by their organelle proteins, HiFi only); both (seed reads plus the clusters called as
     /// the target, each read once). With discovery each assembly graph first loses the
-    /// components that are not the target organelle (`ovasm components`; assembly.filtered.gfa,
+    /// components that are not the target organelle (`ovasm assemble filter`; assembly.filtered.gfa,
     /// components.json), and the later stages work on the kept ones.
     #[arg(long, value_enum, default_value_t = pipeline::RecruitBy::Seeds)]
     recruit: pipeline::RecruitBy,
@@ -369,7 +413,7 @@ struct RunArgs {
     /// Never cache the reads for recruitment (see --recruit-cache).
     #[arg(long, conflicts_with = "recruit_cache")]
     no_recruit_cache: bool,
-    /// HiFi recruitment as up to 0.2.1: without `ovasm recruit --extend-gate --bootstrap`, which
+    /// HiFi recruitment as up to 0.2.1: without `ovasm find recruit --extend-gate --bootstrap`, which
     /// `run` uses for HiFi reads. Ungated, iterative baiting from the built-in seed library ran
     /// into the nuclear genome on species far from it (Carex echinata: 686,022 "plastid" reads,
     /// 8.5 Gb, then 309 GB of memory in assembly).
@@ -387,9 +431,9 @@ struct RunArgs {
     /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
     #[arg(long, default_value_t = 1_000_000_000)]
     recruit_max_bases: u64,
-    /// Seed recruitment: most scanning passes (`ovasm recruit --iterations`). Default: 60 for
+    /// Seed recruitment: most scanning passes (`ovasm find recruit --iterations`). Default: 60 for
     /// HiFi reads, whose gated recruitment grows a large mitochondrion by a few tens of kilobases
-    /// a pass (see pipeline::GATED_RECRUIT_PASSES); `recruit`'s own default otherwise. A target
+    /// a pass (see pipeline::GATED_RECRUIT_PASSES); `find recruit`'s own default otherwise. A target
     /// stops as soon as it stops growing, so the limit only costs time where one is incomplete.
     #[arg(long)]
     recruit_iterations: Option<usize>,
@@ -424,7 +468,7 @@ struct RunArgs {
     sample: String,
     /// Protein panel FASTA (headers `class|gene|species`) of the component filter that
     /// graphs of discovered reads (--recruit discover|both) go through; default: the
-    /// built-in panel. See `ovasm components`.
+    /// built-in panel. See `ovasm assemble filter`.
     #[arg(long)]
     component_panel: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
@@ -518,7 +562,7 @@ fn run(args: RunArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct CorrectArgs {
-    /// Organelle reads (e.g. from `ovasm recruit`), FASTQ/FASTA, optionally .gz.
+    /// Organelle reads (e.g. from `ovasm find recruit`), FASTQ/FASTA, optionally .gz.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
     /// k of each correction round, in order (repeat the flag); small k first for noisy reads.
@@ -608,7 +652,7 @@ struct AssembleArgs {
     /// Record cleaning proposals without deleting unitigs (diagnostic, default off).
     #[arg(long)]
     cleaning_audit_only: bool,
-    /// Organelle reads (e.g. from `ovasm recruit`), FASTQ/FASTA, optionally .gz.
+    /// Organelle reads (e.g. from `ovasm find recruit`), FASTQ/FASTA, optionally .gz.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
     /// Node k-mer length (odd). Longer k gives cleaner graphs at organelle depth; 1001 and 701
@@ -760,10 +804,10 @@ struct UnifyArgs {
     /// Assembly graph from any backend (links must be 0M, nM or *).
     #[arg(long)]
     gfa: PathBuf,
-    /// `ovasm evidence` report for this graph: read support becomes `ev:i` on links.
+    /// `ovasm check evidence` report for this graph: read support becomes `ev:i` on links.
     #[arg(long)]
     evidence: Option<PathBuf>,
-    /// `ovasm linearize` report: the best path (and near-tied alternatives) become P lines.
+    /// `ovasm solve linearize` report: the best path (and near-tied alternatives) become P lines.
     #[arg(long)]
     linearization: Option<PathBuf>,
     /// Sample name used for segment names and the PanSN sample field.
@@ -1041,10 +1085,10 @@ struct LinearizeArgs {
     /// Optional graph-bound U1 phase table; same conservative constraints as primary.
     #[arg(long)]
     phases: Option<PathBuf>,
-    /// The assembly graph given to `ovasm evidence`.
+    /// The assembly graph given to `ovasm check evidence`.
     #[arg(long)]
     gfa: PathBuf,
-    /// JSON report written by `ovasm evidence` for that graph.
+    /// JSON report written by `ovasm check evidence` for that graph.
     #[arg(long)]
     evidence: PathBuf,
     /// Output FASTA with the best linearization.
@@ -1527,14 +1571,14 @@ struct RecruitArgs {
     threads: Option<usize>,
     /// Bootstrap a target whose seed is too distant to recruit its reads: once every other
     /// target's bait has stopped growing, partially matching reads that are deep along their whole length
-    /// (the `discover` test) seed it. Seed every organelle of the sample (e.g. mitochondrion and
+    /// (the `find discover` test) seed it. Seed every organelle of the sample (e.g. mitochondrion and
     /// plastid) so that each target's reads are claimed by their own. Long reads (hifi) only.
     /// Experimental: when another target's seed recruits nothing, that target counts as
     /// complete and the bootstrap can run away into nuclear repeats (v2 holdout, Jasione).
     #[arg(long)]
     bootstrap: bool,
     /// Extend each target's bait only from reads that are organelle-deep along their whole
-    /// length (the `discover` test) and not shallower than a quarter of the target's own reads,
+    /// length (the `find discover` test) and not shallower than a quarter of the target's own reads,
     /// so a stray seed sequence cannot lead extension into the nucleus (nor a plastid into the
     /// mitochondrion); a plastid or mitochondrion whose reads come to stand for more sequence
     /// than any such genome (1 and 20 Mb) stops extending. Use with `--saturation 0` to extend
@@ -1545,7 +1589,7 @@ struct RecruitArgs {
 
 #[derive(clap::Args)]
 struct LabelArgs {
-    /// Read clusters (e.g. `ovasm discover`'s clusterN.fastq), each assembled on its own;
+    /// Read clusters (e.g. `ovasm find discover`'s clusterN.fastq), each assembled on its own;
     /// repeat for every cluster.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -1709,24 +1753,31 @@ fn recruit(args: RecruitArgs) -> Result<()> {
 /// Run one subcommand; `pipeline` runs its stages through this too.
 fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Run(args) => run(args),
-        Command::Reconstruct(args) => reconstruct(args),
-        Command::Recruit(args) => recruit(args),
-        Command::Discover(args) => discover(args),
-        Command::Evidence(args) => evidence(args),
-        Command::Unzip(args) => unzip(args),
-        Command::Linearize(args) => linearize(args),
-        Command::Unify(args) => unify(args),
-        Command::Assemble(args) => assemble(args),
-        Command::Primary(args) => primary(args),
-        Command::Correct(args) => correct(args),
-        Command::Pan(args) => pan(args),
-        Command::Identify(args) => identify(args),
-        Command::Panel(args) => panel(args),
-        Command::Label(args) => label(args),
-        Command::Components(args) => components(args),
-        Command::Chromosomes(args) => chromosomes(args),
-        Command::Sharing(args) => {
+        Command::Run(RunCommand::Short(mut args)) => {
+            args.read_type = pipeline::ReadType::Sr;
+            run(args)
+        }
+        Command::Run(RunCommand::Hifi(mut args)) => {
+            args.read_type = pipeline::ReadType::Hifi;
+            run(args)
+        }
+        Command::Find(FindCommand::Recruit(args)) => recruit(args),
+        Command::Find(FindCommand::Discover(args)) => discover(args),
+        Command::Find(FindCommand::Classify(args)) => panel(args),
+        Command::Find(FindCommand::Label(args)) => label(args),
+        Command::Assemble(AssembleCommand::Correct(args)) => correct(args),
+        Command::Assemble(AssembleCommand::Graph(args)) => assemble(args),
+        Command::Assemble(AssembleCommand::Filter(args)) => components(args),
+        Command::Assemble(AssembleCommand::Unify(args)) => unify(args),
+        Command::Check(CheckCommand::Evidence(args)) => evidence(args),
+        Command::Check(CheckCommand::Unzip(args)) => unzip(args),
+        Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
+        Command::Solve(SolveCommand::Primary(args)) => primary(args),
+        Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),
+        Command::Pan(PanCommand::Merge(args)) => pan(args),
+        Command::Pan(PanCommand::Reconstruct(args)) => reconstruct(args),
+        Command::Pan(PanCommand::Identify(args)) => identify(args),
+        Command::Pan(PanCommand::Sharing(args)) => {
             if !(1..=kmer::MAX_K).contains(&args.k) {
                 bail!("--k must be between 1 and {}", kmer::MAX_K);
             }

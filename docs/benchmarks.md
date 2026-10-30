@@ -31,7 +31,7 @@ new full-input resource and per-job WGS tables are included in this repository. 
 - **Time and memory:** times were measured on a busy shared server and include contention. The historical
   Col-0 timing does not describe ZM4's iterative recruitment; full ZM4 costs are reported below. The historical
   Col-0 run peaks at 229 MB for recruitment and stays under 170 MB for the later
-  steps; the heaviest steps are seed-free `discover` (6.9 GB) and hybrid correction of ONT reads (2.3 GB).
+  steps; the heaviest steps are seed-free `find discover` (6.9 GB) and hybrid correction of ONT reads (2.3 GB).
 - **Platforms (historical check):** on Windows the program builds in 93 s (17 MB), its 141 tests pass, and a full run on the example reads
   takes 5 s. macOS has not been tested.
 

@@ -28,10 +28,21 @@ ovasm --version
 ## Use
 
 ```sh
-ovasm run --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
+ovasm run hifi --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
 ```
 
-Use `--read-type sr` for Illumina. The output contains representative FASTA, GFA, read-support reports and source candidates. Inspect unresolved paths before interpreting graph cycles as physical molecules.
+Use `ovasm run short` for Illumina. The output contains representative FASTA, GFA, read-support reports and source candidates. Inspect unresolved paths before interpreting graph cycles as physical molecules.
+
+Commands are `ovasm <module> <command>`; `-h` works at every level:
+
+| Module | Commands |
+|---|---|
+| `run` | `short`, `hifi`: one step from reads to graph and molecules |
+| `find` | `recruit`, `discover`, `classify`, `label`: the organelle's reads |
+| `assemble` | `correct`, `graph`, `filter`, `unify`: reads to an assembly graph |
+| `check` | `evidence`, `unzip`: the graph against the reads |
+| `solve` | `linearize`, `primary`, `chromosomes`: sequences and chromosomes |
+| `pan` | `merge`, `reconstruct`, `identify`, `sharing`: many samples |
 
 [Species graph → individual WGS](docs/reference-reconstruction.md) · [Commands](https://github.com/forageseed/ovasm/tree/main/docs)
 

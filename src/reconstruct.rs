@@ -1778,7 +1778,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
     let workflow_completed = organelles
         .values()
         .all(|s| s["de_novo"].get("error").is_none());
-    let result = json!({"tool":"ovasm reconstruct","format":"organelleverse.reference-reconstruction.v1","sample":cfg.sample,
+    let result = json!({"tool":"ovasm pan reconstruct","format":"organelleverse.reference-reconstruction.v1","sample":cfg.sample,
         "workflow_completed":workflow_completed,
         "inputs":cfg.reads,"target_read_inputs":cfg.target_reads,
         "input_scope":if targeted {"explicit_target_reads"} else {"whole_genome_recruitment"},

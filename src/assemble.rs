@@ -1,4 +1,4 @@
-//! Stage 4 (S4.1): HiFi assembly on a closed-syncmer sparse de Bruijn graph (`ovasm assemble`).
+//! Stage 4 (S4.1): HiFi assembly on a closed-syncmer sparse de Bruijn graph (`ovasm assemble graph`).
 //!
 //! Only closed-syncmer k-mers are nodes: a k-mer is sampled when the smallest (hashed, canonical)
 //! s-mer inside it sits at its first or its last position. Every window of `k - s + 1` k-mer
@@ -10,7 +10,7 @@
 //! compacting non-branching runs gives unitigs, written as GFA with exact `(k - d)M` overlaps.
 //!
 //! With k shorter than the organelle's repeats, each repeat collapses into a branching unitig,
-//! which is the graph shape `ovasm evidence` and `ovasm linearize` resolve with reads.
+//! which is the graph shape `ovasm check evidence` and `ovasm solve linearize` resolve with reads.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Write as _;
@@ -1446,7 +1446,7 @@ pub const AUTO_K_NODE_DEPTH: f64 = 22.0;
 /// cheap at the depths that need it.
 ///
 /// When even k = 101 stays under the target (about 20x and less), the reads are self-corrected
-/// (`ovasm correct` with its defaults) and the ladder is climbed again on the corrected reads,
+/// (`ovasm assemble correct` with its defaults) and the ladder is climbed again on the corrected reads,
 /// written next to the graph (`<out>.corrected.fa`, named in the report). Correction makes a
 /// read's k-mers error-free over longer stretches, which is what the node depth lacks there; at
 /// higher depth it can only lose detail, so it is not used (12 Zou accessions thinned: one

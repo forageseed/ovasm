@@ -1,4 +1,4 @@
-//! Stage 3: one graph format for every assembly backend (`ovasm unify`).
+//! Stage 3: one graph format for every assembly backend (`ovasm assemble unify`).
 //!
 //! OV-GFA v1 is GFA1 with blunt (0M) links, segments renamed `<sample>.<name>[.<piece>]`, one
 //! depth tag `dp:f` whatever the backend wrote, read support `ev:i` on links (from `ovasm
@@ -141,7 +141,7 @@ fn blunt(g: &Graph) -> Result<Blunt> {
 
 /// `blunt` with more identities: after the links' overlaps, `extra` may join further bases
 /// (union-find over all bases of all segments, `base0[s]` the first base of segment `s`).
-/// `ovasm pan` joins the bases samples share this way.
+/// `ovasm pan merge` joins the bases samples share this way.
 pub(crate) fn blunt_with<F>(g: &Graph, extra: F) -> Result<Blunt>
 where
     F: FnOnce(&mut StrandUf, &[usize]) -> Result<()>,

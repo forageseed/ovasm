@@ -614,7 +614,7 @@ mod tests {
         for flag in ["--multichrom-graph", "--auto-k-depth"] {
             let mut args = vec![
                 "ovasm",
-                "assemble",
+                "assemble", "graph",
                 "--reads",
                 "missing",
                 "--rust-hpc",
@@ -639,7 +639,7 @@ mod tests {
         ] {
             let mut args = vec![
                 "ovasm",
-                "assemble",
+                "assemble", "graph",
                 "--reads",
                 "missing",
                 "--rust-hpc",

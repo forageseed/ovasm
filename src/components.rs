@@ -1,10 +1,10 @@
 //! Stage 2b: which connected components of an assembly graph are the target organelle
-//! (`ovasm components`).
+//! (`ovasm assemble filter`).
 //!
-//! Reads pooled from depth clusters (`ovasm discover`) can hold nuclear high-copy sequence
+//! Reads pooled from depth clusters (`ovasm find discover`) can hold nuclear high-copy sequence
 //! that shares the organelle's depth cluster, and the other organelle's reads; both assemble
 //! into components of their own beside the organelle's. Each component gets its total length,
-//! its length-weighted mean depth and the panel genes its segments encode (the `panel`
+//! its length-weighted mean depth and the panel genes its segments encode (the `find classify`
 //! machinery on assembled sequence: one stop-free stretch is enough for a gene here, a read
 //! set needs two). The component with the most target genes is the reference. A component is
 //! kept when it is the reference, when it holds target genes at a depth that is not far below
@@ -59,11 +59,11 @@ pub struct ComponentParams {
     /// graphs, against 0.51 and more for the published components.
     pub gene_depth_factor: f64,
     /// Genes of the other organelle that make a component the other organelle's, when they
-    /// are also at least twice its target genes (the margin of `panel`'s calls). Fewer are
+    /// are also at least twice its target genes (the margin of `find classify`'s calls). Fewer are
     /// what organelle-derived inserts leave (plastid genes in a mitochondrial chromosome).
     pub min_other_genes: usize,
     /// Amino-acid k-mer length, shortest stop-free stretch and shared k-mers per stretch of
-    /// the gene search (as in `ovasm panel`).
+    /// the gene search (as in `ovasm find classify`).
     pub k: usize,
     pub min_orf: usize,
     pub min_hits: u32,
@@ -543,7 +543,7 @@ pub fn run(
     };
     let (panel_proteins, panel_genes) = panel.sizes();
     let report = ComponentsReport {
-        tool: "ovasm components",
+        tool: "ovasm assemble filter",
         version: env!("CARGO_PKG_VERSION"),
         graph: gfa.display().to_string(),
         organelle: organelle.to_string(),

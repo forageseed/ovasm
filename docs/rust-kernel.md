@@ -3,7 +3,7 @@
 Current graph construction is implemented in Rust, with no graph-kernel FFI or C
 build step. One engine builds the graph in one of two coordinate encodings.
 `ovasm run` and ordinary `assemble` use base coordinates (sparse graph for long
-reads, dense mode for short reads). `assemble --rust-hpc` selects the
+reads, dense mode for short reads). `assemble graph --rust-hpc` selects the
 experimental homopolymer-run encoding; the hidden `--multichrom-graph` is its
 legacy name and does not mean a chosen chromosome count.
 
@@ -27,9 +27,9 @@ homopolymer compression already removes the dominant error class (see the
 design document). The assembly report marks read correction and read-threaded
 unzipping false because `assemble` itself does neither. Repeat phases are
 separate, opt-in commands that work on the restored base graph of either
-encoding: `ovasm unzip` (phase table, optional `--out-gfa` path overlay and
+encoding: `ovasm check unzip` (phase table, optional `--out-gfa` path overlay and
 `--materialize-gfa` split of fully resolved one-to-one repeats), `primary` /
-`linearize --phases`, and `assemble --cleaning-audit-only`. Local link support
+`solve linearize --phases`, and `assemble graph --cleaning-audit-only`. Local link support
 does not certify complete paths, origin or physical topology.
 
 Syncmers are a published method ([Edgar, 2021](https://peerj.com/articles/10805/));
@@ -38,7 +38,7 @@ The implementation is in `src/assemble.rs` and `src/hpc.rs`.
 
 ```sh
 cargo build --release --locked
-ovasm assemble --reads sample.hifi.fastq.gz --rust-hpc \
+ovasm assemble graph --reads sample.hifi.fastq.gz --rust-hpc \
   --min-count 80 --threads 4 --out graph.gfa --out-json graph.json
 ```
 

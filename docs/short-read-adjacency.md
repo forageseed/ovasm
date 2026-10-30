@@ -6,7 +6,7 @@ Short-read mode now additionally counts the exact overlap-edge word, including a
 
 This evidence supports local adjacency. It never enters long-span crossings, read walks, repeat traversals or phased paths. Direct edges between nonrepeat anchors can use the maximum of strict and local support, a conservative lower bound because the two read sets may overlap. Repeat entry/exit phasing retains the existing long-span requirements.
 
-The public `run --read-type sr` workflow enables the rule; `evidence --short-read-adjacency` enables it explicitly. The Python evidence API enables it for `preset="sr"`. HiFi defaults remain unchanged.
+The public `run short` workflow enables the rule; `check evidence --short-read-adjacency` enables it explicitly. The Python evidence API enables it for `preset="sr"`. HiFi defaults remain unchanged.
 
 Evidence JSON keeps `reads` and `adjacency_reads` separate, with `adjacency_ambiguous_reads` and `adjacency_supported_links`. OV-GFA keeps strict support in `ev:i`, local support in `aj:i`, and ambiguous local counts in `aa:i`. Nonzero local tags are emitted independently; an `aj` tag is not repeat phasing or physical topology evidence.
 

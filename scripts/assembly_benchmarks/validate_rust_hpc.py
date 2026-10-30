@@ -84,7 +84,7 @@ def main():
             case['input'] = {'path': str(input_path.resolve()), 'size': st.st_size, 'mtime_ns': st.st_mtime_ns,
                              'expected_records': metadata['reads'], 'expected_bases': metadata['bases']}
             case['fixed_existing_parameters'] = {k: metadata[k] for k in ['k', 's', 'min_count']}
-            step(case, 'assemble', [binary, 'assemble', '--rust-hpc', '--reads', input_path,
+            step(case, 'assemble', [binary, 'assemble', 'graph', '--rust-hpc', '--reads', input_path,
                 '--k', metadata['k'], '--s', metadata['s'], '--min-count', metadata['min_count'],
                 '--threads', 8, '--out', out / 'graph.gfa', '--out-json', out / 'graph.json'])
             graph = json.loads((out / 'graph.json').read_text())
@@ -93,12 +93,12 @@ def main():
             assert input_path.stat().st_mtime_ns == st.st_mtime_ns
             case['graph'] = {k: graph[k] for k in ['reads', 'bases', 'compressed_bases', 'unitigs', 'links', 'total_length', 'consensus']}
             case['segment_length_includes_link_overlaps'] = True
-            step(case, 'evidence', [binary, 'evidence', '--gfa', out / 'graph.gfa', '--reads', input_path,
+            step(case, 'evidence', [binary, 'check', 'evidence', '--gfa', out / 'graph.gfa', '--reads', input_path,
                  '--bootstrap', 0, '--threads', 8, '--out', out / 'evidence.json'])
             ev = json.loads((out / 'evidence.json').read_text())
             assert ev['reads_scanned'] == metadata['reads']
             case['raw_read_evidence'] = {k: v for k, v in ev.items() if not isinstance(v, (list, dict))}
-            step(case, 'primary', [binary, 'primary', '--gfa', out / 'graph.gfa',
+            step(case, 'primary', [binary, 'solve', 'primary', '--gfa', out / 'graph.gfa',
                  '--out', out / 'primary.fasta', '--out-json', out / 'primary.json'])
             old, new = fasta(baseline / 'molecules.fasta'), fasta(out / 'primary.fasta')
             case['primary_record_lengths'] = list(map(len, new))
