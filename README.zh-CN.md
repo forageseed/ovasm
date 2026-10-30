@@ -12,18 +12,18 @@ OVASM 招募细胞器读段、构建组装图，并保留有读段支持的替�
 
 ## 安装
 
-**0.3.0 预编译版，无需编译。**
+**0.6.0 预编译版，无需编译。**
 
-- **Windows x86_64：**[下载 ZIP](https://github.com/forageseed/ovasm/releases/download/v0.3.0/ovasm-v0.3.0-windows-x86_64.zip)，解压后双击 `install.cmd`，重开终端。
+- **Windows x86_64：**[下载 ZIP](https://github.com/forageseed/ovasm/releases/download/v0.6.0/ovasm-v0.6.0-windows-x86_64.zip)，解压后双击 `install.cmd`，重开终端。
 - **Linux x86_64，glibc 2.34+：**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.3.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.6.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
 
-[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.3.0) · [离线安装](docs/installation.md)
+[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.6.0) · [离线安装](docs/installation.md)
 
 ## 使用
 
