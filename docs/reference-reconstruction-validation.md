@@ -349,3 +349,19 @@ mitochondrial read (895,480) and 856,699 of 7,354,090 plastid reads, mates toget
 The plastid closed in the de novo graph itself this time (the reads with mates kept together;
 no read-pair closure was needed) at k 77, 266 bp shorter than the HiFi plastid: the smaller k
 may have compressed its AT-rich inverted repeat. No reference bases were filled anywhere.
+
+### The plastid's 266 bp
+
+The end-to-end plastid circle (125,243 bp) lacks 266 bp of the held-out HiFi plastid at four
+AT-rich places: 74 bp at HiFi 102,965 (microsatellite with short inverted repeats), 72 bp at
+103,708 (two of four 36 bp tandem copies), 63 bp at 120,842 (three of seven 21 bp copies) and 57 bp
+at 120,373-120,430. Each place, with the nearest unique 20 bp on either side, spans 128-247 bp:
+no 150 bp read holds one whole (one read at the 128 bp place). Unit 17-mer depth over the flanks'
+gives 3.6 copies at the 36 bp array (HiFi 4, ours 2) but 2.1 at the 21 bp array (HiFi 7, ours 4),
+where AT-rich coverage is low. Read pairs spanning each place (288-1,063 of them) have, on our
+circle, median inserts 6-17 bp shorter than all pairs' (328 bp) at three places and 16 bp longer
+at the fourth, while two control places give 10 and 18 bp longer: against the controls our circle
+is some 20-30 bp short at three places and not short at the fourth, not the 57-74 bp HiFi has. The
+short reads do not measure these arrays' lengths; the pairs suggest ZM4's WGS DNA has somewhat
+more than our circle and less than the HiFi assembly there (plastid microsatellites vary in
+length between plants and within one).
