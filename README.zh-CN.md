@@ -43,6 +43,14 @@ Illumina 双端读段：
 ovasm run short --reads sample_R1.fq.gz --reads sample_R2.fq.gz --organelle both --threads 8 --out result
 ```
 
+ONT 读段，单独用或加上同一样本的 Illumina 读段（[详细说明](docs/long-reads.md)）。PacBio CLR 读段也用
+`run ont`，但目前只在 ONT 数据上测过。
+
+```sh
+ovasm run ont --reads sample.ont.fastq.gz --organelle both --threads 8 --out result
+ovasm run hybrid --long sample.ont.fastq.gz --short sample_R1.fq.gz --short sample_R2.fq.gz --organelle both --threads 8 --out result
+```
+
 `result/` 下每个细胞器一个文件夹，里面有：
 
 - `molecules.fasta`：组装出的序列；
@@ -58,7 +66,7 @@ ovasm run short --reads sample_R1.fq.gz --reads sample_R2.fq.gz --organelle both
 
 | 模块 | 命令 | 作用 |
 |---|---|---|
-| `run` | `short`、`hifi` | 从读段一步到序列 |
+| `run` | `short`、`hifi`、`ont`、`hybrid` | 从读段一步到序列 |
 | `find` | `recruit`、`discover`、`classify`、`label` | 找出细胞器读段 |
 | `assemble` | `correct`、`graph`、`filter`、`unify` | 构建组装图 |
 | `check` | `evidence`、`unzip`、`assess` | 用读段核对组装图 |

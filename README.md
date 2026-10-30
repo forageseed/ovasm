@@ -44,6 +44,14 @@ Illumina paired reads:
 ovasm run short --reads sample_R1.fq.gz --reads sample_R2.fq.gz --organelle both --threads 8 --out result
 ```
 
+ONT reads, alone or with Illumina reads of the same sample ([details](docs/long-reads.md)). PacBio
+CLR reads go through `run ont` too, but so far it has only been checked on ONT data.
+
+```sh
+ovasm run ont --reads sample.ont.fastq.gz --organelle both --threads 8 --out result
+ovasm run hybrid --long sample.ont.fastq.gz --short sample_R1.fq.gz --short sample_R2.fq.gz --organelle both --threads 8 --out result
+```
+
 Each organelle gets its own folder in `result/` with:
 
 - `molecules.fasta`: the assembled sequences;
@@ -62,7 +70,7 @@ circle in the graph is not proof of a single circular molecule.
 
 | Module | Commands | What it does |
 |---|---|---|
-| `run` | `short`, `hifi` | reads to sequences in one step |
+| `run` | `short`, `hifi`, `ont`, `hybrid` | reads to sequences in one step |
 | `find` | `recruit`, `discover`, `classify`, `label` | find the organelle reads |
 | `assemble` | `correct`, `graph`, `filter`, `unify` | build the assembly graph |
 | `check` | `evidence`, `unzip`, `assess` | check the graph against the reads |
