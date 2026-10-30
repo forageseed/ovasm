@@ -1523,6 +1523,28 @@ fn tag_unified_links(
 // one organelle, and the run
 // ---------------------------------------------------------------------------------------------
 
+/// The headline numbers of `assessment.json` for `summary.json`.
+fn assessment_summary(a: &Value) -> Value {
+    let count = |v: &Value| v.as_array().map_or(0, Vec::len);
+    json!({
+        "single_copy_depth": a["depth"]["single_copy_depth"],
+        "copy_number_agreement": a["copy_number"]["agreement"],
+        "copy_number_disagreements": count(&a["copy_number"]["disagreements"]),
+        "shallow_bases": a["shallow"]["bases"],
+        "unwalked_bases": a["coverage_of_graph"]["unwalked_bases"],
+        "junctions_used": a["junctions"]["used"],
+        "junctions_without_reads": a["junctions"]["without_reads"],
+        "junction_min_reads": a["junctions"]["min_reads"],
+        "complexity": a["complexity"]["class"],
+        "double_forks": a["complexity"]["double_forks"],
+        "recombining_repeats": count(&a["complexity"]["recombining_repeats"]),
+        "gene_calls": a["genes"]
+            .as_array()
+            .map(|g| g.iter().map(|m| m["call"].clone()).collect::<Vec<_>>()),
+        "plastid_structure": a["plastid_structure"]["status"],
+    })
+}
+
 /// Assemble one organelle's reads into `dir` and write its `summary.json`.
 fn assemble_organelle(
     cfg: &RunConfig,
@@ -1600,6 +1622,18 @@ fn assemble_organelle(
         .opt("--out-json", dir.join("chromosomes.json"))
         .run()?;
     let chromosomes = read_json(&dir.join("chromosomes.json"))?;
+    // what the run's own files say about the result, no other tool (`ovasm check assess`)
+    log("assessing the assembly from its own evidence");
+    Argv::new("check assess")
+        .opt("--gfa", &graph)
+        .opt("--evidence", dir.join("evidence.json"))
+        .opt("--linearization", dir.join("linearization.json"))
+        .opt("--chromosomes", dir.join("chromosomes.json"))
+        .opt("--molecules", dir.join("molecules.fasta"))
+        .opt("--organelle", organelle)
+        .opt("--out-json", dir.join("assessment.json"))
+        .run()?;
+    let assessment = assessment_summary(&read_json(&dir.join("assessment.json"))?);
     let replicates = match cfg.mode {
         Mode::Fast => Value::Null,
         Mode::Standard => {
@@ -1631,6 +1665,7 @@ fn assemble_organelle(
         ("evidence", "evidence.json"),
         ("linearization", "linearization.json"),
         ("chromosomes", "chromosomes.json"),
+        ("assessment", "assessment.json"),
         ("summary", "summary.json"),
     ] {
         files.insert(key.into(), path_str(&dir.join(name)));
@@ -1706,6 +1741,8 @@ fn assemble_organelle(
         // how many chromosomes the molecules are (a range when the reads cannot tell), each with
         // its conformations and their shares, and the evidence (`ovasm solve chromosomes`)
         "chromosomes": chromosomes,
+        // copy number, junction reads, complexity, genes, plastid structure (assessment.json)
+        "assessment": assessment,
         "scope": SCOPE,
         "mode_requested": match cfg.mode {
             Mode::Fast => "fast",

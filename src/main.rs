@@ -2,6 +2,7 @@
 //! find, assemble, check, solve, pan.
 
 mod assemble;
+mod assess;
 mod bait;
 mod chromosomes;
 mod close;
@@ -114,6 +115,56 @@ enum CheckCommand {
     /// Count the complete reads that walk entry -> node -> exit through every repeat node of a
     /// graph. Diagnostic only: the graph is never changed.
     Unzip(UnzipArgs),
+    /// Evidence an assembly's own run already holds, no other tool: single-copy depth, copy
+    /// number against the molecules' walks, shallow sequence, reads behind every junction used,
+    /// graph and read-backed complexity, panel genes per molecule, plastid LSC/SSC/IR.
+    Assess(AssessArgs),
+}
+
+#[derive(clap::Args)]
+struct AssessArgs {
+    /// The assembly graph the evidence and linearization are about.
+    #[arg(long)]
+    gfa: PathBuf,
+    #[arg(long)]
+    evidence: PathBuf,
+    #[arg(long)]
+    linearization: PathBuf,
+    /// chromosomes.json (`solve chromosomes`): repeat calls and the chromosome count.
+    #[arg(long)]
+    chromosomes: Option<PathBuf>,
+    /// The molecules' FASTA: the built-in panel's genes on each molecule.
+    #[arg(long)]
+    molecules: Option<PathBuf>,
+    #[arg(long, value_parser = ["mitochondrion", "plastid"])]
+    organelle: String,
+    #[arg(long = "out-json")]
+    out_json: PathBuf,
+}
+
+fn assess(args: AssessArgs) -> Result<()> {
+    let read = |p: &PathBuf| -> Result<serde_json::Value> {
+        Ok(serde_json::from_str(&std::fs::read_to_string(p).with_context(|| {
+            format!("cannot read {}", p.display())
+        })?)?)
+    };
+    let chromosomes = args.chromosomes.as_ref().map(read).transpose()?;
+    let panel = panel::Panel::embedded(6, &[])?;
+    let report = assess::assess(
+        &assess::Inputs {
+            gfa: &args.gfa,
+            evidence: &read(&args.evidence)?,
+            linearization: &read(&args.linearization)?,
+            chromosomes: chromosomes.as_ref(),
+            molecules_fasta: args.molecules.as_deref(),
+            organelle: &args.organelle,
+        },
+        Some(&panel),
+    )?;
+    std::fs::write(&args.out_json, serde_json::to_string_pretty(&report)?)
+        .with_context(|| format!("cannot write {}", args.out_json.display()))?;
+    eprintln!("[ovasm] assess: {}", assess::summary(&report));
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -1768,6 +1819,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Assemble(AssembleCommand::Unify(args)) => unify(args),
         Command::Check(CheckCommand::Evidence(args)) => evidence(args),
         Command::Check(CheckCommand::Unzip(args)) => unzip(args),
+        Command::Check(CheckCommand::Assess(args)) => assess(args),
         Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
         Command::Solve(SolveCommand::Primary(args)) => primary(args),
         Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),
