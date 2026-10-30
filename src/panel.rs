@@ -1,6 +1,6 @@
-//! Stage 1c: which organelle a set of reads comes from, by conserved proteins (`ovasm panel`).
+//! Stage 1c: which organelle a set of reads comes from, by conserved proteins (`ovasm find classify`).
 //!
-//! `ovasm discover` finds organelle reads by depth alone and does not say which depth cluster
+//! `ovasm find discover` finds organelle reads by depth alone and does not say which depth cluster
 //! is which organelle; seeds say so, but only for species close enough to the seeds to share
 //! 21-mers. Protein sequence stays recognisable far beyond that. Reads are translated in six
 //! frames; every stretch between stop codons of at least `min_orf` residues is looked up by
@@ -458,7 +458,7 @@ pub fn run(
         reports.push(panel_set(s, &panel, p)?);
     }
     let report = PanelReport {
-        tool: "ovasm panel",
+        tool: "ovasm find classify",
         version: env!("CARGO_PKG_VERSION"),
         params: p.clone(),
         panel_proteins: panel.proteins,

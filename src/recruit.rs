@@ -851,7 +851,7 @@ pub struct RecruitConfig {
     /// `bootstrap_candidates`). Long reads only: the depth gate needs whole-read depth profiles.
     pub bootstrap: bool,
     /// Extend a target's bait only from reads that are organelle-deep along their whole length
-    /// (`discover`'s test). Iterative extension follows any read the bait covers by
+    /// (`find discover`'s test). Iterative extension follows any read the bait covers by
     /// `min_cover`; one bad seed sequence then walks into the nucleus pass after pass. In the
     /// Carex holdout library, extension to the fixed point added 75,858 reads to the plastid,
     /// 3% of them organelle-like; the 1,141 reads it added to the Buddleja mitochondrion were
@@ -1050,7 +1050,7 @@ fn over_size_cap(name: &str, implied_size: Option<u64>) -> Option<(u64, u64)> {
 /// alone, plastid reads with MTPT-like blocks took its place. Those partial reads are the NUMT
 /// candidates, where nuclear insertions also land; depth separates the two: a mitochondrial read
 /// is deep along its whole length, a nuclear one only at its organellar block. On the three
-/// frozen holdout samples, `discover`'s organelle-like test passed 979 of 989 mitochondrial
+/// frozen holdout samples, `find discover`'s organelle-like test passed 979 of 989 mitochondrial
 /// candidates and 16 of 351 others. A candidate must also fit `t` better than any other target
 /// and not be mostly covered by another target, and be at least `floor` deep; and it is only
 /// used once every other target's bait has stopped growing, so their own reads are recruited,
@@ -1690,7 +1690,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     }
 
     let report = RecruitReport {
-        tool: "ovasm recruit",
+        tool: "ovasm find recruit",
         version: env!("CARGO_PKG_VERSION"),
         k: bait.k,
         params: cfg.params.clone(),

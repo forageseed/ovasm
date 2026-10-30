@@ -36,10 +36,10 @@ a jointly phased inversion or physical circular molecules.
 Both public commands accept an optional evidence file:
 
 ```sh
-ovasm run --reads recruited-mt.fastq --read-set target --read-type hifi \
+ovasm run hifi --reads recruited-mt.fastq --read-set target \
   --organelle mitochondrion --read-context complete-read-context.json --out result
 
-ovasm assemble --reads recruited-mt.fastq --read-context complete-read-context.json \
+ovasm assemble graph --reads recruited-mt.fastq --read-context complete-read-context.json \
   --out assembly.gfa --out-json assembly.json
 ```
 

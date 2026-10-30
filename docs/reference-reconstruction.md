@@ -1,12 +1,12 @@
 # Short-read reconstruction from species reference graphs
 
-`reconstruct` accepts mitochondrial and plastid OV-GFA graphs produced by `ovasm pan`.
+`pan reconstruct` accepts mitochondrial and plastid OV-GFA graphs produced by `ovasm pan merge`.
 It uses every source configuration path for recruitment and for read-to-graph projection.
 Both reference graphs are required so that shared organelle sequence competes under the
 existing Illumina recruitment rules.
 
 ```bash
-ovasm reconstruct \
+ovasm pan reconstruct \
   --reference mitochondrion=species-mt.gfa \
   --reference plastid=species-pt.gfa \
   --reads individual_R1.fastq.gz --reads individual_R2.fastq.gz \
@@ -136,7 +136,7 @@ An explicit target-input stage can reuse previously recruited files without scan
 whole WGS library again:
 
 ```bash
-ovasm reconstruct \
+ovasm pan reconstruct \
   --reference mitochondrion=species-mt.gfa --reference plastid=species-pt.gfa \
   --target-reads mitochondrion=earlier/recruit/mitochondrion.fastq \
   --target-reads plastid=earlier/recruit/plastid.fastq \
@@ -162,7 +162,7 @@ building a species pan graph from the resulting individual graphs.
 The default representative-path search includes the necessary lower bound from
 path ends. Its existing four-cover computational envelope is raised only when that
 bound exceeds four; otherwise the search interval would be empty without examining
-a feasible size. `linearize --max-molecules N` with positive N retains an explicit
+a feasible size. `solve linearize --max-molecules N` with positive N retains an explicit
 limit. Omitted larger cover sizes and expansion-budget exhaustion remain reported
 and continue to prevent a decisive result. No support, optional-anchor or scoring
 threshold is loosened.
@@ -226,7 +226,7 @@ differs from the walk's, with the alleles' read shares (`AF`).
 
 Finally the individual is written back into the species graph: `<organelle>.pan.gfa` is the
 reference graph and the individual's representative molecules (their walks renamed to the
-sample, `<sample>#1#<mt|pt>.<n>`) merged by `ovasm pan` (k 63). Sequence the reference holds is
+sample, `<sample>#1#<mt|pt>.<n>`) merged by `ovasm pan merge` (k 63). Sequence the reference holds is
 shared; the rest becomes new segments (`pan.individual_new_bases`).
 
 Stretches of the final molecules whose length the reads do not fix are listed in

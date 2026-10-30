@@ -1,4 +1,4 @@
-//! Stage 2b: unringing, representative molecules from read-supported paths (`ovasm linearize`).
+//! Stage 2b: unringing, representative molecules from read-supported paths (`ovasm solve linearize`).
 //!
 //! Unique segments (those the evidence report does not list as repeats) are anchors. Two anchors
 //! are bridged when a read-supported phased path runs from one to the other through repeats, or
@@ -455,7 +455,7 @@ fn components(n_seg: usize, br: &[Bridge]) -> Vec<Vec<usize>> {
 }
 
 /// Length-weighted median depth of some anchors (the depth of the base in the middle of them),
-/// as `ovasm evidence` takes it over the whole graph.
+/// as `ovasm check evidence` takes it over the whole graph.
 fn weighted_median_depth(g: &Graph, depth: impl Fn(usize) -> f64, segs: &[usize]) -> f64 {
     let mut v: Vec<(f64, usize)> = segs.iter().map(|&s| (depth(s), g.seqs[s].len())).collect();
     v.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2088,7 +2088,7 @@ mod tests {
         assert_eq!(cover_order(&circles, &off_by_one), Ordering::Less);
     }
 
-    /// Plastid LSC (u0), SSC (u1) and one IR copy (u2), as `ovasm assemble` collapses them,
+    /// Plastid LSC (u0), SSC (u1) and one IR copy (u2), as `ovasm assemble graph` collapses them,
     /// with the junction reads of the Antitrichia holdout: LSC-IR-SSC read twice, the pairing
     /// that closes the circle and its flip-flop rival once each.
     fn run_plastid(phased: Value, dir_name: &str) -> LinearizeReport {

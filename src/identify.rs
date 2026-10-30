@@ -1,4 +1,4 @@
-//! Closest reference genomes of an assembly (`ovasm identify`).
+//! Closest reference genomes of an assembly (`ovasm pan identify`).
 //!
 //! An assembled organelle genome is compared with every reference genome of one or more sets
 //! (e.g. the mitochondrial and plastid SeedDB) by k-mer containment: the fraction of the
@@ -107,7 +107,7 @@ pub fn run(
             .then_with(|| a.id.cmp(&b.id))
     });
     let report = IdentifyReport {
-        tool: "ovasm identify",
+        tool: "ovasm pan identify",
         version: env!("CARGO_PKG_VERSION"),
         query: query.display().to_string(),
         k,

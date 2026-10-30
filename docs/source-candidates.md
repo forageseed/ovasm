@@ -43,7 +43,7 @@ are not changed by this report.
 To add sharing evidence to an existing both-organelle assembly without reassembly:
 
 ```sh
-ovasm sharing --assembly existing-assembly --out evidence-report --k 31
+ovasm pan sharing --assembly existing-assembly --out evidence-report --k 31
 ```
 
 The input graphs and recruited FASTQ are read only; reports go under the chosen

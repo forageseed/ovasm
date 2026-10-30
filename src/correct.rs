@@ -1,4 +1,4 @@
-//! Stage 4 (S4.2): self-correction of noisy organelle long reads (`ovasm correct`).
+//! Stage 4 (S4.2): self-correction of noisy organelle long reads (`ovasm assemble correct`).
 //!
 //! Organelle reads are hundreds to thousands of times deeper than the genome they come from, so
 //! even at 85-93% read identity every true k-mer of a small k is seen many times while error

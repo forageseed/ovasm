@@ -1,6 +1,6 @@
 # Recruitment input replay
 
-`ovasm run` and `ovasm recruit` accept `--recruit-cache NEW_DIRECTORY`.
+`ovasm run` and `ovasm find recruit` accept `--recruit-cache NEW_DIRECTORY`.
 This is an opt-in execution optimization. The scratch directory must not exist
 and must have space for the original sequences and identifiers. Uppercase ACGT
 is stored in two bits per base; other sequences are stored verbatim. No records
@@ -38,7 +38,7 @@ FASTA files, biological recruitment statistics and scientific reports; execution
 timings, paths, new evidence exports and replay profiling are reported separately.
 
 ```sh
-ovasm run --reads full-hifi.fastq.gz --organelle both --read-type hifi \
+ovasm run hifi --reads full-hifi.fastq.gz --organelle both \
   --read-set whole-genome --recruit seeds --mode fast --threads 8 \
   --out sample --recruit-cache /scratch/new-sample-recruit-cache
 ```

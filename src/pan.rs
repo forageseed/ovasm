@@ -1,10 +1,10 @@
-//! Stage 3b: graph-to-graph pangenome (`ovasm pan`).
+//! Stage 3b: graph-to-graph pangenome (`ovasm pan merge`).
 //!
 //! Every sample's OV-GFA (its segments, links and configuration paths, isomers included) goes
 //! into one graph, and bases the samples share become one base: a canonical k-mer (odd k, so
 //! none is its own reverse complement) found in several places joins those places base by
 //! base. The pieces are the non-branching runs of the joined base graph, cut at every sample
-//! segment end: the base-identity blunting of `ovasm unify`, across samples. Each sample
+//! segment end: the base-identity blunting of `ovasm assemble unify`, across samples. Each sample
 //! segment is then a walk over whole pieces, each sample link an adjacency of pieces and each
 //! sample path (every configuration) a pangenome path. Linear pangenome builders take one
 //! sequence per sample, so the isomers a sample's graph holds are lost before they start; here
@@ -130,7 +130,7 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
     }
     if graph.overlaps.iter().any(|&o| o != 0) {
         bail!(
-            "{}: links must be blunt (0M); run `ovasm unify` first",
+            "{}: links must be blunt (0M); run `ovasm assemble unify` first",
             path.display()
         );
     }

@@ -1,10 +1,10 @@
-//! Graph-first target assignment (`ovasm label`): which assembled sequence of a sample is its
+//! Graph-first target assignment (`ovasm find label`): which assembled sequence of a sample is its
 //! mitochondrion, which its plastid.
 //!
 //! Seeds from other species decide which reads a target gets; when they are distant (a plastid
 //! seed against a heavily rearranged plastome, mitochondrial seeds carrying plastid-derived
 //! stretches) the wrong reads or none are recruited. This module asks the sample instead.
-//! `discover` splits the organelle-like reads (deep along their whole length) into depth
+//! `find discover` splits the organelle-like reads (deep along their whole length) into depth
 //! clusters; each cluster holds genomes of one depth, so it is assembled on its own and the
 //! assembler's depth-relative cleaning applies (in one graph, a 14x mitochondrion beside a
 //! 200x plastid is cleaned away). Each unitig is then labelled by the organelle genes it
@@ -14,7 +14,7 @@
 //! organelle's; plastid-derived stretches in a mitochondrion (MTPTs) leave a few plastid genes
 //! beside many mitochondrial ones. Unitigs without genes (intergenic mitochondrial sequence)
 //! take the label of their connected component when its labelled unitigs agree. The labelled
-//! unitigs are the sample's own seeds for `recruit`.
+//! unitigs are the sample's own seeds for `find recruit`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -397,7 +397,7 @@ pub fn run(
         }
     }
     let report = LabelReport {
-        tool: "ovasm label",
+        tool: "ovasm find label",
         version: env!("CARGO_PKG_VERSION"),
         params: p,
         gene_database: gene_db.display().to_string(),

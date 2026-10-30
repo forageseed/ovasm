@@ -264,7 +264,7 @@ fn depth_peaks(medians: &[f64], min_reads: usize) -> Vec<f64> {
     merged
 }
 
-/// The organelle-like read test of `discover`, as a gate for reads found another way.
+/// The organelle-like read test of `find discover`, as a gate for reads found another way.
 pub struct DepthGate {
     sketch: Sketch,
     params: DiscoverParams,
@@ -415,7 +415,7 @@ pub struct ReadDepth {
 }
 
 impl DepthGate {
-    /// Sketch the inputs with `discover`'s long-read defaults (scale 64, the whole input).
+    /// Sketch the inputs with `find discover`'s long-read defaults (scale 64, the whole input).
     pub fn long_reads(inputs: &[PathBuf]) -> Result<Self> {
         Self::long_reads_from(|| read_batches(inputs), "inputs")
     }
@@ -725,7 +725,7 @@ pub fn run(inputs: Vec<PathBuf>, p: DiscoverParams, out_dir: PathBuf) -> Result<
         });
     }
     let report = DiscoverReport {
-        tool: "ovasm discover",
+        tool: "ovasm find discover",
         version: env!("CARGO_PKG_VERSION"),
         inputs: inputs.iter().map(|p| p.display().to_string()).collect(),
         sketch_bases: sketch.bases,

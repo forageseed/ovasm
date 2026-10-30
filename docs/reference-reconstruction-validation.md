@@ -137,7 +137,7 @@ complete reconstruction has not been claimed.
 ## Recruitment to a fixed point, and the frontier walk
 
 Recruitment was first rerun at f6d1745 with `--saturation 0 --iterations 60` and the
-same bait (as `recruit` with `--max-bases` 150 x 350,586). It never settled: the
+same bait (as `find recruit` with `--max-bases` 150 x 350,586). It never settled: the
 mitochondrial reads went from 856,248 (pass 2) to 940,026 (pass 4) and 4,630,842
 (pass 5), then to 28.8 M at pass 60, and the plastid's from 7.35 M to 48.4 M. The
 150x subsample was then mostly nuclear; the reconstructed mitochondrion fell apart
@@ -145,7 +145,7 @@ mitochondrial reads went from 856,248 (pass 2) to 940,026 (pass 4) and 4,630,842
 neither interval was closed (4:37:36, 7.4 GB peak).
 
 A one-pass diagnostic recruitment on the held-out candidate's 20.6 kb around the two
-intervals (diagnostic only, never used by `reconstruct`) found them in the library at
+intervals (diagnostic only, never used by `pan reconstruct`) found them in the library at
 the depth of their flanks: 399 and 390x over all primary alignments, 368 and 357x for
 reads within 1% of the candidate along 90% of their length, against 369-370x for the
 2 kb on either side, with no 250 bp window below 293x and no base without such reads.
@@ -331,7 +331,7 @@ two pieces among it) and the plastid graph from 128,321 to 133,668 bp.
 
 ### End to end from the WGS reads (e4c7eec)
 
-`reconstruct` on ZM4's 155,554,892 WGS records with `--target-depth 1000`: 1:07:10, 4.73 GB
+`pan reconstruct` on ZM4's 155,554,892 WGS records with `--target-depth 1000`: 1:07:10, 4.73 GB
 peak (counting the 31-mers took 2,734 s on a slow disk; 646 s before). Recruitment kept every
 mitochondrial read (895,480) and 856,699 of 7,354,090 plastid reads, mates together.
 

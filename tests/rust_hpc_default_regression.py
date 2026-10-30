@@ -26,7 +26,7 @@ def main():
         for label, binary in [('control', args.control), ('candidate', args.candidate)]:
             out = args.out / name / label
             out.mkdir(parents=True)
-            cmd = [str(binary.resolve()), 'assemble', '--reads', str(args.inputs / 'recruit' / f'{name}.fastq'),
+            cmd = [str(binary.resolve()), 'assemble', 'graph', '--reads', str(args.inputs / 'recruit' / f'{name}.fastq'),
                    '--k', str(metadata['k']), '--s', str(metadata['s']), '--min-count', str(metadata['min_count']),
                    '--threads', '8', '--out', str(out / 'graph.gfa'), '--out-json', str(out / 'graph.json')]
             with (out / 'command.log').open('w') as stream:

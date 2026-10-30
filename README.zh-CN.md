@@ -28,10 +28,21 @@ ovasm --version
 ## 使用
 
 ```sh
-ovasm run --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
+ovasm run hifi --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
 ```
 
-Illumina 数据添加 `--read-type sr`。结果包含代表序列、GFA、连接支持和来源候选。结构有歧义时保留分支；图上的环不能直接当作物理染色体。
+Illumina 数据改用 `ovasm run short`。结果包含代表序列、GFA、连接支持和来源候选。结构有歧义时保留分支；图上的环不能直接当作物理染色体。
+
+命令格式为 `ovasm <模块> <命令>`，每一层都支持 `-h`：
+
+| 模块 | 命令 |
+|---|---|
+| `run` | `short`、`hifi`：从读段一步到组装图和分子 |
+| `find` | `recruit`、`discover`、`classify`、`label`：找细胞器读段 |
+| `assemble` | `correct`、`graph`、`filter`、`unify`：读段拼成组装图 |
+| `check` | `evidence`、`unzip`：用读段核对组装图 |
+| `solve` | `linearize`、`primary`、`chromosomes`：理出序列与染色体 |
+| `pan` | `merge`、`reconstruct`、`identify`、`sharing`：多样本泛图 |
 
 [种内参考图 → 二代个体重建](docs/reference-reconstruction.md) · [详细用法](https://github.com/forageseed/ovasm/tree/main/docs)
 

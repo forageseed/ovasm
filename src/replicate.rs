@@ -1,4 +1,4 @@
-//! Downsampled replicates of an assembly and the junctions they reproduce (`ovasm run --mode
+//! Downsampled replicates of an assembly and the junctions they reproduce (`ovasm run hifi --mode
 //! standard`).
 //!
 //! A junction is a link of the assembly graph with a branching end: where a unitig can be left
@@ -13,7 +13,7 @@
 //! and its reverse complement sorts first. The reverse complement of the span of `a -> b` is the
 //! span of `b' -> a'`, so the signature does not depend on the strand a graph happens to spell,
 //! nor on segment names, and two graphs give the same signature for a junction they both hold at
-//! the same position. (With overlaps that are not exact, which `ovasm assemble` never writes,
+//! the same position. (With overlaps that are not exact, which `ovasm assemble graph` never writes,
 //! the two strands could differ inside the overlap.)
 //!
 //! **Reproduced.** A replicate reproduces a junction of the representative graph when it holds
@@ -244,7 +244,7 @@ pub fn stop_reason(sets: &[BTreeSet<u64>], requested: usize, max: usize) -> Opti
 }
 
 /// Write the reads of `inputs` whose name hashes under `fraction` with this salt (the same
-/// deterministic draw as `ovasm recruit --target-depth --salt`) to `out` as FASTQ, read by
+/// deterministic draw as `ovasm find recruit --target-depth --salt`) to `out` as FASTQ, read by
 /// read: nothing is held in memory. Returns reads and bases written.
 pub fn downsample(inputs: &[PathBuf], fraction: f64, salt: u64, out: &Path) -> Result<(u64, u64)> {
     let (rx, reader) = read_batches(inputs);
@@ -268,7 +268,7 @@ pub fn downsample(inputs: &[PathBuf], fraction: f64, salt: u64, out: &Path) -> R
     Ok((reads, bases))
 }
 
-/// One FASTQ record; FASTA input gets a neutral quality, as in `ovasm recruit`.
+/// One FASTQ record; FASTA input gets a neutral quality, as in `ovasm find recruit`.
 pub fn write_fastq_record(
     w: &mut impl Write,
     id: &[u8],
