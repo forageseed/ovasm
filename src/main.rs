@@ -379,8 +379,9 @@ struct RunArgs {
     /// assembly (their median depth in the depth sketch); 0 keeps every read.
     #[arg(long, default_value_t = 250.0)]
     recruit_max_depth: f64,
-    /// HiFi: keep at most about this many recruited bases per organelle, which bounds the memory
-    /// of assembly whatever recruitment found; 0 for no cap. Assembly memory follows the nuclear
+    /// Keep at most about this many recruited bases per organelle, which bounds the memory of
+    /// assembly whatever recruitment found; 0 for no cap. Short reads too: a plastid at a
+    /// seventh of a library (WL354: 35 M reads, 5.3 Gb) went to assembly whole. Assembly memory follows the nuclear
     /// sequence among the reads, not their bases: 4.3 Gb of Medicago polymorpha plastid reads
     /// took 2.5 GB, 8.5 Gb of mostly nuclear Carex echinata "plastid" reads 309 GB. A billion
     /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
@@ -1444,6 +1445,14 @@ struct RecruitArgs {
     /// Read files (FASTQ/FASTA, optionally .gz); repeat for several libraries.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
+    /// Extend a target only from reads whose new k-mers are at its depth in a count of the
+    /// whole library (4 GiB, after the first pass): keeps short-read extension out of the
+    /// nucleus. `run` uses it for short reads.
+    #[arg(long)]
+    kmer_gate: bool,
+    /// Downsample by the first word of each read name, so a pair's mates stay together.
+    #[arg(long)]
+    mates_together: bool,
     /// Seed as NAME=PATH (e.g. mito=ref_mt.fa); repeat for more targets or more seed files.
     #[arg(long = "seed")]
     seeds: Vec<String>,
@@ -1671,7 +1680,8 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             extend_gate: args.extend_gate,
             max_read_depth: args.max_read_depth,
             max_bases: args.max_bases,
-            mates_together: false,
+            mates_together: args.mates_together,
+            kmer_gate: args.kmer_gate,
         },
     )?;
     for o in &report.outputs {
