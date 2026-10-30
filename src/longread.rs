@@ -310,7 +310,7 @@ fn target_output<'a>(report: &'a Value, organelle: &str) -> Result<&'a Value> {
 pub fn round_grew(previous: Option<u64>, now: u64) -> bool {
     match previous {
         None => true,
-        Some(p) => now as f64 >= p as f64 * (1.0 + ROUND_GROWTH),
+        Some(p) => now > p && now as f64 >= p as f64 * (1.0 + ROUND_GROWTH),
     }
 }
 
@@ -496,17 +496,9 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                                 grown.push(organelle);
                             }
                         }
-                        _ if n("kept_bases") < MIN_RECRUITED_BASES => {
-                            reads.insert(
-                                organelle,
-                                Err(anyhow::anyhow!(
-                                    "only {} bases of {organelle} long reads were recruited (at \
-                                     least {MIN_RECRUITED_BASES} are needed): the seeds may be \
-                                     too distant for noisy reads; give closer seeds",
-                                    n("kept_bases")
-                                )),
-                            );
-                        }
+                        // kept even with no read covered by 80%: with a multi-species seed library
+                        // a mitochondrial ONT read rarely is (ZM4: none in 12 Gb), and the partly
+                        // covered reads alone give the next round's bait
                         _ => {
                             grown.push(organelle);
                             reads.insert(
@@ -547,13 +539,17 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 )?;
                 for organelle in grown {
                     let Some(Ok(r)) = reads.get_mut(organelle) else { continue };
-                    let mut inputs = r.raw.clone();
+                    let mut inputs =
+                        if r.kept.is_some_and(|k| k.1 > 0) { r.raw.clone() } else { Vec::new() };
                     if let Some((p, n, _)) = partial.get(organelle) {
                         log(&format!(
                             "self-correcting the {organelle} long reads of round {round} with \
                              {n} partly covered reads, as bait for the next round"
                         ));
                         inputs.push(p.clone());
+                    }
+                    if inputs.is_empty() {
+                        continue;
                     }
                     let fasta = o.out.join(format!("correct/round{round}/{organelle}.bait.fasta"));
                     let mut c = correct(&inputs, None, &fasta)?;
@@ -563,8 +559,18 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                     r.corrections.push(c);
                 }
             }
-            for (&organelle, r) in reads.iter_mut() {
-                let Ok(r) = r else { continue };
+            for (&organelle, entry) in reads.iter_mut() {
+                let Ok(r) = entry else { continue };
+                let bases = r.kept.map_or(0, |k| k.1);
+                if bases < MIN_RECRUITED_BASES {
+                    *entry = Err(anyhow::anyhow!(
+                        "only {bases} bases of {organelle} long reads were recruited (at least \
+                         {MIN_RECRUITED_BASES} are needed) after {} round(s): the seeds may be \
+                         too distant for noisy reads; give closer seeds or more --recruit-rounds",
+                        r.rounds.len()
+                    ));
+                    continue;
+                }
                 log(&format!("self-correcting the {organelle} long reads to assemble"));
                 let fasta = o.out.join(format!("correct/{organelle}.fasta"));
                 let mut c = correct(&r.raw, None, &fasta)?;
@@ -952,6 +958,8 @@ mod tests {
         assert!(round_grew(Some(1000), 1050));
         assert!(!round_grew(Some(1000), 1049));
         assert!(!round_grew(Some(1000), 900));
+        assert!(!round_grew(Some(0), 0), "nothing twice");
+        assert!(round_grew(Some(0), 1));
     }
 
     #[test]
@@ -980,6 +988,37 @@ mod tests {
         assert_eq!(m["short_read_evidence"], Value::Null);
         assert!(out.join("mitochondrion/assessment.json").is_file());
         assert!(out.join("summary.json").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_seed_of_genes_only_covers_no_read_and_the_partly_covered_reads_take_over() {
+        // the mitochondrial seed is five 2.5 kb "genes" every 6 kb: no 8 kb read is 80% seed
+        // (a multi-species library and a plant mitochondrion; ZM4's ONT: none in 12 Gb)
+        let dir = tmpdir("genes");
+        let s = sample(&dir, 0.05);
+        let genes: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|i| (format!("gene{i}"), s.mito[i * 6000..i * 6000 + 2500].to_vec()))
+            .collect();
+        fasta(&s.mt_seed, &genes);
+        let out = dir.join("out");
+        let mt = format!("mitochondrion={}", s.mt_seed.display());
+        let pt = format!("plastid={}", s.pt_seed.display());
+        let o = options(&["--organelle", "mitochondrion", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt]);
+        let m = run(&[s.long.clone()], None, &o).unwrap();
+        let rounds = m["long_read"]["rounds"].as_array().unwrap();
+        assert_eq!(rounds[0]["recruited_reads"], json!(0), "{rounds:?}");
+        assert!(rounds[1]["recruited_reads"].as_u64().unwrap() > 200, "{rounds:?}");
+        assert_eq!(m["long_read"]["corrections"][0]["purpose"], "bait");
+        assert!(m["long_read"]["corrections"][0]["partial_reads"].as_u64().unwrap() > 200);
+        assert_genome(&out, &s.mito, "mitochondrion from genes");
+        // with one round there is nothing to assemble, and the run says why
+        let o = options(&[
+            "--organelle", "mitochondrion", "--out", dir.join("out1").to_str().unwrap(), "--seeds", &mt,
+            "--seeds", &pt, "--recruit-rounds", "1",
+        ]);
+        let e = run(&[s.long.clone()], None, &o).unwrap_err().to_string();
+        assert!(e.contains("more --recruit-rounds"), "{e}");
         fs::remove_dir_all(&dir).ok();
     }
 
