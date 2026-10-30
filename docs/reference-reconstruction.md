@@ -228,3 +228,11 @@ Finally the individual is written back into the species graph: `<organelle>.pan.
 reference graph and the individual's representative molecules (their walks renamed to the
 sample, `<sample>#1#<mt|pt>.<n>`) merged by `ovasm pan` (k 63). Sequence the reference holds is
 shared; the rest becomes new segments (`pan.individual_new_bases`).
+
+Stretches of the final molecules whose length the reads do not fix are listed in
+`<organelle>/uncertain_regions.tsv` (`uncertain_regions` in the final record): local repeats
+(20-mers repeated within 500 bp: tandem arrays, microsatellites) between their nearest unique
+20-mers, marked when no read can hold both anchors or under a tenth of the reads that would
+at the assembled length do. Each row also gives the read pairs across it and how much longer
+they say it is against pairs 1.5 kb away (an estimate only: inserts vary with the place by
+about 20 bp). Lengths are not corrected.
