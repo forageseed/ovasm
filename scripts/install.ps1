@@ -26,7 +26,7 @@ $expected = ($entries[0] -split '\s+')[0]
 $actual = Get-Sha256 $source
 if ($actual -ine $expected) { throw 'SHA-256 mismatch; nothing installed.' }
 $version = & $source --version
-if ($LASTEXITCODE -ne 0 -or $version -ne 'ovasm 0.3.0') { throw 'Unexpected executable version.' }
+if ($LASTEXITCODE -ne 0 -or $version -ne 'ovasm 0.6.0') { throw 'Unexpected executable version.' }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $target = Join-Path $InstallDir 'ovasm.exe'
 if ([IO.Path]::GetFullPath($source) -ine [IO.Path]::GetFullPath($target)) {
