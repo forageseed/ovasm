@@ -1,5 +1,5 @@
-//! ovasm: OrganelleVerse organelle assembler. `ovasm <module> <command>`: run (short, hifi),
-//! find, assemble, check, solve, pan.
+//! ovasm: OrganelleVerse organelle assembler. `ovasm <module> <command>`: run (short, hifi, ont,
+//! hybrid), find, assemble, check, solve, pan.
 
 mod assemble;
 mod assess;
@@ -18,6 +18,7 @@ mod junctions;
 mod kmer;
 mod label;
 mod linearize;
+mod longread;
 mod pan;
 mod panel;
 mod phase;
@@ -80,6 +81,17 @@ enum RunCommand {
     /// and summary.json says k_accepted: false), check, solve; --mode standard adds downsampled
     /// replicates.
     Hifi(RunArgs),
+    /// Noisy long reads (ONT, PacBio CLR): one recruitment pass with the seeds (k 21, never
+    /// extended from raw reads), self-correction, further rounds baited by the corrected reads
+    /// (--recruit-rounds), then the HiFi stages on the corrected reads (`run hifi --read-set
+    /// target`: sparse graph, k ladder, check, solve, assess).
+    Ont(longread::OntArgs),
+    /// Long reads with short reads of the same sample (--long ONT/CLR, --short Illumina): the
+    /// long reads are recruited and self-corrected as in `run ont`, seed the short reads'
+    /// recruitment, are corrected again with those short reads (hybrid correction, then self
+    /// rounds), go through the HiFi stages, and the graph is checked against both: evidence.json
+    /// (corrected long reads) and evidence.short.json (short reads).
+    Hybrid(longread::HybridArgs),
 }
 
 #[derive(Subcommand)]
@@ -1927,6 +1939,8 @@ fn dispatch(command: Command) -> Result<()> {
             args.read_type = pipeline::ReadType::Hifi;
             run(args)
         }
+        Command::Run(RunCommand::Ont(args)) => longread::run_ont(args),
+        Command::Run(RunCommand::Hybrid(args)) => longread::run_hybrid(args),
         Command::Find(FindCommand::Recruit(args)) => recruit(args),
         Command::Find(FindCommand::Discover(args)) => discover(args),
         Command::Find(FindCommand::Classify(args)) => panel(args),

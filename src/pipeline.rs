@@ -149,24 +149,24 @@ fn log(message: &str) {
 }
 
 /// Arguments of a subcommand, as the command line would give them.
-struct Argv(Vec<OsString>);
+pub(crate) struct Argv(Vec<OsString>);
 
 impl Argv {
     /// `command` is the module and its command, e.g. "find recruit".
-    fn new(command: &str) -> Self {
+    pub(crate) fn new(command: &str) -> Self {
         Argv(std::iter::once("ovasm").chain(command.split_whitespace()).map(OsString::from).collect())
     }
 
-    fn arg(mut self, a: impl Into<OsString>) -> Self {
+    pub(crate) fn arg(mut self, a: impl Into<OsString>) -> Self {
         self.0.push(a.into());
         self
     }
 
-    fn opt(self, flag: &str, value: impl Into<OsString>) -> Self {
+    pub(crate) fn opt(self, flag: &str, value: impl Into<OsString>) -> Self {
         self.arg(flag).arg(value)
     }
 
-    fn each(mut self, flag: &str, values: &[PathBuf]) -> Self {
+    pub(crate) fn each(mut self, flag: &str, values: &[PathBuf]) -> Self {
         for v in values {
             self = self.opt(flag, v);
         }
@@ -174,7 +174,7 @@ impl Argv {
     }
 
     /// Run the subcommand in this process. Its thread pool is the one `ovasm run` set up.
-    fn run(self) -> Result<()> {
+    pub(crate) fn run(self) -> Result<()> {
         let name = self.0[1..3].iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
         let cli = crate::Cli::try_parse_from(&self.0)
             .map_err(|e| anyhow!("internal: bad arguments for `ovasm {name}`: {e}"))?;
@@ -182,14 +182,14 @@ impl Argv {
     }
 }
 
-fn read_json(path: &Path) -> Result<Value> {
+pub(crate) fn read_json(path: &Path) -> Result<Value> {
     serde_json::from_str(
         &fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?,
     )
     .with_context(|| format!("{} is not JSON", path.display()))
 }
 
-fn write_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
     fs::write(path, serde_json::to_string_pretty(value)? + "\n")
         .with_context(|| format!("cannot write {}", path.display()))
 }
@@ -453,7 +453,7 @@ fn molecules_of(linearization: &Value) -> Vec<&Value> {
 }
 
 /// `ovasm check evidence` as the runner calls it for this read type.
-fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType) -> Argv {
+pub(crate) fn evidence_argv(gfa: &Path, reads: &[PathBuf], out: &Path, read_type: ReadType) -> Argv {
     // k, diagonal tolerance, hits per side, anchor: `_EVIDENCE_PRESETS` of `_ovasm.py`; short
     // reads of 100-150 bp can hold few hits per side and anchor 40 bp
     let (side_hits, anchor) = match read_type {
@@ -1930,7 +1930,7 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
         ReadSet::Target => {
             log("using the supplied target reads; whole-genome recruitment was not run");
             if !cfg.seeds.is_empty() {
-                log("note: --seeds are not used with --read-set target");
+                log("note: --seeds are not used for recruitment with --read-set target");
             }
             organelles
                 .iter()
