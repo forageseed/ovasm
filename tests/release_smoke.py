@@ -81,7 +81,7 @@ sequence = ''.join(randomizer.choice('ACGT') for _ in range(2800))
 (out / 'toy.gfa').write_text('S\tleft\t' + sequence[:1400] + '\nS\tright\t' + sequence[1400:] + '\nL\tleft\t+\tright\t+\t0M\n')
 read = sequence[900:1900]
 (out / 'toy.fastq').write_text(''.join(f'@fixture{i}\n{read}\n+\n' + 'I' * len(read) + '\n' for i in range(3)))
-run([installed, 'evidence', '--gfa', out / 'toy.gfa', '--reads', out / 'toy.fastq', '--out', out / 'toy-evidence.json',
+run([installed, 'check', 'evidence', '--gfa', out / 'toy.gfa', '--reads', out / 'toy.fastq', '--out', out / 'toy-evidence.json',
      '--k', '21', '--flank', '500', '--min-anchor', '200', '--bootstrap', '0', '--threads', '1'])
 evidence = json.loads((out / 'toy-evidence.json').read_text())
 assert evidence['reads_scanned'] == 3 and evidence['links_supported'] == 1
