@@ -926,7 +926,7 @@ fn recruit_all(
         }
         let cache = match &cfg.recruit_cache {
             Some(dir) => Some(dir.clone()),
-            None if cfg.auto_recruit_cache && cfg.read_type == ReadType::Hifi => {
+            None if cfg.auto_recruit_cache => {
                 default_recruit_cache(&cfg.reads, &cfg.out, &recruit_dir)?
             }
             None => None,
@@ -950,6 +950,15 @@ fn recruit_all(
             if let Some(d) = cfg.recruit_max_depth {
                 argv = argv.opt("--max-read-depth", d.to_string());
             }
+            if let Some(b) = cfg.recruit_max_bases {
+                argv = argv.opt("--max-bases", b.to_string());
+            }
+        }
+        // Short reads: the k-mer gate keeps extension out of the nucleus (WL354's mitochondrion
+        // went from 0.72 M to 54 M reads ungated), the base cap bounds assembly, and mates stay
+        // together for the read-pair closure.
+        if cfg.read_type == ReadType::Sr {
+            argv = argv.arg("--kmer-gate").arg("--mates-together");
             if let Some(b) = cfg.recruit_max_bases {
                 argv = argv.opt("--max-bases", b.to_string());
             }

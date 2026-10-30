@@ -1677,6 +1677,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 max_bases: None,
                 // read pairs close the circles (`close`)
                 mates_together: true,
+                kmer_gate: false,
             },
         )?)?
     };

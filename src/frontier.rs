@@ -83,6 +83,8 @@ struct Line([AtomicU16; 32]);
 pub struct KmerCounts {
     lines: Vec<Line>,
     line_bits: u32,
+    /// Word length counted (`K` for the frontier walk, the bait's for recruitment's gate).
+    k: usize,
     pub reads: u64,
     pub bases: u64,
     pub seconds: f64,
@@ -97,12 +99,18 @@ fn mix64(mut z: u64) -> u64 {
 
 impl KmerCounts {
     pub fn new(slots_log2: u32) -> Self {
+        Self::with_k(slots_log2, K)
+    }
+
+    /// A table of canonical `k`-mers.
+    pub fn with_k(slots_log2: u32, k: usize) -> Self {
         let line_bits = slots_log2.max(5) - 5;
         Self {
             lines: (0..1usize << line_bits)
                 .map(|_| Line(std::array::from_fn(|_| AtomicU16::new(0))))
                 .collect(),
             line_bits,
+            k,
             reads: 0,
             bases: 0,
             seconds: 0.0,
@@ -111,9 +119,14 @@ impl KmerCounts {
 
     /// Count every read of `inputs` in one pass.
     pub fn from_reads(inputs: &[PathBuf], slots_log2: u32) -> Result<Self> {
+        Self::from_source(crate::recruit::read_batches(inputs), slots_log2, K)
+    }
+
+    /// Count the `k`-mers of every read the batches give (the inputs, or a recruitment cache).
+    pub fn from_source(source: crate::seedfree::Batches, slots_log2: u32, k: usize) -> Result<Self> {
         let start = Instant::now();
-        let mut table = Self::new(slots_log2);
-        let (batches, reader) = crate::recruit::read_batches(inputs);
+        let mut table = Self::with_k(slots_log2, k);
+        let (batches, reader) = source;
         for batch in batches {
             table.reads += batch.len() as u64;
             table.bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
@@ -127,7 +140,7 @@ impl KmerCounts {
     }
 
     fn add_seq(&self, seq: &[u8]) {
-        for (_, key) in CanonicalKmers::new(seq, K) {
+        for (_, key) in CanonicalKmers::new(seq, self.k) {
             self.add(key);
         }
     }
@@ -154,7 +167,7 @@ impl KmerCounts {
     }
 
     #[inline]
-    fn add(&self, key: u64) {
+    pub(crate) fn add(&self, key: u64) {
         let (line, slots) = self.slots(key);
         let values = slots.map(|s| line[s].load(Ordering::Relaxed));
         let min = *values.iter().min().unwrap();

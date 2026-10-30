@@ -872,6 +872,63 @@ pub struct RecruitConfig {
     /// pairs: sampled by whole names, ZM4's plastid at 11.6% kept both mates of 1.3% of its pairs,
     /// and of 21 pairs across its join one was left.
     pub mates_together: bool,
+    /// Short reads: count the library's k-mers once (count-min, after the first pass) and let a
+    /// read extend a target only when the k-mers it would add are at the target's depth
+    /// (`kmer_extends`). Iterative extension follows any read the bait covers by `min_cover`,
+    /// and from a NUMT's edge into the nucleus: WL354's mitochondrion grew from 0.72 M to 54 M
+    /// reads in 20 passes, CRR1151719's to 104 M, and assembly ran out of memory or time.
+    pub kmer_gate: bool,
+}
+
+/// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB.
+const KMER_GATE_SLOTS_LOG2: u32 = 31;
+/// A read extends a target when the median count of the k-mers it would add is from this share
+/// of the target's own k-mer depth up to `KMER_GATE_CEILING` times it: the nucleus is far
+/// shallower than an organelle, a plastid far deeper than a mitochondrion.
+const KMER_GATE_FLOOR: f64 = 0.25;
+const KMER_GATE_CEILING: f64 = 10.0;
+/// Fewer new k-mers than this: the read adds nothing to judge, and extends.
+const KMER_GATE_MIN_NEW: usize = 5;
+
+/// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
+/// those the target's bait lacks, at the target's depth `depth` by the table's counts.
+fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64) -> bool {
+    let bit = 1u8 << t;
+    let mut new: Vec<u32> = CanonicalKmers::new(seq, bait.k)
+        .filter(|&(_, km)| bait.get(km) & bit == 0)
+        .map(|(_, km)| table.get(km))
+        .collect();
+    if new.len() < KMER_GATE_MIN_NEW {
+        return true;
+    }
+    new.sort_unstable();
+    let m = f64::from(new[new.len() / 2]);
+    m >= KMER_GATE_FLOOR * depth && m <= KMER_GATE_CEILING * depth
+}
+
+/// A target's k-mer depth: the median, over its sampled reads, of the median count of each
+/// read's k-mers that are in the target's bait.
+fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, reads: &[&[u8]]) -> Option<f64> {
+    let bit = 1u8 << t;
+    let mut per_read: Vec<u32> = reads
+        .par_iter()
+        .filter_map(|s| {
+            let mut v: Vec<u32> = CanonicalKmers::new(s, bait.k)
+                .filter(|&(_, km)| bait.get(km) & bit != 0)
+                .map(|(_, km)| table.get(km))
+                .collect();
+            if v.is_empty() {
+                return None;
+            }
+            v.sort_unstable();
+            Some(v[v.len() / 2])
+        })
+        .collect();
+    if per_read.is_empty() {
+        return None;
+    }
+    per_read.sort_unstable();
+    Some(f64::from(per_read[per_read.len() / 2]))
 }
 
 /// A bootstrap read must not be this much shallower than the target's own reads (when the
@@ -1162,6 +1219,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let mut core_depth: Vec<Option<f64>> = vec![None; n_targets];
     let mut warnings: Vec<String> = Vec::new();
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
+    // the k-mer gate's table and each target's k-mer depth, from after the first pass
+    let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
+    let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -1201,6 +1261,25 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             gate = Some(build_gate(&cfg.inputs, replay.as_ref(), &mut warnings)?);
         }
         let mut depths = pass_depths(gate.as_ref(), &res);
+        if cfg.kmer_gate && kmer_table.is_none() && !last {
+            let source = match replay.as_ref().filter(|r| r.ready) {
+                Some(cache) => cache.sequences(),
+                None => read_batches(&cfg.inputs),
+            };
+            let table = crate::frontier::KmerCounts::from_source(source, KMER_GATE_SLOTS_LOG2, bait.k)?;
+            for t in 0..n_targets {
+                let reads = res.all_sample[t].reads();
+                kmer_target_depth[t] = kmer_depth(&table, &bait, t, &reads);
+            }
+            eprintln!(
+                "[ovasm] k-mer gate: {} k-mers of {} reads counted in {:.0}s; target depths {:?}",
+                bait.k,
+                table.reads,
+                table.seconds,
+                kmer_target_depth
+            );
+            kmer_table = Some(table);
+        }
         for t in 0..n_targets {
             if core_depth[t].is_none() && depths.measured[t] >= CORE_MIN_READS {
                 core_depth[t] = depths.read[t];
@@ -1314,6 +1393,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     fresh.push(key);
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
                         return;
+                    }
+                    if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
+                        if !kmer_extends(table, &bait, t, &r.seq, d) {
+                            gated_out[t] += 1;
+                            return;
+                        }
                     }
                     let Some(g) = extend_gate else {
                         picked.push(r.seq);
@@ -1662,6 +1747,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_kmer_gate_lets_organelle_sequence_extend_and_keeps_the_nucleus_out() {
+        // an organelle at 200x, its bait the first 1,000 bp; the nucleus at 5x, joined to the
+        // organelle's 900-1,000 bp by a NUMT
+        let organelle = pseudo_random(2000, 41);
+        let nucleus = pseudo_random(1000, 42);
+        let table = crate::frontier::KmerCounts::with_k(20, 21);
+        let count = |seq: &[u8], copies: usize| {
+            for _ in 0..copies {
+                for (_, km) in CanonicalKmers::new(seq, 21) {
+                    table.add(km);
+                }
+            }
+        };
+        count(&organelle, 200);
+        count(&nucleus, 5);
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &organelle[..1000]);
+        bait.prepare_lookup();
+        let reads: Vec<&[u8]> = (0..800).step_by(20).map(|a| &organelle[a..a + 150]).collect();
+        let depth = kmer_depth(&table, &bait, t, &reads).unwrap();
+        assert!((depth - 200.0).abs() < 10.0, "{depth}");
+        // 120 bp on the bait and 30 bp further into the organelle: extends
+        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth));
+        // 120 bp on the bait and 30 bp into the nucleus past the NUMT: does not
+        let numt_edge = [&organelle[880..1000], &nucleus[..30]].concat();
+        assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth));
+    }
+
+    #[test]
     fn mates_are_sampled_together_only_when_asked() {
         let (a, b) = (b"SRR13333747.1 1/1".as_slice(), b"SRR13333747.1 1/2".as_slice());
         assert_eq!(sample_name(a, true), sample_name(b, true));
@@ -1964,6 +2079,7 @@ mod tests {
             max_read_depth: None,
             max_bases: None,
             mates_together: false,
+            kmer_gate: false,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -2053,6 +2169,7 @@ mod tests {
             max_read_depth: None,
             max_bases: None,
             mates_together: false,
+            kmer_gate: false,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -2213,6 +2330,7 @@ mod tests {
             max_read_depth: None,
             max_bases: None,
             mates_together: false,
+            kmer_gate: false,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -2376,6 +2494,7 @@ mod tests {
             max_read_depth: None,
             max_bases: None,
             mates_together: false,
+            kmer_gate: false,
         }
     }
 
