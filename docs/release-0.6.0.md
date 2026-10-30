@@ -33,6 +33,28 @@ choice. The JSON report of `pan reconstruct` says `"tool": "ovasm pan reconstruc
 The same inputs give byte-identical molecules.fasta, assembly.gfa and organelle.gfa with 0.5.0's
 flat commands (plastid HiFi target reads; 200k short reads).
 
+## Assessment (`check assess`)
+
+`run` ends every organelle with `ovasm check assess`, which derives from the run's own files
+(graph, read evidence, molecules, chromosome calls, built-in protein panel), without re-reading
+reads or calling another tool: single-copy depth; copy number (segment depth against the
+molecules' walks); shallow segments; reads behind every junction used; complexity
+(simple/complex/multipartite, dead ends, double forks, recombining repeats with their pairing
+counts); panel genes and depth per molecule; plastid LSC/SSC/IR. It writes `assessment.json`
+and its headline numbers under `"assessment"` in `summary.json`; see `docs/assessment.md`.
+Molecules are unchanged.
+
+## Many-species runs (`scripts/atlas/`)
+
+`make_manifest.py` lists one complete sample per species, `run_batch.py` runs `ovasm run`
+over the list (resumable; time, peak memory, binary checksum per sample) and `aggregate.py`
+writes sample, repeat and gene tables.
+
+## Also from main
+
+`run hifi` always gates HiFi recruitment (`--ungated-recruit` is gone), and free disk space is
+read on Windows so that recruitment caches its input.
+
 ## Short-read recruitment
 
 - `find recruit --kmer-gate`: after the first pass, the library's k-mers are counted once

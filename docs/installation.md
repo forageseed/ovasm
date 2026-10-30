@@ -1,14 +1,14 @@
-# Prebuilt installation (0.3.0)
+# Prebuilt installation (0.6.0)
 
-[Download the release](https://github.com/forageseed/ovasm/releases/tag/v0.3.0).
+[Download the release](https://github.com/forageseed/ovasm/releases/tag/v0.6.0).
 These packages contain the executable and built-in seed references. Building from
 source, installing Rust/C compilers and administrator permission are unnecessary.
 
 ## Windows x86_64
 
-1. Download `ovasm-v0.3.0-windows-x86_64.zip` and extract it completely.
+1. Download `ovasm-v0.6.0-windows-x86_64.zip` and extract it completely.
 2. Double-click `install.cmd` in the extracted folder.
-3. Open a new terminal and run `ovasm --version` (expected: `ovasm 0.3.0`).
+3. Open a new terminal and run `ovasm --version` (expected: `ovasm 0.6.0`).
 
 The installer checks the executable against the packaged SHA-256 manifest,
 copies it to `%LOCALAPPDATA%\Programs\ovasm` and adds that directory to the
@@ -32,7 +32,7 @@ The package is built on Ubuntu 24.04; the minimum glibc symbol requirement is
 checked on the actual executable. No graph-kernel C compiler or zlib development headers are needed.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.3.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.6.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -44,7 +44,7 @@ different location or an already-downloaded package:
 
 ```sh
 sh scripts/install.sh --bin-dir /path/to/my/bin \
-  --archive /path/to/ovasm-v0.3.0-linux-x86_64.tar.gz \
+  --archive /path/to/ovasm-v0.6.0-linux-x86_64.tar.gz \
   --checksums /path/to/SHA256SUMS
 ```
 

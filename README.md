@@ -12,18 +12,18 @@ OVASM recruits organelle reads, builds graphs and retains read-supported alterna
 
 ## Install
 
-**Precompiled 0.3.0 — no compiler required.**
+**Precompiled 0.6.0 — no compiler required.**
 
-- **Windows x86_64:** [download ZIP](https://github.com/forageseed/ovasm/releases/download/v0.3.0/ovasm-v0.3.0-windows-x86_64.zip), extract and double-click `install.cmd`. Reopen the terminal.
+- **Windows x86_64:** [download ZIP](https://github.com/forageseed/ovasm/releases/download/v0.6.0/ovasm-v0.6.0-windows-x86_64.zip), extract and double-click `install.cmd`. Reopen the terminal.
 - **Linux x86_64, glibc 2.34+:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.3.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.6.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
 
-[Downloads](https://github.com/forageseed/ovasm/releases/tag/v0.3.0) · [Offline installation](docs/installation.md)
+[Downloads](https://github.com/forageseed/ovasm/releases/tag/v0.6.0) · [Offline installation](docs/installation.md)
 
 ## Use
 
