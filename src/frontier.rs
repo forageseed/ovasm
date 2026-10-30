@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::kmer::CanonicalKmers;
@@ -396,7 +396,7 @@ pub fn extend(
         })
         .collect();
     let budget = (p.max_fold * stored_bases as f64) as usize;
-    walk(counts, &known, ends, at_depth, budget, p, &mut ext);
+    walk(counts, &known, ends, at_depth, budget, p, false, &mut ext);
     ext
 }
 
@@ -405,8 +405,12 @@ pub fn extend(
 /// seeds holds much the individual lacks, so the target's `depth` is given (recruitment's k-mer
 /// depth of its reads), not the median of `known`. Ends are the known k-mers at depth, either
 /// strand, with a next k-mer at depth that is not known: the bait's edges, and every place where
-/// the individual leaves the seeds (a difference from the related species). At most `budget` new
-/// k-mers.
+/// the individual leaves the seeds (a difference from the related species). Only bridges are
+/// kept: the k-mers on a walk's path from its end to where it rejoins `known`. In a genome's
+/// worth of whole-genome reads a nuclear repeat family is as deep as a mitochondrion, and its
+/// copies also hold the mitochondrion's own fragments of it: WL354's walks that kept every k-mer
+/// at depth took 503,526 (9,131 branches, 59 rejoins), and recruitment then followed them to
+/// 5.8 Gb of reads. At most `budget` new k-mers.
 pub fn extend_from_kmers(
     counts: &KmerCounts,
     known: &FxHashSet<u64>,
@@ -446,7 +450,7 @@ pub fn extend_from_kmers(
         .collect();
     ext.present_reference_kmers = found.iter().filter(|f| f.0).count();
     let ends = found.into_iter().flat_map(|f| f.1).collect();
-    walk(counts, known, ends, at_depth, budget, p, &mut ext);
+    walk(counts, known, ends, at_depth, budget, p, true, &mut ext);
     ext
 }
 
@@ -465,6 +469,8 @@ fn set_depth(ext: &mut Extension, depth: f64, p: &Params) -> Option<impl Fn(u32)
 
 /// Walk from every end (forward words) on the k-mers at depth, until the walk rejoins `known`
 /// (`JOIN_RUN`), stops, or runs out of budget; the new k-mers' unitigs go to `ext.sequences`.
+/// With `bridges_only`, an end's new k-mers are kept only on its paths to a rejoin.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     counts: &KmerCounts,
     known: &FxHashSet<u64>,
@@ -472,6 +478,7 @@ fn walk(
     at_depth: impl Fn(u32) -> bool,
     budget: usize,
     p: &Params,
+    bridges_only: bool,
     ext: &mut Extension,
 ) {
     let w = Words::new(counts.k);
@@ -484,6 +491,9 @@ fn walk(
         let (mut stack, mut walked) = (vec![(end, 0usize)], 0usize);
         // reference k-mers this end's walk went through (`JOIN_RUN`), each once
         let mut through: FxHashSet<u64> = FxHashSet::default();
+        // bridges only: this end's new k-mers, the word each word was first reached from, and
+        // the new k-mers on the paths back from its rejoins
+        let (mut mine, mut from, mut bridge) = (FxHashSet::default(), FxHashMap::default(), FxHashSet::default());
         while let Some((word, run)) = stack.pop() {
             let next: Vec<(u64, u32)> = w
                 .successors(word)
@@ -508,20 +518,42 @@ fn walk(
                 if known.contains(&key) {
                     if run + 1 >= JOIN_RUN {
                         ext.joins += 1;
+                        // bridges only: back along the walk to its end
+                        let mut at = if bridges_only { word } else { end };
+                        while at != end {
+                            let k = w.canonical(at);
+                            if !known.contains(&k) && !bridge.insert(k) {
+                                break; // the rest of the way back is already a bridge
+                            }
+                            match from.get(&at) {
+                                Some(&before) => at = before,
+                                None => break,
+                            }
+                        }
                     } else if through.insert(key) {
+                        if bridges_only {
+                            from.entry(x).or_insert(word);
+                        }
                         stack.push((x, run + 1));
                     }
                     continue;
                 }
-                if !new.insert(key) {
-                    continue;
+                if bridges_only {
+                    if new.contains(&key) || !mine.insert(key) {
+                        continue;
+                    }
+                    from.entry(x).or_insert(word);
+                } else {
+                    if !new.insert(key) {
+                        continue;
+                    }
+                    if new.len() >= budget {
+                        ext.budget_reached = true;
+                        ext.ends_extended += 1;
+                        break 'ends;
+                    }
                 }
                 walked += 1;
-                if new.len() >= budget {
-                    ext.budget_reached = true;
-                    ext.ends_extended += 1;
-                    break 'ends;
-                }
                 if walked >= p.max_per_end {
                     ext.capped_ends += 1;
                     break;
@@ -532,7 +564,16 @@ fn walk(
                 break;
             }
         }
-        ext.ends_extended += usize::from(walked > 0);
+        if bridges_only {
+            ext.ends_extended += usize::from(!bridge.is_empty());
+            new.extend(bridge);
+            if new.len() >= budget {
+                ext.budget_reached = true;
+                break;
+            }
+        } else {
+            ext.ends_extended += usize::from(walked > 0);
+        }
     }
     ext.new_kmers = new.len();
     // A piece that leads nowhere at one end and is shorter than a read is a sequencing error or
@@ -799,20 +840,26 @@ mod tests {
     }
 
     #[test]
-    fn a_bait_of_kmers_alone_walks_past_its_edges_and_past_a_relatives_differences() {
-        // recruitment's gate table: 21-mers; the bait is a relative's copy of the first 2,000
-        // bases (a difference every 400) and the shallow nucleus beside it
+    fn a_bait_of_kmers_alone_is_bridged_across_its_gaps_and_a_relatives_differences_only() {
+        // recruitment's gate table: 21-mers; the bait is a relative's copy of the organelle (a
+        // difference every 400) with 1,000 bases missing, beside the shallow nucleus and a
+        // nuclear repeat family as deep as the organelle that shares 200 bases with it
         let k = 21;
         let organelle = random(4000, 41);
         let nucleus = [random(1500, 42), organelle[2500..2600].to_vec(), random(1500, 43)].concat();
+        let repeat = [organelle[1300..1500].to_vec(), random(1000, 44)].concat();
         let table = KmerCounts::with_k(22, k);
         tile(&table, &organelle, 150, 3, 1); // ~100x
         tile(&table, &nucleus, 150, 30, 1); // ~10x, with a NUMT of the organelle
-        let mut relative = organelle[..2000].to_vec();
-        for i in (200..2000).step_by(400) {
+        tile(&table, &repeat, 150, 3, 1); // ~100x
+        let mut relative = organelle.clone();
+        for i in [200, 600, 1000, 2800, 3200] {
             relative[i] = if relative[i] == b'A' { b'C' } else { b'A' };
         }
-        let known: FxHashSet<u64> = CanonicalKmers::new(&relative, k).map(|(_, x)| x).collect();
+        let known: FxHashSet<u64> = [&relative[..1500], &relative[2500..3900]]
+            .into_iter()
+            .flat_map(|s| CanonicalKmers::new(s, k).map(|(_, x)| x))
+            .collect();
         let ext = extend_from_kmers(&table, &known, 100.0, 1_000_000, &Params::default());
         assert!(ext.skipped.is_none(), "{ext:?}");
         let w = Words::new(k);
@@ -821,16 +868,16 @@ mod tests {
             .copied()
             .chain(ext.sequences.iter().flat_map(|s| w.forward(s).into_iter().map(|(_, x)| w.canonical(x))))
             .collect();
-        // the individual's whole organelle (the tiling thins out over its last read length)
-        let reads_cover = &organelle[..3850];
-        let words: Vec<u64> = CanonicalKmers::new(reads_cover, k).map(|(_, x)| x).collect();
-        assert!(words.iter().all(|x| held.contains(x)), "{ext:?}");
-        // and nothing of the nucleus
-        let nuclear: FxHashSet<u64> = CanonicalKmers::new(&nucleus, k)
-            .map(|(_, x)| x)
-            .filter(|x| !CanonicalKmers::new(&organelle, k).any(|(_, y)| y == *x))
-            .collect();
-        assert!(nuclear.iter().all(|x| !held.contains(x)), "{ext:?}");
+        let words = |s: &[u8]| CanonicalKmers::new(s, k).map(|(_, x)| x).collect::<Vec<u64>>();
+        // the individual's organelle across the gap and the differences
+        assert!(words(&organelle[..3900]).iter().all(|x| held.contains(x)), "{ext:?}");
+        // but not past the bait's edge, where no walk rejoins
+        assert!(words(&organelle[3880..3950]).iter().all(|x| !held.contains(x)), "{ext:?}");
+        // nor into the repeat family, or anything of the nucleus
+        let organelles = words(&organelle).into_iter().collect::<FxHashSet<u64>>();
+        let foreign = words(&nucleus).into_iter().chain(words(&repeat)).filter(|x| !organelles.contains(x));
+        assert!(foreign.into_iter().all(|x| !held.contains(&x)), "{ext:?}");
+        assert!(ext.branches > 0, "{ext:?}");
         // a target far shallower than the floor is not walked
         let ext = extend_from_kmers(&table, &known, 5.0, 1_000_000, &Params::default());
         assert_eq!(ext.skipped, Some("too_shallow"));
