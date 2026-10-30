@@ -44,6 +44,7 @@ use crate::pipeline::{
     MIN_RECRUITED_BASES,
 };
 use crate::bait::BaitSet;
+use crate::kmer::CanonicalKmers;
 use crate::recruit::{classify, peak_rss_mb, unit_hash, Call, ClassifyParams};
 
 /// k of long-read recruitment. `find recruit --preset ont` defaults to 15, which with the
@@ -209,6 +210,71 @@ fn validate(long: &[PathBuf], short: Option<&Short>, o: &LongOptions) -> Result<
     Ok(())
 }
 
+/// A partly covered read joins its target's bait only when its depth is at least this share of
+/// the depth of the reads the target recruited. ZM4's ONT: the plastid seed is close, so the
+/// mitochondrial reads holding plastid-derived (MTPT) stretches fitted the plastid better than
+/// the distant mitochondrial seeds, and as the plastid's partly covered reads (976, 118 Mb) made
+/// its bait 1.3 M k-mers for a 125 kb genome; those reads are at the mitochondrion's depth, a
+/// twentieth of the plastid's. A read that reaches past its own target's bait is at its depth.
+pub const PARTIAL_DEPTH_SHARE: f64 = 0.25;
+
+/// k of the depth comparison: short enough for a read with 5-10% errors to keep many k-mers.
+const DEPTH_K: usize = 17;
+
+fn read_seqs(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    if !path.is_file() || fs::metadata(path)?.len() == 0 {
+        return Ok(out);
+    }
+    let mut reader = needletail::parse_fastx_file(path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    while let Some(record) = reader.next() {
+        out.push(record.with_context(|| format!("malformed record in {}", path.display()))?.seq().into_owned());
+    }
+    Ok(out)
+}
+
+/// An eighth of the canonical `DEPTH_K`-mers of `seq`, chosen by hash (the same in every read).
+fn depth_kmers(seq: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    CanonicalKmers::new(seq, DEPTH_K)
+        .map(|(_, kmer)| kmer)
+        .filter(|kmer| kmer.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61 == 0)
+}
+
+/// Which of the `partial` reads are at the depth of the `recruited` ones: a read's depth is the
+/// median count of its k-mers among both sets, and it is kept when that is at least
+/// `PARTIAL_DEPTH_SHARE` of the recruited reads' median depth. Nothing recruited, nothing to
+/// compare with: every read is kept (a seed that covers no read by 80%).
+pub fn at_target_depth(recruited: &[Vec<u8>], partial: &[&[u8]]) -> Vec<bool> {
+    if recruited.is_empty() {
+        return vec![true; partial.len()];
+    }
+    let mut counts: rustc_hash::FxHashMap<u64, u32> = Default::default();
+    for seq in recruited.iter().map(Vec::as_slice).chain(partial.iter().copied()) {
+        for kmer in depth_kmers(seq) {
+            *counts.entry(kmer).or_insert(0) += 1;
+        }
+    }
+    let depth = |seq: &[u8]| -> Option<u32> {
+        let mut c: Vec<u32> = depth_kmers(seq).map(|kmer| counts[&kmer]).collect();
+        if c.is_empty() {
+            return None;
+        }
+        let mid = c.len() / 2;
+        Some(*c.select_nth_unstable(mid).1)
+    };
+    let mut own: Vec<u32> = recruited.iter().filter_map(|s| depth(s)).collect();
+    if own.is_empty() {
+        return vec![true; partial.len()];
+    }
+    let mid = own.len() / 2;
+    let target = *own.select_nth_unstable(mid).1 as f64;
+    partial
+        .iter()
+        .map(|s| depth(s).is_some_and(|d| d as f64 >= PARTIAL_DEPTH_SHARE * target))
+        .collect()
+}
+
 /// `find recruit --preset ont`'s classification: a read is the target's when the bait covers
 /// 80% of it, partly covered (a NUMT candidate) when it holds a 2 kb block of the bait.
 fn ont_params() -> ClassifyParams {
@@ -260,9 +326,36 @@ fn split_partial(
                 record.with_context(|| format!("malformed record in {}", path.display()))?;
             let seq = record.seq();
             if let (Call::NumtCandidate(t), _) = classify(&seq, &bait, &params) {
-                bases[t] += seq.len() as u64;
                 calls.push((record.id().to_vec(), seq.into_owned(), t));
             }
+        }
+    }
+    // only reads at the depth of what their target recruited (see `at_target_depth`)
+    for (t, target) in bait.targets.iter().enumerate() {
+        let recruited = read_seqs(&dir.join(format!("{}.fastq", target.name)))?;
+        let idx: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].2 == t).collect();
+        let keep = at_target_depth(
+            &recruited,
+            &idx.iter().map(|&i| calls[i].1.as_slice()).collect::<Vec<_>>(),
+        );
+        let dropped = keep.iter().filter(|&&k| !k).count();
+        if dropped > 0 {
+            log(&format!(
+                "{dropped} of {} partly covered {} reads are below a quarter of its recruited \
+                 reads' depth (another organelle's or nuclear) and are left out",
+                idx.len(),
+                target.name
+            ));
+        }
+        for (&i, k) in idx.iter().zip(keep) {
+            if !k {
+                calls[i].2 = usize::MAX;
+            }
+        }
+    }
+    for c in &calls {
+        if c.2 != usize::MAX {
+            bases[c.2] += c.1.len() as u64;
         }
     }
     let mut out = BTreeMap::new();
@@ -950,6 +1043,20 @@ mod tests {
         assert!((len - genome.len() as i64).abs() <= 20, "{what}: {len} bp");
         let m = &molecules(dir)[0];
         assert!(contained(m, genome) > 0.99, "{what}: {:.4}", contained(m, genome));
+    }
+
+    #[test]
+    fn partly_covered_reads_at_another_depth_are_left_out() {
+        // recruited: a 20 kb genome at 50x; partial: 10 reads of it, 10 of a genome seen once
+        let (a, other) = (seq(20_000, 5), seq(60_000, 6));
+        let circ = [a.as_slice(), &a[..4000]].concat();
+        let recruited: Vec<Vec<u8>> = (0..20_000).step_by(80).map(|s| circ[s..s + 4000].to_vec()).collect();
+        let mut partial: Vec<&[u8]> = (0..10).map(|i| &circ[i * 1500..i * 1500 + 4000]).collect();
+        partial.extend((0..10).map(|i| &other[i * 6000..i * 6000 + 4000]));
+        let keep = at_target_depth(&recruited, &partial);
+        assert_eq!(keep, [vec![true; 10], vec![false; 10]].concat());
+        // nothing recruited: nothing to compare with
+        assert_eq!(at_target_depth(&[], &partial), vec![true; 20]);
     }
 
     #[test]
