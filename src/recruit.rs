@@ -1048,6 +1048,9 @@ pub struct RecruitReport {
     /// The depth from which a k-mer counted as deep when each target last extended
     /// (`extension_deep`), with the extension gate.
     pub extension_deep_depth: Vec<Option<f64>>,
+    /// With the k-mer gate: each target's frontier walk on the gate's table after the first
+    /// pass (`kmer_frontier`), None when it was not walked.
+    pub kmer_frontier: Vec<Option<crate::frontier::Extension>>,
     /// What a caller should know about the result: a doubtful depth gate, a target stopped by
     /// `size_cap`, or one still growing when the passes ran out.
     pub warnings: Vec<String>,
@@ -1121,6 +1124,31 @@ const KMER_GATE_FLOOR: f64 = 0.25;
 const KMER_GATE_CEILING: f64 = 10.0;
 /// Fewer new k-mers than this: the read adds nothing to judge, and extends.
 const KMER_GATE_MIN_NEW: usize = 5;
+
+/// Most new k-mers the k-mer gate's frontier walk takes for a target without a `size_cap`.
+const KMER_FRONTIER_BUDGET: u64 = 20_000_000;
+
+/// The frontier walk of the k-mer gate (`RecruitConfig::kmer_gate`): once the library's k-mers are
+/// counted, each target's bait is walked on the counts at its depth (`frontier::extend_from_kmers`)
+/// and the walked sequence joins the bait. Extension alone moves a bait's edge by about a fifth of
+/// a read a pass and stops when a pass grows the reads by under `saturation`: WL354's
+/// mitochondrion stopped after six passes holding reads of 88 kb of each of the two ZM4 HiFi
+/// circles (161 and 146 kb), with 33 and 40 stretches over 500 bp missing. The walk needs no
+/// read to be covered first; the gate's depth band keeps it out of the nucleus and the plastid.
+/// The walk, and the k-mers it added to the target.
+fn kmer_frontier(
+    table: &crate::frontier::KmerCounts,
+    bait: &mut BaitSet,
+    t: usize,
+    depth: f64,
+) -> (crate::frontier::Extension, usize) {
+    let known = bait.target_kmers(t);
+    let budget = size_cap(&bait.targets[t].name).unwrap_or(KMER_FRONTIER_BUDGET) as usize;
+    let ext = crate::frontier::extend_from_kmers(table, &known, depth, budget, &crate::frontier::Params::default());
+    drop(known);
+    let added = ext.sequences.iter().map(|s| bait.add_sequence_counted(t, s)).sum();
+    (ext, added)
+}
 
 /// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
 /// those the target's bait lacks, at the target's depth `depth` by the table's counts.
@@ -1670,6 +1698,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             }
         })
         .flatten();
+    let mut kmer_walks: Vec<Option<crate::frontier::Extension>> = vec![None; n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -1715,6 +1744,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             gate = Some(build_gate(&cfg, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
         }
         let mut depths = pass_depths(gate.as_ref(), &res);
+        // bait k-mers each target's frontier walk added (`kmer_frontier`)
+        let mut walked = vec![0usize; n_targets];
         if cfg.kmer_gate && kmer_table.is_none() && !last {
             let source = match replay.as_ref().filter(|r| r.ready) {
                 Some(cache) => cache.sequences(),
@@ -1732,6 +1763,26 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 table.seconds,
                 kmer_target_depth
             );
+            for t in 0..n_targets {
+                let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t]) else {
+                    continue;
+                };
+                let (ext, n) = kmer_frontier(&table, &mut bait, t, d);
+                walked[t] = n;
+                eprintln!(
+                    "[ovasm] k-mer frontier {}: depth {d:.0}, {} ends, {} extended, {} new {}-mers in {} pieces ({} bp){}{}",
+                    bait.targets[t].name,
+                    ext.ends,
+                    ext.ends_extended,
+                    ext.new_kmers,
+                    bait.k,
+                    ext.unitigs,
+                    ext.unitig_bases,
+                    if ext.budget_reached { " (budget reached)" } else { "" },
+                    ext.skipped.map(|s| format!(" (skipped: {s})")).unwrap_or_default()
+                );
+                kmer_walks[t] = Some(ext);
+            }
             kmer_table = Some(table);
         }
         for t in 0..n_targets {
@@ -1765,7 +1816,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 ));
             }
         }
-        let mut added = vec![0; n_targets];
+        let mut added = walked;
         let mut extended_from = vec![0u64; n_targets];
         let mut gated_out = vec![0u64; n_targets];
         let mut shallow_out = vec![0u64; n_targets];
@@ -1886,20 +1937,20 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         new.dedup();
                     }
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
-                    if runaway_bait_gain(previous, new.len()) {
+                    if runaway_bait_gain(previous, added[t] + new.len()) {
                         saturated[t] = true;
                         stopped[t] = Some("growing");
                         let w = format!(
                             "{}: extension stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved",
-                            bait.targets[t].name, it + 1, new.len(), previous
+                            bait.targets[t].name, it + 1, added[t] + new.len(), previous
                         );
                         eprintln!("[ovasm] warning: {w}");
                         warnings.push(w);
                         continue;
                     }
-                    added[t] = bait.add_kmers(t, &new);
+                    added[t] += bait.add_kmers(t, &new);
                 } else {
-                    added[t] = bait.extend_from_reads(
+                    added[t] += bait.extend_from_reads(
                         t,
                         picked.iter().map(Vec::as_slice),
                         cfg.extend_min_count,
@@ -2388,6 +2439,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             })
             .collect(),
         core_depth,
+        kmer_frontier: kmer_walks,
         warnings,
         elapsed_seconds: start.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),

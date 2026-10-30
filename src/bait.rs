@@ -451,6 +451,16 @@ impl BaitSet {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+
+    /// The canonical k-mers of one target.
+    pub fn target_kmers(&self, target: usize) -> FxHashSet<u64> {
+        let bit = 1u8 << target;
+        self.map
+            .iter()
+            .filter(|&(_, &m)| m & bit != 0)
+            .map(|(&x, _)| x)
+            .collect()
+    }
 }
 
 /// Seed reads keep k-mers from a quarter of the depth peak. Long reads recruited for an

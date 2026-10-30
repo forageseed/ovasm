@@ -33,9 +33,9 @@ use serde::Serialize;
 use crate::kmer::CanonicalKmers;
 
 /// Word length of the walk: long enough that the short repeats of a plant mitochondrion (most
-/// under 30 bp) do not branch it, and a 2-bit word still fits a `u64`.
+/// under 30 bp) do not branch it, and a 2-bit word still fits a `u64`. A walk on another table
+/// (recruitment's k-mer gate counts the bait's 21-mers) takes that table's k (`Words`).
 pub const K: usize = 31;
-const MASK: u64 = (1u64 << (2 * K)) - 1;
 
 /// What the walk needs besides the counts.
 #[derive(Debug, Clone, Serialize)]
@@ -202,52 +202,66 @@ fn encode(base: u8) -> Option<u64> {
     }
 }
 
-/// Reverse complement of a forward `K`-mer, in the encoding of `kmer::CanonicalKmers`.
-#[inline]
-fn rc(x: u64) -> u64 {
-    let mut y = !x;
-    y = ((y >> 2) & 0x3333_3333_3333_3333) | ((y & 0x3333_3333_3333_3333) << 2);
-    y = ((y >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((y & 0x0F0F_0F0F_0F0F_0F0F) << 4);
-    y.swap_bytes() >> (64 - 2 * K)
+/// Forward 2-bit words of one length, in the encoding of `kmer::CanonicalKmers`.
+#[derive(Clone, Copy)]
+struct Words {
+    k: usize,
+    mask: u64,
 }
 
-#[inline]
-fn canonical(x: u64) -> u64 {
-    x.min(rc(x))
-}
-
-/// Forward `K`-mers of a sequence, as (start, word); windows with a non-ACGT base are skipped.
-fn forward_kmers(seq: &[u8]) -> Vec<(usize, u64)> {
-    let (mut out, mut word, mut valid) = (Vec::new(), 0u64, 0usize);
-    for (i, &b) in seq.iter().enumerate() {
-        match encode(b) {
-            Some(c) => {
-                word = ((word << 2) | c) & MASK;
-                valid += 1;
-                if valid >= K {
-                    out.push((i + 1 - K, word));
-                }
-            }
-            None => valid = 0,
-        }
+impl Words {
+    fn new(k: usize) -> Self {
+        assert!((1..=crate::kmer::MAX_K).contains(&k), "k must be in 1..={}", crate::kmer::MAX_K);
+        Self { k, mask: (1u64 << (2 * k)) - 1 }
     }
-    out
-}
 
-fn decode(word: u64) -> Vec<u8> {
-    (0..K)
-        .map(|i| b"ACGT"[((word >> (2 * (K - 1 - i))) & 3) as usize])
-        .collect()
-}
+    /// Reverse complement of a forward word.
+    #[inline]
+    fn rc(self, x: u64) -> u64 {
+        let mut y = !x;
+        y = ((y >> 2) & 0x3333_3333_3333_3333) | ((y & 0x3333_3333_3333_3333) << 2);
+        y = ((y >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((y & 0x0F0F_0F0F_0F0F_0F0F) << 4);
+        y.swap_bytes() >> (64 - 2 * self.k)
+    }
 
-#[inline]
-fn successors(word: u64) -> [u64; 4] {
-    std::array::from_fn(|b| ((word << 2) | b as u64) & MASK)
-}
+    #[inline]
+    fn canonical(self, x: u64) -> u64 {
+        x.min(self.rc(x))
+    }
 
-#[inline]
-fn predecessors(word: u64) -> [u64; 4] {
-    std::array::from_fn(|b| (word >> 2) | ((b as u64) << (2 * (K - 1))))
+    /// Forward words of a sequence, as (start, word); windows with a non-ACGT base are skipped.
+    fn forward(self, seq: &[u8]) -> Vec<(usize, u64)> {
+        let (mut out, mut word, mut valid) = (Vec::new(), 0u64, 0usize);
+        for (i, &b) in seq.iter().enumerate() {
+            match encode(b) {
+                Some(c) => {
+                    word = ((word << 2) | c) & self.mask;
+                    valid += 1;
+                    if valid >= self.k {
+                        out.push((i + 1 - self.k, word));
+                    }
+                }
+                None => valid = 0,
+            }
+        }
+        out
+    }
+
+    fn decode(self, word: u64) -> Vec<u8> {
+        (0..self.k)
+            .map(|i| b"ACGT"[((word >> (2 * (self.k - 1 - i))) & 3) as usize])
+            .collect()
+    }
+
+    #[inline]
+    fn successors(self, word: u64) -> [u64; 4] {
+        std::array::from_fn(|b| ((word << 2) | b as u64) & self.mask)
+    }
+
+    #[inline]
+    fn predecessors(self, word: u64) -> [u64; 4] {
+        std::array::from_fn(|b| (word >> 2) | ((b as u64) << (2 * (self.k - 1))))
+    }
 }
 
 /// The frontier extension of one target, for `reconstruct.json`.
@@ -309,10 +323,11 @@ pub fn extend(
     stored_bases: u64,
     p: &Params,
 ) -> Extension {
+    let w = Words::new(counts.k);
     let mut known: FxHashSet<u64> = FxHashSet::default();
-    let words: Vec<Vec<(usize, u64)>> = reference.iter().map(|s| forward_kmers(s)).collect();
-    for w in &words {
-        known.extend(w.iter().map(|&(_, x)| canonical(x)));
+    let words: Vec<Vec<(usize, u64)>> = reference.iter().map(|s| w.forward(s)).collect();
+    for ws in &words {
+        known.extend(ws.iter().map(|&(_, x)| w.canonical(x)));
     }
     let mut ext = Extension {
         reference_kmers: known.len(),
@@ -338,11 +353,11 @@ pub fn extend(
     // contiguous read-length reference anchor before recovering an absent-majority
     // panel; use the existing minimum retained sequence length, not a new depth gate.
     if supported.len() * 2 < known.len() {
-        let anchored = words.iter().any(|w| {
+        let anchored = words.iter().any(|ws| {
             let mut run = 0usize;
             let mut previous = None;
-            w.iter().any(|&(pos, key)| {
-                if f64::from(counts.get(canonical(key))) >= MIN_DEPTH {
+            ws.iter().any(|&(pos, key)| {
+                if f64::from(counts.get(w.canonical(key))) >= MIN_DEPTH {
                     run = if previous == pos.checked_sub(1) { run + 1 } else { 1 };
                     previous = Some(pos);
                 } else { run = 0; previous = None; }
@@ -352,28 +367,24 @@ pub fn extend(
         if !anchored { ext.skipped = Some("sparse_reference_support"); return ext; }
     }
     let mid = supported.len() / 2;
-    ext.depth = f64::from(*supported.select_nth_unstable(mid).1);
-    let (floor, ceiling) = (p.floor * ext.depth, p.ceiling * ext.depth);
-    (ext.floor, ext.ceiling) = (floor, ceiling);
-    if ext.depth < MIN_DEPTH {
-        ext.skipped = Some("too_shallow");
+    let depth = f64::from(*supported.select_nth_unstable(mid).1);
+    let Some(at_depth) = set_depth(&mut ext, depth, p) else {
         return ext;
-    }
-    let at_depth = move |c: u32| f64::from(c) >= floor && f64::from(c) <= ceiling;
+    };
     ext.present_reference_kmers = depths.iter().filter(|&&c| at_depth(c)).count();
     // Ends: a present reference k-mer whose next one along the sequence (either strand) is not,
     // or that ends the sequence. Node sequences end where the graph goes on; their walk rejoins
     // the next node at once and adds nothing.
-    let present = |x: u64| at_depth(counts.get(canonical(x)));
-    let mut ends: Vec<u64> = words
+    let present = |x: u64| at_depth(counts.get(w.canonical(x)));
+    let ends: Vec<u64> = words
         .par_iter()
-        .flat_map_iter(|w| {
+        .flat_map_iter(|ws| {
             let mut out = Vec::new();
             for strand in [false, true] {
                 let seq: Vec<u64> = if strand {
-                    w.iter().rev().map(|&(_, x)| rc(x)).collect()
+                    ws.iter().rev().map(|&(_, x)| w.rc(x)).collect()
                 } else {
-                    w.iter().map(|&(_, x)| x).collect()
+                    ws.iter().map(|&(_, x)| x).collect()
                 };
                 for i in 0..seq.len() {
                     if present(seq[i]) && (i + 1 == seq.len() || !present(seq[i + 1])) {
@@ -384,10 +395,89 @@ pub fn extend(
             out
         })
         .collect();
+    let budget = (p.max_fold * stored_bases as f64) as usize;
+    walk(counts, &known, ends, at_depth, budget, p, &mut ext);
+    ext
+}
+
+/// Frontier walk from a target's k-mers alone (`known`, canonical, of `counts`' k), as
+/// recruitment's bait holds them: no reference sequence orders them, and a bait of many species'
+/// seeds holds much the individual lacks, so the target's `depth` is given (recruitment's k-mer
+/// depth of its reads), not the median of `known`. Ends are the known k-mers at depth, either
+/// strand, with a next k-mer at depth that is not known: the bait's edges, and every place where
+/// the individual leaves the seeds (a difference from the related species). At most `budget` new
+/// k-mers.
+pub fn extend_from_kmers(
+    counts: &KmerCounts,
+    known: &FxHashSet<u64>,
+    depth: f64,
+    budget: usize,
+    p: &Params,
+) -> Extension {
+    let w = Words::new(counts.k);
+    let mut ext = Extension {
+        reference_kmers: known.len(),
+        ..Default::default()
+    };
+    if known.is_empty() {
+        ext.skipped = Some("empty_reference");
+        return ext;
+    }
+    let Some(at_depth) = set_depth(&mut ext, depth, p) else {
+        return ext;
+    };
+    let present = |x: u64| at_depth(counts.get(w.canonical(x)));
+    let found: Vec<(bool, Vec<u64>)> = known
+        .par_iter()
+        .map(|&x| {
+            if !present(x) {
+                return (false, Vec::new());
+            }
+            let ends = [x, w.rc(x)]
+                .into_iter()
+                .filter(|&y| {
+                    w.successors(y)
+                        .into_iter()
+                        .any(|s| !known.contains(&w.canonical(s)) && present(s))
+                })
+                .collect();
+            (true, ends)
+        })
+        .collect();
+    ext.present_reference_kmers = found.iter().filter(|f| f.0).count();
+    let ends = found.into_iter().flat_map(|f| f.1).collect();
+    walk(counts, known, ends, at_depth, budget, p, &mut ext);
+    ext
+}
+
+/// The target's depth band from its depth (`Extension::depth`, `floor`, `ceiling`); None, with
+/// `skipped`, when it is too shallow to walk.
+fn set_depth(ext: &mut Extension, depth: f64, p: &Params) -> Option<impl Fn(u32) -> bool + Copy + Sync> {
+    ext.depth = depth;
+    let (floor, ceiling) = (p.floor * depth, p.ceiling * depth);
+    (ext.floor, ext.ceiling) = (floor, ceiling);
+    if depth < MIN_DEPTH {
+        ext.skipped = Some("too_shallow");
+        return None;
+    }
+    Some(move |c: u32| f64::from(c) >= floor && f64::from(c) <= ceiling)
+}
+
+/// Walk from every end (forward words) on the k-mers at depth, until the walk rejoins `known`
+/// (`JOIN_RUN`), stops, or runs out of budget; the new k-mers' unitigs go to `ext.sequences`.
+fn walk(
+    counts: &KmerCounts,
+    known: &FxHashSet<u64>,
+    mut ends: Vec<u64>,
+    at_depth: impl Fn(u32) -> bool,
+    budget: usize,
+    p: &Params,
+    ext: &mut Extension,
+) {
+    let w = Words::new(counts.k);
     ends.sort_unstable();
     ends.dedup();
     ext.ends = ends.len();
-    let budget = (p.max_fold * stored_bases as f64) as usize;
     let mut new: FxHashSet<u64> = FxHashSet::default();
     'ends: for &end in &ends {
         // (k-mer, how many reference k-mers in a row the walk has just taken to reach it)
@@ -395,9 +485,10 @@ pub fn extend(
         // reference k-mers this end's walk went through (`JOIN_RUN`), each once
         let mut through: FxHashSet<u64> = FxHashSet::default();
         while let Some((word, run)) = stack.pop() {
-            let next: Vec<(u64, u32)> = successors(word)
+            let next: Vec<(u64, u32)> = w
+                .successors(word)
                 .into_iter()
-                .map(|x| (x, counts.get(canonical(x))))
+                .map(|x| (x, counts.get(w.canonical(x))))
                 .filter(|&(_, c)| at_depth(c))
                 .collect();
             let Some(top) = next.iter().map(|n| n.1).max() else {
@@ -413,7 +504,7 @@ pub fn extend(
                 ext.branches += 1;
             }
             for x in taken {
-                let key = canonical(x);
+                let key = w.canonical(x);
                 if known.contains(&key) {
                     if run + 1 >= JOIN_RUN {
                         ext.joins += 1;
@@ -446,26 +537,25 @@ pub fn extend(
     ext.new_kmers = new.len();
     // A piece that leads nowhere at one end and is shorter than a read is a sequencing error or
     // a collision in the table followed for a few steps, not sequence of the target.
-    let anchored = |x: u64| known.contains(&canonical(x)) || new.contains(&canonical(x));
-    let (kept, tips): (Vec<Vec<u8>>, Vec<Vec<u8>>) = unitigs(&new).into_iter().partition(|s| {
-        let words = forward_kmers(s);
+    let anchored = |x: u64| known.contains(&w.canonical(x)) || new.contains(&w.canonical(x));
+    let (kept, tips): (Vec<Vec<u8>>, Vec<Vec<u8>>) = unitigs(w, &new).into_iter().partition(|s| {
+        let words = w.forward(s);
         let (first, last) = (words[0].1, words[words.len() - 1].1);
-        let left = predecessors(first).into_iter().any(anchored);
-        let right = successors(last).into_iter().any(anchored);
+        let left = w.predecessors(first).into_iter().any(anchored);
+        let right = w.successors(last).into_iter().any(anchored);
         (left && right) || s.len() >= MIN_TIP
     });
     ext.tips_removed = tips.len();
     ext.sequences = kept;
     ext.unitigs = ext.sequences.len();
     ext.unitig_bases = ext.sequences.iter().map(Vec::len).sum();
-    ext
 }
 
 /// Maximal nonbranching chains of a set of canonical k-mers, as sequences.
-fn unitigs(set: &FxHashSet<u64>) -> Vec<Vec<u8>> {
-    let has = |x: u64| set.contains(&canonical(x));
-    let out_of = |x: u64| successors(x).into_iter().filter(|&y| has(y)).collect::<Vec<_>>();
-    let into = |x: u64| predecessors(x).into_iter().filter(|&y| has(y)).count();
+fn unitigs(w: Words, set: &FxHashSet<u64>) -> Vec<Vec<u8>> {
+    let has = |x: u64| set.contains(&w.canonical(x));
+    let out_of = |x: u64| w.successors(x).into_iter().filter(|&y| has(y)).collect::<Vec<_>>();
+    let into = |x: u64| w.predecessors(x).into_iter().filter(|&y| has(y)).count();
     // the one next k-mer of `x` in the set that has `x` as its only predecessor
     let next = |x: u64| match out_of(x)[..] {
         [y] if into(y) == 1 => Some(y),
@@ -483,17 +573,17 @@ fn unitigs(set: &FxHashSet<u64>) -> Vec<Vec<u8>> {
         // where it comes round)
         let (mut first, mut back) = (key, FxHashSet::default());
         back.insert(key);
-        while let Some(y) = next(rc(first)).map(rc) {
-            if used.contains(&canonical(y)) || !back.insert(canonical(y)) {
+        while let Some(y) = next(w.rc(first)).map(|y| w.rc(y)) {
+            if used.contains(&w.canonical(y)) || !back.insert(w.canonical(y)) {
                 break;
             }
             first = y;
         }
-        used.insert(canonical(first));
-        let mut seq = decode(first);
+        used.insert(w.canonical(first));
+        let mut seq = w.decode(first);
         let mut word = first;
         while let Some(y) = next(word) {
-            if !used.insert(canonical(y)) {
+            if !used.insert(w.canonical(y)) {
                 break;
             }
             seq.push(b"ACGT"[(y & 3) as usize]);
@@ -519,6 +609,20 @@ pub fn write_fasta(path: &Path, name: &str, ext: &Extension) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const W: Words = Words { k: K, mask: (1u64 << (2 * K)) - 1 };
+    fn forward_kmers(seq: &[u8]) -> Vec<(usize, u64)> {
+        W.forward(seq)
+    }
+    fn canonical(x: u64) -> u64 {
+        W.canonical(x)
+    }
+    fn rc(x: u64) -> u64 {
+        W.rc(x)
+    }
+    fn decode(x: u64) -> Vec<u8> {
+        W.decode(x)
+    }
 
     // high bits of a mixed counter: xorshift's low bits repeat 31-mers in a few kb
     fn random(n: usize, seed: u64) -> Vec<u8> {
@@ -692,5 +796,43 @@ mod tests {
         let ext = extend(&table, &[genome[..500].to_vec()], 50, &Params::default());
         assert!(ext.budget_reached);
         assert_eq!(ext.new_kmers, 100);
+    }
+
+    #[test]
+    fn a_bait_of_kmers_alone_walks_past_its_edges_and_past_a_relatives_differences() {
+        // recruitment's gate table: 21-mers; the bait is a relative's copy of the first 2,000
+        // bases (a difference every 400) and the shallow nucleus beside it
+        let k = 21;
+        let organelle = random(4000, 41);
+        let nucleus = [random(1500, 42), organelle[2500..2600].to_vec(), random(1500, 43)].concat();
+        let table = KmerCounts::with_k(22, k);
+        tile(&table, &organelle, 150, 3, 1); // ~100x
+        tile(&table, &nucleus, 150, 30, 1); // ~10x, with a NUMT of the organelle
+        let mut relative = organelle[..2000].to_vec();
+        for i in (200..2000).step_by(400) {
+            relative[i] = if relative[i] == b'A' { b'C' } else { b'A' };
+        }
+        let known: FxHashSet<u64> = CanonicalKmers::new(&relative, k).map(|(_, x)| x).collect();
+        let ext = extend_from_kmers(&table, &known, 100.0, 1_000_000, &Params::default());
+        assert!(ext.skipped.is_none(), "{ext:?}");
+        let w = Words::new(k);
+        let held: FxHashSet<u64> = known
+            .iter()
+            .copied()
+            .chain(ext.sequences.iter().flat_map(|s| w.forward(s).into_iter().map(|(_, x)| w.canonical(x))))
+            .collect();
+        // the individual's whole organelle (the tiling thins out over its last read length)
+        let reads_cover = &organelle[..3850];
+        let words: Vec<u64> = CanonicalKmers::new(reads_cover, k).map(|(_, x)| x).collect();
+        assert!(words.iter().all(|x| held.contains(x)), "{ext:?}");
+        // and nothing of the nucleus
+        let nuclear: FxHashSet<u64> = CanonicalKmers::new(&nucleus, k)
+            .map(|(_, x)| x)
+            .filter(|x| !CanonicalKmers::new(&organelle, k).any(|(_, y)| y == *x))
+            .collect();
+        assert!(nuclear.iter().all(|x| !held.contains(x)), "{ext:?}");
+        // a target far shallower than the floor is not walked
+        let ext = extend_from_kmers(&table, &known, 5.0, 1_000_000, &Params::default());
+        assert_eq!(ext.skipped, Some("too_shallow"));
     }
 }
