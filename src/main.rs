@@ -10,6 +10,7 @@ mod components;
 mod correct;
 mod evidence;
 mod frontier;
+mod gpu;
 mod genotype;
 mod hpc;
 mod identify;

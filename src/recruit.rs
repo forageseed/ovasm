@@ -614,9 +614,19 @@ fn scan(
     delta: Option<&BaitSet>,
     final_outputs: bool,
     gate_sketch: Option<&mut crate::seedfree::GateSketch>,
+    gpu: Option<&mut crate::gpu::Gpu>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
+    // the change check of a replay pass, on the GPU while it works (else on the CPU, same answer)
+    let mut gpu = gpu.filter(|_| replaying && !final_outputs);
+    if let Some(d) = delta {
+        if let Some(Err(e)) = gpu.as_mut().map(|g| g.set_delta(d)) {
+            eprintln!("[ovasm] recruit: GPU change check stopped ({e:#}); checking on the CPU");
+            gpu = None;
+        }
+    }
+    let mut t_gpu = 0f64;
     // the depth gate's sketch, counted on its own thread from the k-mers the workers sample
     let sampling = gate_sketch.as_ref().map(|s| s.sampling());
     let sketcher = gate_sketch.map(|s| {
@@ -714,6 +724,17 @@ fn scan(
                 .collect();
             tx.send((reads, batch_bases)).context("depth sketch thread stopped")?;
         }
+        let tg = Instant::now();
+        let on_gpu = match gpu.as_mut().map(|g| g.changed(&batch)) {
+            Some(Ok(v)) => Some(v),
+            Some(Err(e)) => {
+                eprintln!("[ovasm] recruit: GPU change check stopped ({e:#}); checking on the CPU");
+                gpu = None;
+                None
+            }
+            None => None,
+        };
+        t_gpu += tg.elapsed().as_secs_f64();
         // the first pass encodes the batch for the cache while it classifies it
         let storing = !replaying && replay.is_some();
         let (encoded, calls) = rayon::join(
@@ -741,9 +762,10 @@ fn scan(
                         let delta = delta.expect("replay has change set");
                         let td = Instant::now();
                         // cached ACGT-only reads are scanned in their packed form
-                        let changed = match &rec.packed {
-                            Some(packed) => delta.any_key(PackedKmers::new(packed, seq.len(), bait.k)),
-                            None => delta.any_key(CanonicalKmers::new(seq, bait.k).map(|(_, key)| key)),
+                        let changed = match (on_gpu.as_ref().and_then(|v| v[i]), &rec.packed) {
+                            (Some(changed), _) => changed,
+                            (None, Some(packed)) => delta.any_key(PackedKmers::new(packed, seq.len(), bait.k)),
+                            (None, None) => delta.any_key(CanonicalKmers::new(seq, bait.k).map(|(_, key)| key)),
                         };
                         // unchanged: as it was; changed: kept with a new bound only when it
                         // cannot leave `Other` (the bound's full look, for such reads alone)
@@ -853,9 +875,9 @@ fn scan(
     }
     numt_w.flush()?;
     if profiling() { eprintln!(
-        "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
+        "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s gpu={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
         if final_outputs { "final" } else if replaying { "replay" } else { "source" },
-        delta.map_or(0, BaitSet::len), n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_par, t_serial,
+        delta.map_or(0, BaitSet::len), n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_gpu, t_par, t_serial,
         prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS),
         prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS)
     ); }
@@ -1381,6 +1403,18 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
+    let mut gpu = (crate::gpu::requested() && replay.is_some() && cfg.iterations > 1)
+        .then(|| match crate::gpu::Gpu::open() {
+            Ok(g) => {
+                eprintln!("[ovasm] recruit: replay passes check changed k-mers on the GPU (OVASM_GPU=1)");
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("[ovasm] recruit: OVASM_GPU=1 but no GPU ({e:#}); checking on the CPU");
+                None
+            }
+        })
+        .flatten();
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -1416,6 +1450,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             false,
             // only the first pass: without a cache every pass reads the inputs
             if it == 0 { gate_sketch.as_mut() } else { None },
+            gpu.as_mut(),
         )?;
         if crate::recruit::profiling() {
             eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
@@ -1776,6 +1811,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             replay.as_mut(),
             None,
             true,
+            None,
             None,
         )?;
         anyhow::ensure!(
