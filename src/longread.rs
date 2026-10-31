@@ -307,6 +307,69 @@ pub fn at_target_depth(recruited: &[Vec<u8>], partial: &[&[u8]]) -> Vec<bool> {
         .collect()
 }
 
+/// Short tandem repeats masked out of corrected reads used as bait: a run of at least this many
+/// bases of period 1 to `TANDEM_MAX_PERIOD`. Microsatellites occur all over the nuclear genome,
+/// so their k-mers in a bait recruit nuclear reads that are mostly microsatellite: ZM4's ONT at
+/// 12 Gb recruited two such reads into the mitochondrion's 81 in round 2, and after hybrid
+/// correction their (GA)n set the depth of the automatic k (23,504 at k 1001), which left the
+/// graph without a segment. The run is one recruitment k-mer (`RECRUIT_K`): correction leaves
+/// errors in a long microsatellite, which cut it into runs of 20 to 30 bases, and each of those
+/// still held a k-mer of pure repeat.
+pub const TANDEM_MIN_RUN: usize = RECRUIT_K;
+const TANDEM_MAX_PERIOD: usize = 6;
+
+/// Where `seq` repeats itself at a period of 1 to `TANDEM_MAX_PERIOD` for `TANDEM_MIN_RUN` bases or
+/// more, as N.
+pub fn mask_tandem(seq: &mut [u8]) -> usize {
+    let mut mask = vec![false; seq.len()];
+    for p in 1..=TANDEM_MAX_PERIOD {
+        let mut start = 0;
+        for i in 0..=seq.len().saturating_sub(p) {
+            let same = i + p < seq.len()
+                && seq[i].eq_ignore_ascii_case(&seq[i + p])
+                && seq[i] != b'N';
+            if !same {
+                // seq[start..i + p] repeats at period p
+                if i + p - start >= TANDEM_MIN_RUN && i > start {
+                    mask[start..i + p].iter_mut().for_each(|m| *m = true);
+                }
+                start = i + 1;
+            }
+        }
+    }
+    let mut n = 0;
+    for (b, m) in seq.iter_mut().zip(mask) {
+        if m {
+            *b = b'N';
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `src` (FASTA or FASTQ) to the FASTA `dst` with its short tandem repeats masked
+/// (`mask_tandem`); the bases masked.
+fn mask_tandem_fasta(src: &Path, dst: &Path) -> Result<u64> {
+    let mut w = BufWriter::new(fs::File::create(dst)?);
+    let mut masked = 0u64;
+    if src.is_file() && fs::metadata(src)?.len() > 0 {
+        let mut reader = needletail::parse_fastx_file(src)
+            .with_context(|| format!("cannot read {}", src.display()))?;
+        while let Some(record) = reader.next() {
+            let record = record.with_context(|| format!("malformed record in {}", src.display()))?;
+            let mut seq = record.seq().into_owned();
+            masked += mask_tandem(&mut seq) as u64;
+            w.write_all(b">")?;
+            w.write_all(record.id())?;
+            w.write_all(b"\n")?;
+            w.write_all(&seq)?;
+            w.write_all(b"\n")?;
+        }
+    }
+    w.flush()?;
+    Ok(masked)
+}
+
 /// `reads` down to `CORRECT_MAX_DEPTH`: when their median depth (see `read_depths`) is above it,
 /// the reads whose id hashes below the share are written to `out` and it is returned in their
 /// place. Also the record of it: depth, kept share, reads and bases kept.
@@ -752,7 +815,9 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                     let mut c = correct(&inputs, None, &fasta, o.salt)?;
                     c["purpose"] = "bait".into();
                     c["partial_reads"] = partial.get(organelle).map(|x| x.1).into();
-                    r.bait = Some(fasta);
+                    let masked = fasta.with_extension("masked.fasta");
+                    c["tandem_masked_bases"] = mask_tandem_fasta(&fasta, &masked)?.into();
+                    r.bait = Some(masked);
                     r.corrections.push(c);
                 }
             }
@@ -794,7 +859,9 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
         let mut baited = 0;
         for (name, r) in &reads {
             if let Ok(r) = r {
-                argv = argv.opt("--seed-reads", seed_spec(name, &r.corrected));
+                let masked = r.corrected.with_extension("masked.fasta");
+                mask_tandem_fasta(&r.corrected, &masked)?;
+                argv = argv.opt("--seed-reads", seed_spec(name, &masked));
                 baited += 1;
             }
         }
@@ -1176,6 +1243,53 @@ mod tests {
         // all of one depth: all kept
         assert_eq!(at_target_depth(&[], &refs[..40]), vec![true; 40]);
         assert_eq!(at_target_depth(&[], &[]), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn short_tandem_repeats_are_masked_and_the_rest_is_kept() {
+        let flank = seq(200, 9);
+        let ga = b"GA".repeat(20);
+        let mut s = [flank.as_slice(), &ga, &flank, b"C", &b"T".repeat(32), b"C", &flank].concat();
+        let n = mask_tandem(&mut s);
+        assert_eq!(n, 40 + 32, "{}", String::from_utf8_lossy(&s));
+        assert_eq!(&s[..200], flank.as_slice());
+        assert!(s[200..240].iter().all(|&b| b == b'N'));
+        assert_eq!(&s[240..440], flank.as_slice());
+        // runs shorter than a recruitment k-mer stay
+        let mut t = [flank.as_slice(), b"C", &b"GA".repeat(10), b"C", &flank].concat();
+        assert_eq!(mask_tandem(&mut t), 0);
+        // period 6
+        let mut u = [flank.as_slice(), &b"ACGTTG".repeat(5), &flank].concat();
+        assert!((30..=36).contains(&mask_tandem(&mut u)));
+    }
+
+    #[test]
+    fn a_microsatellite_in_the_bait_does_not_bring_in_nuclear_microsatellite_reads() {
+        // (GA)n in the mitochondrion's seed gap, so only round 2's bait of reads holds it, and 30
+        // nuclear reads that are mostly (GA)n
+        let dir = tmpdir("ga");
+        let mut s = sample(&dir, 0.05);
+        let ga = b"GA".repeat(30);
+        s.mito.splice(12_000..12_000, ga.iter().copied());
+        let mut rng = Rng(45);
+        let mut reads = long_reads(&s.mito, 8000, 130, 0.05, "m", &mut rng);
+        reads.extend(long_reads(&s.plastid, 8000, 53, 0.05, "p", &mut rng));
+        let nuclear = seq(400_000, 33);
+        reads.extend((0..30).map(|i| {
+            let r = [&nuclear[i * 9000..i * 9000 + 1000], b"GA".repeat(3500).as_slice()].concat();
+            (format!("g{i}"), noisy(&r, 0.02, &mut rng))
+        }));
+        fasta(&s.long, &reads);
+        let out = dir.join("out");
+        let mt = format!("mitochondrion={}", s.mt_seed.display());
+        let pt = format!("plastid={}", s.pt_seed.display());
+        let o = options(&["--organelle", "mitochondrion", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt]);
+        let m = run(&[s.long.clone()], None, &o).unwrap();
+        let recruited = fs::read_to_string(out.join("recruit/round2/mitochondrion.fastq")).unwrap();
+        assert!(!recruited.lines().any(|l| l.starts_with("@g")), "nuclear (GA)n reads recruited");
+        assert!(m["long_read"]["corrections"][0]["tandem_masked_bases"].as_u64().unwrap() > 40);
+        assert_genome(&out, &s.mito, "mitochondrion with a microsatellite");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
