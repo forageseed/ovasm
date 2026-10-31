@@ -347,6 +347,8 @@ pub struct GateReport {
     pub sampled_kmers: usize,
     pub nuclear_peak_depth: u32,
     pub organelle_min_depth: f64,
+    /// The organelle threshold over the nuclear peak (3, or `find recruit --gate-fold`).
+    pub depth_fold: f64,
     /// "reads" (`nuclear_read_depth`), or "kmers" where no read-depth peak stands for a nuclear
     /// genome (the mode of the read-context k-mer histogram).
     pub nuclear_source: &'static str,
@@ -543,6 +545,7 @@ impl DepthGate {
             sampled_kmers: sketch.counts.len(),
             nuclear_peak_depth: nuclear,
             organelle_min_depth: organelle_min,
+            depth_fold: params.depth_fold,
             nuclear_source,
             judged_reads: read_depth_histogram.iter().map(|h| h.1).sum(),
             peak_window_bases: window_bases,
@@ -568,6 +571,14 @@ impl DepthGate {
     /// Median sampled k-mer depth along the read (sketch depth), if any k-mer was sampled.
     pub fn median_depth(&self, seq: &[u8]) -> Option<f64> {
         self.profile(seq).map(|d| d.median)
+    }
+
+    /// The organelle threshold at `fold` times the nuclear peak instead of `discover`'s 3.
+    pub fn set_depth_fold(&mut self, fold: f64) {
+        self.params.depth_fold = fold;
+        self.organelle_min_depth = self.nuclear_peak_depth as f64 * fold;
+        self.report.organelle_min_depth = self.organelle_min_depth;
+        self.report.depth_fold = fold;
     }
 
     /// Both of the above from one look at the read's sampled k-mers.

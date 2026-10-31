@@ -1678,6 +1678,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 // read pairs close the circles (`close`)
                 mates_together: true,
                 kmer_gate: false,
+                gate_fold: None,
             },
         )?)?
     };
@@ -1718,6 +1719,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             recruit_cache: None,
             auto_recruit_cache: false,
             gated_recruit: false,
+            recruit_gate_fold: None,
             recruit_max_depth: None,
             recruit_max_bases: None,
             recruit_iterations: None,

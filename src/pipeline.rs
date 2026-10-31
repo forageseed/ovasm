@@ -117,6 +117,8 @@ pub struct RunConfig {
     pub auto_recruit_cache: bool,
     /// HiFi seed recruitment with `find recruit --extend-gate --bootstrap`.
     pub gated_recruit: bool,
+    /// `find recruit --gate-fold` of gated HiFi seed recruitment (None: the gate's 3).
+    pub recruit_gate_fold: Option<f64>,
     /// HiFi seed recruitment: `find recruit --max-read-depth` and `--max-bases`.
     pub recruit_max_depth: Option<f64>,
     pub recruit_max_bases: Option<u64>,
@@ -737,6 +739,7 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
     out.insert("gated_by_default".into(), gated.into());
     out.insert("iterations_run".into(), report["iterations_run"].clone());
     out.insert("core_depth".into(), report["core_depth"][index].clone());
+    out.insert("extension_deep_depth".into(), report["extension_deep_depth"][index].clone());
     let gate = &report["depth_gate"];
     out.insert(
         "depth_gate".into(),
@@ -746,6 +749,7 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
             json!({
                 "nuclear_peak_depth": gate["nuclear_peak_depth"],
                 "organelle_min_depth": gate["organelle_min_depth"],
+                "depth_fold": gate["depth_fold"],
                 "peak_window_bases": gate["peak_window_bases"],
                 "kmer_peak_depth": gate["kmer_peak_depth"],
                 "source": gate["source"],
@@ -969,6 +973,9 @@ fn recruit_all(
         if cfg.read_type == ReadType::Hifi {
             if cfg.gated_recruit {
                 argv = argv.arg("--extend-gate").arg("--bootstrap");
+                if let Some(f) = cfg.recruit_gate_fold {
+                    argv = argv.opt("--gate-fold", f.to_string());
+                }
             }
             if let Some(d) = cfg.recruit_max_depth {
                 argv = argv.opt("--max-read-depth", d.to_string());
@@ -2360,6 +2367,7 @@ mod tests {
             // `ovasm run`'s defaults
             auto_recruit_cache: true,
             gated_recruit: true,
+            recruit_gate_fold: None,
             recruit_max_depth: Some(250.0),
             recruit_max_bases: Some(1_000_000_000),
             recruit_iterations: None,
