@@ -387,6 +387,17 @@ impl BaitSet {
         })
     }
 
+    /// The prepared index as `gpu_delta.cu` reads it: filter words (eight per block), block mask,
+    /// table keys, table mask. Only the change set's are used there, whose masks are all 1.
+    pub fn lookup_parts(&self) -> Option<(&[u64], u64, &[u64], u64)> {
+        let index = self.lookup.as_ref()?;
+        // SAFETY: a `BloomBlock` is eight `u64`s (64 bytes, no padding).
+        let words = unsafe {
+            std::slice::from_raw_parts(index.bloom.as_ptr().cast::<u64>(), index.bloom.len() * 8)
+        };
+        Some((words, index.bloom_mask as u64, &index.keys, index.table_mask as u64))
+    }
+
     /// Rebuild after extension, before scanning reads (see `LookupIndex`).
     /// This changes lookup cost only: masks and all classification scores are exact.
     pub fn prepare_lookup(&mut self) {
