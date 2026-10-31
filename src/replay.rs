@@ -1,5 +1,10 @@
 //! Process-local, lossless replay of the original ordered recruitment batches.
 //! Only sequences are cached. Final output replays the original input once for exact qualities.
+//!
+//! Caching the qualities too did not pay: deflated (8.5 GB for a 12.9 GB DToL HiFi library)
+//! they cost the first pass about the 40 s they saved the final one, and stored as they are
+//! (19.6 GB) the final pass took 335 s to read them from a busy disk, against 99 s to
+//! decompress the input.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -7,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::recruit::{read_batches, Rec};
 use anyhow::{ensure, Context, Result};
+use rayon::prelude::*;
 
 pub struct Entry {
     pub rec: Rec,
@@ -18,6 +24,9 @@ pub struct Replay {
 
     pub ready: bool,
     pub calls: Vec<crate::recruit::Call>,
+    /// Per read, an upper bound on its coverage by any target since it was last classified
+    /// (`recruit::still_other`).
+    pub cover_bounds: Vec<u16>,
     pub reclassified_reads: Vec<u64>,
 }
 
@@ -53,6 +62,25 @@ fn pack(seq: &[u8]) -> Option<Vec<u8>> {
         out[i / 4] |= value << (2 * (i % 4));
     }
     Some(out)
+}
+
+/// One read's `sequence.bin` record: id and sequence lengths, whether the sequence is packed,
+/// the id, the sequence.
+fn encode(r: &Rec) -> Vec<u8> {
+    let packed = pack(&r.seq);
+    let body = packed.as_deref().unwrap_or(&r.seq);
+    let mut out = Vec::with_capacity(17 + r.id.len() + body.len());
+    out.extend_from_slice(&(r.id.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(r.seq.len() as u64).to_le_bytes());
+    out.push(u8::from(packed.is_some()));
+    out.extend_from_slice(&r.id);
+    out.extend_from_slice(body);
+    out
+}
+
+/// One batch encoded for the cache (`Replay::encode`), written by `Replay::write`.
+pub struct Encoded {
+    records: Vec<Vec<u8>>,
 }
 
 /// The four bases of every packed byte (`pack` puts base i at bits 2(i % 4) of byte i / 4).
@@ -99,24 +127,31 @@ impl Replay {
             sequence: Some(create("sequence.bin")?),
             ready: false,
             calls: Vec::new(),
+            cover_bounds: Vec::new(),
             reclassified_reads: Vec::new(),
         })
     }
 
-    pub fn store(&mut self, batch: &[Entry]) -> Result<()> {
+    /// One batch for `write`, encoded on the worker threads: the scan encodes a batch while it
+    /// classifies it (packing on the scan's own thread took 46-53 s of a ~200 s first pass).
+    pub fn encode(batch: &[Entry]) -> Encoded {
+        Encoded {
+            records: batch.par_iter().map(|e| encode(&e.rec)).collect(),
+        }
+    }
+
+    pub fn write(&mut self, batch: Encoded) -> Result<()> {
         ensure!(!self.ready, "recruit cache is already complete");
         let s = self.sequence.as_mut().expect("writer open");
-        number(s, batch.len() as u64)?;
-        for entry in batch {
-            let r = &entry.rec;
-            let packed = pack(&r.seq);
-            number(s, r.id.len() as u64)?;
-            number(s, r.seq.len() as u64)?;
-            s.write_all(&[u8::from(packed.is_some())])?;
-            s.write_all(&r.id)?;
-            s.write_all(packed.as_deref().unwrap_or(&r.seq))?;
+        number(s, batch.records.len() as u64)?;
+        for r in &batch.records {
+            s.write_all(r)?;
         }
         Ok(())
+    }
+
+    pub fn store(&mut self, batch: &[Entry]) -> Result<()> {
+        self.write(Self::encode(batch))
     }
 
     pub fn finish(&mut self) -> Result<()> {
@@ -138,6 +173,7 @@ impl Replay {
         let thread = std::thread::spawn(move || -> Result<()> {
             let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
             loop {
+                let tw = std::time::Instant::now();
                 let count = next_number(&mut r)?;
                 if count == 0 {
                     break;
@@ -167,9 +203,12 @@ impl Replay {
                         },
                     });
                 }
+                crate::recruit::PROF_READER_WORK_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                let ts = std::time::Instant::now();
                 if tx.send(batch).is_err() {
                     return Ok(());
                 }
+                crate::recruit::PROF_READER_SEND_NS.fetch_add(ts.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(())
         });

@@ -65,6 +65,70 @@ struct Sketch {
     bases: u64,
 }
 
+/// `find discover`'s long-read defaults, as `DepthGate::long_reads` sketches with them (scale
+/// 64, the whole input).
+fn long_read_gate_params() -> DiscoverParams {
+    DiscoverParams {
+        k: 21,
+        scale: 64,
+        sketch_bases: 0,
+        depth_fold: 3.0,
+        min_sampled: 20,
+        min_high_frac: 0.9,
+        max_spread: 1.5,
+        min_distinct: 0.8,
+        min_cluster_reads: 20,
+        target_depth: None,
+        salt: 0,
+        dump_profiles: false,
+    }
+}
+
+/// The depth gate's first sketch pass, counted from reads another pass already reads
+/// (recruitment's first pass): `sample` per read on any thread, `add` in any order. The counts do
+/// not depend on the order, so the gate is the one `DepthGate::long_reads_from` builds.
+pub struct GateSketch {
+    sketch: Sketch,
+    k: usize,
+    threshold: u64,
+}
+
+impl Default for GateSketch {
+    fn default() -> Self {
+        let p = long_read_gate_params();
+        Self {
+            sketch: Sketch {
+                counts: FxHashMap::default(),
+                bases: 0,
+            },
+            k: p.k,
+            threshold: u64::MAX / p.scale,
+        }
+    }
+}
+
+impl GateSketch {
+    /// The sampled k-mers of one read.
+    pub fn sample(k: usize, threshold: u64, seq: &[u8]) -> Vec<u64> {
+        sampled(seq, k, threshold).collect()
+    }
+
+    /// `k` and `threshold` for `sample`.
+    pub fn sampling(&self) -> (usize, u64) {
+        (self.k, self.threshold)
+    }
+
+    /// One batch: the sampled k-mers of each read and the batch's bases.
+    pub fn add(&mut self, reads: Vec<Vec<u64>>, bases: u64) {
+        self.sketch.bases += bases;
+        for v in reads {
+            for km in v {
+                *self.sketch.counts.entry(km).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
 /// Batches of reads and the thread producing them: the input files (`read_batches`), or the
 /// recruitment cache that holds their sequences (`Replay::sequences`).
 pub type Batches = (
@@ -425,28 +489,37 @@ impl DepthGate {
         Self::long_reads_with(source, label, MIN_NUCLEAR_GENOME)
     }
 
+    /// `long_reads_from` with the sketch already counted (`GateSketch`, during recruitment's first
+    /// pass over the inputs): only the nuclear pass reads `source`.
+    pub fn long_reads_from_sketch(
+        sketch: GateSketch,
+        source: impl Fn() -> Batches,
+        label: &'static str,
+    ) -> Result<Self> {
+        Self::long_reads_with_sketch(Some(sketch.sketch), source, label, MIN_NUCLEAR_GENOME)
+    }
+
     fn long_reads_with(
         source: impl Fn() -> Batches,
         label: &'static str,
         min_genome: u64,
     ) -> Result<Self> {
+        Self::long_reads_with_sketch(None, source, label, min_genome)
+    }
+
+    fn long_reads_with_sketch(
+        sketch: Option<Sketch>,
+        source: impl Fn() -> Batches,
+        label: &'static str,
+        min_genome: u64,
+    ) -> Result<Self> {
         let start = Instant::now();
-        let params = DiscoverParams {
-            k: 21,
-            scale: 64,
-            sketch_bases: 0,
-            depth_fold: 3.0,
-            min_sampled: 20,
-            min_high_frac: 0.9,
-            max_spread: 1.5,
-            min_distinct: 0.8,
-            min_cluster_reads: 20,
-            target_depth: None,
-            salt: 0,
-            dump_profiles: false,
-        };
+        let params = long_read_gate_params();
         let threshold = u64::MAX / params.scale;
-        let sketch = build_sketch(source(), &params, threshold)?;
+        let sketch = match sketch {
+            Some(sketch) => sketch,
+            None => build_sketch(source(), &params, threshold)?,
+        };
         let (kmers, medians) = nuclear_pass(source(), &sketch, &params, threshold)?;
         let kmer_peak = histogram_peak(&kmers);
         let (by_reads, read_depth_histogram) = nuclear_read_depth(&medians, min_genome);

@@ -13,6 +13,19 @@ use rustc_hash::{FxHashSet, FxHasher};
 use serde::Serialize;
 
 use crate::bait::BaitSet;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+/// Profiling build: nanoseconds summed over threads.
+pub static PROF_DELTA_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_CLASSIFY_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_READER_WORK_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_READER_SEND_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+fn prof_take(a: &AtomicU64) -> f64 { a.swap(0, Relaxed) as f64 / 1e9 }
+/// `OVASM_PROFILE` set: each recruitment pass reports where its time went.
+pub fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OVASM_PROFILE").is_some())
+}
 use crate::kmer::CanonicalKmers;
 use crate::seedfree::{DepthGate, ReadDepth};
 
@@ -77,6 +90,8 @@ pub struct ReadScore {
     pub longest_block: usize,
     /// Covered, but a tandem array (`ClassifyParams::min_distinct`): called `Other`.
     pub tandem: bool,
+    /// The best target's gap-bridged coverage in bases, the most of any target (`still_other`).
+    pub cover: usize,
 }
 
 /// Bait hits of one read, per target.
@@ -101,11 +116,10 @@ fn target_hits(seq: &[u8], bait: &BaitSet, block_gap: usize) -> TargetHits {
     };
     let mut last_end = [0usize; 8];
     let mut block_start = [0usize; 8];
-    for (pos, kmer) in CanonicalKmers::new(seq, k) {
+    bait.scan_masks(seq, |pos, mask| {
         h.total += 1;
-        let mask = bait.get(kmer);
         if mask == 0 {
-            continue;
+            return;
         }
         let end = pos + k;
         for t in 0..n {
@@ -123,7 +137,7 @@ fn target_hits(seq: &[u8], bait: &BaitSet, block_gap: usize) -> TargetHits {
             last_end[t] = last_end[t].max(end);
             h.hits[t] += 1;
         }
-    }
+    });
     for t in 0..n {
         if h.hits[t] > 0 {
             let len = last_end[t] - block_start[t];
@@ -132,6 +146,49 @@ fn target_hits(seq: &[u8], bait: &BaitSet, block_gap: usize) -> TargetHits {
         }
     }
     h
+}
+
+/// What a bait change can add to a read's coverage, for `still_other`: `None` when no k-mer of the
+/// read changed, else an upper bound on how much any target's gap-bridged coverage
+/// (`TargetHits::block_cover`) can grow. A target's new hits are its old ones plus some of the
+/// changed k-mers. Coverage only grows as hits are added, and the changed k-mers' own blocks
+/// (bridged as `target_hits` bridges) add at most their length plus one bridged gap of at most
+/// `block_gap` on each side to a target's blocks: hence their length plus `2 * block_gap` a block.
+fn added_cover(seq: &[u8], delta: &BaitSet, block_gap: usize) -> Option<usize> {
+    let k = delta.k;
+    let (mut any, mut start, mut last_end, mut cover, mut blocks) = (false, 0, 0, 0, 0);
+    delta.scan_masks(seq, |pos, mask| {
+        if mask == 0 {
+            return;
+        }
+        if !any {
+            any = true;
+            start = pos;
+        } else if pos > last_end + block_gap {
+            cover += last_end - start;
+            blocks += 1;
+            start = pos;
+        }
+        last_end = last_end.max(pos + k);
+    });
+    any.then(|| cover + (last_end - start) + 2 * block_gap * (blocks + 1))
+}
+
+/// A read last called `Other` with at most `bound` coverage by any target stays `Other` when even
+/// `bound + added` reaches neither the organelle call's `min_cover` nor a NUMT candidate's block
+/// (a block is never longer than the coverage): then the new bound, and the read is not
+/// reclassified. `u16::MAX` stands for an unknown bound (coverage past 65,535 bp).
+///
+/// Bait extension reclassified reads holding any changed k-mer, and the k-mers of a repeat
+/// reach most reads of a library: on Eleocharis quinqueflora HiFi two of sixteen replayed passes
+/// reclassified 2.25 M of 2.25 M reads, at 160-175 s each, for a few organelle reads.
+fn still_other(call: Call, bound: u16, added: usize, len: usize, p: &ClassifyParams) -> Option<u16> {
+    if call != Call::Other || bound == u16::MAX {
+        return None;
+    }
+    let new = bound as usize + added;
+    let below = new < p.numt_min_block && (new as f64) < p.min_cover * len as f64;
+    (below && new < u16::MAX as usize).then_some(new as u16)
 }
 
 /// Score a read against every target and decide what it is.
@@ -159,6 +216,7 @@ pub fn classify(seq: &[u8], bait: &BaitSet, p: &ClassifyParams) -> (Call, ReadSc
         hit_frac: hits[best] as f64 / total as f64,
         longest_block: longest[best],
         tandem: false,
+        cover: block_cover[best],
     };
     let call = if score.cover_frac >= p.min_cover && score.hit_frac >= p.min_hit_frac {
         if p.min_distinct > 0.0 && distinct_share(seq, bait.k) < p.min_distinct {
@@ -503,6 +561,7 @@ fn read_file(path: &Path, tx: &crossbeam_channel::Sender<Vec<Rec>>) -> Result<()
     let mut parser = needletail::parse_fastx_file(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     let (mut batch, mut bases) = (Vec::new(), 0usize);
+    let mut tp = Instant::now();
     while let Some(record) = parser.next() {
         let record = record.with_context(|| format!("malformed record in {}", path.display()))?;
         bases += record.num_bases();
@@ -512,9 +571,13 @@ fn read_file(path: &Path, tx: &crossbeam_channel::Sender<Vec<Rec>>) -> Result<()
             qual: record.qual().map(<[u8]>::to_vec),
         });
         if bases >= BATCH_BASES {
+            PROF_PARSE_NS.fetch_add(tp.elapsed().as_nanos() as u64, Relaxed);
+            let ts = Instant::now();
             if tx.send(std::mem::take(&mut batch)).is_err() {
                 return Ok(());
             }
+            PROF_READER_SEND_NS.fetch_add(ts.elapsed().as_nanos() as u64, Relaxed);
+            tp = Instant::now();
             bases = 0;
         }
     }
@@ -550,9 +613,23 @@ fn scan(
     mut replay: Option<&mut crate::replay::Replay>,
     delta: Option<&BaitSet>,
     final_outputs: bool,
+    gate_sketch: Option<&mut crate::seedfree::GateSketch>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
+    // the depth gate's sketch, counted on its own thread from the k-mers the workers sample
+    let sampling = gate_sketch.as_ref().map(|s| s.sampling());
+    let sketcher = gate_sketch.map(|s| {
+        let (tx, rx) = crossbeam_channel::bounded::<(Vec<Vec<u64>>, u64)>(4);
+        let mut owned = std::mem::take(s);
+        let thread = std::thread::spawn(move || {
+            for (reads, bases) in rx {
+                owned.add(reads, bases);
+            }
+            owned
+        });
+        (s, tx, thread)
+    });
     let (rx, reader) = if replaying && !final_outputs {
         replay.as_ref().unwrap().batches()
     } else {
@@ -588,7 +665,16 @@ fn scan(
         reclassified: 0,
         tandem: 0,
     };
-    for batch in rx {
+    let (mut t_wait, mut t_par, mut t_serial, mut t_check, mut n_batches) = (0f64, 0f64, 0f64, 0f64, 0u64);
+    let scan_start = Instant::now();
+    let _ = (prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS), prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS));
+    let mut rx_iter = rx.into_iter();
+    loop {
+        let tw = Instant::now();
+        let Some(batch) = rx_iter.next() else { break };
+        t_wait += tw.elapsed().as_secs_f64();
+        n_batches += 1;
+        let tc = Instant::now();
         if let Some((expected, _)) = &expected_input {
             let cached = expected
                 .recv()
@@ -602,51 +688,93 @@ fn scan(
                 "original identifiers or sequences changed during recruitment replay"
             );
         }
-        if !replaying {
-            if let Some(cache) = replay.as_mut() {
-                cache.store(&batch)?;
-            }
-        }
+        t_check += tc.elapsed().as_secs_f64();
         let offset = out.reads as usize;
         let previous = if replaying {
-            Some(
-                replay
-                    .as_ref()
-                    .unwrap()
+            let cache = replay.as_ref().unwrap();
+            let range = offset..offset + batch.len();
+            Some((
+                cache
                     .calls
-                    .get(offset..offset + batch.len())
+                    .get(range.clone())
                     .context("input has more records than the recruitment cache")?,
-            )
+                &cache.cover_bounds[range],
+            ))
         } else {
             None
         };
         out.reads += batch.len() as u64;
-        out.bases += batch.iter().map(|r| r.rec.seq.len() as u64).sum::<u64>();
-        let calls: Vec<(Call, crate::replay::Entry, bool, bool)> = batch
-            .into_par_iter()
-            .enumerate()
-            .map(|(i, rec)| {
-                let changed = previous.is_none()
-                    || (!final_outputs
-                        && CanonicalKmers::new(&rec.rec.seq, bait.k)
-                            .any(|(_, key)| delta.expect("replay has change set").get(key) != 0));
-                let (call, tandem) = if changed {
-                    let (call, score) = classify(&rec.rec.seq, bait, p);
-                    (call, score.tandem)
-                } else {
-                    (previous.unwrap()[i], false)
-                };
-                (call, rec, changed, tandem)
-            })
-            .collect();
-        for (i, (call, entry, changed, tandem)) in calls.into_iter().enumerate() {
+        let batch_bases = batch.iter().map(|r| r.rec.seq.len() as u64).sum::<u64>();
+        out.bases += batch_bases;
+        let tpar = Instant::now();
+        if let (Some((k, threshold)), Some((_, tx, _))) = (sampling, sketcher.as_ref()) {
+            let reads = batch
+                .par_iter()
+                .map(|r| crate::seedfree::GateSketch::sample(k, threshold, &r.rec.seq))
+                .collect();
+            tx.send((reads, batch_bases)).context("depth sketch thread stopped")?;
+        }
+        // the first pass encodes the batch for the cache while it classifies it
+        let storing = !replaying && replay.is_some();
+        let (encoded, calls) = rayon::join(
+            || storing.then(|| crate::replay::Replay::encode(&batch)),
+            || -> Vec<(Call, bool, bool, u16)> {
+                batch
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, rec)| {
+                        let seq = &rec.rec.seq;
+                        let classified = || {
+                            let tcl = Instant::now();
+                            let (call, score) = classify(seq, bait, p);
+                            PROF_CLASSIFY_NS.fetch_add(tcl.elapsed().as_nanos() as u64, Relaxed);
+                            let bound = u16::try_from(score.cover).unwrap_or(u16::MAX);
+                            (call, true, score.tandem, bound)
+                        };
+                        let Some((calls, bounds)) = previous else {
+                            return classified();
+                        };
+                        let (call, bound) = (calls[i], bounds[i]);
+                        if final_outputs {
+                            return (call, false, false, bound);
+                        }
+                        let delta = delta.expect("replay has change set");
+                        let td = Instant::now();
+                        let changed = CanonicalKmers::new(seq, bait.k).any(|(_, key)| delta.get(key) != 0);
+                        // unchanged: as it was; changed: kept with a new bound only when it
+                        // cannot leave `Other` (the bound's full look, for such reads alone)
+                        let kept = if !changed {
+                            Some(bound)
+                        } else if call == Call::Other && bound != u16::MAX {
+                            added_cover(seq, delta, p.block_gap)
+                                .and_then(|added| still_other(call, bound, added, seq.len(), p))
+                        } else {
+                            None
+                        };
+                        PROF_DELTA_NS.fetch_add(td.elapsed().as_nanos() as u64, Relaxed);
+                        match kept {
+                            Some(bound) => (call, false, false, bound),
+                            None => classified(),
+                        }
+                    })
+                    .collect()
+            },
+        );
+        if let Some(encoded) = encoded {
+            replay.as_mut().expect("storing into the cache").write(encoded)?;
+        }
+        t_par += tpar.elapsed().as_secs_f64();
+        let tser = Instant::now();
+        for (i, ((call, changed, tandem, bound), entry)) in calls.into_iter().zip(batch).enumerate() {
             out.reclassified += u64::from(changed);
             out.tandem += u64::from(tandem);
             if let Some(cache) = replay.as_mut() {
                 if replaying {
                     cache.calls[offset + i] = call;
+                    cache.cover_bounds[offset + i] = bound;
                 } else {
                     cache.calls.push(call);
+                    cache.cover_bounds.push(bound);
                 }
             }
             if call == Call::Other {
@@ -693,7 +821,9 @@ fn scan(
                 Call::Other => {}
             }
         }
+        t_serial += tser.elapsed().as_secs_f64();
     }
+    let t_loop = scan_start.elapsed().as_secs_f64();
     reader.join().expect("reader thread panicked")?;
     if let Some((expected, reader)) = expected_input {
         anyhow::ensure!(
@@ -701,6 +831,10 @@ fn scan(
             "original input has fewer batches than its recruitment cache"
         );
         reader.join().expect("cache reader panicked")?;
+    }
+    if let Some((s, tx, thread)) = sketcher {
+        drop(tx);
+        *s = thread.join().expect("depth sketch thread panicked");
     }
     if let Some(cache) = replay {
         if !replaying {
@@ -714,6 +848,14 @@ fn scan(
         w.flush()?;
     }
     numt_w.flush()?;
+    if profiling() { eprintln!(
+        "[ovasm] profile scan kind={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
+        if final_outputs { "final" } else if replaying { "replay" } else { "source" },
+        n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_par, t_serial,
+        prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS),
+        prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS)
+    ); }
+    let _ = t_loop;
     Ok(out)
 }
 
@@ -1093,11 +1235,18 @@ fn bootstrap_candidates(
 fn build_gate(
     inputs: &[PathBuf],
     replay: Option<&crate::replay::Replay>,
+    sketch: Option<crate::seedfree::GateSketch>,
     warnings: &mut Vec<String>,
 ) -> Result<DepthGate> {
-    let gate = match replay.filter(|r| r.ready) {
-        Some(cache) => DepthGate::long_reads_from(|| cache.sequences(), "recruitment cache")?,
-        None => DepthGate::long_reads(inputs)?,
+    let gate = match (replay.filter(|r| r.ready), sketch) {
+        (Some(cache), Some(s)) => {
+            DepthGate::long_reads_from_sketch(s, || cache.sequences(), "first pass and recruitment cache")?
+        }
+        (None, Some(s)) => {
+            DepthGate::long_reads_from_sketch(s, || read_batches(inputs), "first pass and inputs")?
+        }
+        (Some(cache), None) => DepthGate::long_reads_from(|| cache.sequences(), "recruitment cache")?,
+        (None, None) => DepthGate::long_reads(inputs)?,
     };
     eprintln!(
         "[ovasm] depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth), from the {} in {:.0}s",
@@ -1216,6 +1365,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // the first time a target needs bootstrapping.
     let mut gate: Option<DepthGate> = None;
     let wants_gate = cfg.extend_gate || cfg.max_read_depth.is_some();
+    // The gate's first sketch pass, counted during the first pass over the inputs instead of in
+    // a pass of its own (129-181 s for the two passes on 13-15 GB of DToL HiFi): whenever a gate
+    // may be built, by the condition after the first pass or by a bootstrap.
+    let mut gate_sketch = ((wants_gate || cfg.bootstrap)
+        && (cfg.iterations.max(1) > 1 || cfg.max_read_depth.is_some()))
+    .then(crate::seedfree::GateSketch::default);
     let mut core_depth: Vec<Option<f64>> = vec![None; n_targets];
     let mut warnings: Vec<String> = Vec::new();
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
@@ -1255,10 +1410,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             replay.as_mut(),
             delta.as_ref(),
             false,
+            // only the first pass: without a cache every pass reads the inputs
+            if it == 0 { gate_sketch.as_mut() } else { None },
         )?;
+        if crate::recruit::profiling() {
+            eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
+        }
         let last = it + 1 == cfg.iterations.max(1);
         if gate.is_none() && wants_gate && (!last || cfg.max_read_depth.is_some()) {
-            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), &mut warnings)?);
+            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
         }
         let mut depths = pass_depths(gate.as_ref(), &res);
         if cfg.kmer_gate && kmer_table.is_none() && !last {
@@ -1485,7 +1645,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     continue;
                 }
                 if gate.is_none() {
-                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), &mut warnings)?);
+                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
                     depths = pass_depths(gate.as_ref(), &res);
                 }
                 if !numt_ready {
@@ -1612,6 +1772,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             replay.as_mut(),
             None,
             true,
+            None,
         )?;
         anyhow::ensure!(
             final_res.reads == res.reads && final_res.bases == res.bases,
@@ -1813,6 +1974,73 @@ mod tests {
                 assert_eq!(replayed, classify(read, &bait, &params()).0);
             }
         }
+    }
+
+    #[test]
+    fn reads_skipped_by_their_cover_bound_keep_the_calls_of_a_full_reclassification() {
+        // a repeat in every "nuclear" read; bait grows by organelle pieces and by the repeat
+        let organelle = pseudo_random(30_000, 701);
+        let repeat = pseudo_random(60, 702);
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        for i in 0..60u64 {
+            let mut r = pseudo_random(3000, 800 + i);
+            let at = (i as usize * 37) % 2900;
+            r[at..at + 60].copy_from_slice(&repeat);
+            if i % 5 == 0 {
+                // a NUMT-like read: 600 bp of organelle in nuclear flanks
+                let o = (i as usize * 401) % 29_000;
+                r[1000..1600].copy_from_slice(&organelle[o..o + 600]);
+            }
+            reads.push(r);
+        }
+        for i in 0..20 {
+            reads.push(organelle[i * 1400..i * 1400 + 3000].to_vec());
+        }
+        let p = ClassifyParams {
+            min_distinct: 0.0,
+            min_cover: 0.8,
+            min_hit_frac: 0.2,
+            numt_min_block: 300,
+            block_gap: 50,
+        };
+        let mut bait = bait_from(&organelle[..2000], 21);
+        bait.target("plastid").unwrap();
+        bait.track_changes();
+        let (mut calls, mut bounds): (Vec<Call>, Vec<u16>) = reads
+            .iter()
+            .map(|r| {
+                let (c, s) = classify(r, &bait, &p);
+                (c, s.cover as u16)
+            })
+            .unzip();
+        let mut skipped = 0;
+        let pieces: Vec<(usize, Vec<u8>)> = (0..14)
+            .map(|i| (0, organelle[2000 + i * 2000..4000 + i * 2000].to_vec()))
+            .chain([(0, repeat[..40].to_vec()), (1, repeat.clone()), (1, organelle[100..900].to_vec())])
+            .collect();
+        for (target, piece) in pieces {
+            bait.add_sequence(target, &piece);
+            bait.prepare_lookup();
+            let delta = bait.take_changes();
+            for (i, r) in reads.iter().enumerate() {
+                let fresh = classify(r, &bait, &p);
+                if let Some(added) = added_cover(r, &delta, p.block_gap) {
+                    match still_other(calls[i], bounds[i], added, r.len(), &p) {
+                        Some(b) => {
+                            skipped += 1;
+                            assert!(b as usize >= fresh.1.cover, "bound {b} below cover {}", fresh.1.cover);
+                            bounds[i] = b;
+                        }
+                        None => {
+                            calls[i] = fresh.0;
+                            bounds[i] = fresh.1.cover as u16;
+                        }
+                    }
+                }
+                assert_eq!(calls[i], fresh.0, "read {i}");
+            }
+        }
+        assert!(skipped > 30, "the bound skipped only {skipped} reclassifications");
     }
 
     fn bait_from(seq: &[u8], k: usize) -> BaitSet {
@@ -2187,10 +2415,10 @@ mod tests {
         let cached = run(bait.clone(), replayed).unwrap();
         let gated = run(bait, cfg(true)).unwrap();
         assert_same_recruitment(&gated, &cached);
-        assert_eq!(gated.depth_gate.as_ref().unwrap().source, "inputs");
+        assert_eq!(gated.depth_gate.as_ref().unwrap().source, "first pass and inputs");
         assert_eq!(
             cached.depth_gate.as_ref().unwrap().source,
-            "recruitment cache"
+            "first pass and recruitment cache"
         );
         assert!(
             nuclear_reads(&plain) > nuclear_reads(&gated) + 100,

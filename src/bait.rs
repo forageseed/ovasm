@@ -29,27 +29,136 @@ pub struct BaitSet {
     changes: Option<FxHashSet<u64>>,
 }
 
-/// Compact presence index for the immutable bait used during one scan. An unset
-/// bit proves absence; set bits always go through the exact target-mask map.
-/// Collisions only add map lookups, never bait hits or recruitment decisions.
+/// Read-only index of the bait used during one scan: a blocked Bloom filter (three bits in one
+/// 64-byte block per key) in front of an exact open-addressing copy of the key-to-mask map. A
+/// clear bit proves absence; a set one is settled by the table, so masks are exactly the map's.
+///
+/// Classification is bound by memory latency: a 10 kb HiFi read looks up ten thousand k-mers at
+/// random places of a bait of ~10 million keys. The previous single-bit filter passed 12% of
+/// absent keys on to the hash map (one more cache miss each), and the map's buckets could not be
+/// prefetched. Here one block holds all of a key's bits (about 0.6% pass, 12 bits a key), the
+/// table's slots can be prefetched (`BaitSet::scan_masks`) and a hit is a few probes in one line.
 #[derive(Clone)]
 struct LookupIndex {
-    bits: Vec<u64>,
-    mask: usize,
+    bloom: Vec<BloomBlock>,
+    bloom_mask: usize,
+    /// `EMPTY` for an unused slot; linear probing.
+    keys: Vec<u64>,
+    masks: Vec<u8>,
+    table_mask: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct BloomBlock([u64; 8]);
+
+/// No canonical k-mer (at most 62 bits, `MAX_K` 31) is all ones.
+const EMPTY: u64 = u64::MAX;
+const BLOOM_BITS_PER_KEY: usize = 12;
+
+/// Half of MurmurHash3's finalizer: k-mer codes are far from uniform in their low bits, and one
+/// multiply keeps a lookup of a small (cache-resident) set as cheap as the bit test it is.
+#[inline]
+fn mix(key: u64) -> u64 {
+    let h = (key ^ (key >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^ (h >> 33)
+}
+
+/// An index this small stays in cache: `scan_masks` looks it up without prefetching.
+const PREFETCH_FROM_BYTES: usize = 4 << 20;
+
+#[inline]
+fn prefetch<T>(r: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is only a hint; `r` is a valid reference.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(r as *const T as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = r;
 }
 
 impl LookupIndex {
+    fn build(map: &FxHashMap<u64, u8>) -> Self {
+        let n = map.len();
+        let blocks = (n * BLOOM_BITS_PER_KEY).div_ceil(512).max(1).next_power_of_two();
+        // load at most 0.8: hits take a few probes; misses come here only past the filter
+        let slots = (n * 5 / 4 + 1).max(16).next_power_of_two();
+        let mut index = Self {
+            bloom: vec![BloomBlock::default(); blocks],
+            bloom_mask: blocks - 1,
+            keys: vec![EMPTY; slots],
+            masks: vec![0; slots],
+            table_mask: slots - 1,
+        };
+        for (&key, &mask) in map {
+            let h = mix(key);
+            let block = &mut index.bloom[h as usize & index.bloom_mask];
+            for bit in Self::bits(h) {
+                block.0[bit >> 6] |= 1u64 << (bit & 63);
+            }
+            let mut slot = Self::slot(h, index.table_mask);
+            while index.keys[slot] != EMPTY {
+                slot = (slot + 1) & index.table_mask;
+            }
+            index.keys[slot] = key;
+            index.masks[slot] = mask;
+        }
+        index
+    }
+
+    /// Three bit positions in a 512-bit block, from bits the block index does not use.
     #[inline]
-    fn slot(&self, key: u64) -> usize {
-        key.wrapping_mul(0x517CC1B727220A95).rotate_left(23) as usize & self.mask
+    fn bits(h: u64) -> [usize; 3] {
+        [
+            (h >> 37) as usize & 511,
+            (h >> 46) as usize & 511,
+            (h >> 55) as usize & 511,
+        ]
     }
 
     #[inline]
-    fn may_contain(&self, key: u64) -> bool {
-        let slot = self.slot(key);
-        self.bits[slot >> 6] & (1u64 << (slot & 63)) != 0
+    fn slot(h: u64, table_mask: usize) -> usize {
+        h.rotate_left(32) as usize & table_mask
+    }
+
+    #[inline]
+    fn may_contain(&self, h: u64) -> bool {
+        let block = &self.bloom[h as usize & self.bloom_mask];
+        Self::bits(h)
+            .iter()
+            .all(|&bit| block.0[bit >> 6] & (1u64 << (bit & 63)) != 0)
+    }
+
+    #[inline]
+    fn exact(&self, key: u64, h: u64) -> u8 {
+        let mut slot = Self::slot(h, self.table_mask);
+        loop {
+            let k = self.keys[slot];
+            if k == key {
+                return self.masks[slot];
+            }
+            if k == EMPTY {
+                return 0;
+            }
+            slot = (slot + 1) & self.table_mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: u64) -> u8 {
+        let h = mix(key);
+        if self.may_contain(h) {
+            self.exact(key, h)
+        } else {
+            0
+        }
     }
 }
+
+/// How far ahead `scan_masks` prefetches: filter blocks `AHEAD` k-mers ahead, table slots of the
+/// keys that passed `AHEAD / 2` ahead.
+const AHEAD: usize = 16;
 
 impl BaitSet {
     pub fn new(k: usize) -> Self {
@@ -183,30 +292,64 @@ impl BaitSet {
 
     #[inline]
     pub fn get(&self, kmer: u64) -> u8 {
-        if self
-            .lookup
-            .as_ref()
-            .is_some_and(|index| !index.may_contain(kmer))
-        {
-            return 0;
+        match &self.lookup {
+            Some(index) => index.get(kmer),
+            None => self.map.get(&kmer).copied().unwrap_or(0),
         }
-        self.map.get(&kmer).copied().unwrap_or(0)
     }
 
-    /// Rebuild after extension, before scanning reads. Eight presence bits per
-    /// bait key keep the index much smaller than the exact key-to-mask map.
+    /// `f(start, mask)` for every canonical k-mer of `seq` in order, as
+    /// `CanonicalKmers::new(seq, k).map(|(pos, km)| (pos, self.get(km)))` gives them, with the
+    /// prepared index's memory reads issued ahead so that their latencies overlap.
+    #[inline]
+    pub fn scan_masks(&self, seq: &[u8], mut f: impl FnMut(usize, u8)) {
+        let index = match &self.lookup {
+            Some(index) if index.bloom.len() * 64 + index.keys.len() * 9 >= PREFETCH_FROM_BYTES => index,
+            _ => {
+                for (pos, km) in CanonicalKmers::new(seq, self.k) {
+                    f(pos, self.get(km));
+                }
+                return;
+            }
+        };
+        // ring of (start, key, hash, passed the filter); entry i is filter-tested when i + AHEAD/2
+        // arrives and resolved when i + AHEAD does
+        let mut ring = [(0usize, 0u64, 0u64, false); AHEAD];
+        let mut n = 0usize;
+        let test = |e: &mut (usize, u64, u64, bool)| {
+            e.3 = index.may_contain(e.2);
+            if e.3 {
+                prefetch(&index.keys[LookupIndex::slot(e.2, index.table_mask)]);
+                prefetch(&index.masks[LookupIndex::slot(e.2, index.table_mask)]);
+            }
+        };
+        for (pos, key) in CanonicalKmers::new(seq, self.k) {
+            if n >= AHEAD {
+                let e = ring[n % AHEAD];
+                f(e.0, if e.3 { index.exact(e.1, e.2) } else { 0 });
+            }
+            let h = mix(key);
+            prefetch(&index.bloom[h as usize & index.bloom_mask]);
+            ring[n % AHEAD] = (pos, key, h, false);
+            if n >= AHEAD / 2 {
+                test(&mut ring[(n - AHEAD / 2) % AHEAD]);
+            }
+            n += 1;
+        }
+        // the last AHEAD entries: those not yet filter-tested first, then all in order
+        for i in n.saturating_sub(AHEAD / 2)..n {
+            test(&mut ring[i % AHEAD]);
+        }
+        for i in n.saturating_sub(AHEAD)..n {
+            let e = ring[i % AHEAD];
+            f(e.0, if e.3 { index.exact(e.1, e.2) } else { 0 });
+        }
+    }
+
+    /// Rebuild after extension, before scanning reads (see `LookupIndex`).
     /// This changes lookup cost only: masks and all classification scores are exact.
     pub fn prepare_lookup(&mut self) {
-        let size = (self.map.len() * 8).max(64).next_power_of_two();
-        let mut index = LookupIndex {
-            bits: vec![0; size / 64],
-            mask: size - 1,
-        };
-        for &key in self.map.keys() {
-            let slot = index.slot(key);
-            index.bits[slot >> 6] |= 1u64 << (slot & 63);
-        }
-        self.lookup = Some(index);
+        self.lookup = Some(LookupIndex::build(&self.map));
     }
 
     /// Only replay needs mutation tracking. A new target bit on an existing key
@@ -340,6 +483,45 @@ mod tests {
         bait.prepare_lookup();
         bait.extend_from_reads(1, [added.as_slice(), added.as_slice(), added.as_slice()], 3);
         assert!(CanonicalKmers::new(&added, bait.k).all(|(_, key)| bait.get(key) & 3 == 3));
+    }
+
+    #[test]
+    fn scanned_masks_are_the_lookups_in_order() {
+        // 450,000 keys: an index past `PREFETCH_FROM_BYTES`, scanned with prefetching
+        let mut bait = BaitSet::new(21);
+        for t in 0..3 {
+            let target = bait.target(&format!("t{t}")).unwrap();
+            bait.add_sequence(target, &genome(150_000, t as u64 + 31));
+        }
+        let mut reads = vec![Vec::new(), b"ACGT".to_vec(), genome(25, 2), genome(30, 3)];
+        reads.push([genome(3000, 4), genome(20_000, 31)[500..4500].to_vec()].concat());
+        let mut mixed = genome(20_000, 32)[..2000].to_vec();
+        mixed.extend_from_slice(b"NNNNacgtRY");
+        mixed.extend(genome(500, 5));
+        reads.push(mixed);
+        for prepared in [false, true] {
+            if prepared {
+                bait.prepare_lookup();
+                let index = bait.lookup.as_ref().unwrap();
+                assert!(index.bloom.len() * 64 + index.keys.len() * 9 >= PREFETCH_FROM_BYTES);
+            }
+            for r in &reads {
+                let expected: Vec<(usize, u8)> = CanonicalKmers::new(r, 21)
+                    .map(|(pos, km)| (pos, bait.map.get(&km).copied().unwrap_or(0)))
+                    .collect();
+                let mut got = Vec::new();
+                bait.scan_masks(r, |pos, mask| got.push((pos, mask)));
+                assert_eq!(got, expected);
+            }
+        }
+        // absent keys: a filter false positive still reads 0 from the table
+        let absent = genome(200_000, 77);
+        let mut wrong = 0;
+        bait.scan_masks(&absent, |pos, mask| {
+            let km = CanonicalKmers::new(&absent[pos..pos + 21], 21).next().unwrap().1;
+            wrong += usize::from(mask != bait.map.get(&km).copied().unwrap_or(0));
+        });
+        assert_eq!(wrong, 0);
     }
 
     #[test]
