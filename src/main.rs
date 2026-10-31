@@ -477,6 +477,17 @@ struct RunArgs {
     /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
     #[arg(long, default_value_t = 1_000_000_000)]
     recruit_max_bases: u64,
+    /// HiFi: the depth gate's organelle threshold for seed recruitment, in multiples of the
+    /// nuclear peak depth (`find recruit --gate-fold`; default 3). Extension already lowers it
+    /// for an organelle shallower than that but deeper than the nucleus.
+    #[arg(long, conflicts_with = "no_extend_gate")]
+    extend_gate_fold: Option<f64>,
+    /// HiFi: recruit without the depth gate (`find recruit` without --extend-gate --bootstrap),
+    /// as up to 0.2.1. On a species far from the seed library extension can then run into the
+    /// nucleus (Carex echinata: 8.5 Gb of "plastid" reads); --recruit-max-bases still bounds what
+    /// goes on to assembly.
+    #[arg(long)]
+    no_extend_gate: bool,
     /// Seed recruitment: most scanning passes (`ovasm find recruit --iterations`). Default: 60 for
     /// HiFi reads, whose gated recruitment grows a large mitochondrion by a few tens of kilobases
     /// a pass (see pipeline::GATED_RECRUIT_PASSES); `find recruit`'s own default otherwise. A target
@@ -533,6 +544,9 @@ fn run(args: RunArgs) -> Result<()> {
     if args.recruit_iterations == Some(0) {
         bail!("--recruit-iterations must be at least 1");
     }
+    if args.extend_gate_fold.is_some_and(|f| f.is_nan() || f <= 0.0) {
+        bail!("--extend-gate-fold must be positive");
+    }
     let single = match args.organelle {
         pipeline::OrganelleChoice::Mitochondrion => Some("mitochondrion"),
         pipeline::OrganelleChoice::Plastid => Some("plastid"),
@@ -582,10 +596,11 @@ fn run(args: RunArgs) -> Result<()> {
         recruit_depth: args.recruit_depth,
         recruit_cache: args.recruit_cache,
         auto_recruit_cache: !args.no_recruit_cache,
-        // HiFi recruitment in `run` is always gated (`find recruit --extend-gate --bootstrap`): the
-        // 0.2.1 ungated mode ran into the nucleus on species far from the seed library (see
-        // docs/release-0.3.0.md). `ovasm find recruit` without --extend-gate remains for other callers.
-        gated_recruit: true,
+        // HiFi recruitment in `run` is gated (`find recruit --extend-gate --bootstrap`) unless
+        // --no-extend-gate: the 0.2.1 ungated mode ran into the nucleus on species far from the
+        // seed library (see docs/release-0.3.0.md).
+        gated_recruit: !args.no_extend_gate,
+        recruit_gate_fold: args.extend_gate_fold,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
         recruit_iterations: args.recruit_iterations,
@@ -1634,6 +1649,10 @@ struct RecruitArgs {
     /// until no bait grows. Long reads (hifi) only.
     #[arg(long)]
     extend_gate: bool,
+    /// The depth gate's organelle threshold, in multiples of the nuclear peak depth (default 3).
+    /// Extension already lowers it for a target shallower than that (see `--extend-gate`).
+    #[arg(long)]
+    gate_fold: Option<f64>,
 }
 
 #[derive(clap::Args)]
@@ -1712,6 +1731,9 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     if args.extend_gate && !matches!(args.preset, Preset::Hifi) {
         bail!("--extend-gate needs the hifi preset: its depth gate judges whole long reads");
     }
+    if args.gate_fold.is_some_and(|f| f.is_nan() || f <= 0.0) {
+        bail!("--gate-fold must be positive");
+    }
     if args.max_read_depth.is_some() && !matches!(args.preset, Preset::Hifi) {
         bail!("--max-read-depth needs the hifi preset: its depth sketch judges whole long reads");
     }
@@ -1775,6 +1797,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             max_bases: args.max_bases,
             mates_together: args.mates_together,
             kmer_gate: args.kmer_gate,
+            gate_fold: args.gate_fold,
         },
     )?;
     for o in &report.outputs {

@@ -994,6 +994,9 @@ pub struct RecruitReport {
     pub depth_gate: Option<crate::seedfree::GateReport>,
     /// Each target's core depth (see `EXTEND_CORE_FLOOR`), once set.
     pub core_depth: Vec<Option<f64>>,
+    /// The depth from which a k-mer counted as deep when each target last extended
+    /// (`extension_deep`), with the extension gate.
+    pub extension_deep_depth: Vec<Option<f64>>,
     /// What a caller should know about the result: a doubtful depth gate, a target stopped by
     /// `size_cap`, or one still growing when the passes ran out.
     pub warnings: Vec<String>,
@@ -1046,6 +1049,8 @@ pub struct RecruitConfig {
     /// and from a NUMT's edge into the nucleus: WL354's mitochondrion grew from 0.72 M to 54 M
     /// reads in 20 passes, CRR1151719's to 104 M, and assembly ran out of memory or time.
     pub kmer_gate: bool,
+    /// The depth gate's organelle threshold over the nuclear peak (None: 3, `discover`'s).
+    pub gate_fold: Option<f64>,
 }
 
 /// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB.
@@ -1155,12 +1160,27 @@ fn gauge(d: Option<ReadDepth>, floor: Option<f64>, ceiling: Option<f64>) -> Gaug
 /// the Lophophora williamsii mitochondrion (core 104x, nucleus 22x, threshold 66x) has 236 kb
 /// at its depth between two stretches at 66-90x; reads there kept a tenth of their k-mers below
 /// 66x, the gate turned them down, and recruitment stopped on both sides of the 236 kb.
+///
+/// Nor above `EXTEND_NEAR_CORE` of the core depth, unless that is below the nuclear depth: for a
+/// target less than 1.8 times as deep as the nucleus, halfway is too close to its own depth for
+/// nine tenths of a read's k-mers to clear it. Lespedeza davurica (HiFi, 25x subsample):
+/// nucleus 56x, mitochondrial core 72x, halfway 63x; extension turned down 312 reads, the
+/// mitochondrion stopped at 993 reads and assembled 250 kb of the 379 kb that ungated
+/// recruitment (1,350 reads) assembles. A nuclear read has about half of its k-mers above the
+/// nuclear depth, far from nine tenths.
 fn extension_deep(g: &DepthGate, core: Option<f64>) -> f64 {
     let organelle = g.organelle_min_depth;
+    let nuclear = f64::from(g.nuclear_peak_depth);
     core.map_or(organelle, |c| {
-        organelle.min((f64::from(g.nuclear_peak_depth) * c).sqrt())
+        organelle
+            .min((nuclear * c).sqrt())
+            .min((EXTEND_NEAR_CORE * c).max(nuclear))
     })
 }
+
+/// See `extension_deep`: three quarters of a target's core depth leaves nearly all k-mers of its
+/// reads above the deep threshold (at 72x, 97% of Poisson counts are at least 54).
+const EXTEND_NEAR_CORE: f64 = 0.75;
 
 /// The extension gate on a read (deep k-mers from `deep`, `extension_deep`): on the whole of it,
 /// and when that fails, on the sequence it would add to target `t`, its k-mers the bait lacks.
@@ -1262,9 +1282,10 @@ fn build_gate(
     inputs: &[PathBuf],
     replay: Option<&crate::replay::Replay>,
     sketch: Option<crate::seedfree::GateSketch>,
+    fold: Option<f64>,
     warnings: &mut Vec<String>,
 ) -> Result<DepthGate> {
-    let gate = match (replay.filter(|r| r.ready), sketch) {
+    let mut gate = match (replay.filter(|r| r.ready), sketch) {
         (Some(cache), Some(s)) => {
             DepthGate::long_reads_from_sketch(s, || cache.sequences(), "first pass and recruitment cache")?
         }
@@ -1274,6 +1295,9 @@ fn build_gate(
         (Some(cache), None) => DepthGate::long_reads_from(|| cache.sequences(), "recruitment cache")?,
         (None, None) => DepthGate::long_reads(inputs)?,
     };
+    if let Some(f) = fold {
+        gate.set_depth_fold(f);
+    }
     eprintln!(
         "[ovasm] depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth), from the {} in {:.0}s",
         gate.nuclear_peak_depth,
@@ -1457,7 +1481,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         }
         let last = it + 1 == cfg.iterations.max(1);
         if gate.is_none() && wants_gate && (!last || cfg.max_read_depth.is_some()) {
-            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
+            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), cfg.gate_fold, &mut warnings)?);
         }
         let mut depths = pass_depths(gate.as_ref(), &res);
         if cfg.kmer_gate && kmer_table.is_none() && !last {
@@ -1684,7 +1708,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     continue;
                 }
                 if gate.is_none() {
-                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
+                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), cfg.gate_fold, &mut warnings)?);
                     depths = pass_depths(gate.as_ref(), &res);
                 }
                 if !numt_ready {
@@ -1920,6 +1944,13 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         bootstrap_nuclear_peak_depth: gate.as_ref().map(|g| g.nuclear_peak_depth),
         bootstrap_organelle_min_depth: gate.as_ref().map(|g| g.organelle_min_depth),
         depth_gate: gate.as_ref().map(|g| g.report.clone()),
+        extension_deep_depth: core_depth
+            .iter()
+            .map(|&c| {
+                let g = gate.as_ref().filter(|_| cfg.extend_gate)?;
+                Some(extension_deep(g, c))
+            })
+            .collect(),
         core_depth,
         warnings,
         elapsed_seconds: start.elapsed().as_secs_f64(),
@@ -2348,6 +2379,7 @@ mod tests {
             max_bases: None,
             mates_together: false,
             kmer_gate: false,
+            gate_fold: None,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -2438,6 +2470,7 @@ mod tests {
             max_bases: None,
             mates_together: false,
             kmer_gate: false,
+            gate_fold: None,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -2599,6 +2632,7 @@ mod tests {
             max_bases: None,
             mates_together: false,
             kmer_gate: false,
+            gate_fold: None,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -2763,6 +2797,7 @@ mod tests {
             max_bases: None,
             mates_together: false,
             kmer_gate: false,
+            gate_fold: None,
         }
     }
 
@@ -2841,6 +2876,82 @@ mod tests {
         let core = gated.core_depth[0].unwrap();
         assert!((core - 119.0).abs() < 5.0, "core depth {core}");
         assert!(gated.iterations[0].extension_deep_out[0] > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_target_little_deeper_than_the_nucleus_extends_through_the_gate() {
+        // A 40 kb mitochondrion at 40x, 6 kb of it at 33x (reads every 90 bp instead of 75),
+        // beside a 200 kb nucleus at 30x. The gate's threshold is 90x; halfway between the
+        // nucleus and the core depth is 35x, above the shallower stretch, so extension from the
+        // 6 kb seed stopped at it. Three quarters of the core depth (30x) takes the seed through
+        // it to the whole mitochondrion, as ungated recruitment does.
+        let mito = pseudo_random(40_000, 7);
+        let nuclear = pseudo_random(200_000, 33);
+        let circ = [mito.as_slice(), &mito[..3000]].concat();
+        let starts: Vec<usize> = (0..20_000)
+            .step_by(75)
+            .chain((20_000..26_000).step_by(90))
+            .chain((26_000..40_000).step_by(75))
+            .collect();
+        let mut text: String = starts
+            .iter()
+            .enumerate()
+            .map(|(i, &st)| format!(">m{i}\n{}\n", std::str::from_utf8(&circ[st..st + 3000]).unwrap()))
+            .collect();
+        text += &linear_reads(&nuclear, 100, "n");
+        let dir = std::env::temp_dir().join(format!("ovasm-little-deeper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, text).unwrap();
+        let bait = bait_from(&mito[..6000], 21);
+        let plain = run(bait.clone(), test_config(&fa, dir.join("plain"), 80, false)).unwrap();
+        let gated = run(bait.clone(), test_config(&fa, dir.join("gated"), 80, true)).unwrap();
+        let gate = gated.depth_gate.as_ref().unwrap();
+        assert_eq!((gate.nuclear_peak_depth, gate.organelle_min_depth), (30, 90.0));
+        assert_eq!(gated.core_depth[0], Some(40.0));
+        assert_eq!(gated.extension_deep_depth[0], Some(30.0));
+        let mito_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'm');
+        assert_eq!(mito_reads(&plain), starts.len());
+        assert_eq!(mito_reads(&gated), starts.len());
+        assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
+        // --gate-fold sets the gate's own threshold
+        let cfg = RecruitConfig {
+            gate_fold: Some(1.5),
+            ..test_config(&fa, dir.join("fold"), 80, true)
+        };
+        let fold = run(bait, cfg).unwrap();
+        let gate = fold.depth_gate.as_ref().unwrap();
+        assert_eq!((gate.organelle_min_depth, gate.depth_fold), (45.0, 1.5));
+        assert_eq!(mito_reads(&fold), starts.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extension_deep_is_three_quarters_of_a_core_little_deeper_than_the_nucleus() {
+        let nuclear = pseudo_random(200_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-little-deeper-rule-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, linear_reads(&nuclear, 100, "n")).unwrap();
+        let g = DepthGate::long_reads(&[fa]).unwrap();
+        assert_eq!((g.nuclear_peak_depth, g.organelle_min_depth), (30, 90.0));
+        let at = |c| extension_deep(&g, c);
+        assert_eq!(at(None), 90.0);
+        // nine times the nucleus and deeper: the gate's threshold
+        assert_eq!(at(Some(3000.0)), 90.0);
+        assert_eq!(at(Some(270.0)), 90.0);
+        // halfway (log scale) from 1.8 times the nucleus up
+        assert_eq!(at(Some(120.0)), 60.0);
+        assert_eq!(at(Some(30.0 * 1.8)), (30.0f64 * 54.0).sqrt().min(40.5));
+        // below: three quarters of the core, not below the nucleus
+        assert_eq!(at(Some(48.0)), 36.0);
+        assert_eq!(at(Some(40.0)), 30.0);
+        // at or under the nuclear depth, halfway as before
+        assert_eq!(at(Some(30.0)), 30.0);
+        assert_eq!(at(Some(20.0)), (600.0f64).sqrt());
         std::fs::remove_dir_all(&dir).ok();
     }
 
