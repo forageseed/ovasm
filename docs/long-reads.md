@@ -70,53 +70,78 @@ used round, and:
 - `short_read_evidence` (hybrid): links and short-read-supported links of the graph;
 - `total_elapsed_seconds` and `peak_rss_mb` of the whole run.
 
-## ZM4 trial (2026-10-30)
+## ZM4 trial (2026-10-30/31)
 
 Alfalfa cultivar ZM-4, existing reads only (nothing downloaded): ONT CRR2374622 (CRA034439,
 R10.4.1 HAC, 131 Gb, reads of about 95 kb), HiFi CRR2374621 of the same project, Illumina
 SRR13333747 (cultivar ZM-4; not shown to be the same plant). Prefixes of the files: ONT the
-first 130,000 reads (12.3 Gb), HiFi the first 800,000 (15.8 Gb), Illumina the first 20 M pairs
-(6 Gb). Built-in seeds, `--organelle both --threads 6`, CPUs 24-27,80-83, 64 GiB limit, ovasm
-e92095b. Reference: the full-input ZM4 HiFi assembly (CRA032787: mitochondrion 160,953 +
-146,073 bp, a 307,026 bp single cycle; plastid 125,509 bp); molecules aligned with minimap2
-asm5, identity = matching bases / alignment columns.
+first 130,000 reads (12.3 Gb) or 400,000 (38 Gb), HiFi the first 800,000 (15.8 Gb), Illumina
+the first 20 M pairs (6 Gb). Built-in seeds, `--organelle both --threads 6`, CPUs 24-27,80-83,
+64 GiB limit, ovasm e5c2a3c (e92095b in the second table). Reference: the full-input ZM4 HiFi
+assembly (CRA032787: mitochondrion 160,953 + 146,073 bp, a 307,026 bp single cycle; plastid
+125,509 bp); molecules aligned with minimap2 asm5, identity = matching bases / alignment
+columns.
 
 | Run | Organelle | Molecules | Length (bp) | Circular | Reference covered | Identity | Wall | Peak RSS |
 |---|---|---:|---|---|---:|---:|---:|---:|
-| `run ont` 12 Gb | plastid | 1 | 125,456 | yes | 100% | 99.957% | 41.4 min | 4.09 GiB |
-| | mitochondrion | 73 | 460,768 in all, longest 178,656 | 4 | 91.6% | 99.61% | | |
-| `run hybrid` 12 Gb + 6 Gb | plastid | 1 | 125,498 | yes | 100% | 99.991% | 42.6 min | 5.26 GiB |
-| | mitochondrion | 3 | 374,992 + 6,330 + 4,640 | 2 | 100% | 100.00% | | |
-| `run ont` 38 Gb | plastid | 1 | 125,432 | yes | 100% | 99.938% | 316.0 min | 11.18 GiB |
-| | mitochondrion | 1 | 307,000 | no | 100% | 99.991% | | |
+| `run ont` 12 Gb | plastid | 1 | 125,438 | yes | 100% | 99.943% | 13.5 min | 3.04 GiB |
+| | mitochondrion | 6 | 307,562 in all, longest 207,572 | 0 | 99.95% | 99.987% | | |
+| `run hybrid` 12 Gb + 6 Gb | plastid | 1 | 125,498 | yes | 100% | 99.991% | 29.4 min | 3.74 GiB |
+| | mitochondrion | 2 | 298,803 + 1,215 | 0 | 97.3% | 100.00% | | |
+| `run ont` 38 Gb | plastid | 1 | 125,438 | yes | 100% | 99.943% | 52.1 min | 3.44 GiB |
+| | mitochondrion | 2 | 160,947 + 146,059 | 2 | 100% | 99.993% | | |
 | `run hifi` 15.8 Gb (control) | plastid | 2 | 90,083 in all | no | 71.8% | 99.999% | 20.8 min | 1.49 GiB |
 | | mitochondrion | 3 | 199,416 in all | no | 65.0% | 100.00% | | |
 
-- Plastid, ONT alone: one circle of the reference's length (53 bp short), recruited 1,683 reads
-  in round 1 (131 Mb, about 1,000x); what is left is the residual ONT error (about 1 in 2,300,
+ovasm e92095b on the same inputs:
+
+| Run | Organelle | Molecules | Length (bp) | Reference covered | Identity | Wall | Peak RSS |
+|---|---|---:|---|---:|---:|---:|---:|
+| `run ont` 12 Gb | plastid | 1 | 125,456 circle | 100% | 99.957% | 41.4 min | 4.09 GiB |
+| | mitochondrion | 73 | 460,768 in all | 91.6% | 99.61% | | |
+| `run hybrid` 12 Gb + 6 Gb | plastid | 1 | 125,498 circle | 100% | 99.991% | 42.6 min | 5.26 GiB |
+| | mitochondrion | 3 | 374,992 circle + 6,330 + 4,640 | 100% | 100.00% | | |
+| `run ont` 38 Gb | plastid | 1 | 125,432 circle | 100% | 99.938% | 316.0 min | 11.18 GiB |
+| | mitochondrion | 1 | 307,000 | 100% | 99.991% | | |
+
+- Plastid, ONT alone: one circle 71 bp shorter than the reference, recruited 1,683 reads in
+  round 1 (131 Mb, about 1,000x); what is left is the residual ONT error (about 1 in 1,800,
   homopolymer-like). Hybrid correction takes it to 1 in 11,000. Round 2 added under 5% and was
   not used. `check assess` calls it simple, without an inverted repeat, as the IRLC legumes are.
 - Mitochondrion, ONT alone: no read was 80% covered by the library's seeds (round 1: 0
-  reads); 142 partly covered reads made the round-2 bait, which recruited 177 reads (14 Mb,
-  about 46x). Self-correction at that depth anchors 83% of the bases and leaves the graph in 73
-  pieces that cover 92% of the reference. Depth, not recruitment, is what ONT alone lacks here:
-  with the first 400,000 reads (38 Gb) round 2 recruited 354 reads (26.7 Mb, about 87x) and the
-  graph resolves at k 1001 into one 307,000 bp molecule, the reference's single cycle less 26 bp
-  (17 of 18 links supported, not closed into a circle; decisive false).
-- Cost of the 38 Gb run: 5.3 h, of which round 2 was 2.6 h, at 11.2 GiB. The plastid's round 1
-  already reached `--recruit-max-bases` (400 Mb) and its round 2 took 3.2 Gb (kept 413 Mb), so
-  that round only fed the mitochondrion; an organelle that reaches the cap in a round would not
-  need another one (not done yet).
-- Mitochondrion, hybrid: the 177 corrected long reads recruited 2.6 M short reads (394 Mb); after
-  hybrid correction the same reads assemble at k 1001 into a 374,992 bp circle that covers the
-  whole reference without a mismatch in the aligned columns (its extra length is a further copy
-  of repeats the reads do not resolve; decisive false), and the short reads support 26 of the 36
-  graph links.
+  reads); the partly covered reads at the mitochondrion's own depth made the round-2 bait, which
+  recruited 79 reads (6.6 Mb, about 21x). At 12 Gb they assemble into 6 pieces covering 99.95%
+  of the reference; at 38 Gb 266 reads (20.8 Mb, about 68x) give the reference's two circles at
+  k 1001 (12 of 12 links supported; decisive false, as the two are also one 307 kb cycle).
+- Mitochondrion, hybrid: the 79 corrected long reads recruit the short reads that correct them;
+  the graph at k 101 has a 298,803 bp piece, and the short reads support 78 of its 100 links.
+  8 kb of the reference (2.7%) is missing; e92095b, from 177 noisier reads, had covered it all
+  in a longer circle.
 - HiFi at 15.8 Gb is not a complete control: its recruitment stopped at 199 kb of the
   mitochondrion and the plastid was downsampled to 931 reads (read-depth cap 250x) in two
   pieces. The full-input HiFi assembly is the reference above.
-- Bugs these runs found and fixed: k 15 recruitment (every read), the round-1 refusal of an
+
+What changed from e92095b to e5c2a3c, and why:
+
+- **Partly covered reads are gated at their own depth when nothing was recruited.** The
+  mitochondrion's round 1 recruits nothing, so the e92095b gate (a quarter of the recruited
+  reads' depth) kept every partly covered read, nuclear ones too. Without recruited reads they
+  are now compared with one another and kept at a quarter of the 90th percentile of their
+  depths. At 12 Gb that keeps 64 of 72 mitochondrial reads and 14 of 60 others; at 38 Gb 224 of
+  255 and 35 of 190.
+- **Correction depth is capped at 300x** (`depth_cap` of each correction). The plastid's reads
+  are about 3,000x at 38 Gb, where systematic ONT errors pass the solid count; above 300x a
+  hash-chosen share of the reads is corrected. With the cleaner bait this took the 38 Gb run
+  from 5.3 h and 11.2 GiB to 52 min and 3.4 GiB.
+- **An organelle whose round was sampled at `--recruit-max-bases` takes no further round**
+  (`capped_before` in its next round's entry); the rounds end when no organelle below the cap
+  grew 5%. In ZM4 the plastid's 38 Gb round 1 stopped at 399,979,844 bases, just under the cap,
+  so it still ran round 2.
+- **Short tandem repeats are masked in baits** (`tandem_masked_bases`): runs of period 1 to 6
+  and at least 21 bases are N in the next round's bait and in the long-read seeds of the
+  short-read pass, not in the reads that are assembled. Through (GA)n k-mers of the bait the
+  mitochondrion had recruited two nuclear microsatellite reads; hybrid correction lengthened
+  their runs and the automatic k took that k-mer as the node depth, leaving no segment.
+- Earlier fixes from these runs: k 15 recruitment (every read), the round-1 refusal of an
   organelle no read was 80% covered for, and partly covered mitochondrial reads with
-  plastid-derived stretches growing the plastid's bait (1.3 M k-mers for a 125 kb genome; round
-  2 then took 920 Mb as plastid): partly covered reads now join a bait only at a quarter of its
-  recruited reads' depth (909 of 976 left out).
+  plastid-derived stretches growing the plastid's bait (1.3 M k-mers for a 125 kb genome).
