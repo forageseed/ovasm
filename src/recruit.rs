@@ -1167,20 +1167,46 @@ fn gauge(d: Option<ReadDepth>, floor: Option<f64>, ceiling: Option<f64>) -> Gaug
 ///
 /// Nor above `EXTEND_NEAR_CORE` of the core depth, unless that is below the nuclear depth: for a
 /// target less than 1.8 times as deep as the nucleus, halfway is too close to its own depth for
-/// nine tenths of a read's k-mers to clear it. Lespedeza davurica (HiFi, 25x subsample):
-/// nucleus 56x, mitochondrial core 72x, halfway 63x; extension turned down 312 reads, the
-/// mitochondrion stopped at 993 reads and assembled 250 kb of the 379 kb that ungated
-/// recruitment (1,350 reads) assembles. A nuclear read has about half of its k-mers above the
-/// nuclear depth, far from nine tenths.
+/// nine tenths of a read's k-mers to clear it. A nuclear read has about half of its k-mers above
+/// the nuclear depth, far from nine tenths.
+///
+/// The nuclear depth is `extension_nuclear`'s.
 fn extension_deep(g: &DepthGate, core: Option<f64>) -> f64 {
     let organelle = g.organelle_min_depth;
-    let nuclear = f64::from(g.nuclear_peak_depth);
+    let nuclear = extension_nuclear(g);
     core.map_or(organelle, |c| {
         organelle
             .min((nuclear * c).sqrt())
             .min((EXTEND_NEAR_CORE * c).max(nuclear))
     })
 }
+
+/// The nuclear depth extension measures a target against: the gate's nuclear peak, but the k-mer
+/// peak where the peak of the reads' median depths is about twice it. A read's median stands at
+/// two copies where most of the read is in repeats or in sequence a polyploid has twice:
+/// Lespedeza davurica (allotetraploid, 60% repeats; HiFi 25% subsample, 34 Gb of a 1.26 Gb
+/// genome, 27x) has its read medians at 56x and its k-mer peak at 28x, and the mitochondrion at
+/// 72x stopped at 250 kb of 379 kb: halfway between 56x and 72x is 63x, too close to 72x for
+/// nine tenths of a read's k-mers. In a heterozygous genome the k-mer peak can instead be the
+/// half-depth peak; the lower depth then only lowers extension's threshold for a target under 9
+/// times the read peak, where a single-copy nuclear read still has half its k-mers below it. The
+/// gate's own threshold (bootstrapping, seedless reads) keeps the read peak; the nuclear depth
+/// given (`--nuclear-depth`, `--genome-size`) is used as it is.
+fn extension_nuclear(g: &DepthGate) -> f64 {
+    let (reads, kmers) = (g.nuclear_peak_depth, g.report.kmer_peak_depth);
+    let ratio = f64::from(reads) / f64::from(kmers.max(1));
+    if g.report.nuclear_source == "reads"
+        && kmers >= MIN_KMER_PEAK
+        && (NUCLEAR_DOUBT_RATIO..=TWO_COPY_RATIO).contains(&ratio)
+    {
+        f64::from(kmers)
+    } else {
+        f64::from(reads)
+    }
+}
+
+/// Upper end of the read peak over the k-mer peak taken for two copies (`extension_nuclear`).
+const TWO_COPY_RATIO: f64 = 2.5;
 
 /// See `extension_deep`: three quarters of a target's core depth leaves nearly all k-mers of its
 /// reads above the deep threshold (at 72x, 97% of Poisson counts are at least 54).
@@ -1305,9 +1331,6 @@ fn build_gate(
     if let Some((depth, source)) = given {
         gate.set_nuclear_depth(depth, source);
     }
-    if let Some(w) = nuclear_depth_doubt(&gate.report) {
-        warnings.push(w);
-    }
     eprintln!(
         "[ovasm] depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth), from the {} in {:.0}s",
         gate.nuclear_peak_depth,
@@ -1342,23 +1365,38 @@ fn given_nuclear_depth(cfg: &RecruitConfig, sketch_bases: u64) -> Option<(u32, &
 /// The gate's two nuclear depths disagree by about twice or more: the read-median peak over the
 /// k-mer peak is a heterozygous genome's k-mers at half depth (the read peak right), or a
 /// repeat-rich or polyploid genome's reads at two copies (the k-mer peak right); a depth given
-/// so far from the k-mer peak may be in the wrong unit.
+/// so far from the k-mer peak may be in the wrong unit. Judged from the reads, it matters only
+/// for a target whose core is under the organelle threshold.
 const NUCLEAR_DOUBT_RATIO: f64 = 1.7;
+/// A k-mer peak below this is the sketch's error spike, not the nucleus: 13 of 29 Darwin Tree
+/// of Life HiFi libraries have it at 2x (Carex echinata: read peak 61x).
+const MIN_KMER_PEAK: u32 = 10;
 
-fn nuclear_depth_doubt(r: &crate::seedfree::GateReport) -> Option<String> {
+fn nuclear_depth_doubt(r: &crate::seedfree::GateReport, core: &[Option<f64>]) -> Option<String> {
     let (nuclear, kmer) = (f64::from(r.nuclear_peak_depth), f64::from(r.kmer_peak_depth));
-    if kmer <= 0.0 || (nuclear / kmer).max(kmer / nuclear) < NUCLEAR_DOUBT_RATIO {
+    if r.kmer_peak_depth < MIN_KMER_PEAK || (nuclear / kmer).max(kmer / nuclear) < NUCLEAR_DOUBT_RATIO
+    {
         return None;
     }
+    let under = core.iter().flatten().filter(|&&c| c < r.organelle_min_depth).count();
     Some(match r.nuclear_source {
+        "reads" if under == 0 => return None,
         "reads" => format!(
             "the depth gate's nuclear peak from read medians ({nuclear}x) is {:.1} times the \
-             k-mer peak ({kmer}x): right for a heterozygous genome, but a repeat-rich or \
-             polyploid genome's reads can peak at two copies, and an organelle less than 3 \
-             times deeper than the true nucleus is gated out; if the genome is homozygous, give \
-             --genome-size (the collapsed assembly's length: all subgenomes of an allopolyploid, \
-             one set of an autopolyploid) or --nuclear-depth",
-            nuclear / kmer
+             k-mer peak ({kmer}x), and {under} target(s) are under the organelle threshold \
+             ({:.0}x): right for a heterozygous genome, but a repeat-rich or polyploid genome's \
+             reads can peak at two copies; {}; --genome-size (the collapsed assembly's length: \
+             all subgenomes of an allopolyploid, one set of an autopolyploid) or \
+             --nuclear-depth sets the nuclear depth for both",
+            nuclear / kmer,
+            r.organelle_min_depth,
+            if nuclear / kmer <= TWO_COPY_RATIO {
+                "extension measured the targets against the k-mer peak, the gate's own \
+                 threshold (bootstrapping) kept the read peak"
+            } else {
+                "both kept the read peak (too far from twice the k-mer peak to take it for two \
+                 copies)"
+            }
         ),
         _ => format!(
             "the nuclear depth {nuclear}x ({}) is {:.1} times off the k-mer peak ({kmer}x): \
@@ -1960,6 +1998,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             kept_bases,
             output: path.display().to_string(),
         });
+    }
+    if let Some(w) = gate.as_ref().and_then(|g| nuclear_depth_doubt(&g.report, &core_depth)) {
+        warnings.push(w);
     }
     for w in &warnings {
         eprintln!("[ovasm] recruit warning: {w}");
@@ -3017,18 +3058,28 @@ mod tests {
         std::fs::write(&fa, linear_reads(&nuclear, 100, "n")).unwrap();
         let mut g = DepthGate::long_reads(&[fa]).unwrap();
         // agreeing peaks: no warning
-        assert_eq!(nuclear_depth_doubt(&g.report), None);
-        // Lespedeza davurica: read medians at 56x, the k-mer peak at 28x
+        let lespedeza = [Some(72.0), Some(3437.0)];
+        assert_eq!(nuclear_depth_doubt(&g.report, &lespedeza), None);
+        // Lespedeza davurica: read medians at 56x, the k-mer peak at 28x, the mitochondrion's
+        // core at 72x under the 168x threshold
         g.report.nuclear_peak_depth = 56;
+        g.report.organelle_min_depth = 168.0;
         g.report.kmer_peak_depth = 28;
-        let w = nuclear_depth_doubt(&g.report).unwrap();
-        assert!(w.contains("2.0 times") && w.contains("--genome-size"), "{w}");
-        // a given depth half the k-mer peak: the unit is doubted
+        g.report.nuclear_source = "reads";
+        let w = nuclear_depth_doubt(&g.report, &lespedeza).unwrap();
+        assert!(w.contains("2.0 times") && w.contains("1 target(s)") && w.contains("--genome-size"), "{w}");
+        // every target above the threshold: the read peak does no harm
+        assert_eq!(nuclear_depth_doubt(&g.report, &[Some(679.0), Some(18284.0), None]), None);
+        // a k-mer peak at the error spike (Carex echinata: 61x over 2x) is no evidence
+        g.report.kmer_peak_depth = 2;
+        assert_eq!(nuclear_depth_doubt(&g.report, &lespedeza), None);
+        g.report.kmer_peak_depth = 28;
+        // a given depth half the k-mer peak: the unit is doubted, whatever the targets
         g.set_nuclear_depth(14, "genome size");
-        let w = nuclear_depth_doubt(&g.report).unwrap();
+        let w = nuclear_depth_doubt(&g.report, &[]).unwrap();
         assert!(w.contains("14x (genome size)") && w.contains("not the 2C"), "{w}");
         g.set_nuclear_depth(27, "genome size");
-        assert_eq!(nuclear_depth_doubt(&g.report), None);
+        assert_eq!(nuclear_depth_doubt(&g.report, &lespedeza), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3056,6 +3107,24 @@ mod tests {
         // at or under the nuclear depth, halfway as before
         assert_eq!(at(Some(30.0)), 30.0);
         assert_eq!(at(Some(20.0)), (600.0f64).sqrt());
+        // Lespedeza davurica: read medians at 56x, the k-mer peak at 28x; extension measures the
+        // 72x mitochondrion against 28x, the 3437x plastid still against the gate's 168x
+        let mut g = g;
+        g.nuclear_peak_depth = 56;
+        g.organelle_min_depth = 168.0;
+        g.report.kmer_peak_depth = 28;
+        g.report.nuclear_source = "reads";
+        assert_eq!(extension_deep(&g, Some(72.0)), (28.0f64 * 72.0).sqrt());
+        assert_eq!(extension_deep(&g, Some(3437.0)), 168.0);
+        // a k-mer peak at the error spike, or far from half the read peak: the read peak
+        g.report.kmer_peak_depth = 2;
+        assert_eq!(extension_deep(&g, Some(72.0)), 56.0f64.max(0.75 * 72.0).min((56.0f64 * 72.0).sqrt()));
+        g.report.kmer_peak_depth = 18;
+        assert_eq!(extension_deep(&g, Some(72.0)), 56.0f64.max(0.75 * 72.0).min((56.0f64 * 72.0).sqrt()));
+        // a given nuclear depth is used as it is
+        g.report.kmer_peak_depth = 28;
+        g.set_nuclear_depth(40, "given");
+        assert_eq!(extension_deep(&g, Some(72.0)), 54.0f64.min((40.0f64 * 72.0).sqrt()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
