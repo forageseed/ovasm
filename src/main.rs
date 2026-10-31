@@ -482,6 +482,16 @@ struct RunArgs {
     /// for an organelle shallower than that but deeper than the nucleus.
     #[arg(long, conflicts_with = "no_extend_gate")]
     extend_gate_fold: Option<f64>,
+    /// HiFi: the depth gate's nuclear peak, given instead of judged from the reads' median
+    /// depths (`find recruit --nuclear-depth`), which stand two copies deep in a repeat-rich or
+    /// polyploid genome.
+    #[arg(long, conflicts_with_all = ["no_extend_gate", "genome_size"])]
+    nuclear_depth: Option<u32>,
+    /// HiFi: the nuclear genome's collapsed size for the depth gate (`find recruit
+    /// --genome-size`): all subgenomes of an allopolyploid (1C), one set of an autopolyploid;
+    /// bases, or with k, m or g (1.26g).
+    #[arg(long, value_parser = parse_bases, conflicts_with = "no_extend_gate")]
+    genome_size: Option<u64>,
     /// HiFi: recruit without the depth gate (`find recruit` without --extend-gate --bootstrap),
     /// as up to 0.2.1. On a species far from the seed library extension can then run into the
     /// nucleus (Carex echinata: 8.5 Gb of "plastid" reads); --recruit-max-bases still bounds what
@@ -547,6 +557,9 @@ fn run(args: RunArgs) -> Result<()> {
     if args.extend_gate_fold.is_some_and(|f| f.is_nan() || f <= 0.0) {
         bail!("--extend-gate-fold must be positive");
     }
+    if args.nuclear_depth == Some(0) {
+        bail!("--nuclear-depth must be positive");
+    }
     let single = match args.organelle {
         pipeline::OrganelleChoice::Mitochondrion => Some("mitochondrion"),
         pipeline::OrganelleChoice::Plastid => Some("plastid"),
@@ -601,6 +614,8 @@ fn run(args: RunArgs) -> Result<()> {
         // seed library (see docs/release-0.3.0.md).
         gated_recruit: !args.no_extend_gate,
         recruit_gate_fold: args.extend_gate_fold,
+        recruit_nuclear_depth: args.nuclear_depth,
+        recruit_genome_size: args.genome_size,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
         recruit_iterations: args.recruit_iterations,
@@ -1653,6 +1668,29 @@ struct RecruitArgs {
     /// Extension already lowers it for a target shallower than that (see `--extend-gate`).
     #[arg(long)]
     gate_fold: Option<f64>,
+    /// The depth gate's nuclear peak (sketch depth, about the single-copy read depth), given
+    /// instead of judged from the reads' median depths. Those stand two copies deep in a
+    /// repeat-rich or polyploid genome (Lespedeza davurica: 56x for 27x).
+    #[arg(long, conflicts_with = "genome_size")]
+    nuclear_depth: Option<u32>,
+    /// The nuclear genome's size, for the depth gate's nuclear peak (the input's bases over it):
+    /// the length of a collapsed assembly, all subgenomes of an allopolyploid (1C) but one set of
+    /// an autopolyploid; bases, or with k, m or g (1.26g).
+    #[arg(long, value_parser = parse_bases)]
+    genome_size: Option<u64>,
+}
+
+/// Bases, plain or with a k, m or g suffix (1.26g).
+fn parse_bases(s: &str) -> std::result::Result<u64, String> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, scale) = match t.strip_suffix(['k', 'm', 'g']) {
+        Some(n) => (n, match t.chars().last() { Some('k') => 1e3, Some('m') => 1e6, _ => 1e9 }),
+        None => (t.as_str(), 1.0),
+    };
+    match num.parse::<f64>() {
+        Ok(v) if v.is_finite() && v * scale >= 1.0 => Ok((v * scale).round() as u64),
+        _ => Err(format!("{s}: not a size in bases (e.g. 1260000000 or 1.26g)")),
+    }
 }
 
 #[derive(clap::Args)]
@@ -1734,6 +1772,17 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     if args.gate_fold.is_some_and(|f| f.is_nan() || f <= 0.0) {
         bail!("--gate-fold must be positive");
     }
+    if args.nuclear_depth == Some(0) {
+        bail!("--nuclear-depth must be positive");
+    }
+    if (args.nuclear_depth.is_some() || args.genome_size.is_some())
+        && !(args.extend_gate || args.bootstrap || args.max_read_depth.is_some())
+    {
+        bail!(
+            "--nuclear-depth and --genome-size set the depth gate's nuclear peak: give \
+             --extend-gate, --bootstrap or --max-read-depth"
+        );
+    }
     if args.max_read_depth.is_some() && !matches!(args.preset, Preset::Hifi) {
         bail!("--max-read-depth needs the hifi preset: its depth sketch judges whole long reads");
     }
@@ -1798,6 +1847,8 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             mates_together: args.mates_together,
             kmer_gate: args.kmer_gate,
             gate_fold: args.gate_fold,
+            nuclear_depth: args.nuclear_depth,
+            genome_size: args.genome_size,
         },
     )?;
     for o in &report.outputs {
@@ -1862,4 +1913,21 @@ fn dispatch(command: Command) -> Result<()> {
 
 fn main() -> Result<()> {
     dispatch(Cli::parse().command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bases;
+
+    #[test]
+    fn genome_sizes_parse_with_or_without_a_suffix() {
+        assert_eq!(parse_bases("1260000000"), Ok(1_260_000_000));
+        assert_eq!(parse_bases("1.26g"), Ok(1_260_000_000));
+        assert_eq!(parse_bases("1.26G"), Ok(1_260_000_000));
+        assert_eq!(parse_bases("450m"), Ok(450_000_000));
+        assert_eq!(parse_bases("150k"), Ok(150_000));
+        assert!(parse_bases("0").is_err());
+        assert!(parse_bases("-3g").is_err());
+        assert!(parse_bases("big").is_err());
+    }
 }

@@ -1679,6 +1679,8 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 mates_together: true,
                 kmer_gate: false,
                 gate_fold: None,
+                nuclear_depth: None,
+                genome_size: None,
             },
         )?)?
     };
@@ -1720,6 +1722,8 @@ pub fn run(cfg: &Config) -> Result<Value> {
             auto_recruit_cache: false,
             gated_recruit: false,
             recruit_gate_fold: None,
+            recruit_nuclear_depth: None,
+            recruit_genome_size: None,
             recruit_max_depth: None,
             recruit_max_bases: None,
             recruit_iterations: None,
