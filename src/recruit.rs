@@ -26,7 +26,7 @@ pub fn profiling() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OVASM_PROFILE").is_some())
 }
-use crate::kmer::CanonicalKmers;
+use crate::kmer::{CanonicalKmers, PackedKmers};
 use crate::seedfree::{DepthGate, ReadDepth};
 
 #[derive(Debug, Clone, Serialize)]
@@ -740,7 +740,11 @@ fn scan(
                         }
                         let delta = delta.expect("replay has change set");
                         let td = Instant::now();
-                        let changed = CanonicalKmers::new(seq, bait.k).any(|(_, key)| delta.get(key) != 0);
+                        // cached ACGT-only reads are scanned in their packed form
+                        let changed = match &rec.packed {
+                            Some(packed) => delta.any_key(PackedKmers::new(packed, seq.len(), bait.k)),
+                            None => delta.any_key(CanonicalKmers::new(seq, bait.k).map(|(_, key)| key)),
+                        };
                         // unchanged: as it was; changed: kept with a new bound only when it
                         // cannot leave `Other` (the bound's full look, for such reads alone)
                         let kept = if !changed {
@@ -849,9 +853,9 @@ fn scan(
     }
     numt_w.flush()?;
     if profiling() { eprintln!(
-        "[ovasm] profile scan kind={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
+        "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
         if final_outputs { "final" } else if replaying { "replay" } else { "source" },
-        n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_par, t_serial,
+        delta.map_or(0, BaitSet::len), n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_par, t_serial,
         prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS),
         prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS)
     ); }

@@ -346,6 +346,47 @@ impl BaitSet {
         }
     }
 
+    /// Whether any of `keys` is in the set, as `keys.any(|km| self.get(km) != 0)` says, with the
+    /// lookups of a large prepared index prefetched like `scan_masks`. The replay passes ask this
+    /// of every cached read against the k-mers the last extension changed.
+    #[inline]
+    pub fn any_key(&self, mut keys: impl Iterator<Item = u64>) -> bool {
+        let index = match &self.lookup {
+            Some(index) if index.bloom.len() * 64 + index.keys.len() * 9 >= PREFETCH_FROM_BYTES => index,
+            _ => return keys.any(|km| self.get(km) != 0),
+        };
+        let mut ring = [(0u64, 0u64, false); AHEAD];
+        let mut n = 0usize;
+        let test = |e: &mut (u64, u64, bool)| {
+            e.2 = index.may_contain(e.1);
+            if e.2 {
+                prefetch(&index.keys[LookupIndex::slot(e.1, index.table_mask)]);
+            }
+        };
+        for key in keys.by_ref() {
+            if n >= AHEAD {
+                let e = ring[n % AHEAD];
+                if e.2 && index.exact(e.0, e.1) != 0 {
+                    return true;
+                }
+            }
+            let h = mix(key);
+            prefetch(&index.bloom[h as usize & index.bloom_mask]);
+            ring[n % AHEAD] = (key, h, false);
+            if n >= AHEAD / 2 {
+                test(&mut ring[(n - AHEAD / 2) % AHEAD]);
+            }
+            n += 1;
+        }
+        for i in n.saturating_sub(AHEAD / 2)..n {
+            test(&mut ring[i % AHEAD]);
+        }
+        (n.saturating_sub(AHEAD)..n).any(|i| {
+            let e = ring[i % AHEAD];
+            e.2 && index.exact(e.0, e.1) != 0
+        })
+    }
+
     /// Rebuild after extension, before scanning reads (see `LookupIndex`).
     /// This changes lookup cost only: masks and all classification scores are exact.
     pub fn prepare_lookup(&mut self) {
@@ -522,6 +563,34 @@ mod tests {
             wrong += usize::from(mask != bait.map.get(&km).copied().unwrap_or(0));
         });
         assert_eq!(wrong, 0);
+    }
+
+    #[test]
+    fn any_key_is_any_lookup_at_every_position_of_the_hit() {
+        let mut bait = BaitSet::new(21);
+        let target = bait.target("t").unwrap();
+        bait.add_sequence(target, &genome(450_000, 41));
+        let present = genome(450_000, 41);
+        let absent = genome(30_000, 78);
+        for prepared in [false, true] {
+            if prepared {
+                bait.prepare_lookup();
+                let index = bait.lookup.as_ref().unwrap();
+                assert!(index.bloom.len() * 64 + index.keys.len() * 9 >= PREFETCH_FROM_BYTES);
+            }
+            let keys = |s: &[u8]| CanonicalKmers::new(s, 21).map(|(_, km)| km).collect::<Vec<_>>();
+            assert!(!bait.any_key(std::iter::empty()));
+            assert!(!bait.any_key(keys(&absent).into_iter()));
+            // one present k-mer at the start, inside the prefetch ring, and at the very end
+            for at in [0, 3, 9, 15, 16, 17, 200, 29_978] {
+                let mut s = absent[..at].to_vec();
+                s.extend_from_slice(&present[1000..1021]);
+                s.extend_from_slice(&absent[at..at + 50.min(30_000 - at)]);
+                let ks = keys(&s);
+                assert_eq!(bait.any_key(ks.iter().copied()), ks.iter().any(|&km| bait.get(km) != 0), "at {at}");
+                assert!(bait.any_key(ks.into_iter()), "at {at}");
+            }
+        }
     }
 
     #[test]
