@@ -221,6 +221,21 @@ pub const PARTIAL_DEPTH_SHARE: f64 = 0.25;
 /// k of the depth comparison: short enough for a read with 5-10% errors to keep many k-mers.
 const DEPTH_K: usize = 17;
 
+/// A target that recruited nothing has no depth to compare with; its partly covered reads are
+/// compared with one another instead. Its own reads overlap one another (they hold a few kb of
+/// one small genome), a NUMT read's nuclear flank is single-copy among them, so the reference is
+/// this quantile of their depths, the organelle's reads. ZM4's ONT, 38 Gb: 481 ungated partly
+/// covered mitochondrial reads as bait made 199,750 of the 400,000 reads of round 2 partly
+/// covered (21 Gb, two hours of `find recruit`'s source candidates).
+pub const SELF_DEPTH_QUANTILE: f64 = 0.9;
+
+/// Reads go into `assemble correct` down to this depth (median count of their `DEPTH_K`-mers,
+/// below read depth by the errors). Deeper, systematic errors recur in enough reads to pass the
+/// solid count: ZM4's plastid at about 3,000x (400 Mb, the `--recruit-max-bases` cap) had a
+/// solid peak of 17 at k 25 against 1,074 at 1,000x, took 2.4 hours to correct, and as bait
+/// held 370,000 k-mers for a 125 kb genome.
+pub const CORRECT_MAX_DEPTH: f64 = 300.0;
+
 fn read_seqs(path: &Path) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     if !path.is_file() || fs::metadata(path)?.len() == 0 {
@@ -241,38 +256,104 @@ fn depth_kmers(seq: &[u8]) -> impl Iterator<Item = u64> + '_ {
         .filter(|kmer| kmer.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61 == 0)
 }
 
-/// Which of the `partial` reads are at the depth of the `recruited` ones: a read's depth is the
-/// median count of its k-mers among both sets, and it is kept when that is at least
-/// `PARTIAL_DEPTH_SHARE` of the recruited reads' median depth. Nothing recruited, nothing to
-/// compare with: every read is kept (a seed that covers no read by 80%).
-pub fn at_target_depth(recruited: &[Vec<u8>], partial: &[&[u8]]) -> Vec<bool> {
-    if recruited.is_empty() {
-        return vec![true; partial.len()];
-    }
+/// Per read, the median count of its `depth_kmers` among all of `seqs` (`None` for a read too
+/// short to hold one).
+fn read_depths(seqs: &[&[u8]]) -> Vec<Option<u32>> {
+    use rayon::prelude::*;
     let mut counts: rustc_hash::FxHashMap<u64, u32> = Default::default();
-    for seq in recruited.iter().map(Vec::as_slice).chain(partial.iter().copied()) {
+    for seq in seqs {
         for kmer in depth_kmers(seq) {
             *counts.entry(kmer).or_insert(0) += 1;
         }
     }
-    let depth = |seq: &[u8]| -> Option<u32> {
-        let mut c: Vec<u32> = depth_kmers(seq).map(|kmer| counts[&kmer]).collect();
-        if c.is_empty() {
-            return None;
-        }
-        let mid = c.len() / 2;
-        Some(*c.select_nth_unstable(mid).1)
-    };
-    let mut own: Vec<u32> = recruited.iter().filter_map(|s| depth(s)).collect();
-    if own.is_empty() {
-        return vec![true; partial.len()];
-    }
-    let mid = own.len() / 2;
-    let target = *own.select_nth_unstable(mid).1 as f64;
-    partial
-        .iter()
-        .map(|s| depth(s).is_some_and(|d| d as f64 >= PARTIAL_DEPTH_SHARE * target))
+    seqs.par_iter()
+        .map(|seq| {
+            let mut c: Vec<u32> = depth_kmers(seq).map(|kmer| counts[&kmer]).collect();
+            if c.is_empty() {
+                return None;
+            }
+            let mid = c.len() / 2;
+            Some(*c.select_nth_unstable(mid).1)
+        })
         .collect()
+}
+
+/// The `quantile` (0 to 1) of the known depths.
+fn depth_quantile(depths: &[Option<u32>], quantile: f64) -> Option<f64> {
+    let mut d: Vec<u32> = depths.iter().flatten().copied().collect();
+    if d.is_empty() {
+        return None;
+    }
+    let i = ((d.len() - 1) as f64 * quantile) as usize;
+    Some(*d.select_nth_unstable(i).1 as f64)
+}
+
+/// Which of the `partial` reads are at the depth of the `recruited` ones: a read's depth is the
+/// median count of its k-mers among both sets, and it is kept when that is at least
+/// `PARTIAL_DEPTH_SHARE` of the recruited reads' median depth. Nothing recruited (a seed that
+/// covers no read by 80%): of the `SELF_DEPTH_QUANTILE` of the partly covered reads' own depths.
+pub fn at_target_depth(recruited: &[Vec<u8>], partial: &[&[u8]]) -> Vec<bool> {
+    let all: Vec<&[u8]> =
+        recruited.iter().map(Vec::as_slice).chain(partial.iter().copied()).collect();
+    let depths = read_depths(&all);
+    let (own, theirs) = depths.split_at(recruited.len());
+    let target = depth_quantile(own, 0.5).or_else(|| depth_quantile(theirs, SELF_DEPTH_QUANTILE));
+    let Some(target) = target else {
+        return vec![true; partial.len()];
+    };
+    theirs
+        .iter()
+        .map(|d| d.is_some_and(|d| d as f64 >= PARTIAL_DEPTH_SHARE * target))
+        .collect()
+}
+
+/// `reads` down to `CORRECT_MAX_DEPTH`: when their median depth (see `read_depths`) is above it,
+/// the reads whose id hashes below the share are written to `out` and it is returned in their
+/// place. Also the record of it: depth, kept share, reads and bases kept.
+fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, Value)> {
+    let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for path in reads {
+        if !path.is_file() || fs::metadata(path)?.len() == 0 {
+            continue;
+        }
+        let mut reader = needletail::parse_fastx_file(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        while let Some(record) = reader.next() {
+            let record =
+                record.with_context(|| format!("malformed record in {}", path.display()))?;
+            records.push((record.id().to_vec(), record.seq().into_owned()));
+        }
+    }
+    let depths = read_depths(&records.iter().map(|r| r.1.as_slice()).collect::<Vec<_>>());
+    let depth = depth_quantile(&depths, 0.5);
+    let Some(d) = depth.filter(|&d| d > CORRECT_MAX_DEPTH) else {
+        return Ok((reads.to_vec(), json!({"depth": depth, "kept_fraction": 1.0})));
+    };
+    let fraction = CORRECT_MAX_DEPTH / d;
+    let mut w = BufWriter::new(fs::File::create(out)?);
+    let (mut n, mut b) = (0u64, 0u64);
+    for (id, seq) in records.iter().filter(|r| unit_hash(&r.0, salt) < fraction) {
+        w.write_all(b">")?;
+        w.write_all(id)?;
+        w.write_all(b"\n")?;
+        w.write_all(seq)?;
+        w.write_all(b"\n")?;
+        n += 1;
+        b += seq.len() as u64;
+    }
+    w.flush()?;
+    log(&format!(
+        "reads for {} at depth {d:.0}: correcting {n} of {} ({:.1} Mb), down to depth \
+         {CORRECT_MAX_DEPTH:.0}",
+        out.display(),
+        records.len(),
+        b as f64 / 1e6
+    ));
+    Ok((
+        vec![out.to_path_buf()],
+        json!({"depth": d, "kept_fraction": fraction, "kept_reads": n, "kept_bases": b,
+               "reads": path_str(out)}),
+    ))
 }
 
 /// `find recruit --preset ont`'s classification: a read is the target's when the bait covers
@@ -414,11 +495,13 @@ fn seed_spec(name: &str, path: &Path) -> OsString {
 }
 
 /// `assemble correct` of `reads` into `fasta` (and its report beside it): self-correction, or
-/// hybrid with `short` (then the self rounds of `assemble correct`'s default).
-fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path) -> Result<Value> {
+/// hybrid with `short` (then the self rounds of `assemble correct`'s default); the reads down to
+/// `CORRECT_MAX_DEPTH` first (see `cap_depth`).
+fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> Result<Value> {
     let json = fasta.with_extension("json");
+    let (reads, depth_cap) = cap_depth(reads, &fasta.with_extension("capped.fasta"), salt)?;
     let mut argv = Argv::new("assemble correct")
-        .each("--reads", reads)
+        .each("--reads", &reads)
         .opt("--out", fasta)
         .opt("--out-json", &json);
     if let Some(s) = short {
@@ -431,6 +514,7 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path) -> Result<Valu
         "reads": path_str(fasta),
         "report": path_str(&json),
         "hybrid": short.is_some(),
+        "depth_cap": depth_cap,
         "rounds": report["rounds"].as_array().map(|r| r.iter().map(|x| json!({
             "k": x["k"],
             "hybrid": x["hybrid"],
@@ -456,6 +540,9 @@ struct Reads {
     /// The reads that are assembled: `raw`, corrected (hybrid in `run hybrid`).
     corrected: PathBuf,
     kept: Option<(u64, u64)>,
+    /// A used round reached `--recruit-max-bases`: later rounds cannot add to what is kept, so
+    /// they are not used for it and it gets no bait of reads.
+    capped: bool,
     rounds: Vec<Value>,
     corrections: Vec<Value>,
     short: Value,
@@ -497,7 +584,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
             let organelle = organelles[0];
             log(&format!("correcting the supplied {organelle} long reads"));
             let fasta = o.out.join(format!("correct/{organelle}.fasta"));
-            let mut c = correct(long, None, &fasta)?;
+            let mut c = correct(long, None, &fasta, o.salt)?;
             c["purpose"] = "assembly".into();
             reads.insert(
                 organelle,
@@ -506,6 +593,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                     bait: None,
                     corrected: fasta,
                     kept: None,
+                    capped: false,
                     rounds: Vec::new(),
                     corrections: vec![c],
                     short: Value::Null,
@@ -552,18 +640,20 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 files.insert(format!("recruitment_round{round}"), path_str(&dir.join("recruit.json")));
                 let report = read_json(&dir.join("recruit.json"))?;
                 let mut grown = Vec::new();
+                let mut capped = Vec::new();
                 for &organelle in organelles {
                     if matches!(reads.get(organelle), Some(Err(_))) {
                         continue;
                     }
                     let out = target_output(&report, organelle)?;
                     let n = |key: &str| out[key].as_u64().unwrap_or(0);
-                    let previous = reads
-                        .get(organelle)
-                        .and_then(|r| r.as_ref().ok())
+                    let before = reads.get(organelle).and_then(|r| r.as_ref().ok());
+                    let previous = before
                         .and_then(|r| r.rounds.iter().rev().find(|x| x["used"] == true))
                         .and_then(|r| r["recruited_bases"].as_u64());
-                    let grew = round_grew(previous, n("recruited_bases"));
+                    let was_capped = before.is_some_and(|r| r.capped);
+                    let grew = !was_capped && round_grew(previous, n("recruited_bases"));
+                    let at_cap = grew && out["sampled_by"] == "max_bases";
                     let entry = json!({
                         "round": round,
                         "bait": if seed_reads.iter().any(|(s, _)| s == organelle) {
@@ -577,6 +667,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                         "kept_bases": n("kept_bases"),
                         "sampled_by": out["sampled_by"],
                         "used": grew,
+                        "capped_before": was_capped,
                         "seconds": report["elapsed_seconds"],
                     });
                     let raw = vec![dir.join(format!("{organelle}.fastq"))];
@@ -585,15 +676,13 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                         Some(Ok(r)) => {
                             r.rounds.push(entry);
                             if grew {
-                                (r.raw, r.kept) = (raw, kept);
-                                grown.push(organelle);
+                                (r.raw, r.kept, r.capped) = (raw, kept, at_cap);
                             }
                         }
                         // kept even with no read covered by 80%: with a multi-species seed library
                         // a mitochondrial ONT read rarely is (ZM4: none in 12 Gb), and the partly
                         // covered reads alone give the next round's bait
                         _ => {
-                            grown.push(organelle);
                             reads.insert(
                                 organelle,
                                 Ok(Reads {
@@ -601,6 +690,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                                     bait: None,
                                     corrected: PathBuf::new(),
                                     kept,
+                                    capped: at_cap,
                                     rounds: vec![entry],
                                     corrections: Vec::new(),
                                     short: Value::Null,
@@ -608,13 +698,27 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                             );
                         }
                     }
+                    if at_cap {
+                        capped.push(organelle);
+                    } else if grew {
+                        grown.push(organelle);
+                    }
+                }
+                if !capped.is_empty() && round < o.recruit_rounds {
+                    log(&format!(
+                        "round {round} reached --recruit-max-bases for {}: its reads are kept and \
+                         later rounds are not used for it",
+                        capped.join(" and ")
+                    ));
                 }
                 if grown.is_empty() {
-                    log(&format!(
-                        "round {round} added under {:.0}% of the bases: the reads of the round \
-                         before are assembled",
-                        ROUND_GROWTH * 100.0
-                    ));
+                    if round < o.recruit_rounds {
+                        log(&format!(
+                            "round {round}: no organelle below --recruit-max-bases gained {:.0}% \
+                             of its bases; the reads of each one's last used round are assembled",
+                            ROUND_GROWTH * 100.0
+                        ));
+                    }
                     break;
                 }
                 if round == o.recruit_rounds {
@@ -645,7 +749,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                         continue;
                     }
                     let fasta = o.out.join(format!("correct/round{round}/{organelle}.bait.fasta"));
-                    let mut c = correct(&inputs, None, &fasta)?;
+                    let mut c = correct(&inputs, None, &fasta, o.salt)?;
                     c["purpose"] = "bait".into();
                     c["partial_reads"] = partial.get(organelle).map(|x| x.1).into();
                     r.bait = Some(fasta);
@@ -666,7 +770,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 }
                 log(&format!("self-correcting the {organelle} long reads to assemble"));
                 let fasta = o.out.join(format!("correct/{organelle}.fasta"));
-                let mut c = correct(&r.raw, None, &fasta)?;
+                let mut c = correct(&r.raw, None, &fasta, o.salt)?;
                 c["purpose"] = "assembly".into();
                 r.corrected = fasta;
                 r.corrections.push(c);
@@ -727,7 +831,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 }
                 log(&format!("correcting the {organelle} long reads with its short reads"));
                 let fasta = o.out.join("correct/hybrid").join(format!("{organelle}.fasta"));
-                let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta)?;
+                let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta, o.salt)?;
                 c["purpose"] = "assembly".into();
                 r.corrected = fasta;
                 r.corrections.push(c);
@@ -1055,8 +1159,82 @@ mod tests {
         partial.extend((0..10).map(|i| &other[i * 6000..i * 6000 + 4000]));
         let keep = at_target_depth(&recruited, &partial);
         assert_eq!(keep, [vec![true; 10], vec![false; 10]].concat());
-        // nothing recruited: nothing to compare with
-        assert_eq!(at_target_depth(&[], &partial), vec![true; 20]);
+    }
+
+    #[test]
+    fn with_nothing_recruited_the_partly_covered_reads_are_compared_with_one_another() {
+        // 40 reads of a 20 kb genome every 500 bp (8x among themselves), and 10 NUMT reads:
+        // 1.5 kb of it in 2.5 kb of a single-copy nuclear flank
+        let (a, other) = (seq(20_000, 5), seq(60_000, 6));
+        let circ = [a.as_slice(), &a[..4000]].concat();
+        let mut partial: Vec<Vec<u8>> = (0..40).map(|i| circ[i * 500..i * 500 + 4000].to_vec()).collect();
+        partial.extend((0..10).map(|i| {
+            [&a[i * 1500..i * 1500 + 1500], &other[i * 6000..i * 6000 + 2500]].concat()
+        }));
+        let refs: Vec<&[u8]> = partial.iter().map(Vec::as_slice).collect();
+        assert_eq!(at_target_depth(&[], &refs), [vec![true; 40], vec![false; 10]].concat());
+        // all of one depth: all kept
+        assert_eq!(at_target_depth(&[], &refs[..40]), vec![true; 40]);
+        assert_eq!(at_target_depth(&[], &[]), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn deep_reads_are_corrected_down_to_the_depth_cap() {
+        let dir = tmpdir("cap");
+        let g = seq(5_000, 7);
+        let circ = [g.as_slice(), &g[..2000]].concat();
+        let deep: Vec<(String, Vec<u8>)> =
+            (0..5000).step_by(5).map(|s| (format!("r{s}"), circ[s..s + 2000].to_vec())).collect();
+        let path = dir.join("deep.fa");
+        fasta(&path, &deep);
+        let (reads, cap) = cap_depth(&[path.clone()], &dir.join("capped.fa"), 0).unwrap();
+        assert_eq!(reads, vec![dir.join("capped.fa")]);
+        let depth = cap["depth"].as_f64().unwrap();
+        assert!((350.0..=400.0).contains(&depth), "{cap}");
+        let n = cap["kept_reads"].as_u64().unwrap() as f64;
+        let expected = 1000.0 * CORRECT_MAX_DEPTH / depth;
+        assert!((n - expected).abs() < 0.15 * expected, "{n} reads kept, {expected} expected");
+        assert_eq!(read_seqs(&reads[0]).unwrap().len() as f64, n);
+        // shallow reads go in as they are
+        fasta(&path, &deep.iter().step_by(20).cloned().collect::<Vec<_>>());
+        let (reads, cap) = cap_depth(&[path.clone()], &dir.join("capped2.fa"), 0).unwrap();
+        assert_eq!(reads, vec![path]);
+        assert_eq!(cap["kept_fraction"], json!(1.0));
+        assert!(!dir.join("capped2.fa").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_organelle_at_the_recruitment_cap_takes_no_further_round() {
+        // the plastid's 3 Mb of reads pass a 2.5 Mb cap in round 1; the mitochondrion's seed gap
+        // still needs round 2
+        let dir = tmpdir("capped");
+        let s = sample(&dir, 0.05);
+        let out = dir.join("out");
+        let mt = format!("mitochondrion={}", s.mt_seed.display());
+        let pt = format!("plastid={}", s.pt_seed.display());
+        let o = options(&[
+            "--organelle", "both", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt,
+            "--recruit-max-bases", "2500000",
+        ]);
+        let report = run(&[s.long.clone()], None, &o).unwrap();
+        assert_eq!(report["failed"], json!([]));
+        let p = read_json(&out.join("plastid/summary.json")).unwrap();
+        let rounds = p["long_read"]["rounds"].as_array().unwrap();
+        assert_eq!(rounds[0]["sampled_by"], "max_bases", "{rounds:?}");
+        assert_eq!(rounds[0]["used"], json!(true));
+        assert_eq!(rounds[1]["used"], json!(false));
+        assert_eq!(rounds[1]["capped_before"], json!(true));
+        assert_eq!(rounds[1]["bait"], "seeds", "no bait of reads for a capped organelle");
+        let purposes: Vec<&Value> =
+            p["long_read"]["corrections"].as_array().unwrap().iter().map(|c| &c["purpose"]).collect();
+        assert_eq!(purposes, [&json!("assembly")]);
+        assert!(p["long_read"]["assembled_reads"].as_str().unwrap().ends_with("correct/plastid.fasta"));
+        assert_genome(&out.join("plastid"), &s.plastid, "capped plastid");
+        let m = read_json(&out.join("mitochondrion/summary.json")).unwrap();
+        assert_eq!(m["long_read"]["rounds"][1]["used"], json!(true));
+        assert_genome(&out.join("mitochondrion"), &s.mito, "mitochondrion beside a capped plastid");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
