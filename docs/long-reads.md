@@ -87,6 +87,8 @@ asm5, identity = matching bases / alignment columns.
 | | mitochondrion | 73 | 460,768 in all, longest 178,656 | 4 | 91.6% | 99.61% | | |
 | `run hybrid` 12 Gb + 6 Gb | plastid | 1 | 125,498 | yes | 100% | 99.991% | 42.6 min | 5.26 GiB |
 | | mitochondrion | 3 | 374,992 + 6,330 + 4,640 | 2 | 100% | 100.00% | | |
+| `run ont` 38 Gb | plastid | 1 | 125,432 | yes | 100% | 99.938% | 316.0 min | 11.18 GiB |
+| | mitochondrion | 1 | 307,000 | no | 100% | 99.991% | | |
 | `run hifi` 15.8 Gb (control) | plastid | 2 | 90,083 in all | no | 71.8% | 99.999% | 20.8 min | 1.49 GiB |
 | | mitochondrion | 3 | 199,416 in all | no | 65.0% | 100.00% | | |
 
@@ -98,7 +100,13 @@ asm5, identity = matching bases / alignment columns.
   reads); 142 partly covered reads made the round-2 bait, which recruited 177 reads (14 Mb,
   about 46x). Self-correction at that depth anchors 83% of the bases and leaves the graph in 73
   pieces that cover 92% of the reference. Depth, not recruitment, is what ONT alone lacks here:
-  see the 38 Gb run.
+  with the first 400,000 reads (38 Gb) round 2 recruited 354 reads (26.7 Mb, about 87x) and the
+  graph resolves at k 1001 into one 307,000 bp molecule, the reference's single cycle less 26 bp
+  (17 of 18 links supported, not closed into a circle; decisive false).
+- Cost of the 38 Gb run: 5.3 h, of which round 2 was 2.6 h, at 11.2 GiB. The plastid's round 1
+  already reached `--recruit-max-bases` (400 Mb) and its round 2 took 3.2 Gb (kept 413 Mb), so
+  that round only fed the mitochondrion; an organelle that reaches the cap in a round would not
+  need another one (not done yet).
 - Mitochondrion, hybrid: the 177 corrected long reads recruited 2.6 M short reads (394 Mb); after
   hybrid correction the same reads assemble at k 1001 into a 374,992 bp circle that covers the
   whole reference without a mismatch in the aligned columns (its extra length is a further copy
