@@ -73,9 +73,83 @@ impl Iterator for CanonicalKmers<'_> {
     }
 }
 
+/// The canonical k-mers of a 2-bit packed sequence (base i at bits 2(i % 4) of byte i / 4, A C G
+/// T = 0 1 2 3, as the recruitment cache stores ACGT-only reads), in order: the keys
+/// `CanonicalKmers` gives for the unpacked sequence, without decoding a base or testing for N.
+pub struct PackedKmers<'a> {
+    packed: &'a [u8],
+    len: usize,
+    k: usize,
+    mask: u64,
+    shift: u32,
+    fwd: u64,
+    rev: u64,
+    pos: usize,
+}
+
+impl<'a> PackedKmers<'a> {
+    pub fn new(packed: &'a [u8], len: usize, k: usize) -> Self {
+        assert!((1..=MAX_K).contains(&k), "k must be in 1..={MAX_K}");
+        assert!(packed.len() * 4 >= len, "packed sequence shorter than its length");
+        Self {
+            packed,
+            len,
+            k,
+            mask: (1u64 << (2 * k)) - 1,
+            shift: (2 * (k - 1)) as u32,
+            fwd: 0,
+            rev: 0,
+            pos: 0,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self) {
+        let code = u64::from(self.packed[self.pos >> 2] >> (2 * (self.pos & 3))) & 3;
+        self.fwd = ((self.fwd << 2) | code) & self.mask;
+        self.rev = (self.rev >> 2) | ((3 - code) << self.shift);
+        self.pos += 1;
+    }
+}
+
+impl Iterator for PackedKmers<'_> {
+    type Item = u64;
+
+    #[inline]
+    fn next(&mut self) -> Option<u64> {
+        if self.len < self.k {
+            return None;
+        }
+        while self.pos + 1 < self.k {
+            self.push();
+        }
+        if self.pos >= self.len {
+            return None;
+        }
+        self.push();
+        Some(self.fwd.min(self.rev))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_kmers_are_the_canonical_kmers_of_the_unpacked_sequence() {
+        for len in 0..70usize {
+            let seq: Vec<u8> = (0..len).map(|i| b"ACGT"[(i * 7 + i / 3 + len) % 4]).collect();
+            let mut packed = vec![0u8; len.div_ceil(4)];
+            for (i, &b) in seq.iter().enumerate() {
+                packed[i / 4] |= (encode(b).unwrap() as u8) << (2 * (i % 4));
+            }
+            for k in [1, 5, 21, 31] {
+                let want: Vec<u64> = CanonicalKmers::new(&seq, k).map(|(_, km)| km).collect();
+                let got: Vec<u64> = PackedKmers::new(&packed, len, k).collect();
+                assert_eq!(got, want, "len {len} k {k}");
+            }
+        }
+    }
 
     fn revcomp(s: &[u8]) -> Vec<u8> {
         s.iter()

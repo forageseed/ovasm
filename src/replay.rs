@@ -16,6 +16,9 @@ use rayon::prelude::*;
 
 pub struct Entry {
     pub rec: Rec,
+    /// A cached ACGT-only read's sequence as the cache stores it (`pack`), for replay passes to
+    /// scan without decoding (`kmer::PackedKmers`).
+    pub packed: Option<Vec<u8>>,
 }
 
 pub struct Replay {
@@ -192,15 +195,17 @@ impl Replay {
                     r.read_exact(&mut id)?;
                     let mut seq = vec![0; if flags[0] == 1 { len.div_ceil(4) } else { len }];
                     r.read_exact(&mut seq)?;
-                    if flags[0] == 1 {
-                        seq = unpack(&seq, len);
-                    }
+                    let packed = (flags[0] == 1).then(|| {
+                        let unpacked = unpack(&seq, len);
+                        std::mem::replace(&mut seq, unpacked)
+                    });
                     batch.push(Entry {
                         rec: Rec {
                             id,
                             seq,
                             qual: None,
                         },
+                        packed,
                     });
                 }
                 crate::recruit::PROF_READER_WORK_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -261,7 +266,7 @@ pub fn source_batches(
     let (tx, rx) = crossbeam_channel::bounded(1);
     let thread = std::thread::spawn(move || -> Result<()> {
         for batch in original {
-            let batch = batch.into_iter().map(|rec| Entry { rec }).collect();
+            let batch = batch.into_iter().map(|rec| Entry { rec, packed: None }).collect();
             if tx.send(batch).is_err() {
                 return Ok(());
             }
@@ -289,6 +294,7 @@ mod tests {
                     seq: seq.to_vec(),
                     qual: (i != 2).then(|| vec![b'!' + i as u8; seq.len()]),
                 },
+                packed: None,
             })
             .collect();
         cache.store(&entries[..2]).unwrap();
@@ -308,6 +314,8 @@ mod tests {
                 assert_eq!(entry.rec.id, entries[index].rec.id);
                 assert_eq!(entry.rec.seq, entries[index].rec.seq);
                 assert!(entry.rec.qual.is_none());
+                // ACGT-only reads come with their packed form
+                assert_eq!(entry.packed, pack(&entries[index].rec.seq));
                 index += 1;
             }
         }
