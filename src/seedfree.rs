@@ -350,8 +350,11 @@ pub struct GateReport {
     /// The organelle threshold over the nuclear peak (3, or `find recruit --gate-fold`).
     pub depth_fold: f64,
     /// "reads" (`nuclear_read_depth`), or "kmers" where no read-depth peak stands for a nuclear
-    /// genome (the mode of the read-context k-mer histogram).
+    /// genome (the mode of the read-context k-mer histogram); "given" (`find recruit
+    /// --nuclear-depth`) or "genome size" (`--genome-size`) where it was not judged.
     pub nuclear_source: &'static str,
+    /// The peak judged from the reads ("reads" or "kmers" above), kept where one was given.
+    pub judged_peak_depth: u32,
     /// Reads whose median depth could be judged (see `nuclear_read_depth`).
     pub judged_reads: u64,
     /// The genome size the peak stands for: the bases of the reads within half a log2 unit of it
@@ -547,7 +550,8 @@ impl DepthGate {
             organelle_min_depth: organelle_min,
             depth_fold: params.depth_fold,
             nuclear_source,
-            judged_reads: read_depth_histogram.iter().map(|h| h.1).sum(),
+            judged_peak_depth: nuclear,
+            judged_reads:read_depth_histogram.iter().map(|h| h.1).sum(),
             peak_window_bases: window_bases,
             kmer_peak_depth: kmer_peak,
             read_depth_histogram,
@@ -579,6 +583,19 @@ impl DepthGate {
         self.organelle_min_depth = self.nuclear_peak_depth as f64 * fold;
         self.report.organelle_min_depth = self.organelle_min_depth;
         self.report.depth_fold = fold;
+    }
+
+    /// The nuclear peak at `depth` instead of the judged one, the organelle threshold with it.
+    /// The reads' median depths stand for the nucleus's single-copy depth only where most of a
+    /// read is single-copy: in Lespedeza davurica (allotetraploid, 60% repeats, 238 Mb of A/B
+    /// sequence in two copies) they peak at 56x on a 34 Gb library of a 1.26 Gb genome (27x,
+    /// the k-mer peak 28x), and the mitochondrion at 72x stood under the threshold.
+    pub fn set_nuclear_depth(&mut self, depth: u32, source: &'static str) {
+        self.nuclear_peak_depth = depth;
+        self.organelle_min_depth = depth as f64 * self.params.depth_fold;
+        self.report.nuclear_peak_depth = depth;
+        self.report.organelle_min_depth = self.organelle_min_depth;
+        self.report.nuclear_source = source;
     }
 
     /// Both of the above from one look at the read's sampled k-mers.

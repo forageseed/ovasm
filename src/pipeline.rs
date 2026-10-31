@@ -119,6 +119,9 @@ pub struct RunConfig {
     pub gated_recruit: bool,
     /// `find recruit --gate-fold` of gated HiFi seed recruitment (None: the gate's 3).
     pub recruit_gate_fold: Option<f64>,
+    /// `find recruit --nuclear-depth` and `--genome-size` of gated HiFi seed recruitment.
+    pub recruit_nuclear_depth: Option<u32>,
+    pub recruit_genome_size: Option<u64>,
     /// HiFi seed recruitment: `find recruit --max-read-depth` and `--max-bases`.
     pub recruit_max_depth: Option<f64>,
     pub recruit_max_bases: Option<u64>,
@@ -750,6 +753,8 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
                 "nuclear_peak_depth": gate["nuclear_peak_depth"],
                 "organelle_min_depth": gate["organelle_min_depth"],
                 "depth_fold": gate["depth_fold"],
+                "nuclear_source": gate["nuclear_source"],
+                "judged_peak_depth": gate["judged_peak_depth"],
                 "peak_window_bases": gate["peak_window_bases"],
                 "kmer_peak_depth": gate["kmer_peak_depth"],
                 "source": gate["source"],
@@ -975,6 +980,12 @@ fn recruit_all(
                 argv = argv.arg("--extend-gate").arg("--bootstrap");
                 if let Some(f) = cfg.recruit_gate_fold {
                     argv = argv.opt("--gate-fold", f.to_string());
+                }
+                if let Some(d) = cfg.recruit_nuclear_depth {
+                    argv = argv.opt("--nuclear-depth", d.to_string());
+                }
+                if let Some(g) = cfg.recruit_genome_size {
+                    argv = argv.opt("--genome-size", g.to_string());
                 }
             }
             if let Some(d) = cfg.recruit_max_depth {
@@ -2368,6 +2379,8 @@ mod tests {
             auto_recruit_cache: true,
             gated_recruit: true,
             recruit_gate_fold: None,
+            recruit_nuclear_depth: None,
+            recruit_genome_size: None,
             recruit_max_depth: Some(250.0),
             recruit_max_bases: Some(1_000_000_000),
             recruit_iterations: None,

@@ -1051,6 +1051,10 @@ pub struct RecruitConfig {
     pub kmer_gate: bool,
     /// The depth gate's organelle threshold over the nuclear peak (None: 3, `discover`'s).
     pub gate_fold: Option<f64>,
+    /// The depth gate's nuclear peak, given instead of judged (`DepthGate::set_nuclear_depth`).
+    pub nuclear_depth: Option<u32>,
+    /// The nuclear genome's collapsed size: the gate's nuclear peak is the input's bases over it.
+    pub genome_size: Option<u64>,
 }
 
 /// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB.
@@ -1279,10 +1283,9 @@ fn bootstrap_candidates(
 /// The depth sketch: from the recruitment cache when there is one, which saves its two passes
 /// over the original input (each a full decompression).
 fn build_gate(
-    inputs: &[PathBuf],
+    cfg: &RecruitConfig,
     replay: Option<&crate::replay::Replay>,
     sketch: Option<crate::seedfree::GateSketch>,
-    fold: Option<f64>,
     warnings: &mut Vec<String>,
 ) -> Result<DepthGate> {
     let mut gate = match (replay.filter(|r| r.ready), sketch) {
@@ -1290,13 +1293,20 @@ fn build_gate(
             DepthGate::long_reads_from_sketch(s, || cache.sequences(), "first pass and recruitment cache")?
         }
         (None, Some(s)) => {
-            DepthGate::long_reads_from_sketch(s, || read_batches(inputs), "first pass and inputs")?
+            DepthGate::long_reads_from_sketch(s, || read_batches(&cfg.inputs), "first pass and inputs")?
         }
         (Some(cache), None) => DepthGate::long_reads_from(|| cache.sequences(), "recruitment cache")?,
-        (None, None) => DepthGate::long_reads(inputs)?,
+        (None, None) => DepthGate::long_reads(&cfg.inputs)?,
     };
-    if let Some(f) = fold {
+    if let Some(f) = cfg.gate_fold {
         gate.set_depth_fold(f);
+    }
+    let given = given_nuclear_depth(cfg, gate.report.sketch_bases);
+    if let Some((depth, source)) = given {
+        gate.set_nuclear_depth(depth, source);
+    }
+    if let Some(w) = nuclear_depth_doubt(&gate.report) {
+        warnings.push(w);
     }
     eprintln!(
         "[ovasm] depth gate: nuclear peak {}x, organelle threshold {:.0}x (sketch depth), from the {} in {:.0}s",
@@ -1306,7 +1316,7 @@ fn build_gate(
         gate.report.seconds
     );
     // the nuclear peak stands for no nuclear genome: the organelle threshold is doubtful
-    if gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME {
+    if given.is_none() && gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME {
         warnings.push(format!(
             "the depth sketch's nuclear peak ({}x) stands for {:.1} Mb of sequence, too little \
              for a nuclear genome: the library may be too shallow for the nucleus to show, and \
@@ -1317,6 +1327,47 @@ fn build_gate(
         ));
     }
     Ok(gate)
+}
+
+/// The nuclear depth given for the gate: `--nuclear-depth`, or the sketched bases over
+/// `--genome-size` (all of them: the gate's sketch reads the whole input).
+fn given_nuclear_depth(cfg: &RecruitConfig, sketch_bases: u64) -> Option<(u32, &'static str)> {
+    match (cfg.nuclear_depth, cfg.genome_size) {
+        (Some(d), _) => Some((d, "given")),
+        (None, Some(g)) => Some((((sketch_bases as f64 / g as f64).round() as u32).max(1), "genome size")),
+        (None, None) => None,
+    }
+}
+
+/// The gate's two nuclear depths disagree by about twice or more: the read-median peak over the
+/// k-mer peak is a heterozygous genome's k-mers at half depth (the read peak right), or a
+/// repeat-rich or polyploid genome's reads at two copies (the k-mer peak right); a depth given
+/// so far from the k-mer peak may be in the wrong unit.
+const NUCLEAR_DOUBT_RATIO: f64 = 1.7;
+
+fn nuclear_depth_doubt(r: &crate::seedfree::GateReport) -> Option<String> {
+    let (nuclear, kmer) = (f64::from(r.nuclear_peak_depth), f64::from(r.kmer_peak_depth));
+    if kmer <= 0.0 || (nuclear / kmer).max(kmer / nuclear) < NUCLEAR_DOUBT_RATIO {
+        return None;
+    }
+    Some(match r.nuclear_source {
+        "reads" => format!(
+            "the depth gate's nuclear peak from read medians ({nuclear}x) is {:.1} times the \
+             k-mer peak ({kmer}x): right for a heterozygous genome, but a repeat-rich or \
+             polyploid genome's reads can peak at two copies, and an organelle less than 3 \
+             times deeper than the true nucleus is gated out; if the genome is homozygous, give \
+             --genome-size (the collapsed assembly's length: all subgenomes of an allopolyploid, \
+             one set of an autopolyploid) or --nuclear-depth",
+            nuclear / kmer
+        ),
+        _ => format!(
+            "the nuclear depth {nuclear}x ({}) is {:.1} times off the k-mer peak ({kmer}x): \
+             --genome-size is the collapsed assembly's length (all subgenomes of an \
+             allopolyploid, one set of an autopolyploid), not the 2C or a single subgenome",
+            r.nuclear_source,
+            (nuclear / kmer).max(kmer / nuclear)
+        ),
+    })
 }
 
 /// The NUMT candidates of the last pass, from the cache: a replayed pass does not write them.
@@ -1481,7 +1532,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         }
         let last = it + 1 == cfg.iterations.max(1);
         if gate.is_none() && wants_gate && (!last || cfg.max_read_depth.is_some()) {
-            gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), cfg.gate_fold, &mut warnings)?);
+            gate = Some(build_gate(&cfg, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
         }
         let mut depths = pass_depths(gate.as_ref(), &res);
         if cfg.kmer_gate && kmer_table.is_none() && !last {
@@ -1708,7 +1759,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     continue;
                 }
                 if gate.is_none() {
-                    gate = Some(build_gate(&cfg.inputs, replay.as_ref(), gate_sketch.take(), cfg.gate_fold, &mut warnings)?);
+                    gate = Some(build_gate(&cfg, replay.as_ref(), gate_sketch.take(), &mut warnings)?);
                     depths = pass_depths(gate.as_ref(), &res);
                 }
                 if !numt_ready {
@@ -2380,6 +2431,8 @@ mod tests {
             mates_together: false,
             kmer_gate: false,
             gate_fold: None,
+            nuclear_depth: None,
+            genome_size: None,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -2471,6 +2524,8 @@ mod tests {
             mates_together: false,
             kmer_gate: false,
             gate_fold: None,
+            nuclear_depth: None,
+            genome_size: None,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -2633,6 +2688,8 @@ mod tests {
             mates_together: false,
             kmer_gate: false,
             gate_fold: None,
+            nuclear_depth: None,
+            genome_size: None,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -2798,6 +2855,8 @@ mod tests {
             mates_together: false,
             kmer_gate: false,
             gate_fold: None,
+            nuclear_depth: None,
+            genome_size: None,
         }
     }
 
@@ -2925,6 +2984,51 @@ mod tests {
         let gate = fold.depth_gate.as_ref().unwrap();
         assert_eq!((gate.organelle_min_depth, gate.depth_fold), (45.0, 1.5));
         assert_eq!(mito_reads(&fold), starts.len());
+        // --nuclear-depth and --genome-size set the nuclear peak; the judged one is kept
+        let cfg = RecruitConfig {
+            nuclear_depth: Some(20),
+            ..test_config(&fa, dir.join("given"), 80, true)
+        };
+        let given = run(bait_from(&mito[..6000], 21), cfg).unwrap();
+        let gate = given.depth_gate.as_ref().unwrap();
+        assert_eq!((gate.nuclear_peak_depth, gate.organelle_min_depth), (20, 60.0));
+        assert_eq!((gate.nuclear_source, gate.judged_peak_depth), ("given", 30));
+        assert_eq!(mito_reads(&given), starts.len());
+        assert_eq!(count_reads(&given.outputs[0].output, b'n'), 0);
+        let size = gate.sketch_bases / 25;
+        let cfg = RecruitConfig {
+            genome_size: Some(size),
+            ..test_config(&fa, dir.join("size"), 80, true)
+        };
+        let sized = run(bait_from(&mito[..6000], 21), cfg).unwrap();
+        let gate = sized.depth_gate.as_ref().unwrap();
+        assert_eq!((gate.nuclear_peak_depth, gate.nuclear_source), (25, "genome size"));
+        assert_eq!(mito_reads(&sized), starts.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_nuclear_peak_twice_the_kmer_peak_is_doubted() {
+        let nuclear = pseudo_random(200_000, 33);
+        let dir = std::env::temp_dir().join(format!("ovasm-nuclear-doubt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, linear_reads(&nuclear, 100, "n")).unwrap();
+        let mut g = DepthGate::long_reads(&[fa]).unwrap();
+        // agreeing peaks: no warning
+        assert_eq!(nuclear_depth_doubt(&g.report), None);
+        // Lespedeza davurica: read medians at 56x, the k-mer peak at 28x
+        g.report.nuclear_peak_depth = 56;
+        g.report.kmer_peak_depth = 28;
+        let w = nuclear_depth_doubt(&g.report).unwrap();
+        assert!(w.contains("2.0 times") && w.contains("--genome-size"), "{w}");
+        // a given depth half the k-mer peak: the unit is doubted
+        g.set_nuclear_depth(14, "genome size");
+        let w = nuclear_depth_doubt(&g.report).unwrap();
+        assert!(w.contains("14x (genome size)") && w.contains("not the 2C"), "{w}");
+        g.set_nuclear_depth(27, "genome size");
+        assert_eq!(nuclear_depth_doubt(&g.report), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
