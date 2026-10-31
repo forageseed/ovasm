@@ -1048,9 +1048,9 @@ pub struct RecruitReport {
     /// The depth from which a k-mer counted as deep when each target last extended
     /// (`extension_deep`), with the extension gate.
     pub extension_deep_depth: Vec<Option<f64>>,
-    /// With the k-mer gate: each target's frontier walk on the gate's table after the first
-    /// pass (`kmer_frontier`), None when it was not walked.
-    pub kmer_frontier: Vec<Option<crate::frontier::Extension>>,
+    /// With the k-mer gate: each target's frontier walks on the gate's table, one after each
+    /// pass but the last from the first on (`kmer_frontier`) while the target grows.
+    pub kmer_frontier: Vec<Vec<crate::frontier::Extension>>,
     /// What a caller should know about the result: a doubtful depth gate, a target stopped by
     /// `size_cap`, or one still growing when the passes ran out.
     pub warnings: Vec<String>,
@@ -1115,8 +1115,8 @@ pub struct RecruitConfig {
     pub genome_size: Option<u64>,
 }
 
-/// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB.
-const KMER_GATE_SLOTS_LOG2: u32 = 31;
+/// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB (4 MiB in tests).
+const KMER_GATE_SLOTS_LOG2: u32 = if cfg!(test) { 21 } else { 31 };
 /// A read extends a target when the median count of the k-mers it would add is from this share
 /// of the target's own k-mer depth up to `KMER_GATE_CEILING` times it: the nucleus is far
 /// shallower than an organelle, a plastid far deeper than a mitochondrion.
@@ -1698,7 +1698,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             }
         })
         .flatten();
-    let mut kmer_walks: Vec<Option<crate::frontier::Extension>> = vec![None; n_targets];
+    let mut kmer_walks: Vec<Vec<crate::frontier::Extension>> = vec![Vec::new(); n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -1763,15 +1763,24 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 table.seconds,
                 kmer_target_depth
             );
+            kmer_table = Some(table);
+        }
+        // Every pass, not the first alone: from the second on the bait holds the individual's own
+        // sequence, the walks rejoin it (`JOIN_RUN`) and their bridges are kept. On the seeds
+        // alone, WL354's plastid walks crossed none of its breaks: a relative's seeds differ every
+        // few dozen bases, and recruitment crept a few bases a pass over a 2 bp indel (512 reads
+        // 20 bp before it, 39 at it, none across) until it counted as saturated.
+        if let Some(table) = kmer_table.as_ref().filter(|_| !last) {
             for t in 0..n_targets {
                 let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t]) else {
                     continue;
                 };
-                let (ext, n) = kmer_frontier(&table, &mut bait, t, d);
+                let (ext, n) = kmer_frontier(table, &mut bait, t, d);
                 walked[t] = n;
                 eprintln!(
-                    "[ovasm] k-mer frontier {}: depth {d:.0}, {} ends, {} extended, {} new {}-mers in {} pieces ({} bp){}{}",
+                    "[ovasm] k-mer frontier {} pass {}: depth {d:.0}, {} ends, {} extended, {} new {}-mers in {} pieces ({} bp){}{}",
                     bait.targets[t].name,
+                    it + 1,
                     ext.ends,
                     ext.ends_extended,
                     ext.new_kmers,
@@ -1781,9 +1790,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if ext.budget_reached { " (budget reached)" } else { "" },
                     ext.skipped.map(|s| format!(" (skipped: {s})")).unwrap_or_default()
                 );
-                kmer_walks[t] = Some(ext);
+                kmer_walks[t].push(ext);
             }
-            kmer_table = Some(table);
         }
         for t in 0..n_targets {
             if core_depth[t].is_none() && depths.measured[t] >= CORE_MIN_READS {
@@ -4177,6 +4185,40 @@ mod tests {
             gated.iterations.len(),
             plain.iterations.len()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_kmer_frontier_walks_every_pass_and_bridges_once_the_bait_holds_the_individual() {
+        // An 8 kb mitochondrion at ~130x in 150 bp reads, its bait a relative's copy of its
+        // first 3 kb (a difference every 40 bp), beside a shallow nucleus. On the relative's
+        // k-mers no walk rejoins (`frontier::JOIN_RUN`), so the first pass's walk keeps nothing;
+        // once a pass has added the individual's own k-mers, a walk from its edge goes round the
+        // circle to its other edge, and that bridge is kept.
+        let mito = pseudo_random(8000, 81);
+        let nuclear = pseudo_random(100_000, 82);
+        let dir = std::env::temp_dir().join(format!("ovasm-kmer-passes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, tiled(&mito, 1, 150, true, "m") + &tiled(&nuclear, 30, 150, false, "n")).unwrap();
+        let mut relative = mito[..3000].to_vec();
+        for i in (20..3000).step_by(40) {
+            relative[i] = if relative[i] == b'A' { b'C' } else { b'A' };
+        }
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &relative);
+        let mut config = test_config(&fa, dir.join("out"), 20, false);
+        config.kmer_gate = true;
+        let report = run(bait, config).unwrap();
+        let walks = &report.kmer_frontier[0];
+        let grew: Vec<(u64, bool)> = report.iterations.iter().map(|it| (it.recruited[0].reads, it.saturated[0])).collect();
+        assert!(walks.len() >= 2, "{grew:?} {walks:?}");
+        assert_eq!(walks[0].new_kmers, 0, "{:?}", walks[0]);
+        assert!(walks[1..].iter().any(|w| w.new_kmers > 4000), "{walks:?}");
+        assert_eq!(count_reads(&report.outputs[0].output, b'm'), 8000);
+        assert_eq!(count_reads(&report.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
