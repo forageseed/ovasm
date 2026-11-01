@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install an official prebuilt package; never invoke a compiler or sudo.
 set -eu
-version=0.6.0
+version=0.7.0
 bin_dir=${OVASM_INSTALL_DIR:-"$HOME/.local/bin"}
 archive=
 checksums=
@@ -18,7 +18,7 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2 ;;
         --help)
-            echo 'Usage: install.sh [--bin-dir DIR] [--version 0.6.0] [--archive FILE --checksums SHA256SUMS]'
+            echo 'Usage: install.sh [--bin-dir DIR] [--version 0.7.0] [--archive FILE --checksums SHA256SUMS]'
             exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac

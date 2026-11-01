@@ -4,61 +4,143 @@
 
 # OVASM
 
-**Rust organelle assembly: reads → mitochondrial and plastid sequences, GFA and read evidence.**
+OVASM assembles plant mitochondrial and plastid genomes from sequencing reads. Give it HiFi or
+Illumina reads and it picks out the organelle reads, builds an assembly graph and writes the
+sequences, the graph (GFA) and the reads that support each connection.
 
-OVASM recruits organelle reads, builds graphs and retains read-supported alternative connections. HiFi and Illumina inputs are supported; species reference graphs can assist WGS reconstruction.
+It is a single Rust program. It does not need conda, a container or other assemblers, and a typical
+plant HiFi sample finishes in about 20 minutes on 8 threads with around 2 GB of memory.
 
-![OVASM mechanism](docs/figures/ovasm-mechanism-v2.svg)
+![How OVASM works](docs/figures/ovasm-mechanism-v2.svg)
 
 ## Install
 
-**Precompiled 0.6.0 — no compiler required.**
+Precompiled builds of 0.7.0 are on the [release page](https://github.com/forageseed/ovasm/releases/tag/v0.7.0).
 
-- **Windows x86_64:** [download ZIP](https://github.com/forageseed/ovasm/releases/download/v0.6.0/ovasm-v0.6.0-windows-x86_64.zip), extract and double-click `install.cmd`. Reopen the terminal.
-- **Linux x86_64, glibc 2.34+:**
+- **Windows x86_64:** download the
+  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.7.0/ovasm-v0.7.0-windows-x86_64.zip),
+  extract it, double-click `install.cmd` and open a new terminal.
+- **Linux x86_64 (glibc 2.34 or newer):**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.6.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.7.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
 
-[Downloads](https://github.com/forageseed/ovasm/releases/tag/v0.6.0) · [Offline installation](docs/installation.md)
+No internet on the machine? See [offline installation](docs/installation.md).
 
-## Use
+## Quick start
+
+HiFi reads:
 
 ```sh
 ovasm run hifi --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
 ```
 
-Use `ovasm run short` for Illumina. The output contains representative FASTA, GFA, read-support reports and source candidates. Inspect unresolved paths before interpreting graph cycles as physical molecules.
+Illumina paired reads:
 
-Commands are `ovasm <module> <command>`; `-h` works at every level:
+```sh
+ovasm run short --reads sample_R1.fq.gz --reads sample_R2.fq.gz --organelle both --threads 8 --out result
+```
 
-| Module | Commands |
-|---|---|
-| `run` | `short`, `hifi`: one step from reads to graph and molecules |
-| `find` | `recruit`, `discover`, `classify`, `label`: the organelle's reads |
-| `assemble` | `correct`, `graph`, `filter`, `unify`: reads to an assembly graph |
-| `check` | `evidence`, `unzip`: the graph against the reads |
-| `solve` | `linearize`, `primary`, `chromosomes`: sequences and chromosomes |
-| `pan` | `merge`, `reconstruct`, `identify`, `sharing`: many samples |
+Each organelle gets its own folder in `result/` with:
 
-[Species graph → individual WGS](docs/reference-reconstruction.md) · [Commands](https://github.com/forageseed/ovasm/tree/main/docs)
+- `molecules.fasta`: the assembled sequences;
+- `organelle.gfa`: the assembly graph, including alternative connections that reads support;
+- `evidence.json` and `assessment.json`: read support for every junction, depth, copy number,
+  genes found and how complex the graph is.
 
-## Results
+Plant mitochondria often recombine across repeats, so one sample can carry several arrangements of
+the same sequence. OVASM keeps those alternatives in the graph rather than picking one silently. A
+circle in the graph is not proof of a single circular molecule.
 
-| Complete ZM4 HiFi input, 8 threads | Wall time | Peak sampled process-group RSS |
+### Commands
+
+`ovasm run` does everything in one step. The individual steps are also available as
+`ovasm <module> <command>`, and `-h` works at every level.
+
+| Module | Commands | What it does |
+|---|---|---|
+| `run` | `short`, `hifi` | reads to sequences in one step |
+| `find` | `recruit`, `discover`, `classify`, `label` | find the organelle reads |
+| `assemble` | `correct`, `graph`, `filter`, `unify` | build the assembly graph |
+| `check` | `evidence`, `unzip`, `assess` | check the graph against the reads |
+| `solve` | `linearize`, `primary`, `chromosomes` | turn the graph into sequences |
+| `pan` | `merge`, `reconstruct`, `identify`, `sharing` | work across many samples |
+
+More: [rebuilding an individual from a species graph](docs/reference-reconstruction.md) ·
+[all documentation](docs/).
+
+## How well it works
+
+### 112 Darwin Tree of Life species, against published Oatk assemblies
+
+We ran `ovasm run hifi` with default settings on the HiFi reads of 112 species from the Darwin Tree
+of Life project (104 vascular plants and 8 mosses) and compared the result with the Oatk assemblies
+the Oatk authors published for the same species (Zenodo 15053552). For 108 species both assemblies
+exist. The numbers are the share of the Oatk sequence that the OVASM assembly covers, using
+minimap2 `asm5`.
+
+| | Plastid | Mitochondrion |
 |---|---:|---:|
-| OVASM | 210.20 min | 1.983 GiB |
-| OATK, including annotation | 942.35 min | 310.416 GiB |
+| Species compared | 108 | 108 |
+| OVASM covers ≥ 99% of the Oatk assembly | **107** | **89** |
+| 95–99% | 0 | 8 |
+| 50–95% | 0 | 9 |
+| under 50% | 1 | 2 |
+| Median share of Oatk covered | 99.99% | 99.98% |
+| Median identity of the main alignments | 100% | 100% |
 
-OVASM produced MT representatives of 160,953 and 146,073 bp and a PT representative of 125,509 bp. These are sequence representatives, not certified physical chromosome counts. The table records the named full-input benchmark versions; it is not a new 0.3.0 speed measurement.
+| Cost per species, 8 threads | Median | Largest |
+|---|---:|---:|
+| Wall time | 18.6 min | 190.6 min |
+| Peak memory | 1.8 GB | 7.3 GB |
 
-The 20-WGS first-attempt panel completed 14 commands; six hit resource limits. Complete MT assembly was not established by those execution results.
+![OVASM compared with published Oatk assemblies on 112 DToL species](docs/figures/ovasm-vs-oatk-dtol.svg)
 
-[Benchmark details](docs/benchmarks.md) · [WGS panel](docs/existing-wgs-benchmark.md) · [GFA/ONT evidence](docs/hifi-configuration-comparison.md) · [Rust HPC validation](docs/rust-kernel.md)
+Where OVASM covers less than 95% of the Oatk mitochondrion (11 species), the problem is almost
+always missing sequence rather than wrong sequence: in 9 of those 11, at least 99% of OVASM's own
+assembly lies inside Oatk's. The clearest misses are the mitochondria of *Viscum album* (73 of
+544 kb) and *Ballota nigra* (183 of 396 kb) and the plastid of *Linaria vulgaris* (37 of 151 kb).
 
-## Contributors and license
+Keep in mind:
 
-Codex (OpenAI): implementation, testing, figures and documentation. **MIT**.
+- The Oatk assemblies are a point of comparison, not a gold standard; where the two differ, neither
+  has been checked against an independent truth.
+- These runs used build `78a265c` (0.6.0 plus `check assess`). The 0.7.0 recruitment fix for
+  genomes whose read depth was misread (below) has not been rerun on this panel yet.
+- The per-species table is in [`docs/figures/ovasm-vs-oatk-dtol.tsv`](docs/figures/ovasm-vs-oatk-dtol.tsv).
+
+### Alfalfa ZM4, full HiFi data, against Oatk
+
+Same 134 Gb of HiFi reads, 8 threads, on the same shared server:
+
+| | Wall time | Peak memory |
+|---|---:|---:|
+| OVASM (`74e0cf7`) | 210 min | 2.0 GB |
+| Oatk 1.0, including its annotation step | 942 min | 310 GB |
+
+Both gave the same 125,509 bp plastid. OVASM's mitochondrion came out as 160,953 and 146,073 bp
+sequences, with the 307,026 bp single-circle arrangement that Oatk reports kept as an alternative in
+the graph. Details, graph figures and read support are in [benchmarks](docs/benchmarks.md).
+
+### Illumina
+
+Short reads are harder. On 20 existing alfalfa WGS samples an earlier build finished 14 runs; plastids
+assembled well, but mitochondria usually came out in many pieces. Work on joining those pieces with
+read pairs is ongoing. See the [WGS panel](docs/existing-wgs-benchmark.md).
+
+## What's new in 0.7.0
+
+- Recruiting reads is faster, with byte-identical output. An optional GPU path (`OVASM_GPU=1`) takes
+  the Potentilla test sample from 13 to 10 minutes.
+- Genomes whose read depth was misread no longer lose mitochondrial reads. *Lespedeza davurica*
+  (allotetraploid) now gives its complete 378,667 bp mitochondrion without any extra options.
+  `--genome-size` and `--nuclear-depth` let you set the depth by hand.
+
+Full notes: [release 0.7.0](docs/release-0.7.0.md).
+
+## License
+
+MIT
