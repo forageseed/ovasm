@@ -40,3 +40,10 @@ too. In *Lespedeza davurica* (allotetraploid) the read-median peak was 56× agai
 
 *Lespedeza davurica* now assembles its complete 378,667 bp mitochondrion with default settings
 (34:43, 2.4 GB). Carex and Lophophora give the same recruited reads as before.
+
+## ONT reads
+
+New `run ont` assembles from ONT reads alone and `run hybrid` from ONT plus Illumina reads of the
+same sample ([how it works](long-reads.md)). On 38 Gb of alfalfa ZM4 ONT reads, `run ont` gave the
+plastid and both mitochondrial circles of the reference (52 min, 3.4 GiB). PacBio CLR reads also go
+through `run ont`, but it has not yet been checked on real CLR data.
