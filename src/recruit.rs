@@ -1188,8 +1188,10 @@ fn extension_deep(g: &DepthGate, core: Option<f64>) -> f64 {
 /// genome, 27x) has its read medians at 56x and its k-mer peak at 28x, and the mitochondrion at
 /// 72x stopped at 250 kb of 379 kb: halfway between 56x and 72x is 63x, too close to 72x for
 /// nine tenths of a read's k-mers. In a heterozygous genome the k-mer peak can instead be the
-/// half-depth peak; the lower depth then only lowers extension's threshold for a target under 9
-/// times the read peak, where a single-copy nuclear read still has half its k-mers below it. The
+/// half-depth peak, and for a target up to about 1.3 times as deep as the nucleus the threshold
+/// then falls below the nuclear depth (read peak 40x, k-mer peak 20x, core 48x: 31x instead of
+/// 40x), so single-copy nuclear reads can extend it; `nuclear_depth_doubt` warns, and
+/// `--nuclear-depth` with the read peak keeps the nucleus out. The
 /// gate's own threshold (bootstrapping, seedless reads) keeps the read peak; the nuclear depth
 /// given (`--nuclear-depth`, `--genome-size`) is used as it is.
 fn extension_nuclear(g: &DepthGate) -> f64 {
@@ -1390,9 +1392,11 @@ fn nuclear_depth_doubt(r: &crate::seedfree::GateReport, core: &[Option<f64>]) ->
              --nuclear-depth sets the nuclear depth for both",
             nuclear / kmer,
             r.organelle_min_depth,
-            if nuclear / kmer <= TWO_COPY_RATIO {
+            if (NUCLEAR_DOUBT_RATIO..=TWO_COPY_RATIO).contains(&(nuclear / kmer)) {
                 "extension measured the targets against the k-mer peak, the gate's own \
                  threshold (bootstrapping) kept the read peak"
+            } else if nuclear < kmer {
+                "both kept the read peak (the k-mer peak above it is no half-depth peak)"
             } else {
                 "both kept the read peak (too far from twice the k-mer peak to take it for two \
                  copies)"

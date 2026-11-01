@@ -490,7 +490,7 @@ struct RunArgs {
     /// HiFi: the nuclear genome's collapsed size for the depth gate (`find recruit
     /// --genome-size`): all subgenomes of an allopolyploid (1C), one set of an autopolyploid;
     /// bases, or with k, m or g (1.26g).
-    #[arg(long, value_parser = parse_bases, conflicts_with = "no_extend_gate")]
+    #[arg(long, value_parser = parse_genome_size, conflicts_with = "no_extend_gate")]
     genome_size: Option<u64>,
     /// HiFi: recruit without the depth gate (`find recruit` without --extend-gate --bootstrap),
     /// as up to 0.2.1. On a species far from the seed library extension can then run into the
@@ -559,6 +559,23 @@ fn run(args: RunArgs) -> Result<()> {
     }
     if args.nuclear_depth == Some(0) {
         bail!("--nuclear-depth must be positive");
+    }
+    let gate_options = args.extend_gate_fold.is_some()
+        || args.nuclear_depth.is_some()
+        || args.genome_size.is_some()
+        || args.no_extend_gate;
+    if gate_options && args.read_type != pipeline::ReadType::Hifi {
+        bail!(
+            "--extend-gate-fold, --nuclear-depth, --genome-size and --no-extend-gate set the HiFi depth gate: run hifi only (short reads are gated by their k-mer depths)"
+        );
+    }
+    if gate_options
+        && (args.read_set == pipeline::ReadSet::Target
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!(
+            "--extend-gate-fold, --nuclear-depth, --genome-size and --no-extend-gate set seed recruitment's depth gate: not with --read-set target or --recruit discover"
+        );
     }
     let single = match args.organelle {
         pipeline::OrganelleChoice::Mitochondrion => Some("mitochondrion"),
@@ -1676,7 +1693,7 @@ struct RecruitArgs {
     /// The nuclear genome's size, for the depth gate's nuclear peak (the input's bases over it):
     /// the length of a collapsed assembly, all subgenomes of an allopolyploid (1C) but one set of
     /// an autopolyploid; bases, or with k, m or g (1.26g).
-    #[arg(long, value_parser = parse_bases)]
+    #[arg(long, value_parser = parse_genome_size)]
     genome_size: Option<u64>,
 }
 
@@ -1692,6 +1709,25 @@ fn parse_bases(s: &str) -> std::result::Result<u64, String> {
         _ => Err(format!("{s}: not a size in bases (e.g. 1260000000 or 1.26g)")),
     }
 }
+
+/// A nuclear genome's size (`parse_bases`) within land plants' range, so that a forgotten
+/// suffix (1260 for 1260m) or a stray exponent does not set the gate's nuclear depth to
+/// thousands or to 1.
+fn parse_genome_size(s: &str) -> std::result::Result<u64, String> {
+    let b = parse_bases(s)?;
+    if (MIN_GENOME_SIZE..=MAX_GENOME_SIZE).contains(&b) {
+        Ok(b)
+    } else {
+        Err(format!(
+            "{s}: {b} bases is no nuclear genome (land plants have about 60 Mb to 150 Gb); give the size with k, m or g (1.26g)"
+        ))
+    }
+}
+
+/// Bounds of `parse_genome_size`: below the smallest land-plant nuclear genomes (~60 Mb) and
+/// above the largest (Paris japonica, ~150 Gb).
+const MIN_GENOME_SIZE: u64 = 10_000_000;
+const MAX_GENOME_SIZE: u64 = 300_000_000_000;
 
 #[derive(clap::Args)]
 struct LabelArgs {
@@ -1771,6 +1807,13 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     }
     if args.gate_fold.is_some_and(|f| f.is_nan() || f <= 0.0) {
         bail!("--gate-fold must be positive");
+    }
+    if args.gate_fold.is_some()
+        && !(args.extend_gate || args.bootstrap || args.max_read_depth.is_some())
+    {
+        bail!(
+            "--gate-fold sets the depth gate's organelle threshold: give --extend-gate, --bootstrap or --max-read-depth"
+        );
     }
     if args.nuclear_depth == Some(0) {
         bail!("--nuclear-depth must be positive");
@@ -1917,7 +1960,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bases;
+    use super::{parse_bases, parse_genome_size};
 
     #[test]
     fn genome_sizes_parse_with_or_without_a_suffix() {
@@ -1929,5 +1972,13 @@ mod tests {
         assert!(parse_bases("0").is_err());
         assert!(parse_bases("-3g").is_err());
         assert!(parse_bases("big").is_err());
+    }
+
+    #[test]
+    fn genome_sizes_outside_land_plants_are_refused() {
+        assert_eq!(parse_genome_size("1.26g"), Ok(1_260_000_000));
+        assert!(parse_genome_size("1260").is_err(), "a forgotten suffix");
+        assert!(parse_genome_size("150k").is_err());
+        assert!(parse_genome_size("1e30g").is_err());
     }
 }

@@ -134,6 +134,9 @@ impl Gpu {
         unsafe {
             if b.cap < bytes.len().max(1) {
                 if b.cap > 0 {
+                    // forgotten before the allocation, which can fail: a later pass would
+                    // otherwise copy into the freed address, perhaps another buffer's by then
+                    b.cap = 0;
                     check((self.api.mem_free)(b.ptr), "free")?;
                 }
                 let cap = bytes.len().max(1).next_power_of_two();
