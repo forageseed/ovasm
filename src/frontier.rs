@@ -57,6 +57,8 @@ pub struct Params {
     pub max_per_end: usize,
     /// Most new k-mers walked for a target, as a multiple of its stored reference bases.
     pub max_fold: f64,
+    /// `extend_from_kmers` walks nothing from more ends than this (`skipped`: "ends_growing").
+    pub max_ends: usize,
 }
 
 impl Default for Params {
@@ -68,6 +70,7 @@ impl Default for Params {
             dominance: 0.5,
             max_per_end: 50_000,
             max_fold: 2.0,
+            max_ends: usize::MAX,
         }
     }
 }
@@ -449,7 +452,14 @@ pub fn extend_from_kmers(
         })
         .collect();
     ext.present_reference_kmers = found.iter().filter(|f| f.0).count();
-    let ends = found.into_iter().flat_map(|f| f.1).collect();
+    let mut ends: Vec<u64> = found.into_iter().flat_map(|f| f.1).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    if ends.len() > p.max_ends {
+        ext.ends = ends.len();
+        ext.skipped = Some("ends_growing");
+        return ext;
+    }
     walk(counts, known, ends, at_depth, budget, p, true, &mut ext);
     ext
 }
@@ -881,5 +891,13 @@ mod tests {
         // a target far shallower than the floor is not walked
         let ext = extend_from_kmers(&table, &known, 5.0, 1_000_000, &Params::default());
         assert_eq!(ext.skipped, Some("too_shallow"));
+        // nor one whose bait has more ends than the caller allows: nothing is walked
+        let all = extend_from_kmers(&table, &known, 100.0, 1_000_000, &Params::default());
+        let p = Params { max_ends: all.ends - 1, ..Params::default() };
+        let ext = extend_from_kmers(&table, &known, 100.0, 1_000_000, &p);
+        assert_eq!((ext.skipped, ext.ends, ext.new_kmers), (Some("ends_growing"), all.ends, 0));
+        assert!(ext.sequences.is_empty());
+        let p = Params { max_ends: all.ends, ..Params::default() };
+        assert_eq!(extend_from_kmers(&table, &known, 100.0, 1_000_000, &p).sequences, all.sequences);
     }
 }

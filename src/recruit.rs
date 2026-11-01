@@ -1128,6 +1128,14 @@ const KMER_GATE_MIN_NEW: usize = 5;
 /// Most new k-mers the k-mer gate's frontier walk takes for a target without a `size_cap`.
 const KMER_FRONTIER_BUDGET: u64 = 20_000_000;
 
+/// A target's frontier walk stops for good at a pass whose bait has more than this many times the
+/// last walk's ends. Closing an organelle leaves fewer ends a pass (WL354's mitochondrion 1,595,
+/// 1,024, 890); ends that multiply are the bait growing into the nucleus, whose repeat families
+/// of tens to hundreds of copies sit in the walk's depth band and rejoin the copies the bait
+/// already holds, so their walks count as bridges (CRR2683883's mitochondrion 1,698, 3,719,
+/// 11,395, 65,796 and 47 M reads; JN-L's 6,552, 13,189, 48,996 and 12.4 Gb of 40 Gb).
+const KMER_FRONTIER_MAX_END_GROWTH: f64 = 1.25;
+
 /// The frontier walk of the k-mer gate (`RecruitConfig::kmer_gate`): once the library's k-mers are
 /// counted, each target's bait is walked on the counts at its depth (`frontier::extend_from_kmers`)
 /// and the walked sequence joins the bait. Extension alone moves a bait's edge by about a fifth of
@@ -1141,10 +1149,12 @@ fn kmer_frontier(
     bait: &mut BaitSet,
     t: usize,
     depth: f64,
+    max_ends: usize,
 ) -> (crate::frontier::Extension, usize) {
     let known = bait.target_kmers(t);
     let budget = size_cap(&bait.targets[t].name).unwrap_or(KMER_FRONTIER_BUDGET) as usize;
-    let ext = crate::frontier::extend_from_kmers(table, &known, depth, budget, &crate::frontier::Params::default());
+    let p = crate::frontier::Params { max_ends, ..Default::default() };
+    let ext = crate::frontier::extend_from_kmers(table, &known, depth, budget, &p);
     drop(known);
     let added = ext.sequences.iter().map(|s| bait.add_sequence_counted(t, s)).sum();
     (ext, added)
@@ -1699,6 +1709,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         })
         .flatten();
     let mut kmer_walks: Vec<Vec<crate::frontier::Extension>> = vec![Vec::new(); n_targets];
+    // each target's last frontier walk's ends, and whether its walks stopped for good
+    // (`KMER_FRONTIER_MAX_END_GROWTH`)
+    let mut walk_ends: Vec<Option<usize>> = vec![None; n_targets];
+    let mut walk_stopped = vec![false; n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -1772,11 +1786,26 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         // 20 bp before it, 39 at it, none across) until it counted as saturated.
         if let Some(table) = kmer_table.as_ref().filter(|_| !last) {
             for t in 0..n_targets {
-                let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t]) else {
+                let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t] && !walk_stopped[t]) else {
                     continue;
                 };
-                let (ext, n) = kmer_frontier(table, &mut bait, t, d);
+                let max_ends = walk_ends[t].map_or(usize::MAX, |e| (e as f64 * KMER_FRONTIER_MAX_END_GROWTH) as usize);
+                let (ext, n) = kmer_frontier(table, &mut bait, t, d, max_ends);
                 walked[t] = n;
+                if ext.skipped == Some("ends_growing") {
+                    walk_stopped[t] = true;
+                    let w = format!(
+                        "{}: the k-mer frontier walk stopped at pass {}: its ends grew from {} to {} (the bait was growing into nuclear repeats)",
+                        bait.targets[t].name,
+                        it + 1,
+                        walk_ends[t].unwrap_or(0),
+                        ext.ends
+                    );
+                    eprintln!("[ovasm] warning: {w}");
+                    warnings.push(w);
+                } else if ext.skipped.is_none() {
+                    walk_ends[t] = Some(ext.ends);
+                }
                 eprintln!(
                     "[ovasm] k-mer frontier {} pass {}: depth {d:.0}, {} ends, {} extended, {} new {}-mers in {} pieces ({} bp){}{}",
                     bait.targets[t].name,
