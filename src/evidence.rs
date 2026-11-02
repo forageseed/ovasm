@@ -803,6 +803,15 @@ const REPEAT_FOLD: f64 = 1.35;
 /// A segment end's second-strongest way must hold at least this share of the strongest's reads
 /// for the end to count as a crossroad end (see `crossroads`).
 const CROSSROAD_SHARE: f64 = 1.0 / 3.0;
+/// A crossroad (`crossroads`) at most this many times the median depth and at least
+/// `CROSSROAD_LONG` bp long is single-copy whatever its ways: over that length depth is no noise.
+/// The Medicago arabica mitochondrion (HiFi) has a 69.7 kb circle of two segments, 23.4 and 46.3
+/// kb at 0.92x the median, that recombines with the rest through repeats shorter than k: both of
+/// their ends have two well-read ways. As repeats they were left out of every molecule, and 70 kb
+/// of the 317 kb genome with them. The repeats the crossroad rule is for are short or deeper
+/// (142-555 bp at 0.84-1.37x in the Zou accessions at 15x; the Geg-14 18.9 kb repeat at 1.37x).
+const CROSSROAD_ONE_COPY: f64 = 1.2;
+const CROSSROAD_LONG: usize = 5_000;
 
 /// Mean depth of every segment from its GFA tags (dp, DP, KC/LN or RC/LN), if all have one.
 fn segment_depths(text: &str, g: &Graph) -> Option<Vec<f64>> {
@@ -893,6 +902,17 @@ fn crossroads(g: &Graph, link_reads: &[u64]) -> Vec<bool> {
     };
     (0..g.seqs.len())
         .map(|s| crossing((s, true)) && crossing((s, false)))
+        .collect()
+}
+
+/// Segments that depth says are single-copy even at a crossroad (`CROSSROAD_ONE_COPY`).
+fn single_copy_crossroads(g: &Graph, depth: Option<&[f64]>) -> Vec<bool> {
+    let Some(d) = depth else {
+        return vec![false; g.seqs.len()];
+    };
+    let median = median_depth(g, d);
+    (0..g.seqs.len())
+        .map(|s| median > 0.0 && g.seqs[s].len() >= CROSSROAD_LONG && d[s] <= CROSSROAD_ONE_COPY * median)
         .collect()
 }
 
@@ -1339,8 +1359,9 @@ pub fn run(
         .map(|(&crossing, &adjacency)| crossing > 0 || adjacency > 0)
         .collect();
     let mut repeat = repeat_segments(&g, p.max_repeat_len, &supported_links, rdepths.as_deref());
-    for (r, c) in repeat.iter_mut().zip(crossroads(&g, &link_reads)) {
-        *r |= c;
+    let one_copy = single_copy_crossroads(&g, rdepths.as_deref());
+    for ((r, c), one) in repeat.iter_mut().zip(crossroads(&g, &link_reads)).zip(one_copy) {
+        *r |= c && !one;
     }
     let ambiguous = ambiguous_repeats(
         &g,
@@ -2257,5 +2278,21 @@ mod tests {
         assert_eq!(crossroads(&g, &[18, 2, 7, 11]), vec![false; 5]);
         // unread links do not count
         assert_eq!(crossroads(&g, &[9, 0, 7, 11]), vec![false; 5]);
+    }
+
+    #[test]
+    fn a_long_crossroad_at_single_copy_depth_is_no_repeat() {
+        // Medicago arabica: a 23 kb segment at 0.92x the median with two ways at each end
+        let seg = |n: usize| vec![b'A'; n];
+        let g = Graph {
+            names: ["A", "X", "S", "R"].map(String::from).to_vec(),
+            seqs: vec![seg(40_000), seg(23_000), seg(800), seg(18_900)],
+            links: vec![],
+            overlaps: vec![],
+        };
+        // X single-copy; S short (its depth is noise); R at 1.37x, a two-copy repeat (Geg-14)
+        let depth = [110.0, 101.0, 95.0, 151.0];
+        assert_eq!(single_copy_crossroads(&g, Some(&depth)), vec![true, true, false, false]);
+        assert_eq!(single_copy_crossroads(&g, None), vec![false; 4]);
     }
 }

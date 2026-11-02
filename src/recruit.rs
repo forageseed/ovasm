@@ -1117,6 +1117,13 @@ const BOOTSTRAP_DEPTH_FLOOR: f64 = 0.5;
 const BOOTSTRAP_DEPTH_MIN_READS: usize = 10;
 /// A bootstrap read must not be covered this much by another target's bait.
 const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
+/// Depth range, as shares of a target's read depth, of the deep partial candidates left beside a
+/// target that has its genome which bootstrap it once more (see the bootstrap in `run`): a
+/// multipartite mitochondrion's other circles are at its depth (Buxus sempervirens 1.05,
+/// Bellardia viscosa 0.76, Euphorbia lathyris 0.71-0.90 by the published Oatk circles).
+const LEFTOVER_DEPTH: (f64, f64) = (0.5, 2.0);
+/// Fewest such leftovers for that bootstrap.
+const LEFTOVER_MIN_READS: usize = 5;
 
 /// With the extension gate, a read extends a target only from this share of the target's core
 /// depth up: the median depth of its reads in the first pass that recruited `CORE_MIN_READS`.
@@ -1517,6 +1524,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let mut core_depth: Vec<Option<f64>> = vec![None; n_targets];
     let mut warnings: Vec<String> = Vec::new();
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
+    // Targets whose leftover candidates have been judged (the bootstrap in the pass loop).
+    let mut leftovers_judged = vec![false; n_targets];
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
@@ -1823,11 +1832,35 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     g,
                     &boot_used[t],
                 )?;
-                // Only a seed that failed is bootstrapped: one that recruits more reads than are
-                // left as deep partial candidates has its genome already. Its leftovers are
-                // other deep sequence (Antitrichia: 7 nuclear repeat reads beside the complete
-                // 592-read mitochondrion, from which extension ran away into the nucleus).
-                if picked.is_empty() || picked.len() as u64 <= res.recruited[t].reads {
+                // A seed that failed is bootstrapped from all of them. One that recruits more
+                // reads than are left as deep partial candidates has its genome already, and its
+                // leftovers are other deep sequence (Antitrichia: 7 nuclear repeat reads beside
+                // the complete 592-read mitochondrion, from which extension ran away into the
+                // nucleus) or chromosomes of its own that no read joins to the rest: the other
+                // circles of a multipartite mitochondrion hold seed genes but no read the bait
+                // covers, so they never start (the Buxus sempervirens 89 kb circle with atp9,
+                // nad2 and nad9 at 1,434x beside the rest at 1,366x; Bellardia viscosa, 75 kb;
+                // Euphorbia lathyris, 41 and 86 kb). Leftovers at the target's own depth
+                // (`LEFTOVER_DEPTH`) bootstrap it once, from `LEFTOVER_MIN_READS` of them.
+                let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads {
+                    (picked, keys)
+                } else {
+                    let Some(own) = depths.read[t].filter(|_| !leftovers_judged[t]) else {
+                        continue;
+                    };
+                    leftovers_judged[t] = true;
+                    let (lo, hi) = (LEFTOVER_DEPTH.0 * own, LEFTOVER_DEPTH.1 * own);
+                    let (p, k): (Vec<Vec<u8>>, Vec<u64>) = picked
+                        .into_iter()
+                        .zip(keys)
+                        .filter(|(s, _)| g.median_depth(s).is_some_and(|d| (lo..=hi).contains(&d)))
+                        .unzip();
+                    if p.len() < LEFTOVER_MIN_READS {
+                        continue;
+                    }
+                    (p, k)
+                };
+                if picked.is_empty() {
                     continue;
                 }
                 for seq in &picked {
@@ -2513,6 +2546,52 @@ mod tests {
         let pt = ids(&boot.outputs[c].output);
         assert_eq!(pt.len(), 2000);
         assert!(pt.iter().all(|id| id.starts_with('p')));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_circle_at_the_targets_depth_is_bootstrapped_from_leftovers() {
+        // The mitochondrion is two circles at 100x: the first (12 kb) is the seed, the second
+        // (10 kb) shares nothing with it and holds a 1.5 kb gene that is in the seed too, so no
+        // 3 kb read of it reaches 80% cover. A third circle, 10 kb at 300x (three times the
+        // target's depth: a high-copy nuclear repeat), also holds a seed gene and must stay out,
+        // as must a NUMT of the second circle's gene at nuclear depth. Their partial reads are
+        // fewer than the first circle's, so the seed has not failed: they are leftovers.
+        let main = pseudo_random(12_000, 7);
+        let mut second = pseudo_random(10_000, 41);
+        let mut deep = pseudo_random(10_000, 43);
+        let mut nuclear = pseudo_random(300_000, 33);
+        let gene = pseudo_random(1_500, 45);
+        let deep_gene = pseudo_random(1_500, 47);
+        second[4000..5500].copy_from_slice(&gene);
+        deep[4000..5500].copy_from_slice(&deep_gene);
+        nuclear[150_000..151_500].copy_from_slice(&gene);
+        let mut fasta = circle_reads(&main, 30, "m"); // 100x
+        fasta.push_str(&circle_reads(&second, 30, "s")); // 100x
+        fasta.push_str(&circle_reads(&deep, 10, "d")); // 300x
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n")); // 2x
+        let dir = std::env::temp_dir().join(format!("ovasm-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene);
+        bait.add_sequence(m, &deep_gene);
+        bait.targets[m].seed_length = (main.len() + second.len()) as u64;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        let out = &rep.outputs[m].output;
+        assert_eq!(count_reads(out, b'm'), 400, "every read of the first circle");
+        assert_eq!(count_reads(out, b's'), 334, "every read of the second circle");
+        assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
+        assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
+        assert!(rep.iterations.iter().any(|it| it.bootstrapped_from_reads[m] > 0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
