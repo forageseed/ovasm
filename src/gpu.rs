@@ -26,14 +26,14 @@ pub fn requested() -> bool {
 
 #[cfg(target_os = "linux")]
 mod driver {
-    use std::ffi::c_void;
+    use std::ffi::{c_char, c_void};
 
     pub type CuResult = i32;
     pub type DevPtr = u64;
 
     extern "C" {
-        fn dlopen(file: *const i8, mode: i32) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, name: *const i8) -> *mut c_void;
+        fn dlopen(file: *const c_char, mode: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     }
     const RTLD_NOW: i32 = 2;
 
@@ -50,7 +50,7 @@ mod driver {
                             return None;
                         }
                         Some(Self { $($field: {
-                            let f = dlsym(lib, concat!($sym, "\0").as_ptr() as *const i8);
+                            let f = dlsym(lib, concat!($sym, "\0").as_ptr() as *const c_char);
                             if f.is_null() { return None; }
                             std::mem::transmute::<*mut c_void, unsafe extern "C" fn($($arg),*) -> CuResult>(f)
                         },)* })
@@ -66,7 +66,7 @@ mod driver {
         primary_ctx_retain = "cuDevicePrimaryCtxRetain": fn(*mut *mut c_void, i32);
         ctx_set_current = "cuCtxSetCurrent": fn(*mut c_void);
         module_load_data = "cuModuleLoadData": fn(*mut *mut c_void, *const c_void);
-        module_get_function = "cuModuleGetFunction": fn(*mut *mut c_void, *mut c_void, *const i8);
+        module_get_function = "cuModuleGetFunction": fn(*mut *mut c_void, *mut c_void, *const c_char);
         mem_alloc = "cuMemAlloc_v2": fn(*mut DevPtr, usize);
         mem_free = "cuMemFree_v2": fn(DevPtr);
         htod = "cuMemcpyHtoD_v2": fn(DevPtr, *const c_void, usize);
