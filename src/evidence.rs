@@ -40,6 +40,16 @@ pub fn revcomp(s: &[u8]) -> Vec<u8> {
             b'C' | b'c' => b'G',
             b'G' | b'g' => b'C',
             b'T' | b't' => b'A',
+            b'R' | b'r' => b'Y',
+            b'Y' | b'y' => b'R',
+            b'S' | b's' => b'S',
+            b'W' | b'w' => b'W',
+            b'K' | b'k' => b'M',
+            b'M' | b'm' => b'K',
+            b'B' | b'b' => b'V',
+            b'D' | b'd' => b'H',
+            b'H' | b'h' => b'D',
+            b'V' | b'v' => b'B',
             _ => b'N',
         })
         .collect()
@@ -1584,6 +1594,12 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reverse_complement_preserves_iupac_graph_alleles() {
+        assert_eq!(super::revcomp(b"ACGTRYSWKMBDHVN"), b"NBDHVKMWSRYACGT");
+        assert_eq!(super::revcomp(&super::revcomp(b"ACGTRYSWKMBDHVN")), b"ACGTRYSWKMBDHVN");
+    }
+
     use super::*;
 
     fn dense_edge() -> (Graph, Vec<u8>) {

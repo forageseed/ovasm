@@ -20,6 +20,8 @@ mod label;
 mod linearize;
 mod longread;
 mod pan;
+mod pan_external;
+mod pan_backend;
 mod panel;
 mod phase;
 mod pipeline;
@@ -195,6 +197,10 @@ enum SolveCommand {
 
 #[derive(Subcommand)]
 enum PanCommand {
+    /// Import PGGB GFA or minigraph rGFA as a validated reconstruction reference.
+    Import(PanImportArgs),
+    /// Build a graph using PGGB or minigraph and normalize it for reconstruction.
+    Build(PanBuildArgs),
     /// Merge samples' OV-GFA graphs into one pangenome graph, keeping every configuration path.
     Merge(PanArgs),
     /// Reconstruct one WGS sample using all paths of mitochondrial and plastid reference graphs.
@@ -292,6 +298,52 @@ struct SharingArgs {
     /// Exact word length; divergent homology and transfer direction are not inferred.
     #[arg(long, default_value_t = 31)]
     k: usize,
+}
+
+#[derive(clap::Args)]
+struct PanImportArgs {
+    #[arg(long)]
+    input: PathBuf,
+    /// Optional file containing additional validated GFA P/W walks.
+    #[arg(long)]
+    extra_paths: Option<PathBuf>,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, default_value = "external")]
+    sample: String,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PanBackendChoice { Pggb, Minigraph }
+
+#[derive(clap::Args)]
+struct PanBuildArgs {
+    #[arg(long, value_enum)]
+    backend: PanBackendChoice,
+    /// One assembly per sample, SAMPLE=FASTA; first is the minigraph backbone.
+    #[arg(long = "assembly", required = true)]
+    assemblies: Vec<String>,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long, default_value = "external")]
+    sample: String,
+    #[arg(long, default_value_t = 8)]
+    threads: usize,
+    /// Executable path; otherwise resolve the selected backend on PATH.
+    #[arg(long)]
+    executable: Option<PathBuf>,
+}
+
+fn build_external_pan(args: PanBuildArgs) -> Result<()> {
+    let inputs = args.assemblies.iter().map(|s| {
+        let (name, path) = s.split_once('=').context("--assembly requires SAMPLE=FASTA")?;
+        Ok((name.to_string(), PathBuf::from(path)))
+    }).collect::<Result<Vec<_>>>()?;
+    pan_backend::run(&pan_backend::Config {
+        backend: match args.backend { PanBackendChoice::Pggb => pan_backend::Backend::Pggb, PanBackendChoice::Minigraph => pan_backend::Backend::Minigraph },
+        inputs, out: args.out, threads: args.threads, executable: args.executable, sample: args.sample,
+    })?;
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -1957,6 +2009,11 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
         Command::Solve(SolveCommand::Primary(args)) => primary(args),
         Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),
+        Command::Pan(PanCommand::Import(args)) => {
+            pan_external::run(&pan_external::Config { input: args.input, extra_paths: args.extra_paths, out: args.out, sample: args.sample })?;
+            Ok(())
+        }
+        Command::Pan(PanCommand::Build(args)) => build_external_pan(args),
         Command::Pan(PanCommand::Merge(args)) => pan(args),
         Command::Pan(PanCommand::Reconstruct(args)) => reconstruct(args),
         Command::Pan(PanCommand::Identify(args)) => identify(args),
