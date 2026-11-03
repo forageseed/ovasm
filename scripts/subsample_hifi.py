@@ -7,6 +7,8 @@ from decimal import Decimal
 import gzip
 import hashlib
 import json
+import math
+import shutil
 from pathlib import Path
 import sys
 
@@ -72,7 +74,11 @@ def main(argv=None):
     p.add_argument("--fraction", action="append", required=True, type=fraction)
     p.add_argument("--seed", action="append", required=True, type=int)
     p.add_argument("--out", required=True, type=Path, help="New directory; existing paths refused")
+    p.add_argument("--min-free-gib", type=float, default=30,
+                   help="Abort below this available output-disk space (default: 30 GiB)")
     args = p.parse_args(argv)
+    if not math.isfinite(args.min_free_gib) or args.min_free_gib < 0:
+        p.error("--min-free-gib must be finite and nonnegative")
     paths = [x.resolve(strict=True) for x in args.reads]
     if len(set(paths)) != len(paths):
         p.error("duplicate input paths are not allowed")
@@ -93,6 +99,8 @@ def main(argv=None):
         "source_id_policy": "Explicit IDs preferred; defaults ordinal:basename. Preserve IDs and record order when relocating inputs.",
         "record_note": "Sequence and quality bytes preserved; missing final newline is added to keep concatenated FASTQ valid.",
         "coverage_note": "Fractions are not nuclear coverage. Actual bases may differ from expected; reads are never truncated.",
+        "min_free_gib": args.min_free_gib,
+        "space_check_interval": "at start, then every 64 MiB uncompressed input or 1000 records",
         "seeds": seeds, "fractions": [str(f) for f in fractions],
         "sources": [{"path": str(x), "source_id": sid, "size": st.st_size,
                      "mtime_ns": st.st_mtime_ns} for x, sid, st in zip(paths, ids, snapshots)],
@@ -105,8 +113,16 @@ def main(argv=None):
         tmp.write_text(json.dumps(manifest, indent=2) + "\n")
         tmp.replace(manifest_path)
 
+    def check_space():
+        free = shutil.disk_usage(args.out).free
+        if free < args.min_free_gib * (1 << 30):
+            raise OSError(f"output disk has {free / (1 << 30):.3f} GiB free, "
+                          f"below --min-free-gib {args.min_free_gib:g}; outputs incomplete")
+
     save()
     try:
+        check_space()
+        checked_bytes = checked_records = 0
         with ExitStack() as stack:
             outputs = []
             for seed in seeds:
@@ -123,6 +139,11 @@ def main(argv=None):
                 opener = gzip.open if path.suffix.lower() == ".gz" else open
                 with opener(path, "rb") as handle:
                     for idx, read_id, length, record in records(handle):
+                        checked_bytes += len(record)
+                        checked_records += 1
+                        if checked_bytes >= 64 * (1 << 20) or checked_records >= 1000:
+                            check_space()
+                            checked_bytes = checked_records = 0
                         counts[length] += 1
                         digest.update(record)
                         hashes = {}
@@ -145,6 +166,7 @@ def main(argv=None):
                 entry.update(distribution(hist))
                 entry["actual_base_fraction"] = entry["bases"] / total_bases if total_bases else None
                 entry["uncompressed_fastq_sha256"] = digest.hexdigest()
+        check_space()
         for entry in manifest["subsets"]:
             entry["compressed_bytes"] = (args.out / entry["path"]).stat().st_size
         manifest["status"] = "complete"

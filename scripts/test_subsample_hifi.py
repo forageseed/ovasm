@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("subsample_hifi", Path(__file__).with_name("subsample_hifi.py"))
 mod = importlib.util.module_from_spec(spec)
@@ -79,6 +81,26 @@ class SubsamplingTests(unittest.TestCase):
             rows = list(mod.records(handle))
         self.assertEqual(len(rows), 201)
         self.assertEqual(rows[0][1], b"last")
+
+    def test_low_disk_space_leaves_incomplete_manifest(self):
+        with patch.object(mod.shutil, "disk_usage", return_value=SimpleNamespace(free=0)):
+            with self.assertRaisesRegex(OSError, "below --min-free-gib"):
+                self.run_subsets("no-space")
+        out = self.root / "no-space"
+        self.assertTrue((out / "INCOMPLETE").exists())
+        report = json.loads((out / "manifest.json").read_text())
+        self.assertEqual(report["status"], "incomplete")
+        self.assertEqual(report["min_free_gib"], 30)
+        self.assertIn("outputs incomplete", report["error"])
+
+    def test_disk_space_is_rechecked_during_input(self):
+        self.a.write_bytes(b"@a\nACGT\n+\nIIII\n" * 1100)
+        with patch.object(mod.shutil, "disk_usage", side_effect=[
+                SimpleNamespace(free=100 * (1 << 30)), SimpleNamespace(free=0)]) as disk:
+            with self.assertRaisesRegex(OSError, "below --min-free-gib"):
+                self.run_subsets("space-ran-out")
+            self.assertEqual(disk.call_count, 2)
+        self.assertTrue((self.root / "space-ran-out" / "INCOMPLETE").exists())
 
     def test_refuses_overwrite(self):
         self.run_subsets("same")
