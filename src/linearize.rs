@@ -1312,12 +1312,17 @@ pub fn run_phased(
     }
     let (mut br, self_loops) = bridges(&g, &report, &repeat, p.min_reads)?;
     br.retain(|b| phases.allows_walk(&b.walk, false));
-    let support = |a: usize| -> u64 {
-        br.iter()
-            .filter(|b| b.walk[0].0 == a || b.walk[b.walk.len() - 1].0 == a)
-            .map(|b| b.reads)
-            .sum()
-    };
+    // Count each bridge once per distinct endpoint, including self-returning bridges.
+    // Scanning all bridges for each anchor is quadratic on fragmented short-read graphs.
+    let mut endpoint_support = vec![0u64; g.names.len()];
+    for b in &br {
+        let (a, z) = (b.walk[0].0, b.walk[b.walk.len() - 1].0);
+        endpoint_support[a] += b.reads;
+        if z != a {
+            endpoint_support[z] += b.reads;
+        }
+    }
+    let support = |a: usize| endpoint_support[a];
     let mut totals: Vec<u64> = anchors
         .iter()
         .map(|&a| support(a))
