@@ -1124,6 +1124,11 @@ const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
 const LEFTOVER_DEPTH: (f64, f64) = (0.5, 2.0);
 /// Fewest such leftovers for that bootstrap.
 const LEFTOVER_MIN_READS: usize = 5;
+/// The only target the leftover bootstrap applies to. A plastid is one circle; what is left at its
+/// depth beside it is nuclear repeat sequence (rDNA, satellites at thousands of copies), and
+/// bootstrapping from it ran the Pseudognaphalium luteoalbum plastid away to the 1 Mb size cap
+/// (535,449 reads, 1,735 pieces) where it had been one 153 kb circle.
+const LEFTOVER_TARGET: &str = "mitochondrion";
 
 /// With the extension gate, a read extends a target only from this share of the target's core
 /// depth up: the median depth of its reads in the first pass that recruited `CORE_MIN_READS`.
@@ -1845,7 +1850,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads {
                     (picked, keys)
                 } else {
-                    let Some(own) = depths.read[t].filter(|_| !leftovers_judged[t]) else {
+                    let Some(own) = depths.read[t]
+                        .filter(|_| !leftovers_judged[t] && bait.targets[t].name == LEFTOVER_TARGET)
+                    else {
                         continue;
                     };
                     leftovers_judged[t] = true;
@@ -2592,6 +2599,49 @@ mod tests {
         assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
         assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
         assert!(rep.iterations.iter().any(|it| it.bootstrapped_from_reads[m] > 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plastid_is_not_bootstrapped_from_leftovers() {
+        // The case above with the plastid as the target: a plastid is one circle and what is left at
+        // its depth beside it is nuclear repeat sequence, so no leftover bootstrap is made and the
+        // second circle, which no read the bait covers reaches, stays out.
+        let main = pseudo_random(12_000, 7);
+        let mut second = pseudo_random(10_000, 41);
+        let mut deep = pseudo_random(10_000, 43);
+        let mut nuclear = pseudo_random(300_000, 33);
+        let gene = pseudo_random(1_500, 45);
+        let deep_gene = pseudo_random(1_500, 47);
+        second[4000..5500].copy_from_slice(&gene);
+        deep[4000..5500].copy_from_slice(&deep_gene);
+        nuclear[150_000..151_500].copy_from_slice(&gene);
+        let mut fasta = circle_reads(&main, 30, "m"); // 100x
+        fasta.push_str(&circle_reads(&second, 30, "s")); // 100x
+        fasta.push_str(&circle_reads(&deep, 10, "d")); // 300x
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n")); // 2x
+        let dir = std::env::temp_dir().join(format!("ovasm-leftover-pt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("plastid").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene);
+        bait.add_sequence(m, &deep_gene);
+        bait.targets[m].seed_length = (main.len() + second.len()) as u64;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        let out = &rep.outputs[m].output;
+        assert_eq!(count_reads(out, b'm'), 400, "every read of the first circle");
+        assert!(count_reads(out, b's') < 334, "the second circle is not bootstrapped in");
+        assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
+        assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
+        assert!(rep.iterations.iter().all(|it| it.bootstrapped_from_reads[m] == 0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
