@@ -2,6 +2,7 @@
 Usage: python3 -I compare_validation.py RUN_ROOT ZENODO_DATA MINIMAP2 OUTPUT_JSON
 Pending samples remain explicit. Coordinates are zero-based half-open.
 """
+import argparse
 import hashlib
 import json
 import re
@@ -67,8 +68,30 @@ def compare(query, target, mm, work):
                 identity=match/aligned if aligned else None, references=result)
 
 
+def reference_candidates(sample, refs, mapping):
+    if sample in mapping:
+        name = mapping[sample]
+        if not isinstance(name, str) or Path(name).name != name:
+            raise ValueError("reference map values must be directory basenames")
+        target = refs / name
+        return [target] if target.is_dir() else []
+    species = sample.split("_")[:2]
+    if len(species) != 2:
+        return []
+    key = species[0][:3].capitalize()+species[1][:4].capitalize()
+    return [p for p in refs.iterdir() if p.is_dir() and key in p.name]
+
+
 def main():
-    root, refs, mm, output = map(Path, sys.argv[1:])
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("root", "refs", "mm", "output"):
+        parser.add_argument(name, type=Path)
+    parser.add_argument("--reference-map", type=Path, help="JSON mapping sample name to reference directory basename")
+    args = parser.parse_args()
+    root, refs, mm, output = args.root, args.refs, args.mm, args.output
+    mapping = json.loads(args.reference_map.read_text()) if args.reference_map else {}
+    if not isinstance(mapping, dict):
+        raise ValueError("reference map must be a JSON object")
     if output.exists(): raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -90,12 +113,15 @@ def main():
                 row["status"] = "finished_without_summary"
                 row["command_record"] = str(timing)
             continue
-        species = sample.name.split("_")[:2]
-        key = species[0][:3].capitalize()+species[1][:4].capitalize()
-        hits = [p for p in refs.iterdir() if key in p.name]
-        if len(hits) != 1: raise ValueError(f"ambiguous reference: {sample.name}: {hits}")
+        hits = reference_candidates(sample.name, refs, mapping)
         failed = json.loads(summary.read_text()).get("failed", [])
         row.update(status="partial" if failed else "failed_exit" if exit_code not in (None, 0) else "complete", failed=failed)
+        if len(hits) != 1:
+            row["reference_status"] = "missing" if not hits else "ambiguous"
+            row["reference_candidates"] = [str(p) for p in hits]
+            if row["status"] == "complete":
+                row["status"] = "unresolved_reference"
+            continue
         for org, ref in [("mitochondrion", "MITO.fasta"), ("plastid", "PLTD.fasta")]:
             query = sample / "ovasm" / org / "molecules.fasta"
             target = hits[0] / ref

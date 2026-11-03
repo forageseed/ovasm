@@ -49,6 +49,28 @@ class ComparisonTests(unittest.TestCase):
             (sample/"time.txt").write_text("Exit status: 0\n")
             with patch.object(m.sys,"argv",["compare",str(p/"runs"),str(p/"refs"),"minimap2",str(p/"report.json")]):m.main()
             self.assertEqual(json.loads((p/"report.json").read_text())["samples"][0]["status"],"missing_outputs_or_reference")
+    def test_explicit_reference_map_handles_nonstandard_abbreviation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp); target=p/"cbPolForo1"; target.mkdir()
+            sample="Polytrichum_formosum_PRJEB73437"
+            self.assertEqual(m.reference_candidates(sample,p,{}),[])
+            self.assertEqual(m.reference_candidates(sample,p,{sample:"cbPolForo1"}),[target])
+            with self.assertRaises(ValueError):
+                m.reference_candidates(sample,p,{sample:"../outside"})
+    def test_unresolved_reference_does_not_abort_other_sample_reporting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp); refs=p/"refs"; refs.mkdir()
+            for name in ("Polytrichum_formosum_test", "Lathyrus_linifolius_test"):
+                sample=p/"runs/default"/name
+                (sample/"ovasm").mkdir(parents=True)
+                (sample/"ovasm/summary.json").write_text('{"failed": []}')
+            (refs/"drLatLini1").mkdir()
+            output=p/"report.json"
+            with patch.object(m.sys,"argv",["compare",str(p/"runs"),str(refs),"minimap2",str(output)]):m.main()
+            rows={x["sample"]:x for x in json.loads(output.read_text())["samples"]}
+            self.assertEqual(rows["Polytrichum_formosum_test"]["status"],"unresolved_reference")
+            self.assertEqual(rows["Polytrichum_formosum_test"]["reference_status"],"missing")
+            self.assertEqual(rows["Lathyrus_linifolius_test"]["status"],"missing_outputs_or_reference")
     def test_identity_requests_cigar_alignment(self):
         with tempfile.TemporaryDirectory() as tmp:
             p=Path(tmp);f=p/"a.fa";f.write_text(">a\nACGT\n")
