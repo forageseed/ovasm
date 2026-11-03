@@ -83,3 +83,8 @@ but it still does not certify the physical origin of every historical read.
   the repaired broad shoulder, the censored low-depth boundary, and a supported
   read peak that must not follow the low k-mer mode. They are three regression
   cases, not proof of unchanged behavior across all 173 historical reports.
+
+
+### Reference-span checks for the two regression species
+
+CIGAR-based comparison of both completed runs is recorded in ../.agent-work/ovasm-five-fixes-20261103/comparison.json, with explicit reference IDs cbPolForo1 and cbPolComm4. P. commune covers 100% of both Oatk reference spans. P. formosum covers 52.9162% of the mitochondrial span and 100% of the plastid span. Its identical historical recruitment therefore validates preservation of the low-depth boundary behavior, not complete mitochondrial recovery at 3x. Reference-span coverage is not independent structural certification.
