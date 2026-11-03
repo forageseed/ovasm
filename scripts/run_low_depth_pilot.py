@@ -60,8 +60,10 @@ def execute(command, dest, cfg, is_ovasm):
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument("manifest",type=Path);ap.add_argument("subsets",type=Path)
+    ap.add_argument("--ovasm", type=Path, required=True, help="Explicit frozen binary; never auto-use target/release")
     ap.add_argument("--out",type=Path,required=True);ap.add_argument("--execute",action="store_true")
     args=ap.parse_args();cfg=json.loads(args.manifest.read_text());subpath=args.subsets.resolve()
+    cfg["ovasm"] = str(args.ovasm.resolve(strict=True))
     data=json.loads(subpath.read_text());root=args.out.resolve()
     if data.get("status")!="complete" or (subpath.parent/"INCOMPLETE").exists():raise ValueError("incomplete subsampling")
     if root.exists():raise FileExistsError(root)
