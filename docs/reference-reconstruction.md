@@ -253,3 +253,11 @@ and propagates reference-filled segment membership to a path-level `rf` marker.
 Tagged unresolved/reference-filled paths remain recruitment candidates but are excluded
 from reference-prior ranking and gap filling. Legacy graphs whose tags were already
 lost cannot retroactively acquire trusted provenance and require a provenance audit.
+
+Length-uncertain FASTA outputs carry `length_uncertain=true`, so exporting a FASTA does not
+silently drop the JSON uncertainty. External pan builders restore known OVASM FASTA provenance
+on normalized paths; input records with unresolved configurations or reference fills remain
+ineligible as independent configuration priors after a build/import round trip.
+Pan reconstruction enables its own cumulative bait-growth guard without a second WGS k-mer
+count. A `growing` stop is explicitly non-converged. This is a resource/expansion safeguard,
+not a certificate that all sample-specific sequence has been found.

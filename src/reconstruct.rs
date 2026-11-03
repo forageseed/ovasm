@@ -60,7 +60,12 @@ impl Reference {
         let mut walks = Vec::new();
         let mut sources = BTreeSet::new();
         let mut path_names = BTreeSet::new();
-        for line in fs::read_to_string(input)?.lines() {
+        let reference_text = fs::read_to_string(input)?;
+        let inferred_segments: BTreeSet<&str> = reference_text.lines().filter_map(|line| {
+            let f: Vec<_> = line.split('\t').collect();
+            (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration")).then(|| f[1])
+        }).collect();
+        for line in reference_text.lines() {
             let f: Vec<_> = line.split('\t').collect();
             if f[0] != "P" {
                 continue;
@@ -98,13 +103,15 @@ impl Reference {
                 bail!("circular reference path {} lacks its closing edge", f[1]);
             }
             sources.insert(f[1].split('#').next().unwrap().to_string());
+            let trusted_prior = !f[4..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill" || *t == "st:Z:external_walk_interval" || *t == "st:Z:reference_backbone_only")
+                && steps.iter().all(|(id, _)| !inferred_segments.contains(graph.names[*id].as_str()));
             walks.push(Walk {
                 name: f[1].into(),
                 steps,
                 starts,
                 sequence,
                 circular,
-                trusted_prior: !f[4..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill"),
+                trusted_prior,
             });
         }
         if walks.is_empty() {
@@ -1468,9 +1475,20 @@ fn final_outputs(
     } else {
         Value::Null
     };
-    if uncertain["marked"].as_u64().unwrap_or(0) > 0 && status == "complete" {
-        status = "closed_length_uncertain".to_string();
-        reasons.push("the graph is closed but reads do not establish lengths of all repeat regions".to_string());
+    if uncertain["marked"].as_u64().unwrap_or(0) > 0 {
+        if status == "complete" {
+            status = "closed_length_uncertain".to_string();
+            reasons.push("the graph is closed but reads do not establish lengths of all repeat regions".to_string());
+        }
+        // Keep uncertainty when a FASTA, rather than its JSON sidecar, is passed to
+        // an external pan builder. No sequence bases or ordering are changed.
+        let text = fs::read_to_string(&fasta_out)?;
+        let annotated = text.lines().map(|line| {
+            if line.starts_with('>') && !line.split_whitespace().any(|f| f == "length_uncertain=true") {
+                format!("{line} length_uncertain=true\n")
+            } else { format!("{line}\n") }
+        }).collect::<String>();
+        fs::write(&fasta_out, annotated)?;
     }
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
@@ -1841,6 +1859,24 @@ mod tests {
         assert_eq!(g.walks.len(), 3);
         assert_eq!(g.walks.iter().filter(|w| w.trusted_prior).count(), 1);
         assert!(g.bait_sequences(5).len() >= 3);
+        let filled_segment = reference("S\ta\tACGT\trf:Z:source\nP\tsample#1#pt\ta+\t*\n");
+        assert!(!filled_segment.walks[0].trusted_prior);
+    }
+
+    #[test]
+    fn imported_rgfa_is_directly_readable_but_not_a_sample_configuration_prior() {
+        let dir = std::env::temp_dir().join(format!("ovasm-import-reference-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("input.gfa");
+        fs::write(&input, "S\ta\tACGT\tSN:Z:ref\tSO:i:0\tSR:i:0\nS\tb\tTTAA\tSN:Z:ref\tSO:i:4\tSR:i:0\nL\ta\t+\tb\t+\t0M\n").unwrap();
+        let out = dir.join("imported");
+        crate::pan_external::run(&crate::pan_external::Config { input, extra_paths: None, out: out.clone(), sample: "external".into() }).unwrap();
+        let r = Reference::read(&out.join("normalized.gfa")).unwrap();
+        assert_eq!(r.walks.len(), 1);
+        assert_eq!(r.walks[0].sequence, b"ACGTTTAA");
+        assert!(!r.walks[0].trusted_prior);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
