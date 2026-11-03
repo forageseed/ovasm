@@ -1874,6 +1874,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
     let report = recruit::run(
         bait,
         recruit::RecruitConfig {
+            bait_growth_guard: false,
             replay_dir: args.recruit_cache,
             inputs: args.reads,
             params: recruit::ClassifyParams {

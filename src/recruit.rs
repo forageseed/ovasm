@@ -465,6 +465,7 @@ fn target_depth(reads: &mut [(f64, usize)], organelle_min: f64) -> f64 {
     median
 }
 
+
 /// Which of a target's recruited reads a pass writes to its pass file.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Keep {
@@ -951,7 +952,7 @@ pub struct TargetOutput {
     /// --saturation), bait_complete (extension added nothing), size_cap (stood for more than
     /// `size_cap`), iteration_limit (still growing when the passes ran out) or single_pass.
     pub stop_reason: &'static str,
-    /// False for iteration_limit and size_cap: the reads may be incomplete or hold others.
+    /// False for iteration_limit, size_cap and growing: reads may be incomplete or hold others.
     pub converged: bool,
     pub sampling_fraction: f64,
     /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
@@ -1005,6 +1006,8 @@ pub struct RecruitReport {
 }
 
 pub struct RecruitConfig {
+    /// Check accelerated bait growth before committing extension, independently of depth gates.
+    pub bait_growth_guard: bool,
     /// Optional new directory for lossless, process-local input replay.
     pub replay_dir: Option<PathBuf>,
     pub inputs: Vec<PathBuf>,
@@ -1471,6 +1474,12 @@ fn pass_depths(gate: Option<&DepthGate>, res: &ScanResult) -> PassDepths {
     d
 }
 
+/// Stop before committing a rapidly expanding k-mer-gated bait. This is a
+/// recruitment guard, not a determination of the sequence's physical origin.
+fn runaway_bait_gain(previous: Option<usize>, gain: usize) -> bool {
+    previous.is_some_and(|p| gain >= 20_000 && gain as f64 > 1.5 * p as f64)
+}
+
 pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let start = Instant::now();
     std::fs::create_dir_all(&cfg.out_dir)?;
@@ -1745,11 +1754,28 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                 })?;
                 extended_from[t] = picked.len() as u64;
-                added[t] = bait.extend_from_reads(
-                    t,
-                    picked.iter().map(Vec::as_slice),
-                    cfg.extend_min_count,
-                );
+                if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some()) {
+                    let new = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), cfg.extend_min_count);
+                    let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                    if runaway_bait_gain(previous, new.len()) {
+                        saturated[t] = true;
+                        stopped[t] = Some("growing");
+                        let w = format!(
+                            "{}: extension stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved",
+                            bait.targets[t].name, it + 1, new.len(), previous
+                        );
+                        eprintln!("[ovasm] warning: {w}");
+                        warnings.push(w);
+                        continue;
+                    }
+                    added[t] = bait.add_kmers(t, &new);
+                } else {
+                    added[t] = bait.extend_from_reads(
+                        t,
+                        picked.iter().map(Vec::as_slice),
+                        cfg.extend_min_count,
+                    );
+                }
                 used[t].extend(fresh);
                 // Within-pass extension from the partial reads at its edges (`FRONTIER_STEPS`),
                 // gated as extension is.
@@ -1790,7 +1816,21 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                     frontier_reads[t] += picked.len() as u64;
                     frontier_steps[t] += 1;
-                    let more = bait.extend_from_reads(t, picked, cfg.extend_min_count);
+                    let more = if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some()) {
+                        let new = bait.new_from_reads(t, picked, cfg.extend_min_count);
+                        let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                        if runaway_bait_gain(previous, added[t].saturating_add(new.len())) {
+                            saturated[t] = true;
+                            stopped[t] = Some("growing");
+                            let w = format!("{}: frontier extension stopped at pass {}: cumulative bait gain {}; rapid bait growth, sequence source unresolved", bait.targets[t].name, it + 1, added[t].saturating_add(new.len()));
+                            eprintln!("[ovasm] warning: {w}");
+                            warnings.push(w);
+                            break;
+                        }
+                        bait.add_kmers(t, &new)
+                    } else {
+                        bait.extend_from_reads(t, picked, cfg.extend_min_count)
+                    };
                     added[t] += more;
                     if more == 0 {
                         break;
@@ -1810,7 +1850,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     || added[t] > 0
                     || !others_complete
                     || !boot_used[t].is_empty()
-                    || stopped[t] == Some("size_cap")
+                    || matches!(stopped[t], Some("size_cap" | "growing"))
                 {
                     continue;
                 }
@@ -2035,7 +2075,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             read_depth: final_depths.read[t],
             implied_size: final_depths.implied_size[t],
             stop_reason,
-            converged: !matches!(stop_reason, "iteration_limit" | "size_cap"),
+            converged: !matches!(stop_reason, "iteration_limit" | "size_cap" | "growing"),
             sampling_fraction: fraction,
             sampled_by,
             kept_reads,
@@ -2113,6 +2153,23 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runaway_gain_detects_jnl_but_keeps_closing_organelle_frontiers() {
+        assert!(!runaway_bait_gain(Some(20_000), 15_001));
+        assert!(runaway_bait_gain(Some(20_000), 15_000 + 15_001));
+        // Recorded JN-L gains before 76 million reads were recruited.
+        assert!(!runaway_bait_gain(None, 141_275));
+        assert!(!runaway_bait_gain(Some(141_275), 152_343));
+        assert!(runaway_bait_gain(Some(152_343), 492_828));
+        // WL354's complete organelle approaches closure without this growth.
+        for (a, b) in [(82_929, 83_137), (83_137, 13_740), (13_740, 1_531)] {
+            assert!(!runaway_bait_gain(Some(a), b));
+        }
+        assert!(!runaway_bait_gain(Some(0), 19_999));
+        assert!(!runaway_bait_gain(Some(20_000), 30_000));
+        assert!(runaway_bait_gain(Some(20_000), 30_001));
+    }
 
     #[test]
     fn the_kmer_gate_lets_organelle_sequence_extend_and_keeps_the_nucleus_out() {
@@ -2493,6 +2550,7 @@ mod tests {
         bait.targets[m].seed_length = mito.len() as u64;
         bait.targets[c].seed_length = plastid.len() as u64;
         let cfg = |bootstrap| RecruitConfig {
+            bait_growth_guard: false,
             replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
@@ -2675,6 +2733,7 @@ mod tests {
         let mut bait = bait_from(&mito, 21);
         bait.add_sequence(0, &nuclear[100_000..120_000]);
         let cfg = |extend_gate| RecruitConfig {
+            bait_growth_guard: false,
             replay_dir: None,
             inputs: vec![fa.clone()],
             params: ClassifyParams {
@@ -2839,6 +2898,7 @@ mod tests {
         let mut bait = bait_from(&genome[..5000], 21);
         bait.targets[0].seed_length = genome.len() as u64;
         let cfg = |iterations| RecruitConfig {
+            bait_growth_guard: false,
             replay_dir: None,
             inputs: vec![reads.clone()],
             params: ClassifyParams {
@@ -3005,6 +3065,7 @@ mod tests {
 
     fn test_config(fa: &Path, out: PathBuf, iterations: usize, extend_gate: bool) -> RecruitConfig {
         RecruitConfig {
+            bait_growth_guard: false,
             replay_dir: None,
             inputs: vec![fa.to_path_buf()],
             params: ClassifyParams {
@@ -3151,6 +3212,7 @@ mod tests {
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         // --gate-fold sets the gate's own threshold
         let cfg = RecruitConfig {
+            bait_growth_guard: false,
             gate_fold: Some(1.5),
             ..test_config(&fa, dir.join("fold"), 80, true)
         };
@@ -3160,6 +3222,7 @@ mod tests {
         assert_eq!(mito_reads(&fold), starts.len());
         // --nuclear-depth and --genome-size set the nuclear peak; the judged one is kept
         let cfg = RecruitConfig {
+            bait_growth_guard: false,
             nuclear_depth: Some(20),
             ..test_config(&fa, dir.join("given"), 80, true)
         };
@@ -3171,6 +3234,7 @@ mod tests {
         assert_eq!(count_reads(&given.outputs[0].output, b'n'), 0);
         let size = gate.sketch_bases / 25;
         let cfg = RecruitConfig {
+            bait_growth_guard: false,
             genome_size: Some(size),
             ..test_config(&fa, dir.join("size"), 80, true)
         };
@@ -3357,6 +3421,26 @@ mod tests {
     }
 
     #[test]
+    fn independent_growth_guard_preserves_a_small_organelle_without_kmer_gate() {
+        let mito = pseudo_random(30_000, 11);
+        let dir = std::env::temp_dir().join(format!("ovasm-independent-growth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, circle_reads(&mito, 25, "m")).unwrap();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &mito[..4000]);
+        let mut cfg = test_config(&fa, dir.join("guard"), 60, false);
+        cfg.bait_growth_guard = true;
+        assert!(!cfg.kmer_gate);
+        let result = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&result.outputs[0].output, b'm'), 1200);
+        assert!(result.outputs[0].converged);
+        assert!(result.depth_gate.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn frontier_reads_extend_a_gated_target_within_a_pass() {
         // A 30 kb mitochondrion at 120x seeded with 4 kb of itself: one pass moves each edge by a
         // fraction of a read; from the pass's partial reads at the edges the gated target moves
@@ -3495,6 +3579,7 @@ mod tests {
             22.0
         );
     }
+
 
     #[test]
     fn outputs_are_downsampled_to_the_read_depth_and_to_the_base_cap() {
