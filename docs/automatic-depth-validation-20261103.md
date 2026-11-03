@@ -8,9 +8,9 @@ The Lathyrus development case now runs without a supplied nuclear depth. This is
 - Formal source location: /home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm.
 - Automatic depth estimate: 5; nuclear source: reads; organelle gate: 15.
 - Mitochondrial output: one circular 446,897-bp representative, decisive=false.
-- Windowed Oatk comparator breadth: 446,859/446,899 = 99.991049%; aligned identity: 99.995973%.
+- CIGAR-based windowed Oatk comparator reference-span coverage: 446,899/446,899 = 100%; aligned identity: 99.999553%. The initial approximate PAF comparison (without minimap2 -c) reported 99.991049% and is superseded.
 - The mitochondrial FASTA is byte-identical to the earlier --nuclear-depth 4 output.
-- Remaining window-uncovered intervals: [0,9), [398875,398904), [446897,446899). These are not automatically certified biological deletions.
+- No uncovered reference-span intervals remain in the CIGAR-based reanalysis. This is span coverage, not proof of base identity or correct structural conformation. Evidence: ../.agent-work/comparison-cigar-auto.json.
 - Wall time 9:14.84; peak RSS 1,949,660 KiB; exit status 0. Shared-machine timing is descriptive.
 - Tested executable SHA-256: f1ccd141b12a96161daa0509db44354d5a47e9a11cc44132f227c5c451bee92f.
 
