@@ -1137,7 +1137,16 @@ mod tests {
         std::fs::create_dir(&out).unwrap();
         rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
         eprintln!("full-library depth audit: building gate from {} complete input files", inputs.len());
-        let gate = DepthGate::long_reads(&inputs).unwrap();
+        let gate = if let Some(cache_dir) = manifest["completed_cache"].as_str() {
+            let cache = crate::replay::Replay::audit_completed_cache(
+                std::path::Path::new(cache_dir)).unwrap();
+            eprintln!("using independently retained and verified complete input cache: {cache_dir}");
+            let gate = DepthGate::long_reads_from(|| cache.sequences(), "verified complete input cache").unwrap();
+            assert_eq!(gate.report.sketch_bases, manifest["expected_input_bases"].as_u64().unwrap());
+            gate
+        } else {
+            DepthGate::long_reads(&inputs).unwrap()
+        };
         std::fs::write(out.join("gate.json"), serde_json::to_vec_pretty(&gate.report).unwrap()).unwrap();
         let own = manifest["target_depth"].as_f64().unwrap();
         let floor = own * 0.5;

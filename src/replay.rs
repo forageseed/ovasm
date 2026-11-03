@@ -112,6 +112,19 @@ fn unpack(bytes: &[u8], len: usize) -> Vec<u8> {
 }
 
 impl Replay {
+    /// Test-only audit handle for a separately retained, completed sequence cache.
+    /// This creates no writer, calls no remove method, and Replay has no Drop cleanup.
+    #[cfg(test)]
+    pub(crate) fn audit_completed_cache(dir: &Path) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = File::open(dir.join("sequence.bin"))?;
+        ensure!(file.metadata()?.len() >= 8, "incomplete audit cache");
+        file.seek(SeekFrom::End(-8))?;
+        ensure!(next_number(&mut file)? == 0, "audit cache has no terminal batch marker");
+        Ok(Self { dir: dir.to_path_buf(), sequence: None, ready: true,
+            calls: Vec::new(), cover_bounds: Vec::new(), reclassified_reads: Vec::new() })
+    }
+
     pub fn new(dir: &Path) -> Result<Self> {
         // No persistent-cache reuse: this directory belongs to one invocation.
         std::fs::create_dir(dir)
@@ -280,6 +293,22 @@ pub fn source_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit_cache_is_read_only_and_requires_a_completion_marker() {
+        let dir = std::env::temp_dir().join(format!("ovasm-audit-cache-{}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("sequence.bin"), [1u8;8]).unwrap();
+        assert!(Replay::audit_completed_cache(&dir).is_err());
+        std::fs::write(dir.join("sequence.bin"), [0u8;8]).unwrap();
+        let handle = Replay::audit_completed_cache(&dir).unwrap();
+        let (rx, reader) = handle.sequences();
+        assert!(rx.iter().next().is_none());
+        reader.join().unwrap().unwrap();
+        drop(handle);
+        assert!(dir.join("sequence.bin").exists(), "audit must not remove its source");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn cached_sequences_and_ids_are_exact_including_non_acgt_and_fasta() {
         let dir = std::env::temp_dir().join(format!("ovasm-replay-{}", std::process::id()));
