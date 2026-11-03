@@ -1018,6 +1018,36 @@ fn link_overlap(g: &Graph, a: Oriented, b: Oriented) -> Option<usize> {
         .map(|(_, &ov)| ov)
 }
 
+fn overlap_index(g: &Graph) -> FxHashMap<(Oriented, Oriented), usize> {
+    let mut overlaps = FxHashMap::default();
+    for (&(a, b), &ov) in g.links.iter().zip(&g.overlaps) {
+        // Match link_overlap's first-edge semantics, including reverse orientation.
+        overlaps.entry((a, b)).or_insert(ov);
+        overlaps.entry((flip(b), flip(a))).or_insert(ov);
+    }
+    overlaps
+}
+
+fn spelled_length(
+    g: &Graph,
+    walk: &[Oriented],
+    circular: bool,
+    overlaps: &FxHashMap<(Oriented, Oriented), usize>,
+) -> Result<usize> {
+    let first = *walk.first().context("empty molecule walk")?;
+    let mut length = g.seqs[first.0].len();
+    for w in walk.windows(2) {
+        let ov = *overlaps.get(&(w[0], w[1])).context("missing link in molecule walk")?;
+        let added = g.seqs[w[1].0].len().checked_sub(ov).context("overlap exceeds segment length")?;
+        length = length.checked_add(added).context("molecule length overflow")?;
+    }
+    if circular {
+        let ov = *overlaps.get(&(*walk.last().unwrap(), first)).context("missing closing link")?;
+        length = length.checked_sub(ov).context("closing overlap exceeds molecule length")?;
+    }
+    Ok(length)
+}
+
 /// Sequence of a walk, each link's overlap written once. A circular walk also drops the overlap
 /// of the closing link from its end.
 pub(crate) fn spell(g: &Graph, walk: &[Oriented], circular: bool) -> Result<Vec<u8>> {
@@ -1420,13 +1450,14 @@ pub fn run_phased(
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let indexed_overlaps = overlap_index(&g);
     let describe = |f: &Found| -> Result<(Vec<Oriented>, Linearization)> {
         let walk = candidate_walk(&br, f);
         let fractions: Vec<f64> = f.bridges.iter().map(|&i| frac[i]).collect();
         let lin = Linearization {
             path: label(&walk),
             circular: f.circular,
-            length: spell(&g, &walk, f.circular)?.len(),
+            length: spelled_length(&g, &walk, f.circular, &indexed_overlaps)?,
             score: path_score(&fractions),
             bridge_reads: f.bridges.iter().map(|&i| br[i].reads).collect(),
             exit_fractions: fractions,
@@ -1532,14 +1563,12 @@ pub fn run_phased(
             );
             rep.search_truncated |= truncated;
             for cover in found {
-                let (walks, report) = cover_report(&cover)?;
-                let mut key: Vec<(bool, Vec<Oriented>)> = walks
-                    .iter()
-                    .zip(&report.molecules)
-                    .map(|(w, l)| (l.circular, canonical_key(w, l.circular)))
+                let mut key: Vec<(bool, Vec<Oriented>)> = cover.iter()
+                    .map(|f| (f.circular, canonical_key(&candidate_walk(&br, f), f.circular)))
                     .collect();
                 key.sort();
                 if seen.insert(key) {
+                    let (walks, report) = cover_report(&cover)?;
                     ranked.push((walks, report, cover));
                 }
             }
@@ -2889,6 +2918,34 @@ mod tests {
         let ev = evidence(&[("A+ R+ B+", 30), ("C+ R+ D+", 20)], &[]);
         let (br, _) = bridges(&g, &ev, &repeat, 2).unwrap();
         assert!(pairs(&br).iter().all(|p| !p.2));
+    }
+
+    #[test]
+    fn indexed_lengths_match_spelling_in_both_orientations() {
+        let g = Graph {
+            names: vec!["A".into(), "B".into()],
+            seqs: vec![b"ACGTAC".to_vec(), b"ACGGTA".to_vec()],
+            links: vec![((0, true), (1, true)), ((1, true), (0, true))],
+            overlaps: vec![2, 1],
+        };
+        let index = overlap_index(&g);
+        for walk in [vec![(0, true), (1, true)], vec![(1, false), (0, false)]] {
+            for circular in [false, true] {
+                assert_eq!(spelled_length(&g, &walk, circular, &index).unwrap(),
+                           spell(&g, &walk, circular).unwrap().len());
+            }
+        }
+        assert!(spelled_length(&g, &[(0, true), (0, true)], false, &index).is_err());
+        let mut duplicates = g;
+        duplicates.links.extend([((0, true), (1, true)), ((1, false), (0, false)), ((0, true), (0, true))]);
+        duplicates.overlaps.extend([4, 3, 2]);
+        let index = overlap_index(&duplicates);
+        for walk in [vec![(0, true), (1, true)], vec![(1, false), (0, false)], vec![(0, true)]] {
+            for circular in [false, true] {
+                assert_eq!(spelled_length(&duplicates, &walk, circular, &index).unwrap(),
+                           spell(&duplicates, &walk, circular).unwrap().len());
+            }
+        }
     }
 
     #[test]
