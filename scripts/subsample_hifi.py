@@ -76,6 +76,8 @@ def main(argv=None):
     p.add_argument("--out", required=True, type=Path, help="New directory; existing paths refused")
     p.add_argument("--min-free-gib", type=float, default=30,
                    help="Abort below this available output-disk space (default: 30 GiB)")
+    p.add_argument("--compresslevel", type=int, choices=range(0, 10), default=1,
+                   help="Gzip compression level 0-9 (default: 1 for throughput)")
     args = p.parse_args(argv)
     if not math.isfinite(args.min_free_gib) or args.min_free_gib < 0:
         p.error("--min-free-gib must be finite and nonnegative")
@@ -100,6 +102,7 @@ def main(argv=None):
         "record_note": "Sequence and quality bytes preserved; missing final newline is added to keep concatenated FASTQ valid.",
         "coverage_note": "Fractions are not nuclear coverage. Actual bases may differ from expected; reads are never truncated.",
         "min_free_gib": args.min_free_gib,
+        "compresslevel": args.compresslevel,
         "space_check_interval": "at start, then every 64 MiB uncompressed input or 1000 records",
         "seeds": seeds, "fractions": [str(f) for f in fractions],
         "sources": [{"path": str(x), "source_id": sid, "size": st.st_size,
@@ -129,7 +132,7 @@ def main(argv=None):
                 for f in fractions:
                     name = f"seed-{seed}.fraction-{format(f, 'f')}.fastq.gz"
                     raw = stack.enter_context((args.out / name).open("xb"))
-                    writer = stack.enter_context(gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0))
+                    writer = stack.enter_context(gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=args.compresslevel))
                     entry = {"seed": seed, "fraction": str(f), "path": name}
                     manifest["subsets"].append(entry)
                     outputs.append((seed, int(f * (1 << 64)), writer, Counter(), hashlib.sha256(), entry))

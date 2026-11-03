@@ -28,14 +28,15 @@ class SubsamplingTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_subsets(self, name, reads=None):
+    def run_subsets(self, name, reads=None, compresslevel=1):
         out = self.root / name
         argv = []
         for path in reads or [self.a, self.b]:
             argv += ["--reads", str(path)]
         argv += ["--source-id", "runA", "--source-id", "runB",
                  "--fraction", ".2", "--fraction", ".6", "--fraction", "1",
-                 "--seed", "7", "--seed", "8", "--out", str(out)]
+                 "--seed", "7", "--seed", "8", "--out", str(out),
+                 "--compresslevel", str(compresslevel)]
         mod.main(argv)
         return out, json.loads((out / "manifest.json").read_text())
 
@@ -101,6 +102,17 @@ class SubsamplingTests(unittest.TestCase):
                 self.run_subsets("space-ran-out")
             self.assertEqual(disk.call_count, 2)
         self.assertTrue((self.root / "space-ran-out" / "INCOMPLETE").exists())
+
+    def test_compression_level_does_not_change_selected_records(self):
+        fast, fast_report = self.run_subsets("fast", compresslevel=1)
+        dense, dense_report = self.run_subsets("dense", compresslevel=9)
+        self.assertEqual(fast_report["compresslevel"], 1)
+        self.assertEqual(dense_report["compresslevel"], 9)
+        for a, b in zip(fast_report["subsets"], dense_report["subsets"]):
+            self.assertEqual(a["uncompressed_fastq_sha256"], b["uncompressed_fastq_sha256"])
+            self.assertEqual(a["reads"], b["reads"])
+            self.assertEqual(gzip.decompress((fast / a["path"]).read_bytes()),
+                             gzip.decompress((dense / b["path"]).read_bytes()))
 
     def test_refuses_overwrite(self):
         self.run_subsets("same")
