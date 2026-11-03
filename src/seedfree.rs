@@ -353,6 +353,10 @@ pub struct GateReport {
     /// genome (the mode of the read-context k-mer histogram); "given" (`find recruit
     /// --nuclear-depth`) or "genome size" (`--genome-size`) where it was not judged.
     pub nuclear_source: &'static str,
+    /// A read-derived estimate has a local peak above both neighbouring shoulders.
+    /// None for k-mer fallback or explicit depth: neither is certified by this diagnostic.
+    pub nuclear_peak_shape_supported: Option<bool>,
+    pub nuclear_depth_warning: Option<&'static str>,
     /// The peak judged from the reads ("reads" or "kmers" above), kept where one was given.
     pub judged_peak_depth: u32,
     /// Reads whose median depth could be judged (see `nuclear_read_depth`).
@@ -435,6 +439,20 @@ fn nuclear_read_depth(
         }
     }
     (None, histogram)
+}
+
+/// Diagnostic only: do not replace an uncertain read peak with the often spurious 2x
+/// k-mer peak. Compare disjoint three-bin windows one octave apart; a flat shoulder
+/// cannot establish a nuclear peak even when its inferred size clears the size floor.
+fn read_peak_shape_supported(depth: u32, histogram: &[(f64, u64)]) -> bool {
+    let bin = |d: f64| (d.log2() / DEPTH_BIN).floor() as i64;
+    let at = bin(f64::from(depth));
+    let mass = |centre: i64| -> u64 {
+        histogram.iter().filter(|&&(d, _)| (bin(d) - centre).abs() <= 1)
+            .map(|&(_, n)| n).sum()
+    };
+    let peak = mass(at);
+    peak > mass(at - 4) && peak > mass(at + 4)
 }
 
 /// One pass for the nuclear depth: the read-context k-mer histogram (the estimate up to 0.2.1,
@@ -542,6 +560,14 @@ impl DepthGate {
             }
         };
         let organelle_min = nuclear as f64 * params.depth_fold;
+        let nuclear_peak_shape_supported = (nuclear_source == "reads")
+            .then(|| read_peak_shape_supported(nuclear, &read_depth_histogram));
+        let nuclear_depth_warning = (nuclear_peak_shape_supported == Some(false)).then_some(
+            "automatic nuclear depth is on a flat or sloping read-depth distribution, not a supported peak; use --nuclear-depth or --genome-size; the conservative threshold is retained, not replaced by the low k-mer peak"
+        );
+        if let Some(warning) = nuclear_depth_warning {
+            eprintln!("[ovasm] warning: {warning}");
+        }
         let report = GateReport {
             source: label,
             sketch_bases: sketch.bases,
@@ -550,6 +576,8 @@ impl DepthGate {
             organelle_min_depth: organelle_min,
             depth_fold: params.depth_fold,
             nuclear_source,
+            nuclear_peak_shape_supported,
+            nuclear_depth_warning,
             judged_peak_depth: nuclear,
             judged_reads:read_depth_histogram.iter().map(|h| h.1).sum(),
             peak_window_bases: window_bases,
@@ -596,6 +624,8 @@ impl DepthGate {
         self.report.nuclear_peak_depth = depth;
         self.report.organelle_min_depth = self.organelle_min_depth;
         self.report.nuclear_source = source;
+        self.report.nuclear_peak_shape_supported = None;
+        self.report.nuclear_depth_warning = None;
     }
 
     /// Both of the above from one look at the read's sampled k-mers.
@@ -971,6 +1001,12 @@ mod tests {
             gate.nuclear_peak_depth
         );
         assert!(gate.organelle_min_depth >= 51.0);
+        assert_eq!(gate.report.nuclear_peak_shape_supported, Some(true));
+        assert!(gate.report.nuclear_depth_warning.is_none());
+        let mut gate = gate;
+        gate.set_nuclear_depth(4, "given");
+        assert_eq!(gate.report.nuclear_peak_shape_supported, None);
+        assert!(gate.report.nuclear_depth_warning.is_none());
         // at the real size floor the 300 kb genome is no nucleus, and the k-mer estimate stands
         let small = DepthGate::long_reads(&[fa]).unwrap();
         assert_eq!(
@@ -978,6 +1014,83 @@ mod tests {
             (2, "kmers")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lathyrus_recorded_histogram_does_not_support_the_85x_estimate() {
+        // Same ERR13245275 input as the 2026-11-03 validation, not simulated counts.
+        let histogram = [
+            (3.0844216508158815, 25051),
+            (4.362030930661031, 34482),
+            (5.187358218604039, 33827),
+            (6.168843301631763, 28470),
+            (7.33603234563737, 23238),
+            (8.724061861322062, 36164),
+            (10.374716437208077, 29528),
+            (12.337686603263526, 24869),
+            (14.67206469127474, 21878),
+            (17.448123722644123, 37335),
+            (20.749432874416154, 23436),
+            (24.675373206527052, 26995),
+            (29.34412938254948, 28726),
+            (34.896247445288246, 34336),
+            (41.49886574883231, 29439),
+            (49.350746413054104, 29503),
+            (58.68825876509896, 32098),
+            (69.79249489057649, 35794),
+            (82.99773149766462, 33713),
+            (98.70149282610821, 36969),
+            (117.37651753019792, 38767),
+            (139.58498978115298, 41400),
+            (165.99546299532923, 40908),
+            (197.40298565221642, 41773),
+            (234.75303506039583, 41596),
+            (279.16997956230597, 44206),
+            (331.99092599065847, 45883),
+            (394.80597130443283, 45934),
+            (469.50607012079166, 46188),
+            (558.3399591246119, 46141),
+            (663.9818519813169, 46430),
+            (789.6119426088657, 45357),
+            (939.0121402415833, 44129),
+            (1116.6799182492239, 43388),
+            (1327.9637039626339, 39353),
+            (1579.2238852177313, 35078),
+            (1878.0242804831666, 29379),
+            (2233.3598364984477, 27528),
+            (2655.9274079252677, 23939),
+            (3158.4477704354626, 22484),
+            (3756.0485609663333, 19743),
+            (4466.7196729968955, 33986),
+            (5311.8548158505355, 78083),
+            (6316.895540870925, 15576),
+            (7512.097121932667, 14972),
+            (8933.439345993791, 7127),
+            (10623.709631701071, 11988),
+            (12633.79108174185, 1089),
+            (15024.194243865333, 566),
+            (17866.878691987582, 170),
+            (21247.419263402142, 276),
+            (25267.5821634837, 99),
+            (30048.388487730666, 625),
+            (35733.757383975164, 69),
+            (42494.838526804284, 1),
+            (50535.1643269674, 329),
+            (60096.77697546133, 2),
+            (71467.51476795033, 428),
+            (169979.35410721714, 52)
+        ];
+        assert!(!read_peak_shape_supported(85, &histogram));
+    }
+
+    #[test]
+    fn a_flat_or_sloping_read_distribution_is_not_a_supported_peak() {
+        let histogram = |counts: &[u64]| counts.iter().enumerate()
+            .map(|(i, &n)| (2f64.powf((20.5 + i as f64) * DEPTH_BIN), n))
+            .collect::<Vec<_>>();
+        assert!(!read_peak_shape_supported(85, &histogram(&[30; 13])));
+        assert!(!read_peak_shape_supported(85, &histogram(&[20,21,22,23,24,25,26,27,28,29,30,31,32])));
+        assert!(read_peak_shape_supported(85, &histogram(&[10,10,10,20,40,60,40,20,10,10,10,10,10])));
     }
 
     #[test]
