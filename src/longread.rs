@@ -1010,7 +1010,7 @@ fn choose_assemble_k(reads: &Path, dir: &Path) -> Result<usize> {
 /// `ASSEMBLE_K_LOW` when its graph (`low` bases) holds `ASSEMBLE_K_GROWTH` times the sequence of
 /// the higher k's (`high`), else `ASSEMBLE_K_HIGH`; a higher k with no graph is not preferred.
 fn pick_assemble_k(high: f64, low: f64) -> usize {
-    if high > 0.0 && low >= ASSEMBLE_K_GROWTH * high {
+    if low > 0.0 && (high <= 0.0 || low >= ASSEMBLE_K_GROWTH * high) {
         ASSEMBLE_K_LOW
     } else {
         ASSEMBLE_K_HIGH
@@ -1146,7 +1146,9 @@ mod tests {
         assert_eq!(pick_assemble_k(299_707.0, 300_178.0), ASSEMBLE_K_HIGH);
         assert_eq!(pick_assemble_k(100.0, 111.0), ASSEMBLE_K_LOW, "over a tenth more counts");
         assert_eq!(pick_assemble_k(100.0, 109.0), ASSEMBLE_K_HIGH);
-        assert_eq!(pick_assemble_k(0.0, 500.0), ASSEMBLE_K_HIGH, "no graph at the higher k");
+        assert_eq!(pick_assemble_k(0.0, 500.0), ASSEMBLE_K_LOW, "recover the nonempty graph");
+        assert_eq!(pick_assemble_k(0.0, 0.0), ASSEMBLE_K_HIGH);
+        assert_eq!(pick_assemble_k(500.0, 0.0), ASSEMBLE_K_HIGH);
     }
 
     use super::*;
