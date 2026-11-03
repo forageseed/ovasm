@@ -182,7 +182,8 @@ impl KmerCounts {
         }
     }
 
-    /// Count of a canonical k-mer (at least its occurrences, up to 65,535).
+    /// Approximate count, capped at 65,535. Collisions can overcount; concurrent
+    /// conservative updates can lose increments, so this is not a strict lower bound.
     #[inline]
     pub fn get(&self, key: u64) -> u32 {
         let (line, slots) = self.slots(key);
@@ -253,6 +254,9 @@ fn predecessors(word: u64) -> [u64; 4] {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Extension {
     pub reference_kmers: usize,
+    /// Reference words meeting MIN_DEPTH; does not certify organelle origin.
+    pub depth_supported_kmers: usize,
+    pub depth_supported_fraction: f64,
     /// Median count of the reference k-mers: the target's depth in the table.
     pub depth: f64,
     pub floor: f64,
@@ -318,9 +322,37 @@ pub fn extend(
         ext.skipped = Some("empty_reference");
         return ext;
     }
-    let mut depths: Vec<u32> = known.par_iter().map(|&x| counts.get(x)).collect();
-    depths.sort_unstable();
-    ext.depth = f64::from(depths[depths.len() / 2]);
+    // Absent panel alleles are not zero-depth observations of this individual's
+    // organelle. Estimate only from reference words meeting the existing minimum
+    // evidence depth; otherwise a larger pan can disable discovery altogether.
+    let depths: Vec<u32> = known.par_iter().map(|&x| counts.get(x)).collect();
+    let mut supported: Vec<u32> = depths.iter().copied()
+        .filter(|&d| f64::from(d) >= MIN_DEPTH).collect();
+    ext.depth_supported_kmers = supported.len();
+    ext.depth_supported_fraction = supported.len() as f64 / known.len() as f64;
+    if supported.is_empty() {
+        ext.skipped = Some("too_shallow");
+        return ext;
+    }
+    // Isolated above-threshold words can be count-min collisions. Require a
+    // contiguous read-length reference anchor before recovering an absent-majority
+    // panel; use the existing minimum retained sequence length, not a new depth gate.
+    if supported.len() * 2 < known.len() {
+        let anchored = words.iter().any(|w| {
+            let mut run = 0usize;
+            let mut previous = None;
+            w.iter().any(|&(pos, key)| {
+                if f64::from(counts.get(canonical(key))) >= MIN_DEPTH {
+                    run = if previous == pos.checked_sub(1) { run + 1 } else { 1 };
+                    previous = Some(pos);
+                } else { run = 0; previous = None; }
+                run >= MIN_TIP.saturating_sub(K - 1)
+            })
+        });
+        if !anchored { ext.skipped = Some("sparse_reference_support"); return ext; }
+    }
+    let mid = supported.len() / 2;
+    ext.depth = f64::from(*supported.select_nth_unstable(mid).1);
     let (floor, ceiling) = (p.floor * ext.depth, p.ceiling * ext.depth);
     (ext.floor, ext.ceiling) = (floor, ceiling);
     if ext.depth < MIN_DEPTH {
@@ -554,6 +586,39 @@ mod tests {
             });
         assert!(found, "{ext:?}");
         assert_eq!(ext.new_kmers, 800 + K - 1);
+    }
+
+    #[test]
+    fn isolated_supported_words_do_not_establish_organelle_depth() {
+        let reference = random(10000, 101);
+        let table = KmerCounts::new(22);
+        for (_, key) in CanonicalKmers::new(&reference, K).step_by(1000) {
+            for _ in 0..30 { table.add(key); }
+        }
+        let ext = extend(&table, &[reference], 10000, &Params::default());
+        assert_eq!(ext.skipped, Some("sparse_reference_support"));
+        assert!(ext.depth_supported_kmers > 0);
+        assert!(ext.depth_supported_fraction < 0.01);
+        assert_eq!(ext.new_kmers, 0);
+    }
+
+    #[test]
+    fn absent_panel_alleles_do_not_disable_novel_sequence_discovery() {
+        let genome = random(4000, 11);
+        let table = KmerCounts::new(22);
+        tile(&table, &genome, 150, 3, 1);
+        let reference = [genome[..1000].to_vec(), random(300, 5), genome[1800..].to_vec()].concat();
+        let base = extend(&table, &[reference.clone()], 3300, &Params::default());
+        let enlarged = extend(&table, &[reference, random(12000, 99)], 15300, &Params::default());
+        assert!(enlarged.skipped.is_none(), "{enlarged:?}");
+        assert_eq!(base.depth, enlarged.depth);
+        assert_eq!(base.new_kmers, enlarged.new_kmers);
+        let mut a = base.sequences;
+        let mut b = enlarged.sequences;
+        a.sort(); b.sort();
+        assert_eq!(a, b);
+        let absent = extend(&table, &[random(12000, 99)], 12000, &Params::default());
+        assert_eq!(absent.skipped, Some("too_shallow"));
     }
 
     #[test]
