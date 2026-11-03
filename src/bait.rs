@@ -290,6 +290,36 @@ impl BaitSet {
         added
     }
 
+    /// The k-mers `extend_from_reads` would add to a target, without adding them.
+    pub fn new_from_reads<'a, I>(&self, target: usize, reads: I, min_count: u32) -> Vec<u64>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let bit = 1u8 << target;
+        solid_kmers(self.k, reads, min_count, 0.1)
+            .into_iter()
+            .filter(|kmer| self.map.get(kmer).map_or(true, |&m| m & bit == 0))
+            .collect()
+    }
+
+    /// Add k-mers to a target; returns how many were new to it.
+    pub fn add_kmers(&mut self, target: usize, kmers: &[u64]) -> usize {
+        self.lookup = None;
+        let bit = 1u8 << target;
+        let mut added = 0;
+        for &kmer in kmers {
+            let entry = self.map.entry(kmer).or_insert(0);
+            if *entry & bit == 0 {
+                if let Some(changes) = self.changes.as_mut() {
+                    changes.insert(kmer);
+                }
+                *entry |= bit;
+                added += 1;
+            }
+        }
+        added
+    }
+
     #[inline]
     pub fn get(&self, kmer: u64) -> u8 {
         match &self.lookup {
@@ -496,6 +526,24 @@ mod tests {
         }
         assert_eq!(bait.take_changes().len(), 0);
         assert!(CanonicalKmers::new(&seq, 21).all(|(_, key)| delta.get(key) != 0));
+    }
+
+    #[test]
+    fn judging_then_adding_reads_matches_extending_from_them() {
+        let (seq, extra) = (genome(1000, 403), genome(1000, 404));
+        let reads = [seq.as_slice(), extra.as_slice(), extra.as_slice(), extra.as_slice()];
+        let mut a = BaitSet::new(21);
+        a.target("a").unwrap();
+        a.add_sequence(0, &seq);
+        let mut b = a.clone();
+        let before = b.len();
+        let n = a.extend_from_reads(0, reads, 3);
+        let new = b.new_from_reads(0, reads, 3);
+        assert!(n > 0);
+        assert_eq!(new.len(), n);
+        assert_eq!(b.len(), before, "judging adds nothing");
+        assert_eq!(b.add_kmers(0, &new), n);
+        assert_eq!(a.map, b.map);
     }
 
     fn genome(n: usize, seed: u64) -> Vec<u8> {

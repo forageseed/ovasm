@@ -1684,6 +1684,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 // read pairs close the circles (`close`)
                 mates_together: true,
                 kmer_gate: false,
+                bait_growth_guard: true,
                 gate_fold: None,
                 nuclear_depth: None,
                 genome_size: None,
