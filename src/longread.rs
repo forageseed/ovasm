@@ -54,6 +54,23 @@ use crate::recruit::{classify, peak_rss_mb, unit_hash, Call, ClassifyParams};
 /// third of its 21-mers.
 pub const RECRUIT_K: usize = 21;
 
+/// The k of corrected noisy reads' graph is `ASSEMBLE_K_HIGH` unless the graph at `ASSEMBLE_K_LOW`
+/// holds `ASSEMBLE_K_GROWTH` times its sequence or more, which means the higher k lost sequence to
+/// errors the correction left (Nipponbare ONT: 273 kb at 201, 405 kb at 101, of 376 kb; ZM4 ONT:
+/// 299.7 kb at 201, 300.2 kb at 101).
+pub const ASSEMBLE_K_HIGH: usize = 201;
+pub const ASSEMBLE_K_LOW: usize = 101;
+pub const ASSEMBLE_K_GROWTH: f64 = 1.10;
+
+fn parse_assemble_k(s: &str) -> Result<usize, String> {
+    let k: usize = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
+    if crate::assemble::K_LADDER.contains(&k) {
+        Ok(k)
+    } else {
+        Err(format!("k must be one of {:?}", crate::assemble::K_LADDER))
+    }
+}
+
 /// A recruitment round that adds less than this share of the previous round's bases is not
 /// used, and ends the rounds.
 pub const ROUND_GROWTH: f64 = 0.05;
@@ -94,6 +111,14 @@ pub struct LongOptions {
     /// 300 kb mitochondrion at 1,300x.
     #[arg(long, default_value_t = 400_000_000)]
     recruit_max_bases: u64,
+    /// k the graph of the corrected reads starts at (odd, one of 1001, 701, 501, 351, 251, 201,
+    /// 151, 101); it steps down as `run hifi` does when the molecules explain under half of the
+    /// graph. Default: 201, or 101 when the graph at 101 holds a tenth more sequence than at 201
+    /// (`choose_assemble_k`). Corrected noisy reads keep errors that repeat across reads (ONT
+    /// homopolymers), and at the HiFi default of 1001 their graph breaks (Nipponbare ONT, 600x:
+    /// 1 of 16 junctions at 1001, 9 at 201, 11 at 101).
+    #[arg(long, value_parser = parse_assemble_k)]
+    assemble_k: Option<usize>,
     /// fast or standard, as for `run hifi` (standard: downsampled replicates of the corrected
     /// reads).
     #[arg(long, value_enum, default_value_t = Mode::Fast)]
@@ -952,6 +977,46 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
     Ok(report)
 }
 
+/// k of the graph of corrected `reads`: `ASSEMBLE_K_HIGH`, or `ASSEMBLE_K_LOW` when its graph holds
+/// `ASSEMBLE_K_GROWTH` times the sequence of the higher k's (see there). Each probe is one
+/// `assemble graph` pass over the reads, written beside the graph and removed.
+fn choose_assemble_k(reads: &Path, dir: &Path) -> Result<usize> {
+    let length = |k: usize| -> Result<f64> {
+        let (gfa, json) = (
+            dir.join(format!("probe-k{k}.gfa")),
+            dir.join(format!("probe-k{k}.json")),
+        );
+        Argv::new("assemble graph")
+            .opt("--reads", reads)
+            .opt("--k", k.to_string())
+            .opt("--out", &gfa)
+            .opt("--out-json", &json)
+            .run()?;
+        let total = read_json(&json)?["total_length"].as_f64().unwrap_or(0.0);
+        for f in [&gfa, &json, &gfa.with_extension("cleaning.fa")] {
+            let _ = std::fs::remove_file(f);
+        }
+        Ok(total)
+    };
+    let (high, low) = (length(ASSEMBLE_K_HIGH)?, length(ASSEMBLE_K_LOW)?);
+    let k = pick_assemble_k(high, low);
+    log(&format!(
+        "graph of {} bp at k {ASSEMBLE_K_HIGH}, {} bp at k {ASSEMBLE_K_LOW}: starting at k {k}",
+        high as u64, low as u64
+    ));
+    Ok(k)
+}
+
+/// `ASSEMBLE_K_LOW` when its graph (`low` bases) holds `ASSEMBLE_K_GROWTH` times the sequence of
+/// the higher k's (`high`), else `ASSEMBLE_K_HIGH`; a higher k with no graph is not preferred.
+fn pick_assemble_k(high: f64, low: f64) -> usize {
+    if high > 0.0 && low >= ASSEMBLE_K_GROWTH * high {
+        ASSEMBLE_K_LOW
+    } else {
+        ASSEMBLE_K_HIGH
+    }
+}
+
 /// The HiFi stages on one organelle's corrected reads, then its summary with the long-read
 /// record (and the short-read evidence of `run hybrid`).
 #[allow(clippy::too_many_arguments)]
@@ -975,7 +1040,11 @@ fn assemble(
         .map(|s| (organelle.to_string(), s.clone()))
         .into_iter()
         .collect();
-    log(&format!("assembling the corrected {organelle} reads"));
+    let assemble_k = match o.assemble_k {
+        Some(k) => k,
+        None => choose_assemble_k(&r.corrected, dir)?,
+    };
+    log(&format!("assembling the corrected {organelle} reads from k {assemble_k}"));
     let mut summary = pipeline::run(&pipeline::RunConfig {
         reads: vec![r.corrected.clone()],
         organelle: organelle_choice,
@@ -992,6 +1061,7 @@ fn assemble(
         recruit_gate_fold: None,
         recruit_nuclear_depth: None,
         recruit_genome_size: None,
+        assemble_k: Some(assemble_k),
         recruit_max_depth: None,
         recruit_max_bases: None,
         recruit_iterations: None,
@@ -1069,6 +1139,16 @@ fn assemble(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_lower_k_is_chosen_only_when_the_higher_one_lost_sequence() {
+        // Nipponbare ONT: 321,855 bp at 201, 404,510 at 101; ZM4 ONT: 299,707 and 300,178
+        assert_eq!(pick_assemble_k(321_855.0, 404_510.0), ASSEMBLE_K_LOW);
+        assert_eq!(pick_assemble_k(299_707.0, 300_178.0), ASSEMBLE_K_HIGH);
+        assert_eq!(pick_assemble_k(100.0, 111.0), ASSEMBLE_K_LOW, "over a tenth more counts");
+        assert_eq!(pick_assemble_k(100.0, 109.0), ASSEMBLE_K_HIGH);
+        assert_eq!(pick_assemble_k(0.0, 500.0), ASSEMBLE_K_HIGH, "no graph at the higher k");
+    }
+
     use super::*;
     use clap::Parser;
 
