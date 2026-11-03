@@ -1724,6 +1724,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             recruit_gate_fold: None,
             recruit_nuclear_depth: None,
             recruit_genome_size: None,
+            assemble_k: None,
             recruit_max_depth: None,
             recruit_max_bases: None,
             recruit_iterations: None,

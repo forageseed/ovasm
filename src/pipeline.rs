@@ -122,6 +122,9 @@ pub struct RunConfig {
     /// `find recruit --nuclear-depth` and `--genome-size` of gated HiFi seed recruitment.
     pub recruit_nuclear_depth: Option<u32>,
     pub recruit_genome_size: Option<u64>,
+    /// k the graph's k ladder starts at (`K_LADDER`); None: the recruitment's `start_k`, else
+    /// the assembler's automatic k.
+    pub assemble_k: Option<usize>,
     /// HiFi seed recruitment: `find recruit --max-read-depth` and `--max-bases`.
     pub recruit_max_depth: Option<f64>,
     pub recruit_max_bases: Option<u64>,
@@ -1585,7 +1588,7 @@ fn assemble_organelle(
         None
     };
     let start = match cfg.read_type {
-        ReadType::Hifi => start_k(&recruited.recruitment),
+        ReadType::Hifi => cfg.assemble_k.or_else(|| start_k(&recruited.recruitment)),
         ReadType::Sr => None,
     };
     let mut attempts = GraphAttempts {
@@ -2381,6 +2384,7 @@ mod tests {
             recruit_gate_fold: None,
             recruit_nuclear_depth: None,
             recruit_genome_size: None,
+            assemble_k: None,
             recruit_max_depth: Some(250.0),
             recruit_max_bases: Some(1_000_000_000),
             recruit_iterations: None,
