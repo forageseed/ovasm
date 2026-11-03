@@ -504,6 +504,19 @@ fn search_phased(
     for (i, b) in br.iter().enumerate() {
         out_of.entry(b.walk[0]).or_default().push(i);
     }
+    search_phased_indexed(n_seg, anchors, optional, br, m, max_steps, phases, &out_of)
+}
+
+fn search_phased_indexed(
+    n_seg: usize,
+    anchors: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    m: usize,
+    max_steps: u64,
+    phases: &crate::phase::Constraints,
+    out_of: &FxHashMap<Oriented, Vec<usize>>,
+) -> (Vec<Vec<Found>>, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
         out_of: &'a FxHashMap<Oriented, Vec<usize>>,
@@ -1450,6 +1463,10 @@ pub fn run_phased(
     // what no cover explains, as partial paths
     let mut partial: Vec<(Vec<Oriented>, Linearization)> = Vec::new();
     let bridge_starts: FxHashSet<Oriented> = br.iter().map(|b| b.walk[0]).collect();
+    let mut search_out_of: FxHashMap<Oriented, Vec<usize>> = FxHashMap::default();
+    for (i, b) in br.iter().enumerate() {
+        search_out_of.entry(b.walk[0]).or_default().push(i);
+    }
     for (comp, depth) in anchor_components.into_iter().zip(component_depth) {
         let mut rep = ComponentReport {
             anchors: comp.iter().map(|&a| g.names[a].clone()).collect(),
@@ -1503,7 +1520,7 @@ pub fn run_phased(
         let mut last = envelope.min(comp.len());
         let mut m = rep.min_molecules;
         while m <= last {
-            let (found, truncated) = search_phased(
+            let (found, truncated) = search_phased_indexed(
                 g.names.len(),
                 &comp,
                 &optional,
@@ -1511,6 +1528,7 @@ pub fn run_phased(
                 m,
                 p.max_steps,
                 &phases,
+                &search_out_of,
             );
             rep.search_truncated |= truncated;
             for cover in found {
