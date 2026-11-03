@@ -76,7 +76,12 @@ def main():
         summary = sample / "ovasm/summary.json"
         row = dict(variant=sample.parent.name, sample=sample.name, summary=str(summary), status="pending")
         rows.append(row)
-        if not summary.exists(): continue
+        if not summary.exists():
+            timing = sample / "time.txt"
+            if timing.exists() and "Exit status:" in timing.read_text():
+                row["status"] = "finished_without_summary"
+                row["command_record"] = str(timing)
+            continue
         species = sample.name.split("_")[:2]
         key = species[0][:3].capitalize()+species[1][:4].capitalize()
         hits = [p for p in refs.iterdir() if key in p.name]
