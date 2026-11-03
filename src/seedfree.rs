@@ -354,7 +354,7 @@ pub struct GateReport {
     /// --nuclear-depth`) or "genome size" (`--genome-size`) where it was not judged.
     pub nuclear_source: &'static str,
     /// A read-derived estimate has a local peak above both neighbouring shoulders.
-    /// None for k-mer fallback or explicit depth: neither is certified by this diagnostic.
+    /// None for k-mer fallback, low-depth candidates or explicit depth: none is certified by this diagnostic.
     pub nuclear_peak_shape_supported: Option<bool>,
     pub nuclear_depth_warning: Option<&'static str>,
     /// The peak judged from the reads ("reads" or "kmers" above), kept where one was given.
@@ -368,6 +368,10 @@ pub struct GateReport {
     pub kmer_peak_depth: u32,
     /// Judged reads per quarter-log2 bin of their median depth: (bin centre, reads).
     pub read_depth_histogram: Vec<(f64, u64)>,
+    /// Integer read medians: (depth, reads, bases), retained for low-coverage inference.
+    pub integer_read_depth_histogram: Vec<(u32, u64, u64)>,
+    /// Context-supported distinct k-mers per multiplicity, without log-bin aliasing.
+    pub supported_kmer_histogram: Vec<(u32, u64)>,
     pub seconds: f64,
 }
 
@@ -417,6 +421,11 @@ fn nuclear_read_depth(
     fullest.sort_by_key(|&b| {
         std::cmp::Reverse((raw(b - 1) + raw(b) + raw(b + 1), raw(b), std::cmp::Reverse(b)))
     });
+    // A rejected high-depth peak must not turn its shoulder into a nuclear peak merely
+    // because a wider/deeper window finally represents min_genome bases. Judge actual local
+    // maxima, with the same smoothing/tie rule used by depth_peaks.
+    let key = |b: i64| (raw(b - 1) + raw(b) + raw(b + 1), raw(b));
+    fullest.retain(|&b| key(b) >= key(b - 1) && key(b) > key(b + 1));
     for peak in fullest {
         let mut window: Vec<(u32, u64, u64)> = medians
             .iter()
@@ -453,6 +462,39 @@ fn read_peak_shape_supported(depth: u32, histogram: &[(f64, u64)]) -> bool {
     };
     let peak = mass(at);
     peak > mass(at - 4) && peak > mass(at + 4)
+}
+
+/// Recover a separate low-coverage read population only when the original estimate
+/// is an unsupported high shoulder. Integer bins avoid the empty log bins below 8x.
+/// Require both adjacent counts to be lower by two count standard errors, and enough
+/// bases to represent a nuclear genome. This is a candidate estimate, not a truth call.
+fn low_depth_read_peak(
+    medians: &FxHashMap<u32, (u64, u64)>,
+    selected: u32,
+    min_genome: u64,
+    histogram: &[(f64, u64)],
+) -> Option<(u32, u64)> {
+    if read_peak_shape_supported(selected, histogram) {
+        return None;
+    }
+    let count = |d| medians.get(&d).map_or(0, |x| x.0);
+    for d in MIN_JUDGED_DEPTH..10 {
+        if selected <= 2 * d {
+            continue;
+        }
+        let here = count(d);
+        let above_noise = |other: u64| here > other &&
+            (here - other) as f64 > 2.0 * ((here + other) as f64).sqrt();
+        if !above_noise(count(d - 1)) || !above_noise(count(d + 1)) {
+            continue;
+        }
+        let size = (d - 1..=d + 1)
+            .map(|x| medians.get(&x).map_or(0, |v| v.1)).sum::<u64>() / u64::from(d);
+        if size >= min_genome {
+            return Some((d, size));
+        }
+    }
+    None
 }
 
 /// One pass for the nuclear depth: the read-context k-mer histogram (the estimate up to 0.2.1,
@@ -548,7 +590,12 @@ impl DepthGate {
         let (by_reads, read_depth_histogram) = nuclear_read_depth(&medians, min_genome);
         // No judged depth peak stands for a nuclear genome: the nucleus is below 3x (the k-mer
         // estimate is then right), or the reads are organelle reads only.
-        let (nuclear, window_bases, nuclear_source) = match by_reads {
+        let judged_peak_depth = by_reads.map_or(kmer_peak, |x| x.0);
+        let low_peak = by_reads.and_then(|(d, _)|
+            low_depth_read_peak(&medians, d, min_genome, &read_depth_histogram));
+        let (nuclear, window_bases, nuclear_source) = match low_peak {
+            Some((depth, size)) => (depth, size, "low-depth read peak"),
+            None => match by_reads {
             Some((depth, size)) => (depth, size, "reads"),
             None => {
                 let window: u64 = kmers
@@ -558,16 +605,25 @@ impl DepthGate {
                     .sum();
                 (kmer_peak, window * params.scale, "kmers")
             }
+        },
         };
         let organelle_min = nuclear as f64 * params.depth_fold;
         let nuclear_peak_shape_supported = (nuclear_source == "reads")
             .then(|| read_peak_shape_supported(nuclear, &read_depth_histogram));
-        let nuclear_depth_warning = (nuclear_peak_shape_supported == Some(false)).then_some(
+        let nuclear_depth_warning = if low_peak.is_some() {
+            Some("automatic nuclear depth uses a separate low-depth integer read peak because the original read estimate was an unsupported shoulder; this candidate is uncertain, inspect recruitment and use --nuclear-depth or --genome-size when independently known")
+        } else { (nuclear_peak_shape_supported == Some(false)).then_some(
             "automatic nuclear depth is on a flat or sloping read-depth distribution, not a supported peak; use --nuclear-depth or --genome-size; the conservative threshold is retained, not replaced by the low k-mer peak"
-        );
+        ) };
         if let Some(warning) = nuclear_depth_warning {
             eprintln!("[ovasm] warning: {warning}");
         }
+        let mut integer_read_depth_histogram: Vec<_> = medians.iter()
+            .map(|(&depth, &(reads, bases))| (depth, reads, bases)).collect();
+        integer_read_depth_histogram.sort_unstable();
+        let mut supported_kmer_histogram: Vec<_> = kmers.iter()
+            .map(|(&depth, &count)| (depth, count)).collect();
+        supported_kmer_histogram.sort_unstable();
         let report = GateReport {
             source: label,
             sketch_bases: sketch.bases,
@@ -578,11 +634,13 @@ impl DepthGate {
             nuclear_source,
             nuclear_peak_shape_supported,
             nuclear_depth_warning,
-            judged_peak_depth: nuclear,
+            judged_peak_depth,
             judged_reads:read_depth_histogram.iter().map(|h| h.1).sum(),
             peak_window_bases: window_bases,
             kmer_peak_depth: kmer_peak,
             read_depth_histogram,
+            integer_read_depth_histogram,
+            supported_kmer_histogram,
             seconds: start.elapsed().as_secs_f64(),
         };
         Ok(Self {
@@ -964,6 +1022,24 @@ mod tests {
     }
 
     #[test]
+    fn a_high_depth_shoulders_size_does_not_make_it_a_nuclear_peak() {
+        // Approximate Lathyrus read-depth bins: a broad repeat-rich high-depth population
+        // has no nuclear-sized local peak, but its shoulder at ~85x exceeds 20 Mb.
+        let bins: [(u32, u64); 34] = [
+            (3,25051),(4,34482),(5,33827),(6,28470),(7,23238),(9,36164),
+            (10,29528),(12,24869),(15,21878),(17,37335),(21,23436),(25,26995),
+            (29,28726),(35,34336),(41,29439),(49,29503),(59,32098),(70,35794),
+            (83,33713),(99,36969),(117,38767),(140,41400),(166,40908),
+            (197,41773),(235,41596),(279,44206),(332,45883),(395,45934),
+            (470,46188),(558,46141),(664,46430),(790,45357),(939,44129),(1117,43388)
+        ];
+        let medians = bins.into_iter().map(|(d,n)| (d,(n,n*9000))).collect();
+        let (found, _) = nuclear_read_depth(&medians, MIN_NUCLEAR_GENOME);
+        let depth = found.unwrap().0;
+        assert!(depth < 20, "a shoulder was called a peak: {depth}");
+    }
+
+    #[test]
     fn shallow_reads_no_longer_make_the_nuclear_peak() {
         // A 300 kb nuclear genome at 20x beside 3 Mb of a contaminant at 2x: the contaminant holds
         // ten times the distinct k-mers, all at count 2, and so the read-context k-mer peak; the
@@ -1081,6 +1157,30 @@ mod tests {
             (169979.35410721714, 52)
         ];
         assert!(!read_peak_shape_supported(85, &histogram));
+    }
+
+    #[test]
+    fn unsupported_high_shoulder_uses_a_resolved_integer_low_peak() {
+        // These bins each contain one integer: exact Lathyrus read counts, unlike
+        // the merged bins at 8x and above. No Oatk sequence or target length enters.
+        let medians = FxHashMap::from_iter([(3,25051u64),(4,34482),(5,33827),(6,28470),(7,23238)]
+            .into_iter().map(|(d,n)| (d,(n,n*9000))));
+        let flat: Vec<_> = (8..40).map(|b| (2f64.powf((b as f64+0.5)*DEPTH_BIN),30000)).collect();
+        assert_eq!(low_depth_read_peak(&medians,85,MIN_NUCLEAR_GENOME,&flat).map(|x| x.0),Some(4));
+        assert_eq!(low_depth_read_peak(&medians,4,MIN_NUCLEAR_GENOME,&flat),None);
+        assert_eq!(low_depth_read_peak(&medians,85,1_000_000_000,&flat),None);
+        let high: Vec<_> = (8..40).map(|b| (2f64.powf((b as f64+0.5)*DEPTH_BIN),
+            if (24..=26).contains(&b) {90000} else {30000})).collect();
+        assert_eq!(low_depth_read_peak(&medians,85,MIN_NUCLEAR_GENOME,&high),None);
+        let noise = FxHashMap::from_iter([(3,(10000,90000000)),(4,(10001,90009000)),(5,(10000,90000000))]);
+        assert_eq!(low_depth_read_peak(&noise,85,MIN_NUCLEAR_GENOME,&flat),None);
+        for increasing in [false, true] {
+            let monotonic = FxHashMap::from_iter((2..12u32).map(|d| {
+                let n = if increasing {u64::from(d)*10000} else {u64::from(12-d)*10000};
+                (d,(n,n*9000))
+            }));
+            assert_eq!(low_depth_read_peak(&monotonic,85,MIN_NUCLEAR_GENOME,&flat),None);
+        }
     }
 
     #[test]
