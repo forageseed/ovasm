@@ -1444,6 +1444,7 @@ pub fn run_phased(
     let mut chosen: Vec<(Vec<Oriented>, Linearization)> = Vec::new();
     // what no cover explains, as partial paths
     let mut partial: Vec<(Vec<Oriented>, Linearization)> = Vec::new();
+    let bridge_starts: FxHashSet<Oriented> = br.iter().map(|b| b.walk[0]).collect();
     for (comp, depth) in anchor_components.into_iter().zip(component_depth) {
         let mut rep = ComponentReport {
             anchors: comp.iter().map(|&a| g.names[a].clone()).collect(),
@@ -1467,7 +1468,7 @@ pub fn run_phased(
             comps.push(rep);
             continue;
         }
-        let bridged_at = |o: Oriented| br.iter().any(|b| b.walk[0] == o);
+        let bridged_at = |o: Oriented| bridge_starts.contains(&o);
         let ends: Vec<usize> = comp
             .iter()
             .copied()
