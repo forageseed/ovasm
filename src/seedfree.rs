@@ -1119,6 +1119,64 @@ mod tests {
         assert_ne!(nuclear_read_depth(&rising, MIN_NUCLEAR_GENOME).0.unwrap().0, 3);
     }
 
+    /// Operational diagnostic: the gate always sees the manifest's complete library;
+    /// candidate reads only select which profiles are emitted, never the sketch input.
+    #[test]
+    #[ignore = "full-library depth audit; requires OVASM_DEPTH_AUDIT_MANIFEST"]
+    fn audit_candidates_against_full_library_depth() {
+        use std::io::Write;
+        let manifest_path = std::env::var("OVASM_DEPTH_AUDIT_MANIFEST").unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(manifest_path).unwrap()).unwrap();
+        let inputs: Vec<PathBuf> = serde_json::from_value(manifest["inputs"].clone()).unwrap();
+        let candidates: Vec<PathBuf> = serde_json::from_value(manifest["candidates"].clone()).unwrap();
+        let wanted: std::collections::HashSet<String> = serde_json::from_value(
+            manifest["candidate_ids"].clone()).unwrap();
+        assert!(!inputs.is_empty() && !wanted.is_empty());
+        let out = PathBuf::from(manifest["out"].as_str().unwrap());
+        std::fs::create_dir(&out).unwrap();
+        rayon::ThreadPoolBuilder::new().num_threads(8).build_global().unwrap();
+        eprintln!("full-library depth audit: building gate from {} complete input files", inputs.len());
+        let gate = DepthGate::long_reads(&inputs).unwrap();
+        std::fs::write(out.join("gate.json"), serde_json::to_vec_pretty(&gate.report).unwrap()).unwrap();
+        let own = manifest["target_depth"].as_f64().unwrap();
+        let floor = own * 0.5;
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(out.join("profiles.jsonl")).unwrap());
+        let (rx, reader) = read_batches(&candidates);
+        let mut found = std::collections::HashSet::new();
+        for batch in rx.iter() {
+            for rec in batch {
+                let name = String::from_utf8_lossy(&rec.id).split_whitespace().next().unwrap().to_string();
+                if !wanted.contains(&name) { continue; }
+                found.insert(name.clone());
+                let f = features(&rec.seq, &gate.sketch, &gate.params, gate.threshold, gate.organelle_min_depth);
+                let profile = f.as_ref().map(|f| serde_json::json!({
+                    "sampled":f.sampled,"median":f.median,"distinct_fraction":f.distinct_frac,
+                    "global_high_fraction":f.high_frac,"spread":f.spread,
+                    "global_organelle_like":passes(f,&gate.params),
+                    "passes_target_floor":f.median >= floor,
+                    "passes_leftover_depth_range":f.median >= floor && f.median <= own*2.0,
+                    "sample_count_ok":f.sampled >= gate.params.min_sampled,
+                    "distinct_fraction_ok":f.distinct_frac >= gate.params.min_distinct,
+                    "global_high_fraction_ok":f.high_frac >= gate.params.min_high_frac,
+                    "spread_ok":f.spread <= gate.params.max_spread
+                }));
+                writeln!(writer,"{}",serde_json::json!({"read":name,"length":rec.seq.len(),
+                    "target_depth":own,"target_floor":floor,"global_threshold":gate.organelle_min_depth,
+                    "profile":profile})).unwrap();
+            }
+        }
+        reader.join().unwrap().unwrap();
+        writer.flush().unwrap();
+        let missing: Vec<_> = wanted.difference(&found).collect();
+        std::fs::write(out.join("summary.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "manifest":manifest,"gate_source":"complete library inputs, not candidates",
+            "requested":wanted.len(),"found":found.len(),"missing":missing,
+            "note":"depth predicates only; no claim of physical nuclear or organelle origin"
+        })).unwrap()).unwrap();
+        assert!(missing.is_empty(), "candidate IDs missing from the specified files");
+    }
+
     #[test]
     fn exact_lathyrus_integer_histogram_selects_five_without_manual_depth() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
