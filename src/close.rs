@@ -317,6 +317,7 @@ pub fn reference_fill(molecule: &[u8], walks: &[(Vec<u8>, bool)], gap: f64) -> O
     found.sort_by(|a, b| like[b.2].total_cmp(&like[a.2]).then(a.0.total_cmp(&b.0)));
     let distinct: FxHashSet<&[u8]> = found.iter().map(|f| f.1.as_slice()).collect();
     let candidates = distinct.len();
+    if candidates != 1 { return None; }
     // the most similar walk whose fill differs from the chosen one
     let runner_up = found
         .iter()
@@ -473,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fill_comes_from_the_reference_most_like_the_individual() {
+    fn conflicting_reference_fills_are_not_resolved_by_global_similarity() {
         let individual = random(6000, 11);
         // run 0 differs from the individual at every 50th base (away from the gap's flanks) and
         // holds another 200 bp in the gap; run 1 is the individual's own sequence
@@ -485,11 +486,7 @@ mod tests {
         far[5800..].copy_from_slice(&other);
         let near = individual.clone();
         let walks = vec![(far, true), (near, true)];
-        let f = reference_fill(&individual[..5800], &walks, 200.0).unwrap();
-        assert_eq!(f.walk, 1);
-        assert_eq!(f.sequence, individual[5800..].to_vec());
-        assert_eq!(f.candidates, 2);
-        let (w, s) = f.runner_up.unwrap();
-        assert!(w == 0 && s < f.similarity, "{f:?}");
+        assert!(reference_fill(&individual[..5800], &walks, 200.0).is_none(),
+            "global similarity must not resolve conflicting local gap alleles");
     }
 }

@@ -236,3 +236,20 @@ Stretches of the final molecules whose length the reads do not fix are listed in
 at the assembled length do. Each row also gives the read pairs across it and how much longer
 they say it is against pairs 1.5 kb away (an estimate only: inserts vary with the place by
 about 20 bp). Lengths are not corrected.
+
+
+## Evidence safeguards (2026-11-03)
+
+A circular graph with repeat stretches whose lengths are not established by reads is
+reported as `closed_length_uncertain`, rather than `complete`. It is not repaired by
+copying repeat lengths from a potentially different individual's HiFi assembly.
+Conflicting reference gap fills are withheld even when one source is globally more
+similar. Identical fill candidates can still be used, retaining the reference-fill label.
+
+Automatic pan write-back now requires `complete` and `decisive=true`; otherwise its
+report is `withheld_uncertain` and individual outputs remain available. Existing
+reference graphs are not modified in place. Pan merge preserves P-walk evidence tags
+and propagates reference-filled segment membership to a path-level `rf` marker.
+Tagged unresolved/reference-filled paths remain recruitment candidates but are excluded
+from reference-prior ranking and gap filling. Legacy graphs whose tags were already
+lost cannot retroactively acquire trusted provenance and require a provenance audit.
