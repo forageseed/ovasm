@@ -74,6 +74,8 @@ def main():
     rows = []
     for sample in sorted(root.glob("*/*")):
         if not sample.is_dir(): continue
+        if not ((sample / "ovasm").is_dir() or (sample / "run.log").is_file() or (sample / "time.txt").is_file()):
+            continue
         summary = sample / "ovasm/summary.json"
         row = dict(variant=sample.parent.name, sample=sample.name, summary=str(summary), status="pending")
         timing = sample / "time.txt"
