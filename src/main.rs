@@ -645,6 +645,7 @@ fn run(args: RunArgs) -> Result<()> {
         recruit_gate_fold: args.extend_gate_fold,
         recruit_nuclear_depth: args.nuclear_depth,
         recruit_genome_size: args.genome_size,
+        assemble_k: None,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
         recruit_iterations: args.recruit_iterations,
