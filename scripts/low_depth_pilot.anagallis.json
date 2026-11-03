@@ -1,0 +1,44 @@
+{
+  "sample": "Anagallis_arvensis_PRJEB76361",
+  "reads": [
+    "/home/jiazc/data16t-2/projects/dtol_195_organelle/raw/Anagallis_arvensis_PRJEB76361/ERR13245289.fastq.gz"
+  ],
+  "seeds": [
+    20261103
+  ],
+  "target_expected_bases": [
+    500000000,
+    1000000000,
+    2000000000
+  ],
+  "fractions": [
+    "0.04841811713573071896642087054",
+    "0.09683623427146143793284174107",
+    "0.1936724685429228758656834821"
+  ],
+  "full_input_bases_estimate": 10326713007,
+  "base_estimate_source": "/home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm-worktrees/trials/atlas/hifi-v1/Anagallis_arvensis_PRJEB76361/ovasm/recruit/recruit.json",
+  "ovasm": "/home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm/target/release/ovasm",
+  "oatk": "/home/jiazc/data24t/work-live/mamba/envs/bench-oatk/bin/oatk",
+  "nhmmscan": "/home/jiazc/data24t/work-live/mamba/envs/bench-oatk/bin/nhmmscan",
+  "mt_hmm": "/home/jiazc/data10t/ovasm-paper/nipponbare-bench/tools/oatkdb/v20230210/angiosperm_mito.fam",
+  "pt_hmm": "/home/jiazc/data10t/ovasm-paper/nipponbare-bench/tools/oatkdb/v20230210/angiosperm_pltd.fam",
+  "cpus": [
+    24,
+    25,
+    26,
+    27,
+    80,
+    81,
+    82,
+    83
+  ],
+  "memory_bytes": 68719476736,
+  "reserve_bytes": 32212254720,
+  "timeout_seconds": 1800,
+  "sha256": null,
+  "execution_status": "BLOCKED_PENDING_FROZEN_OVASM_BUILD_AND_REVIEWED_HASHES",
+  "oatk_parameter_policy": "Default c30; fixed c3 exploratory sensitivity, not official recommendation. Official recommends 5-10 times nuclear coverage.",
+  "official_source": "https://github.com/c-zhou/oatk",
+  "memory_policy": "OVASM RLIMIT_AS64GiB; both tools 1-second sampled group RSS cap64GiB; Oatk no RLIMIT_AS; possible overshoot explicitly reported"
+}
