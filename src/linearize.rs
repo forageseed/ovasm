@@ -553,17 +553,20 @@ fn search_phased_indexed(
         }
         if s.covered < c.want {
             for &i in c.out_of.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
-                let mut walk = vec![start];
-                for &j in &s.path {
-                    walk.extend_from_slice(&c.br[j].walk[1..]);
-                }
-                walk.extend_from_slice(&c.br[i].walk[1..]);
-                if !c.phases.allows_walk(&walk, false) {
-                    continue;
-                }
                 let next = *c.br[i].walk.last().unwrap();
                 if s.used[next.0] {
                     continue;
+                }
+                // No node can block a walk when no phase constraints are active.
+                if c.phases.active_nodes > 0 {
+                    let mut walk = vec![start];
+                    for &j in &s.path {
+                        walk.extend_from_slice(&c.br[j].walk[1..]);
+                    }
+                    walk.extend_from_slice(&c.br[i].walk[1..]);
+                    if !c.phases.allows_walk(&walk, false) {
+                        continue;
+                    }
                 }
                 s.used[next.0] = true;
                 s.covered += usize::from(!c.optional[next.0]);
@@ -586,6 +589,9 @@ fn search_phased_indexed(
                 .copied()
                 .filter(|&i| *c.br[i].walk.last().unwrap() == start)
                 .filter(|&i| {
+                    if c.phases.active_nodes == 0 {
+                        return true;
+                    }
                     let mut walk = vec![start];
                     for &j in &s.path {
                         walk.extend_from_slice(&c.br[j].walk[1..]);
@@ -604,6 +610,9 @@ fn search_phased_indexed(
                     let a = c.br[i].walk.last().unwrap().0;
                     if s.used[a] || c.optional[a] {
                         return false;
+                    }
+                    if c.phases.active_nodes == 0 {
+                        return true;
                     }
                     let mut walk = vec![start];
                     for &j in &s.path {
@@ -2918,6 +2927,28 @@ mod tests {
         let ev = evidence(&[("A+ R+ B+", 30), ("C+ R+ D+", 20)], &[]);
         let (br, _) = bridges(&g, &ev, &repeat, 2).unwrap();
         assert!(pairs(&br).iter().all(|p| !p.2));
+    }
+
+    #[test]
+    fn unconstrained_fast_path_preserves_search_candidates_and_budget() {
+        let g = graph();
+        let ev = evidence(&[("A+ R+ B+", 30), ("C+ R+ D+", 20)], &[]);
+        let (br, _) = bridges(&g, &ev, &[false, false, false, false, true], 2).unwrap();
+        let fast = crate::phase::Constraints::default();
+        let mut full_checks = crate::phase::Constraints::default();
+        full_checks.active_nodes = 1; // force walk construction, with no forbidden triples
+        let keys = |covers: Vec<Vec<Found>>| {
+            covers.into_iter().map(|cover| cover.into_iter().map(|f|
+                (f.circular, candidate_walk(&br, &f))).collect::<Vec<_>>()).collect::<Vec<_>>()
+        };
+        for budget in [0, 10, 10000] {
+            for m in [1, 2, 3] {
+                let (a, at) = search_phased(5, &[0, 1, 2, 3], &[false; 5], &br, m, budget, &fast);
+                let (b, bt) = search_phased(5, &[0, 1, 2, 3], &[false; 5], &br, m, budget, &full_checks);
+                assert_eq!(at, bt);
+                assert_eq!(keys(a), keys(b));
+            }
+        }
     }
 
     #[test]
