@@ -1702,6 +1702,9 @@ struct RecruitArgs {
     /// A k-mer must occur in at least this many recruited reads to join the bait set.
     #[arg(long, default_value_t = 3)]
     extend_min_count: u32,
+    /// Internal automatic HiFi pipeline policy; never override an explicit support floor.
+    #[arg(long, hide = true, conflicts_with = "extend_min_count")]
+    auto_shallow_edge_support: bool,
     /// New reads of a target are subsampled to this depth before bait extension.
     #[arg(long, default_value_t = 200.0)]
     extend_depth: f64,
@@ -1944,6 +1947,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
                 Preset::Hifi | Preset::Sr => 20,
             }),
             extend_min_count: args.extend_min_count,
+            auto_shallow_edge_support: args.auto_shallow_edge_support,
             extend_depth: args.extend_depth,
             saturation: args.saturation,
             target_depth: args.target_depth,
@@ -2034,6 +2038,30 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{parse_bases, parse_genome_size};
+    #[test]
+    fn explicit_support_floor_conflicts_with_automatic_shallow_policy() {
+        use clap::Parser;
+        let base = ["ovasm", "find", "recruit", "--reads", "reads.fa", "--out", "out"];
+        for floor in ["3", "10"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--extend-min-count", floor]);
+            let parsed = super::Cli::try_parse_from(&argv).unwrap();
+            if let super::Command::Find(super::FindCommand::Recruit(args)) = parsed.command {
+                assert!(!args.auto_shallow_edge_support);
+                assert_eq!(args.extend_min_count, floor.parse::<u32>().unwrap());
+            } else { panic!("wrong command"); }
+            argv.push("--auto-shallow-edge-support");
+            assert!(super::Cli::try_parse_from(argv).is_err());
+        }
+        let mut automatic = base.to_vec();
+        automatic.push("--auto-shallow-edge-support");
+        let parsed = super::Cli::try_parse_from(automatic).unwrap();
+        if let super::Command::Find(super::FindCommand::Recruit(args)) = parsed.command {
+            assert!(args.auto_shallow_edge_support);
+            assert_eq!(args.extend_min_count, 3);
+        } else { panic!("wrong command"); }
+    }
+
 
     #[test]
     fn genome_sizes_parse_with_or_without_a_suffix() {
