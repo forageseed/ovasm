@@ -45,7 +45,8 @@ struct Stretch {
 }
 
 fn name_of(id: &[u8]) -> Vec<u8> {
-    id.split(|&b| b == b' ' || b == b'\t').next().unwrap_or(id).to_vec()
+    let name = id.split(|&b| b == b' ' || b == b'\t').next().unwrap_or(id);
+    name.strip_suffix(b"/1").or_else(|| name.strip_suffix(b"/2")).unwrap_or(name).to_vec()
 }
 
 fn median(mut v: Vec<i64>) -> Option<f64> {
@@ -103,26 +104,57 @@ fn stretches(seq: &[u8]) -> Vec<Stretch> {
     out
 }
 
+/// Pick the middle of the longest circular run of unique words. Ties are
+/// resolved by sequence, never input coordinates. Only k-mer indexing wraps;
+/// analysis uses one copy of the molecule and scans each read once.
+fn circular_cut(seq: &[u8]) -> usize {
+    let n = seq.len();
+    if n < W { return 0; }
+    let extended = [seq, &seq[..W - 1]].concat();
+    let words: Vec<_> = CanonicalKmers::new(&extended, W).take(n).collect();
+    if words.len() != n { return 0; }
+    let mut counts = FxHashMap::default();
+    for &(_, key) in &words { *counts.entry(key).or_insert(0usize) += 1; }
+    let unique: Vec<_> = words.iter().map(|(_, key)| counts[key] == 1).collect();
+    let Some(start) = unique.iter().position(|&u| !u) else {
+        return (0..n).min_by_key(|&i| &extended[i..i+W]).unwrap_or(0);
+    };
+    let (mut run, mut best_len, mut best) = (0usize, 0usize, 0usize);
+    for step in 1..=n {
+        let i = (start + step) % n;
+        if unique[i] { run += 1; } else if run > 0 {
+            let mid = (i + n - run + run / 2 + W / 2) % n;
+            if run > best_len || (run == best_len && extended[mid..mid+W] < extended[best..best+W]) {
+                best_len = run; best = mid;
+            }
+            run = 0;
+        }
+    }
+    best
+}
+
 /// Mark the stretches of `molecules` (name, sequence, circular; those of at least `min_len`)
 /// whose length the reads (`reads`, mates sharing their name's first word) do not fix. Writes
 /// `uncertain_regions.tsv` into `out`.
 pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: usize, out: &Path) -> Result<Value> {
     let mut tsv = String::from(
-        "molecule\tstart\tend\tlength\tanchor_distance\tspanning_reads\texpected_spanning\tspanning_pairs\tpair_longer_bp\tpair_se\tmarked\treason\n",
+        "molecule\tstart\tend\tlength\tanchor_distance\tspanning_reads\texpected_spanning\tspanning_pairs\tpair_longer_bp\tpair_se\tmarked\treason\twraps_origin\tanalysis_rotation\n",
     );
     let mut marked_total = 0usize;
     let mut listed = Vec::new();
-    for (name, seq, _) in molecules.iter().filter(|m| m.1.len() >= min_len) {
-        let seq = seq.to_ascii_uppercase();
+    for (name, seq, circular) in molecules.iter().filter(|m| m.1.len() >= min_len) {
+        let mut seq = seq.to_ascii_uppercase();
+        let rotation = if *circular { circular_cut(&seq) } else { 0 };
+        seq.rotate_left(rotation);
         let st = stretches(&seq);
         if st.is_empty() {
             continue;
         }
         // reads: anchors of the stretches, and placement by unique words for the pairs
-        let mut anchors: FxHashMap<Vec<u8>, (usize, bool)> = FxHashMap::default();
+        let mut anchors: FxHashMap<Vec<u8>, Vec<(usize, bool)>> = FxHashMap::default();
         for (i, s) in st.iter().enumerate() {
-            anchors.insert(seq[s.left_end - W..s.left_end].to_vec(), (i, true));
-            anchors.insert(seq[s.right_start..s.right_start + W].to_vec(), (i, false));
+            anchors.entry(seq[s.left_end - W..s.left_end].to_vec()).or_default().push((i, true));
+            anchors.entry(seq[s.right_start..s.right_start + W].to_vec()).or_default().push((i, false));
         }
         let mut place: FxHashMap<Vec<u8>, i64> = FxHashMap::default();
         let mut counts: FxHashMap<&[u8], u32> = FxHashMap::default();
@@ -150,16 +182,12 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
                 for strand in [&s, &rs] {
                     let mut left: BTreeMap<usize, usize> = BTreeMap::new();
                     for (p, x) in strand.windows(W).enumerate() {
-                        match anchors.get(x) {
-                            Some(&(i, true)) => {
+                        for &(i, is_left) in anchors.get(x).into_iter().flatten() {
+                            if is_left {
                                 left.entry(i).or_insert(p + W);
+                            } else if let Some(&e) = left.get(&i) {
+                                if p >= e { spans[i].push((p - e) as i64); }
                             }
-                            Some(&(i, false)) => {
-                                if let Some(&e) = left.get(&i) {
-                                    spans[i].push((p - e) as i64);
-                                }
-                            }
-                            None => {}
                         }
                     }
                 }
@@ -205,7 +233,10 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
                 }
                 _ => (None, None),
             };
-            let reason = if room <= 0.0 {
+            let discordant = spans[i].iter().filter(|&&length| length != d as i64).count();
+            let reason = if observed >= 3 && discordant * 5 >= observed * 4 {
+                Some("spanning reads disagree with assembled repeat length")
+            } else if room <= 0.0 {
                 Some("no read can span it")
             } else if (observed as f64) < SPANNING_SHARE * expected {
                 Some("far fewer reads span it than its length allows")
@@ -214,17 +245,20 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
                 // by +-20 bp with the place alone (ZM4's plastid, two controls: 10 and 18 bp)
                 None
             };
+            let start = (s.start + rotation) % seq.len();
+            let end = if *circular { (s.end + rotation) % seq.len() } else { s.end };
+            let wraps = *circular && start > end;
             if reason.is_some() {
                 marked_total += 1;
-                listed.push(json!({"molecule": name, "start": s.start, "end": s.end, "anchor_distance": d,
+                listed.push(json!({"molecule": name, "start": start, "end": end, "wraps_origin": wraps, "analysis_rotation": rotation, "anchor_distance": d,
                     "spanning_reads": observed, "expected_spanning": expected, "pair_longer_bp": shift,
                     "pair_se": se, "reason": reason}));
             }
             writeln!(
                 tsv,
-                "{name}\t{}\t{}\t{}\t{d}\t{observed}\t{expected:.1}\t{}\t{}\t{}\t{}\t{}",
-                s.start,
-                s.end,
+                "{name}\t{}\t{}\t{}\t{d}\t{observed}\t{expected:.1}\t{}\t{}\t{}\t{}\t{}\t{wraps}\t{rotation}",
+                start,
+                end,
                 s.end - s.start,
                 over.len(),
                 shift.map_or("-".to_string(), |x| format!("{x:.0}")),
@@ -236,6 +270,7 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
     }
     fs::write(out.join("uncertain_regions.tsv"), tsv)?;
     Ok(json!({"marked": marked_total, "regions": listed, "table": out.join("uncertain_regions.tsv"),
+        "coordinates": "zero-based half-open; wraps_origin=true means [start,length) plus [0,end)",
         "basis": "local repeats (20-mers repeated within 500 bp) between unique anchors: marked when no read can span them or far fewer do than their assembled length allows; pair_longer_bp (pairs across against pairs 1.5 kb away) is an estimate only; lengths not corrected"}))
 }
 
@@ -254,6 +289,32 @@ mod tests {
                 b"ACGT"[((z ^ (z >> 31)) >> 62) as usize]
             })
             .collect()
+    }
+
+    #[test]
+    fn circular_repeat_detection_is_rotation_invariant() {
+        let unit = random(21, 13);
+        let original = [random(1000, 1), unit.repeat(8), random(1300, 2)].concat();
+        let mut canonical = original.clone();
+        canonical.rotate_left(circular_cut(&original));
+        let expected = stretches(&canonical);
+        assert!(!expected.is_empty());
+        for offset in [1, 990, 1050, 1100, original.len()-1] {
+            let mut rotated = original.clone(); rotated.rotate_left(offset);
+            let cut = circular_cut(&rotated); rotated.rotate_left(cut);
+            assert_eq!(rotated, canonical, "offset {offset}");
+            let observed = stretches(&rotated);
+            assert_eq!(observed.len(), expected.len());
+            for (a,b) in observed.iter().zip(&expected) {
+                assert_eq!((a.start,a.end,a.left_end,a.right_start),(b.start,b.end,b.left_end,b.right_start));
+            }
+        }
+    }
+
+    #[test]
+    fn mate_suffixes_share_fragment_identity() {
+        assert_eq!(name_of(b"fragment/1 comment"), name_of(b"fragment/2 comment"));
+        assert_ne!(name_of(b"fragment/3"), name_of(b"fragment/1"));
     }
 
     #[test]
