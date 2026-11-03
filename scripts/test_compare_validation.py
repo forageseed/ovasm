@@ -49,4 +49,11 @@ class ComparisonTests(unittest.TestCase):
             (sample/"time.txt").write_text("Exit status: 0\n")
             with patch.object(m.sys,"argv",["compare",str(p/"runs"),str(p/"refs"),"minimap2",str(p/"report.json")]):m.main()
             self.assertEqual(json.loads((p/"report.json").read_text())["samples"][0]["status"],"missing_outputs_or_reference")
+    def test_identity_requests_cigar_alignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp);f=p/"a.fa";f.write_text(">a\nACGT\n")
+            with patch.object(m.subprocess,"run",return_value=subprocess.CompletedProcess([],0,stdout="",stderr="")) as run:
+                m.compare(f,f,"minimap2",p)
+                self.assertIn("-c",run.call_args.args[0])
+                self.assertTrue(run.call_args.kwargs["check"])
 if __name__ == "__main__":unittest.main()
