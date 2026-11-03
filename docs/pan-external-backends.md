@@ -40,3 +40,10 @@ Nonzero `reference_fill_bp` marks `rf:Z:input_reference_fill`. The input-to-path
 provenance map is also saved. If an external backend loses exact path correspondence,
 all emitted paths conservatively inherit the uncertainty; conflicting existing status
 annotations cause an error rather than overwriting evidence or silently trusting it.
+
+
+Backend execution uses its own writable output directory as cwd. This is necessary for
+seqwish/SDSL caches, which may otherwise use cwd despite an explicit temp directory.
+Relative executable paths are resolved before changing cwd; version probes use the readable
+input directory. Final PGGB replay from the server's I/O-failing home succeeded after this fix,
+including uncertainty/reference-fill tags on the normalized sample path.

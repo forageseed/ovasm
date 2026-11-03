@@ -125,13 +125,16 @@ pub fn run(cfg: &Config) -> Result<Value> {
         if !path.is_file() { bail!("input FASTA missing: {}", path.display()); }
     }
     let exe = cfg.executable.clone().unwrap_or_else(|| cfg.backend.name().into());
+    let exe = if !exe.is_absolute() && exe.components().count() > 1 {
+        fs::canonicalize(&exe).with_context(|| format!("resolve executable {}", exe.display()))?
+    } else { exe };
     // An explicit environment's backend resolves sibling helpers locally, without
     // mutating the user's shell or global environment.
     let mut search: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
     if let Some(parent) = exe.parent().filter(|p| !p.as_os_str().is_empty()) { search.insert(0,parent.to_path_buf()); }
     let path_env = std::env::join_paths(search)?;
     // Fail clearly before creating output when an optional backend is absent.
-    let probe = Command::new(&exe).env("PATH",&path_env).arg(match cfg.backend { Backend::Pggb => "--version", Backend::Minigraph => "--version" })
+    let probe = Command::new(&exe).current_dir(fs::canonicalize(&cfg.inputs[0].1)?.parent().context("input has no parent directory")?).env("PATH",&path_env).arg(match cfg.backend { Backend::Pggb => "--version", Backend::Minigraph => "--version" })
         .output().with_context(|| format!("cannot execute {}: install the optional {} backend or specify its executable", exe.display(), cfg.backend.name()))?;
     if !probe.status.success() { bail!("{} version probe failed: {}", exe.display(), String::from_utf8_lossy(&probe.stderr)); }
     fs::create_dir(&cfg.out)?;
@@ -148,7 +151,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
     fs::write(out.join("backend-version.txt"),[probe.stdout,probe.stderr].concat())?;
     let raw = external.join("graph.gfa");
     let mut command = Command::new(&exe);
-    command.env("PATH",&path_env);
+    command.current_dir(&out).env("PATH",&path_env);
     match cfg.backend {
         Backend::Minigraph => {
             command.arg("-cxggs").arg(format!("-t{}",cfg.threads)).args(&prepared)
@@ -164,7 +167,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
     }
     command.stdin(Stdio::null()).stderr(fs::File::create(out.join("backend.stderr.log"))?);
     let args: Vec<_> = command.get_args().map(|a|a.to_string_lossy().into_owned()).collect();
-    fs::write(out.join("command.json"),serde_json::to_vec_pretty(&json!({"executable":exe,"args":args,"inputs":cfg.inputs}))?)?;
+    fs::write(out.join("command.json"),serde_json::to_vec_pretty(&json!({"executable":exe,"args":args,"cwd":out,"inputs":cfg.inputs}))?)?;
     let status=command.status().context("launch external pan builder")?;
     fs::write(out.join("backend.exit"), status.code().map_or("signal".into(),|x|x.to_string()))?;
     if !status.success() { bail!("{} failed ({status}); see {}",cfg.backend.name(),out.join("backend.stderr.log").display()); }
@@ -233,5 +236,5 @@ mod tests {
     #[test] fn backend_failure_is_not_success() { let (d,c)=fixture("failure","exit 7");let e=run(&c).unwrap_err().to_string();assert!(e.contains("failed"));assert!(!c.out.join("build.json").exists());fs::remove_dir_all(d).unwrap(); }
     #[test] fn empty_graph_is_not_success() { let (d,c)=fixture("empty","exit 0");assert!(run(&c).unwrap_err().to_string().contains("empty graph"));fs::remove_dir_all(d).unwrap(); }
     #[test] fn missing_backend_and_existing_output_fail_cleanly() { let (d,mut c)=fixture("missing","exit 0");c.executable=Some(d.join("missing"));assert!(run(&c).is_err());assert!(!c.out.exists());fs::create_dir(&c.out).unwrap();assert!(run(&c).unwrap_err().to_string().contains("already exists"));fs::remove_dir_all(d).unwrap(); }
-    #[test] fn minigraph_dispatch_and_normalization() { let (d,c)=fixture("success","printf 'H\\tVN:Z:1.0\\nS\\t1\\tACGTACGTACGTACGTACGTACGTACGTACGT\\nP\\tsample#1#contig_1\\t1+\\t*\\n'");let report=run(&c).unwrap();assert_eq!(report["backend"],"minigraph");assert!(c.out.join("normalized/normalized.gfa").exists());let command=fs::read_to_string(c.out.join("command.json")).unwrap();assert!(command.contains("-cxggs")&&command.contains("-t2"));fs::remove_dir_all(d).unwrap(); }
+    #[test] fn minigraph_dispatch_and_normalization() { let (d,c)=fixture("success","pwd > backend.cwd; printf 'H\\tVN:Z:1.0\\nS\\t1\\tACGTACGTACGTACGTACGTACGTACGTACGT\\nP\\tsample#1#contig_1\\t1+\\t*\\n'");let report=run(&c).unwrap();assert_eq!(report["backend"],"minigraph");assert!(c.out.join("normalized/normalized.gfa").exists());let command=fs::read_to_string(c.out.join("command.json")).unwrap();assert!(command.contains("-cxggs")&&command.contains("-t2"));assert_eq!(fs::read_to_string(c.out.join("backend.cwd")).unwrap().trim(),fs::canonicalize(&c.out).unwrap().to_str().unwrap());fs::remove_dir_all(d).unwrap(); }
 }
