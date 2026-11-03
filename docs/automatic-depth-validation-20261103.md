@@ -26,8 +26,60 @@ The main estimator now limits candidate windows to local maxima rather than allo
 
 The real integer frequency/bases fixture is tests/fixtures/lathyrus-nuclear-depth.json. scripts/replay_nuclear_depth.py replays the old and current estimates without rereading the raw FASTQ or using a reference assembly. Its Rust counterpart checks the production estimator. This is the appropriate first regression for future estimator changes; only changed recruitment behavior requires another end-to-end read run.
 
-The initial audit of 173 old reports cannot establish that all other samples are unchanged. Local-maximum filtering necessarily changes the candidate outcome for the recorded Polytrichum formosum case as well as Lathyrus; the remaining reports lack enough integer-depth/bases data for complete replay. Broader low-depth validation remains necessary.
+The initial audit of 173 old reports cannot establish that all other samples are unchanged. Uncorrected local-maximum filtering necessarily changed the recorded Polytrichum formosum case as well as Lathyrus. The empty-bin boundary correction and actual full-input test below address that specific regression. The other old reports lack enough integer-depth/bases data for complete replay; no claim of universal invariance follows from their binned histograms.
 
 ## Paper experiment
 
 The planned nuclear-depth benchmark compares OVASM with PMAT1 and Oatk, using independent genome-size denominators, matched subsets and repeated seeds. PMAT1 already established the low-coverage HiFi use case. The current Gb-based Anagallis pilot is engineering validation, not evidence of a nuclear-depth limit. See the local manuscript LOW-DEPTH-HIFI-PLAN.md and the server benchmark inventory for the preregistered endpoints and known installation/data limitations.
+
+## Cross-species boundary and strong-peak checks
+
+The unified formal-source executable for these checks has SHA-256
+`449c7f6acaa6c88029caf4aff760814e9e1681fcbb891f55e397a5b1ea57aaee`.
+Its source snapshot and complete commands are recorded in
+`../.agent-work/ovasm-five-fixes-20261103/`. These are whole-input runs with default
+nuclear-depth parameters, not downsampled extrapolations.
+
+### Polytrichum formosum: censored low-depth boundary
+
+- Input: ERR12721079.fastq.gz, 340,868,549 sequenced bases.
+- Both the historical estimator and corrected estimator replay to 3x and a
+  23,670,683-bp window-implied size on the exact new integer histogram.
+- The actual default run reports nuclear depth 3, organelle threshold 9, source
+  `low-depth read boundary`, and a warning that lower depths are censored. This
+  preserves the threshold without claiming independently known nuclear depth.
+- The empty log bin between integer depths 3 and 4 no longer suppresses a decreasing
+  boundary population merely because its smoothed count includes both neighbours.
+- Mitochondrial recruitment: 59 reads / 798,284 bases; plastid: 576 reads / 6,762,887
+  bases. Both recruited FASTQ files are byte-identical to the historical hifi-v1
+  outputs (SHA-256: mt `9c6ea1aedf78bdadd0dec77bbfaa08c50d18200d3fa7c56fc5579df37e420abe`,
+  pt `2d9ff7277dc7e336525d0063b02fe632881eb66c00b88eb180f1c6296718b81f`).
+  Thus this boundary fix did not add recruited reads in this regression case.
+- End-to-end exit 0, wall 1:00.04, peak RSS 879,740 KiB. Output: 60,750-bp linear
+  mitochondrial representative and 126,243-bp circular plastid; both decisive=false.
+- Exact fixture: `tests/fixtures/polytrichum-formosum-nuclear-depth.json`;
+  replay with `python3 scripts/replay_nuclear_depth.py` followed by that path.
+
+Assembly/reference coverage is not used as truth for nuclear depth. Read-set
+identity is a stronger regression check here than an unchanged assembly length,
+but it still does not certify the physical origin of every historical read.
+
+### Polytrichum commune: strong read peak despite a 2x k-mer mode
+
+- Input: ERR9863245.fastq.gz, 10,185,557,573 sequenced bases.
+- Historical and corrected estimators both replay to 24x and 264,538,883 bp of
+  window-implied genome size. The actual run reports source `reads`, nuclear 24,
+  threshold 72, k-mer mode 2, and no nuclear-depth warning. The 2x k-mer mode does
+  not replace a supported read-depth estimate.
+- Mitochondrial recruitment: 3,007 reads / 28,542,545 bases; plastid: 12,175 reads /
+  119,060,334 bases; both saturated. The recruited files are byte-identical to
+  historical hifi-v1 (SHA-256 mt
+  `d745aea7a9f2b835811440252fe64286111dba25c8e8c475773c91dc200fe4fc`,
+  pt `a0434cd2bba6c18585d21002cff81b17b559d80cb57312830744b27b1f0a607b`).
+- End-to-end exit 0, wall 6:01.48, peak RSS 1,690,512 KiB. Mitochondrion:
+  114,831-bp circle, decisive=true; plastid: 126,254-bp circle, decisive=false.
+- Exact fixture: `tests/fixtures/polytrichum-commune-nuclear-depth.json`, usable
+  with the same replay script. Together with Lathyrus and P. formosum these cover
+  the repaired broad shoulder, the censored low-depth boundary, and a supported
+  read peak that must not follow the low k-mer mode. They are three regression
+  cases, not proof of unchanged behavior across all 173 historical reports.
