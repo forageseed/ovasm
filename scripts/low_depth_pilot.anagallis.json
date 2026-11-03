@@ -18,7 +18,7 @@
   ],
   "full_input_bases_estimate": 10326713007,
   "base_estimate_source": "/home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm-worktrees/trials/atlas/hifi-v1/Anagallis_arvensis_PRJEB76361/ovasm/recruit/recruit.json",
-  "ovasm": "/home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm/target/release/ovasm",
+  "ovasm": "REQUIRED_EXPLICIT_FROZEN_BINARY_VIA_--ovasm",
   "oatk": "/home/jiazc/data24t/work-live/mamba/envs/bench-oatk/bin/oatk",
   "nhmmscan": "/home/jiazc/data24t/work-live/mamba/envs/bench-oatk/bin/nhmmscan",
   "mt_hmm": "/home/jiazc/data10t/ovasm-paper/nipponbare-bench/tools/oatkdb/v20230210/angiosperm_mito.fam",
