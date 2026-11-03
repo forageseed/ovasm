@@ -425,7 +425,15 @@ fn nuclear_read_depth(
     // because a wider/deeper window finally represents min_genome bases. Judge actual local
     // maxima, with the same smoothing/tie rule used by depth_peaks.
     let key = |b: i64| (raw(b - 1) + raw(b) + raw(b + 1), raw(b));
-    fullest.retain(|&b| key(b) >= key(b - 1) && key(b) > key(b + 1));
+    fullest.retain(|&b| {
+        // At the censored 3x boundary, the next log bin contains no integer depth.
+        // Its smoothed mass includes both 3x and 4x, spuriously outranking a real
+        // declining boundary population. Compare the actual integer counts there.
+        let boundary = b == bin(MIN_JUDGED_DEPTH)
+            && medians.get(&MIN_JUDGED_DEPTH).map_or(0, |v| v.0)
+                > medians.get(&(MIN_JUDGED_DEPTH + 1)).map_or(0, |v| v.0);
+        boundary || (key(b) >= key(b - 1) && key(b) > key(b + 1))
+    });
     for peak in fullest {
         let mut window: Vec<(u32, u64, u64)> = medians
             .iter()
@@ -596,7 +604,9 @@ impl DepthGate {
         let (nuclear, window_bases, nuclear_source) = match low_peak {
             Some((depth, size)) => (depth, size, "low-depth read peak"),
             None => match by_reads {
-            Some((depth, size)) => (depth, size, "reads"),
+            Some((depth, size)) => (depth, size, if depth == MIN_JUDGED_DEPTH {
+                "low-depth read boundary"
+            } else { "reads" }),
             None => {
                 let window: u64 = kmers
                     .iter()
@@ -610,7 +620,9 @@ impl DepthGate {
         let organelle_min = nuclear as f64 * params.depth_fold;
         let nuclear_peak_shape_supported = (nuclear_source == "reads")
             .then(|| read_peak_shape_supported(nuclear, &read_depth_histogram));
-        let nuclear_depth_warning = if low_peak.is_some() {
+        let nuclear_depth_warning = if nuclear_source == "low-depth read boundary" {
+            Some("automatic nuclear depth lies at the minimum judged read depth; lower depths are censored, so this boundary estimate is uncertain; use --nuclear-depth or --genome-size when independently known")
+        } else if low_peak.is_some() {
             Some("automatic nuclear depth uses a separate low-depth integer read peak because the original read estimate was an unsupported shoulder; this candidate is uncertain, inspect recruitment and use --nuclear-depth or --genome-size when independently known")
         } else { (nuclear_peak_shape_supported == Some(false)).then_some(
             "automatic nuclear depth is on a flat or sloping read-depth distribution, not a supported peak; use --nuclear-depth or --genome-size; the conservative threshold is retained, not replaced by the low k-mer peak"
@@ -1090,6 +1102,21 @@ mod tests {
             (2, "kmers")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn censored_integer_boundary_is_not_displaced_by_an_empty_log_bin() {
+        // Exact old Polytrichum formosum low-bin counts; synthetic uniform lengths
+        // here only exercise the genome-size gate, not a claim of full data replay.
+        let medians = FxHashMap::from_iter([(3,3789u64),(4,1513),(5,872),(6,627),(7,548)]
+            .into_iter().map(|(d,n)| (d,(n,n*14000))));
+        assert_eq!(nuclear_read_depth(&medians, MIN_NUCLEAR_GENOME).0,
+            Some((3, (3789 + 1513) * 14000 / 3)));
+        assert_eq!(nuclear_read_depth(&medians, 1_000_000_000).0, None);
+        // A rising lower edge does not qualify as a declining boundary.
+        let rising = FxHashMap::from_iter([(3,100u64),(4,200),(5,300),(6,200),(7,100)]
+            .into_iter().map(|(d,n)| (d,(n,n*1000000))));
+        assert_ne!(nuclear_read_depth(&rising, MIN_NUCLEAR_GENOME).0.unwrap().0, 3);
     }
 
     #[test]

@@ -20,8 +20,10 @@ def replay(rows, minimum, local_maxima):
     raw = lambda b: bins.get(b, 0)
     key = lambda b: (raw(b - 1) + raw(b) + raw(b + 1), raw(b))
     candidates = sorted(bins, key=lambda b: (-key(b)[0], -key(b)[1], b))
+    counts = {depth: reads for depth, reads, _ in rows}
     for peak in candidates:
-        if local_maxima and not (key(peak) >= key(peak - 1) and key(peak) > key(peak + 1)):
+        boundary = peak == depth_bin(3) and counts.get(3, 0) > counts.get(4, 0)
+        if local_maxima and not (boundary or (key(peak) >= key(peak - 1) and key(peak) > key(peak + 1))):
             continue
         window = sorted(row for row in rows if row[0] >= 3 and abs(depth_bin(row[0]) - peak) <= 2)
         total = sum(row[1] for row in window)
