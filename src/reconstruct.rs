@@ -1690,6 +1690,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 },
                 iterations: 20,
                 extend_min_count: 3,
+                auto_shallow_edge_support: false,
                 extend_depth: 200.0,
                 saturation: 0.05,
                 target_depth: cfg.target_depth,

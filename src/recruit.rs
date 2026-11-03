@@ -974,6 +974,8 @@ pub struct RecruitReport {
     /// Passes actually run: iteration stops early once no target's bait grows.
     pub iterations_run: usize,
     pub extend_min_count: u32,
+    /// Internal automatic HiFi policy; false preserves the configured hard support floor.
+    pub auto_shallow_edge_support: bool,
     pub extend_depth: f64,
     pub saturation: f64,
     pub target_depth: Option<f64>,
@@ -1014,6 +1016,8 @@ pub struct RecruitConfig {
     pub params: ClassifyParams,
     pub iterations: usize,
     pub extend_min_count: u32,
+    /// Internal automatic HiFi policy; false preserves the configured hard support floor.
+    pub auto_shallow_edge_support: bool,
     /// Depth the new reads of a target are subsampled to before counting bait k-mers.
     pub extend_depth: f64,
     /// A target whose recruited reads grow by less than this fraction stops being extended.
@@ -1978,7 +1982,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if p.len() < LEFTOVER_MIN_READS {
                         continue;
                     }
-                    if depths.measured[t] >= CORE_MIN_READS && core_depth[t].is_some() {
+                    if cfg.auto_shallow_edge_support && depths.measured[t] >= CORE_MIN_READS && core_depth[t].is_some() {
                         shallow_leftover_depth[t] = p.iter()
                             .filter_map(|s| g.median_depth(s))
                             .filter(|&d| d < g.organelle_min_depth && d > g.nuclear_peak_depth as f64)
@@ -2188,6 +2192,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         iterations_requested: cfg.iterations,
         iterations_run: iterations.len(),
         extend_min_count: cfg.extend_min_count,
+        auto_shallow_edge_support: cfg.auto_shallow_edge_support,
         extend_depth: cfg.extend_depth,
         saturation: cfg.saturation,
         target_depth: cfg.target_depth,
@@ -2648,6 +2653,7 @@ mod tests {
             },
             iterations: 40,
             extend_min_count: 3,
+            auto_shallow_edge_support: false,
             extend_depth: 200.0,
             saturation: 0.05,
             target_depth: None,
@@ -2783,7 +2789,20 @@ mod tests {
         assert_eq!(cfg.extend_min_count, 3, "exercise the default support threshold");
         cfg.extend_depth = 200.0;
         cfg.saturation = 0.05;
+        let mut hard = test_config(&fa, dir.join("hard10"), 40, true);
+        hard.bootstrap = true;
+        hard.nuclear_depth = Some(5);
+        hard.extend_min_count = 10;
+        hard.auto_shallow_edge_support = false;
+        let strict = run(bait.clone(), hard).unwrap();
+        assert!(count_reads(&strict.outputs[m].output, b's') < 40,
+            "an explicit hard support floor must not silently use support 2");
+        assert!(!strict.auto_shallow_edge_support);
+        assert!(!strict.warnings.iter().any(|w| w.contains("edge support")));
         let rep = run(bait, cfg).unwrap();
+        assert!(rep.auto_shallow_edge_support);
+        assert!(rep.iterations_run < 40, "automatic recovery must converge");
+        assert_eq!(rep.outputs[m].stop_reason, "bait_complete");
         let out = &rep.outputs[m].output;
         assert_eq!(count_reads(out, b'm'), 80, "every read of the first circle");
         assert_eq!(count_reads(out, b's'), 40, "every read of the second circle");
@@ -2895,6 +2914,7 @@ mod tests {
             },
             iterations: 30,
             extend_min_count: 3,
+            auto_shallow_edge_support: false,
             extend_depth: 200.0,
             saturation: 0.0,
             target_depth: None,
@@ -3060,6 +3080,7 @@ mod tests {
             },
             iterations,
             extend_min_count: 3,
+            auto_shallow_edge_support: false,
             extend_depth: 200.0,
             saturation: 0.05,
             target_depth: None,
@@ -3227,6 +3248,7 @@ mod tests {
             },
             iterations,
             extend_min_count: 3,
+            auto_shallow_edge_support: true,
             // no subsampling: every new read extends
             extend_depth: 1e9,
             saturation: 0.0,

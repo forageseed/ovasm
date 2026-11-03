@@ -982,7 +982,7 @@ fn recruit_all(
         // 309 GB of memory in assembly until earlyoom ended it).
         if cfg.read_type == ReadType::Hifi {
             if cfg.gated_recruit {
-                argv = argv.arg("--extend-gate").arg("--bootstrap");
+                argv = argv.arg("--extend-gate").arg("--bootstrap").arg("--auto-shallow-edge-support");
                 if let Some(f) = cfg.recruit_gate_fold {
                     argv = argv.opt("--gate-fold", f.to_string());
                 }
@@ -2514,6 +2514,7 @@ mod tests {
             assert!(r["read_depth"].as_f64().unwrap() < 250.0, "{organelle}");
         }
         let recruitment = read_json(&cfg.out.join("recruit/recruit.json")).unwrap();
+        assert_eq!(recruitment["auto_shallow_edge_support"], json!(true));
         assert!(recruitment["input_replay"].is_object(), "the reads were cached");
         assert!(!cfg.out.join("recruit/input-cache").exists(), "and the cache removed");
         assert_eq!(recruitment["iterations_requested"], json!(GATED_RECRUIT_PASSES));
