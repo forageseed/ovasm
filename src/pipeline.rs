@@ -758,6 +758,8 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
                 "depth_fold": gate["depth_fold"],
                 "nuclear_source": gate["nuclear_source"],
                 "judged_peak_depth": gate["judged_peak_depth"],
+                "nuclear_peak_shape_supported": gate["nuclear_peak_shape_supported"],
+                "nuclear_depth_warning": gate["nuclear_depth_warning"],
                 "peak_window_bases": gate["peak_window_bases"],
                 "kmer_peak_depth": gate["kmer_peak_depth"],
                 "source": gate["source"],
@@ -2006,6 +2008,25 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recruitment_summary_preserves_depth_uncertainty() {
+        let report = serde_json::json!({
+            "outputs": [{}], "warnings": [],
+            "depth_gate": {
+                "nuclear_peak_depth": 85,
+                "nuclear_peak_shape_supported": false,
+                "nuclear_depth_warning": "No supported nuclear peak; supply nuclear depth"
+            }
+        });
+        let summary = recruitment_summary(&report, 0, "mitochondrion", true);
+        assert_eq!(summary["depth_gate"]["nuclear_peak_shape_supported"], false);
+        assert_eq!(summary["depth_gate"]["nuclear_depth_warning"],
+            report["depth_gate"]["nuclear_depth_warning"]);
+        let old = recruitment_summary(&serde_json::json!({"outputs": [{}]}), 0,
+            "mitochondrion", true);
+        assert!(old["depth_gate"].is_null());
+    }
+
     use super::*;
     use crate::evidence::revcomp;
 
