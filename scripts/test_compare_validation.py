@@ -33,4 +33,20 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(row["status"],"partial")
             self.assertEqual(row["failed"],["plastid"])
             self.assertEqual(row["command_record_text"],command)
+    def test_nonzero_exit_with_summary_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp); sample=p/"runs/default/Lathyrus_linifolius_test"
+            (sample/"ovasm").mkdir(parents=True);(p/"refs/drLatLini1").mkdir(parents=True)
+            (sample/"ovasm/summary.json").write_text('{"failed": []}')
+            (sample/"time.txt").write_text("Exit status: 2\n")
+            with patch.object(m.sys,"argv",["compare",str(p/"runs"),str(p/"refs"),"minimap2",str(p/"report.json")]):m.main()
+            self.assertEqual(json.loads((p/"report.json").read_text())["samples"][0]["status"],"failed_exit")
+    def test_missing_outputs_with_exit_zero_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp); sample=p/"runs/default/Lathyrus_linifolius_test"
+            (sample/"ovasm").mkdir(parents=True);(p/"refs/drLatLini1").mkdir(parents=True)
+            (sample/"ovasm/summary.json").write_text('{"failed": []}')
+            (sample/"time.txt").write_text("Exit status: 0\n")
+            with patch.object(m.sys,"argv",["compare",str(p/"runs"),str(p/"refs"),"minimap2",str(p/"report.json")]):m.main()
+            self.assertEqual(json.loads((p/"report.json").read_text())["samples"][0]["status"],"missing_outputs_or_reference")
 if __name__ == "__main__":unittest.main()

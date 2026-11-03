@@ -4,6 +4,7 @@ Pending samples remain explicit. Coordinates are zero-based half-open.
 """
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -35,7 +36,7 @@ def compare(query, target, mm, work):
                 starts.append(len(seq)-10000)
             for start in starts:
                 out.write(f">{name}:{start}\n{seq[start:start+10000]}\n")
-    proc = subprocess.run([str(mm), "-x", "asm5", "-t", "4", "-N", "50", "-p", "0.5", str(target), str(windows)], capture_output=True, text=True, check=True)
+    proc = subprocess.run([str(mm), "-c", "-x", "asm5", "-t", "4", "-N", "50", "-p", "0.5", str(target), str(windows)], capture_output=True, text=True, check=True)
     lengths = {k: len(v) for k, v in fasta(target).items()}
     spans = {k: [] for k in lengths}
     match = aligned = 0
@@ -77,7 +78,9 @@ def main():
         row = dict(variant=sample.parent.name, sample=sample.name, summary=str(summary), status="pending")
         timing = sample / "time.txt"
         timing_text = timing.read_text() if timing.exists() else None
-        row.update(command_record=str(timing), command_record_text=timing_text)
+        exit_match = re.search(r"Exit status:\s*(-?\d+)", timing_text or "")
+        exit_code = int(exit_match.group(1)) if exit_match else None
+        row.update(command_record=str(timing), command_record_text=timing_text, exit_code=exit_code)
         rows.append(row)
         if not summary.exists():
             timing = sample / "time.txt"
@@ -90,17 +93,18 @@ def main():
         hits = [p for p in refs.iterdir() if key in p.name]
         if len(hits) != 1: raise ValueError(f"ambiguous reference: {sample.name}: {hits}")
         failed = json.loads(summary.read_text()).get("failed", [])
-        row.update(status="partial" if failed else "complete", failed=failed)
+        row.update(status="partial" if failed else "failed_exit" if exit_code not in (None, 0) else "complete", failed=failed)
         for org, ref in [("mitochondrion", "MITO.fasta"), ("plastid", "PLTD.fasta")]:
             query = sample / "ovasm" / org / "molecules.fasta"
             target = hits[0] / ref
             if not query.exists() or not target.exists():
                 row[org] = dict(status="missing_assembly_or_reference")
+                if row["status"] == "complete": row["status"] = "missing_outputs_or_reference"
                 continue
             with tempfile.TemporaryDirectory(dir=output.parent) as tmp:
                 row[org] = dict(query=str(query), reference=str(target), query_sha256=hashlib.sha256(query.read_bytes()).hexdigest(), reference_sha256=hashlib.sha256(target.read_bytes()).hexdigest(), oatk=compare(query,target,mm,Path(tmp)), ovasm=compare(target,query,mm,Path(tmp)))
     if not rows: raise ValueError("no sample directories")
-    output.write_text(json.dumps(dict(coordinates="zero-based half-open; windowed asm5 alignment, minimum alignment 1 kb", samples=rows),indent=2)+"\n")
+    output.write_text(json.dumps(dict(coordinates="zero-based half-open; windowed minimap2 asm5 -c alignment, minimum alignment 1 kb; identity from CIGAR-backed PAF primary alignment matches", samples=rows),indent=2)+"\n")
     for row in rows:
         print(row["variant"], row["sample"], row["status"], {k:row.get(k,{}).get("oatk",{}).get("coverage") for k in ["mitochondrion","plastid"]})
 
