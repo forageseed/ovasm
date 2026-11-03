@@ -1315,7 +1315,11 @@ fn bootstrap_candidates(
             || (0..n).any(|u| u != t && h.block_cover[u] as f64 >= BOOTSTRAP_MAX_OTHER_COVER * len)
             || !deep.map_or_else(
                 || gate.organelle_like(&r.seq),
-                |d| gate.profile_of(&r.seq, d, |_| true).is_some_and(|p| p.organelle_like),
+                |d| {
+                    gate.profile_of(&r.seq, d, |_| true).is_some_and(|p| p.organelle_like)
+                        && gate.profile_of(&r.seq, d, |km| bait.get(km) & (1 << t) == 0)
+                            .is_some_and(|p| p.organelle_like)
+                },
             )
             || gate.median_depth(&r.seq).unwrap_or(0.0) < floor
         {
@@ -1325,6 +1329,37 @@ fn bootstrap_candidates(
         picked.push(r.seq);
     })?;
     Ok((picked, keys))
+}
+
+
+/// Additional edge k-mers only from independently observed reads at a validated
+/// shallow mitochondrial circle's depth. Reads have already passed extension gates.
+fn shallow_edge_kmers(
+    bait: &BaitSet, t: usize, reads: &[&[u8]], gate: &DepthGate,
+    depth: f64, min_cover: f64, min_count: u32,
+) -> Vec<u64> {
+    let support = ((depth * (1.0 - min_cover)).floor() as u32).max(2);
+    if support >= min_count { return Vec::new(); }
+    let mut seen = FxHashSet::default();
+    let eligible: Vec<&[u8]> = reads.iter().copied().filter(|s| {
+        let Some(d) = gate.median_depth(s) else { return false };
+        if d <= gate.nuclear_peak_depth as f64
+            || !(0.8 * depth..=1.25 * depth).contains(&d) {
+            return false;
+        }
+        // A sequence in either orientation is one observation, even under
+        // multiple IDs. A hash collision conservatively removes support.
+        let mut forward = FxHasher::default();
+        let mut reverse = FxHasher::default();
+        for &b in *s { forward.write_u8(b.to_ascii_uppercase()); }
+        for &b in s.iter().rev() {
+            reverse.write_u8(match b.to_ascii_uppercase() {
+                b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', _ => b'N',
+            });
+        }
+        seen.insert(forward.finish().min(reverse.finish()))
+    }).collect();
+    bait.new_from_reads(t, eligible, support)
 }
 
 /// The depth sketch: from the recruitment cache when there is one, which saves its two passes
@@ -1544,6 +1579,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
     // Targets whose leftover candidates have been judged (the bootstrap in the pass loop).
     let mut leftovers_judged = vec![false; n_targets];
+    let mut shallow_leftover_depth: Vec<Option<f64>> = vec![None; n_targets];
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
@@ -1758,8 +1794,16 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                 })?;
                 extended_from[t] = picked.len() as u64;
-                if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some()) {
-                    let new = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), cfg.extend_min_count);
+                if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some())
+                    || (extend_gate.is_some() && shallow_leftover_depth[t].is_some()) {
+                    let mut new = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), cfg.extend_min_count);
+                    if let (Some(g), Some(d)) = (extend_gate, shallow_leftover_depth[t]) {
+                        let reads: Vec<&[u8]> = picked.iter().map(Vec::as_slice).collect();
+                        new.extend(shallow_edge_kmers(&bait, t, &reads, g, d,
+                            cfg.params.min_cover, cfg.extend_min_count));
+                        new.sort_unstable();
+                        new.dedup();
+                    }
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                     if runaway_bait_gain(previous, new.len()) {
                         saturated[t] = true;
@@ -1820,8 +1864,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                     frontier_reads[t] += picked.len() as u64;
                     frontier_steps[t] += 1;
-                    let more = if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some()) {
-                        let new = bait.new_from_reads(t, picked, cfg.extend_min_count);
+                    let more = if cfg.bait_growth_guard || (kmer_target_depth[t].is_some() && kmer_table.is_some())
+                        || shallow_leftover_depth[t].is_some() {
+                        let mut new = bait.new_from_reads(t, picked.iter().copied(), cfg.extend_min_count);
+                        if let Some(d) = shallow_leftover_depth[t] {
+                            new.extend(shallow_edge_kmers(&bait, t, &picked, g, d,
+                                cfg.params.min_cover, cfg.extend_min_count));
+                            new.sort_unstable();
+                            new.dedup();
+                        }
                         let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                         if runaway_bait_gain(previous, added[t].saturating_add(new.len())) {
                             saturated[t] = true;
@@ -1926,6 +1977,19 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         .unzip();
                     if p.len() < LEFTOVER_MIN_READS {
                         continue;
+                    }
+                    if depths.measured[t] >= CORE_MIN_READS && core_depth[t].is_some() {
+                        shallow_leftover_depth[t] = p.iter()
+                            .filter_map(|s| g.median_depth(s))
+                            .filter(|&d| d < g.organelle_min_depth && d > g.nuclear_peak_depth as f64)
+                            .min_by(f64::total_cmp);
+                        if let Some(d) = shallow_leftover_depth[t] {
+                            warnings.push(format!(
+                                "{}: validated shallow mitochondrial leftovers at {:.1}x; edge support {} (minimum 2), only reads within 0.8-1.25x that depth",
+                                bait.targets[t].name, d,
+                                cfg.extend_min_count.min(((d * (1.0 - cfg.params.min_cover)).floor() as u32).max(2)),
+                            ));
+                        }
                     }
                     (p, k)
                 };
@@ -2699,6 +2763,9 @@ mod tests {
         fasta.push_str(&circle_reads(&second, 250, "s")); // 12x
         fasta.push_str(&circle_reads(&deep, 50, "d")); // 60x
         fasta.push_str(&linear_reads(&nuclear, 600, "n")); // 5x
+        let mut erroneous = gene.clone();
+        erroneous.extend(pseudo_random(1_500, 99));
+        fasta.push_str(&format!(">e0\n{}\n", String::from_utf8_lossy(&erroneous)));
         let dir = std::env::temp_dir().join(format!("ovasm-shallow-leftover-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2713,9 +2780,7 @@ mod tests {
         let mut cfg = test_config(&fa, dir.join("out"), 40, true);
         cfg.bootstrap = true;
         cfg.nuclear_depth = Some(5);
-        // With 12x reads and 80% cover, the new edge has only ~2.4 supporting
-        // reads: use the existing explicit low-support setting to isolate this gate.
-        cfg.extend_min_count = 2;
+        assert_eq!(cfg.extend_min_count, 3, "exercise the default support threshold");
         cfg.extend_depth = 200.0;
         cfg.saturation = 0.05;
         let rep = run(bait, cfg).unwrap();
@@ -2724,7 +2789,24 @@ mod tests {
         assert_eq!(count_reads(out, b's'), 40, "every read of the second circle");
         assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
         assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
+        assert_eq!(count_reads(out, b'e'), 0, "no unsupported erroneous tail");
         assert!(rep.iterations.iter().any(|it| it.bootstrapped_from_reads[m] > 0));
+        let g = DepthGate::long_reads(&[fa]).unwrap();
+        let mut empty = BaitSet::new(21);
+        let mt = empty.target("mitochondrion").unwrap();
+        let first = &second[..3000];
+        let shifted = &second[250..3250];
+        let rc: Vec<u8> = first.iter().rev().map(|b| match b {
+            b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', _ => b'N',
+        }).collect();
+        assert!(shallow_edge_kmers(&empty, mt, &[first, first, &rc], &g, 12.0, 0.8, 3).is_empty(),
+            "duplicate sequences and their reverse complements are one observation");
+        assert!(!shallow_edge_kmers(&empty, mt, &[first, shifted, &second[500..3500]], &g, 12.0, 0.8, 3).is_empty(),
+            "independent overlapping reads supply shallow edge support");
+        assert!(shallow_edge_kmers(&empty, mt, &[&main[..3000], &main[150..3150]], &g, 12.0, 0.8, 3).is_empty(),
+            "the main circle does not inherit relaxed support");
+        assert!(shallow_edge_kmers(&empty, mt, &[&deep[..3000], &deep[50..3050]], &g, 12.0, 0.8, 3).is_empty());
+        assert!(shallow_edge_kmers(&empty, mt, &[&nuclear[..3000], &nuclear[600..3600]], &g, 12.0, 0.8, 3).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
