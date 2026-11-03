@@ -905,9 +905,14 @@ fn partial_paths_phased(
         exit.insert(a, i);
         exit.insert(flip(b), pos[rc_walk(&br[i].walk).as_slice()]);
     }
+    let mut closing_candidates: FxHashMap<(Oriented, Oriented), Vec<usize>> = FxHashMap::default();
+    for i in 0..br.len() {
+        if !br[i].topological {
+            closing_candidates.entry(ends(i)).or_default().push(i);
+        }
+    }
     let closing = |from: Oriented, to: Oriented| {
-        (0..br.len())
-            .filter(|&i| !br[i].topological && ends(i) == (from, to))
+        closing_candidates.get(&(from, to)).into_iter().flatten().copied()
             .filter(|&i| {
                 let mut walk = vec![to];
                 while *walk.last().unwrap() != from {
