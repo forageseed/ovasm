@@ -1093,6 +1093,19 @@ mod tests {
     }
 
     #[test]
+    fn exact_lathyrus_integer_histogram_selects_five_without_manual_depth() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/lathyrus-nuclear-depth.json")).unwrap();
+        let rows: Vec<(u32, u64, u64)> = serde_json::from_value(
+            fixture["integer_read_depth_histogram"].clone()).unwrap();
+        let medians = FxHashMap::from_iter(rows.into_iter().map(|(d,n,b)| (d,(n,b))));
+        let (chosen, histogram) = nuclear_read_depth(&medians, MIN_NUCLEAR_GENOME);
+        assert_eq!(chosen, Some((5, 212_305_806)));
+        assert_eq!(low_depth_read_peak(&medians, 5, MIN_NUCLEAR_GENOME, &histogram), None);
+        assert!(read_peak_shape_supported(5, &histogram));
+    }
+
+    #[test]
     fn lathyrus_recorded_histogram_does_not_support_the_85x_estimate() {
         // Same ERR13245275 input as the 2026-11-03 validation, not simulated counts.
         let histogram = [
