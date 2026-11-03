@@ -31,6 +31,7 @@ struct Walk {
     starts: Vec<usize>,
     sequence: Vec<u8>,
     circular: bool,
+    trusted_prior: bool,
 }
 
 struct Reference {
@@ -103,6 +104,7 @@ impl Reference {
                 starts,
                 sequence,
                 circular,
+                trusted_prior: !f[4..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill"),
             });
         }
         if walks.is_empty() {
@@ -1212,7 +1214,7 @@ fn reference_prior(
         let gap = asm.seqs[r.0].len() as i64
             - *overlap.get(&(a, r)).unwrap_or(&0) as i64
             - *overlap.get(&(r, b)).unwrap_or(&0) as i64;
-        let (ia, ib) = (probes.len(), probes.len() + 1);
+        let (ia, ib) = (2 * plans.len(), 2 * plans.len() + 1);
         probes.entry(sa[sa.len() - FLANK_K..].to_ascii_uppercase()).or_default().push(ia);
         probes.entry(sb[..FLANK_K].to_ascii_uppercase()).or_default().push(ib);
         plans.push((p, ia, ib, gap.max(0) as usize, asm.seqs[r.0].len()));
@@ -1466,6 +1468,10 @@ fn final_outputs(
     } else {
         Value::Null
     };
+    if uncertain["marked"].as_u64().unwrap_or(0) > 0 && status == "complete" {
+        status = "closed_length_uncertain".to_string();
+        reasons.push("the graph is closed but reads do not establish lengths of all repeat regions".to_string());
+    }
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
@@ -1751,13 +1757,13 @@ pub fn run(cfg: &Config) -> Result<Value> {
         };
         let final_output = if de_novo.get("error").is_none() {
             let walks: Vec<(Vec<u8>, bool)> =
-                r.walks.iter().map(|w| (w.sequence.clone(), w.circular)).collect();
-            let names: Vec<String> = r.walks.iter().map(|w| w.name.clone()).collect();
+                r.walks.iter().filter(|w| w.trusted_prior).map(|w| (w.sequence.clone(), w.circular)).collect();
+            let names: Vec<String> = r.walks.iter().filter(|w| w.trusted_prior).map(|w| w.name.clone()).collect();
             final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names)?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
-        let pan = if de_novo.get("error").is_none() {
+        let pan = if de_novo.get("error").is_none() && final_output["status"] == "complete" && final_output["decisive"] == true {
             let chosen = final_output["representative"]["configuration"].as_u64();
             let p = write_back(&r.input, &cfg.out.join(format!("{o}.gfa")), &cfg.sample, o, chosen, &cfg.out, &dir)?;
             eprintln!(
@@ -1766,7 +1772,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             );
             p
         } else {
-            Value::Null
+            json!({"status":"withheld_uncertain", "reason":"Automatic pan write-back requires complete, read-decided sequence without reference fill or uncertain lengths; individual outputs remain available."})
         };
         eprintln!(
             "[ovasm] reconstruct {o}: {} ({})",
@@ -1828,6 +1834,14 @@ mod tests {
             })
             .collect()
     }
+    #[test]
+    fn unresolved_paths_remain_bait_but_are_not_reference_priors() {
+        let g = reference("S\ta\tACGTACGTACGT\nP\tknown#1#pt\ta+\t*\nP\tguess#1#pt\ta+\t*\tst:Z:unresolved_configuration\nP\tfilled#1#pt\ta+\t*\trf:Z:source\n");
+        assert_eq!(g.walks.len(), 3);
+        assert_eq!(g.walks.iter().filter(|w| w.trusted_prior).count(), 1);
+        assert!(g.bait_sequences(5).len() >= 3);
+    }
+
     #[test]
     fn threads_across_tiny_variant_nodes_and_reverse_complement() {
         let s = random(120);
@@ -1971,7 +1985,7 @@ mod tests {
         let steps_b = vec![s("A"), s("R"), s("B")];
         let steps_c = vec![s("A"), s("R"), s("C")];
         let repeats: BTreeSet<String> = [String::from("R")].into();
-        let pairings = vec![pairings_of(&steps_b, false, &repeats), pairings_of(&steps_c, false, &repeats)];
+        let mut pairings = vec![pairings_of(&steps_b, false, &repeats), pairings_of(&steps_c, false, &repeats)];
         assert_eq!(pairings[0].len(), 1);
         // two runs: one holds A R B, one A R C reversed; a third holds A R B again
         let walks = vec![
@@ -1980,11 +1994,15 @@ mod tests {
             ([a.as_bytes(), r.as_bytes(), b.as_bytes()].concat(), false),
         ];
         let names = vec!["one#1#mt".to_string(), "two#1#mt".to_string(), "three#1#mt".to_string()];
+        // A third distinct pairing sharing both probes must not reuse IDs from the
+        // previous pairing's exit. This occurs at repeated flanks in real panels.
+        pairings.push(vec![(s("A"), s("R"), s("A"))]);
         let p = reference_prior(&g.graph, &index, &BTreeMap::new(), &pairings, &walks, &names);
         assert_eq!(p.runs, 3);
         assert_eq!(p.runs_with_all[0], vec!["one", "three"]);
         assert_eq!(p.runs_with_all[1], vec!["two"]);
         assert!(p.scores[0] > p.scores[1]);
+        assert!(p.runs_with_all[2].is_empty());
     }
 
     #[test]

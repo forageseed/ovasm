@@ -77,14 +77,20 @@ struct SampleGraph {
     path: PathBuf,
     graph: Graph,
     paths: Vec<(String, String, bool)>,
+    path_tags: BTreeMap<String, Vec<String>>,
 }
 
 fn read_sample(path: &Path) -> Result<SampleGraph> {
     let text =
         fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let graph = parse_gfa(path)?;
+    let filled_segments: FxHashSet<&str> = text.lines().filter_map(|line| {
+        let f: Vec<_> = line.split('\t').collect();
+        (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("rf:"))).then(|| f[1])
+    }).collect();
     let mut sample = None;
     let mut paths = Vec::new();
+    let mut path_tags = BTreeMap::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         match f.first() {
@@ -108,6 +114,12 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
                     .collect::<Result<Vec<_>>>()?
                     .join(" ");
                 let circular = f[3..].contains(&"TP:Z:circular");
+                let mut tags: Vec<String> = f.get(4..).unwrap_or(&[]).iter()
+                    .filter(|t| !t.starts_with("TP:" )).map(|t| t.to_string()).collect();
+                if steps.iter().any(|s| filled_segments.contains(&s[..s.len()-1])) && !tags.iter().any(|t| t.starts_with("rf:")) {
+                    tags.push("rf:Z:contains_reference_fill".into());
+                }
+                path_tags.insert(f[1].to_string(), tags);
                 paths.push((f[1].to_string(), walk, circular));
             }
             _ => {}
@@ -139,6 +151,7 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
         path: path.to_path_buf(),
         graph,
         paths,
+        path_tags,
     })
 }
 
@@ -413,7 +426,7 @@ pub fn run(inputs: &[PathBuf], p: &PanParams, out: &Path, out_json: &Path) -> Re
             held.len()
         )?;
     }
-    for (name, steps, circular, _) in &pan_paths {
+    for (name, steps, circular, si) in &pan_paths {
         let walk: Vec<String> = steps
             .iter()
             .map(|&(id, f)| format!("{}{}", id + 1, sign(f)))
@@ -427,6 +440,9 @@ pub fn run(inputs: &[PathBuf], p: &PanParams, out: &Path, out_json: &Path) -> Re
         )?;
         if *circular {
             gfa.push_str("\tTP:Z:circular");
+        }
+        if let Some(tags) = samples[*si].path_tags.get(name) {
+            for tag in tags { write!(gfa, "\t{tag}")?; }
         }
         gfa.push('\n');
     }
@@ -583,6 +599,20 @@ mod tests {
             .lines()
             .any(|l| l.starts_with("P\tS1#1#mt\t") && l.ends_with("TP:Z:circular")));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unresolved_path_provenance_survives_pan_merge() {
+        let dir = std::env::temp_dir().join(format!("ovasm-pan-tags-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let input = sample_gfa(&dir, "tags", &seq(300, 1), &seq(300, 2), &seq(100, 3), false);
+        let text = fs::read_to_string(&input).unwrap().replace("TP:Z:circular", "TP:Z:circular\tst:Z:unresolved_configuration\trf:Z:source");
+        fs::write(&input, text).unwrap();
+        let out = dir.join("pan.gfa");
+        run(&[input], &PanParams { k: 31 }, &out, &dir.join("pan.json")).unwrap();
+        let output = fs::read_to_string(out).unwrap();
+        assert!(output.lines().any(|l| l.starts_with("P\ttags#1#mt\t") && l.contains("st:Z:unresolved_configuration") && l.contains("rf:Z:source")));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
