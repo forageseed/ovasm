@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import tempfile
+import json
 import unittest
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location("comparison",Path(__file__).with_name("compare_validation.py"))
@@ -17,4 +18,19 @@ class ComparisonTests(unittest.TestCase):
             p=Path(tmp)
             with patch.object(m.sys,"argv",["compare",str(p),str(p),"minimap2",str(p/"report.json")]):
                 with self.assertRaisesRegex(ValueError,"no sample"):m.main()
+    def test_failed_summary_and_command_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp); root=p/"runs"; refs=p/"refs"
+            sample=root/"default"/"Lathyrus_linifolius_PRJEB76347"
+            (sample/"ovasm").mkdir(parents=True)
+            (refs/"drLatLini1").mkdir(parents=True)
+            (sample/"ovasm/summary.json").write_text(json.dumps({"failed":["plastid"]}))
+            command='Command being timed: "ovasm run hifi --reads original.fastq.gz"\nExit status: 1\n'
+            (sample/"time.txt").write_text(command)
+            output=p/"report.json"
+            with patch.object(m.sys,"argv",["compare",str(root),str(refs),"minimap2",str(output)]):m.main()
+            row=json.loads(output.read_text())["samples"][0]
+            self.assertEqual(row["status"],"partial")
+            self.assertEqual(row["failed"],["plastid"])
+            self.assertEqual(row["command_record_text"],command)
 if __name__ == "__main__":unittest.main()
