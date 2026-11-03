@@ -75,6 +75,9 @@ def main():
         if not sample.is_dir(): continue
         summary = sample / "ovasm/summary.json"
         row = dict(variant=sample.parent.name, sample=sample.name, summary=str(summary), status="pending")
+        timing = sample / "time.txt"
+        timing_text = timing.read_text() if timing.exists() else None
+        row.update(command_record=str(timing), command_record_text=timing_text)
         rows.append(row)
         if not summary.exists():
             timing = sample / "time.txt"
@@ -86,7 +89,8 @@ def main():
         key = species[0][:3].capitalize()+species[1][:4].capitalize()
         hits = [p for p in refs.iterdir() if key in p.name]
         if len(hits) != 1: raise ValueError(f"ambiguous reference: {sample.name}: {hits}")
-        row.update(status="complete", failed=json.loads(summary.read_text()).get("failed", []), command_record=str(sample / "time.txt"))
+        failed = json.loads(summary.read_text()).get("failed", [])
+        row.update(status="partial" if failed else "complete", failed=failed)
         for org, ref in [("mitochondrion", "MITO.fasta"), ("plastid", "PLTD.fasta")]:
             query = sample / "ovasm" / org / "molecules.fasta"
             target = hits[0] / ref
