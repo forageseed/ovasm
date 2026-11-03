@@ -1298,6 +1298,7 @@ fn bootstrap_candidates(
     p: &ClassifyParams,
     gate: &DepthGate,
     used: &FxHashSet<u64>,
+    deep: Option<f64>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
     let n = bait.targets.len();
     let (mut picked, mut keys) = (Vec::new(), Vec::new());
@@ -1312,7 +1313,10 @@ fn bootstrap_candidates(
         if h.longest[t] < p.numt_min_block
             || (0..n).any(|u| u != t && fit(u) >= fit(t))
             || (0..n).any(|u| u != t && h.block_cover[u] as f64 >= BOOTSTRAP_MAX_OTHER_COVER * len)
-            || !gate.organelle_like(&r.seq)
+            || !deep.map_or_else(
+                || gate.organelle_like(&r.seq),
+                |d| gate.profile_of(&r.seq, d, |_| true).is_some_and(|p| p.organelle_like),
+            )
             || gate.median_depth(&r.seq).unwrap_or(0.0) < floor
         {
             return;
@@ -1876,6 +1880,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     &cfg.params,
                     g,
                     &boot_used[t],
+                    None,
                 )?;
                 // A seed that failed is bootstrapped from all of them. One that recruits more
                 // reads than are left as deep partial candidates has its genome already, and its
@@ -1896,6 +1901,23 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         continue;
                     };
                     leftovers_judged[t] = true;
+                    // Established mitochondrial leftovers use the same nuclear-safe depth
+                    // test as extension. The global 3x-nuclear threshold otherwise rejects
+                    // a shallow second circle before its 0.5-2x target-depth test below.
+                    // Failed seeds and plastids retain the original global candidate test.
+                    let deep = extension_deep(g, Some(own));
+                    let (picked, keys) = if depths.measured[t] >= CORE_MIN_READS
+                        && core_depth[t].is_some()
+                        && own > g.nuclear_peak_depth as f64
+                        && deep < g.organelle_min_depth
+                    {
+                        bootstrap_candidates(
+                            &numt_path, floor, t, &bait, &cfg.params, g,
+                            &boot_used[t], Some(deep),
+                        )?
+                    } else {
+                        (picked, keys)
+                    };
                     let (lo, hi) = (LEFTOVER_DEPTH.0 * own, LEFTOVER_DEPTH.1 * own);
                     let (p, k): (Vec<Vec<u8>>, Vec<u64>) = picked
                         .into_iter()
@@ -2654,6 +2676,52 @@ mod tests {
         let out = &rep.outputs[m].output;
         assert_eq!(count_reads(out, b'm'), 400, "every read of the first circle");
         assert_eq!(count_reads(out, b's'), 334, "every read of the second circle");
+        assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
+        assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
+        assert!(rep.iterations.iter().any(|it| it.bootstrapped_from_reads[m] > 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shallow_second_circle_uses_the_extension_gate_for_bootstrap() {
+        // Main circle 20x, second circle 12x, nucleus 5x, decoy 60x.
+        // The second circle meets 0.5-2x own depth but fails the global 15x gate.
+        let main = pseudo_random(12_000, 7);
+        let mut second = pseudo_random(10_000, 41);
+        let mut deep = pseudo_random(10_000, 43);
+        let mut nuclear = pseudo_random(300_000, 33);
+        let gene = pseudo_random(1_500, 45);
+        let deep_gene = pseudo_random(1_500, 47);
+        second[4000..5500].copy_from_slice(&gene);
+        deep[4000..5500].copy_from_slice(&deep_gene);
+        nuclear[150_000..151_500].copy_from_slice(&gene);
+        let mut fasta = circle_reads(&main, 150, "m"); // 20x
+        fasta.push_str(&circle_reads(&second, 250, "s")); // 12x
+        fasta.push_str(&circle_reads(&deep, 50, "d")); // 60x
+        fasta.push_str(&linear_reads(&nuclear, 600, "n")); // 5x
+        let dir = std::env::temp_dir().join(format!("ovasm-shallow-leftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene);
+        bait.add_sequence(m, &deep_gene);
+        bait.targets[m].seed_length = (main.len() + second.len()) as u64;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, true);
+        cfg.bootstrap = true;
+        cfg.nuclear_depth = Some(5);
+        // With 12x reads and 80% cover, the new edge has only ~2.4 supporting
+        // reads: use the existing explicit low-support setting to isolate this gate.
+        cfg.extend_min_count = 2;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        let out = &rep.outputs[m].output;
+        assert_eq!(count_reads(out, b'm'), 80, "every read of the first circle");
+        assert_eq!(count_reads(out, b's'), 40, "every read of the second circle");
         assert_eq!(count_reads(out, b'd'), 0, "nothing of the deep circle");
         assert_eq!(count_reads(out, b'n'), 0, "nothing of the nucleus");
         assert!(rep.iterations.iter().any(|it| it.bootstrapped_from_reads[m] > 0));
