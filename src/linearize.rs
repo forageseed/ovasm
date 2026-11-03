@@ -559,6 +559,9 @@ fn search_phased(
                 s.path.pop();
                 s.covered -= usize::from(!c.optional[next.0]);
                 s.used[next.0] = false;
+                if s.truncated {
+                    return;
+                }
             }
         }
         // End the molecule here.
@@ -639,6 +642,12 @@ fn search_phased(
                 dfs(c, s, st, st);
                 s.covered -= usize::from(!c.optional[a]);
                 s.used[a] = false;
+                if s.truncated {
+                    break;
+                }
+            }
+            if s.truncated {
+                break;
             }
         }
         s.done.pop();
@@ -676,6 +685,12 @@ fn search_phased(
             st.covered = usize::from(!optional[a]);
             dfs(&ctx, &mut st, start, start);
             st.used[a] = false;
+            if st.truncated {
+                break;
+            }
+        }
+        if st.truncated {
+            break;
         }
     }
     (st.found, st.truncated)
@@ -1498,6 +1513,12 @@ pub fn run_phased(
                 if seen.insert(key) {
                     ranked.push((walks, report, cover));
                 }
+            }
+            // A truncated search cannot establish that this cover size has no solution.
+            // Do not multiply an exhausted budget by trying every larger cover size.
+            if truncated {
+                last = m;
+                break;
             }
             if m == last && ranked.is_empty() && p.max_molecules == 0 && last < comp.len() {
                 last += 1;
@@ -2839,6 +2860,28 @@ mod tests {
         let ev = evidence(&[("A+ R+ B+", 30), ("C+ R+ D+", 20)], &[]);
         let (br, _) = bridges(&g, &ev, &repeat, 2).unwrap();
         assert!(pairs(&br).iter().all(|p| !p.2));
+    }
+
+    #[test]
+    fn exhausted_search_does_not_expand_to_larger_covers() {
+        let dir = std::env::temp_dir().join(format!("ovasm-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.gfa"),
+            "H\tVN:Z:1.0\nS\tA\tACGTACGT\nS\tB\tGCTAGCTA\nS\tC\tTGCATGCA\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tC\t+\tA\t+\t0M\n").unwrap();
+        let ev = json!({"repeat_segments": [], "phased_paths": [], "links": [
+            {"from":"A+", "to":"B+", "reads":10},
+            {"from":"B+", "to":"C+", "reads":10},
+            {"from":"C+", "to":"A+", "reads":10}
+        ]});
+        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
+        let params = LinearizeParams { min_reads: 2, max_steps: 0, max_molecules: 0,
+            max_alternatives: 10, optional_below: 0.5 };
+        let report = run(&dir.join("g.gfa"), &dir.join("e.json"), params,
+            &dir.join("m.fa"), None, &dir.join("l.json")).unwrap();
+        assert!(report.search_truncated);
+        assert!(report.components.iter().all(|c| c.searched_max_molecules == 1));
+        assert!(report.components.iter().all(|c| !c.decisive));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
