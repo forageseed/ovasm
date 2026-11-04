@@ -2006,7 +2006,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // covers, so they never start (the Buxus sempervirens 89 kb circle with atp9,
                 // nad2 and nad9 at 1,434x beside the rest at 1,366x; Bellardia viscosa, 75 kb;
                 // Euphorbia lathyris, 41 and 86 kb). Leftovers at the target's own depth
-                // (`LEFTOVER_DEPTH`) bootstrap it once, from `LEFTOVER_MIN_READS` of them.
+                // (`LEFTOVER_DEPTH`) bootstrap it from `LEFTOVER_MIN_READS` of them, with at most
+                // two rounds when the HiFi automatic policy permits and recruitment grows.
                 let mut established_leftovers = false;
                 let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads && boot_used[t].is_empty() {
                     (picked, keys)
@@ -2072,7 +2073,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if leftover_rounds[t] < 2 {
                         leftovers_judged[t] = false;
                     }
-                    warnings.push(format!("{}: mitochondrial leftover bootstrap round {} of 2 used {} reads", bait.targets[t].name, leftover_rounds[t], picked.len()));
+                    eprintln!("[ovasm] {}: mitochondrial leftover bootstrap round {} of 2 used {} reads", bait.targets[t].name, leftover_rounds[t], picked.len());
                 }
                 boot_used[t].extend(keys);
                 // its bait changed: extend it again from what the next pass recruits, and its
@@ -2911,7 +2912,7 @@ mod tests {
         assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
         assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
         assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
-        assert_eq!(rep.warnings.iter().filter(|w| w.contains("leftover bootstrap round")).count(), 2);
+        assert_eq!(rep.iterations.iter().filter(|it| it.bootstrapped_from_reads[m] > 0).count(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
