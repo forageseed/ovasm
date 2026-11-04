@@ -1631,6 +1631,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
     // Targets whose leftover candidates have been judged (the bootstrap in the pass loop).
     let mut leftovers_judged = vec![false; n_targets];
+    // At most two successful established-mitochondrion bootstrap rounds; a retry
+    // requires subsequent growth in recruited reads and always excludes used reads.
+    let mut leftover_rounds = vec![0u8; n_targets];
+    let mut leftover_boot_reads = vec![0u64; n_targets];
     let mut shallow_leftover_depth: Vec<Option<f64>> = vec![None; n_targets];
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
@@ -1962,7 +1966,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 if bait.targets[t].from_reads
                     || added[t] > 0
                     || !others_complete
-                    || !boot_used[t].is_empty()
+                    || (!boot_used[t].is_empty()
+                        && !(cfg.auto_shallow_edge_support && leftover_rounds[t] == 1
+                            && res.recruited[t].reads > leftover_boot_reads[t]))
                     || matches!(stopped[t], Some("size_cap" | "growing"))
                 {
                     continue;
@@ -2001,7 +2007,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // nad2 and nad9 at 1,434x beside the rest at 1,366x; Bellardia viscosa, 75 kb;
                 // Euphorbia lathyris, 41 and 86 kb). Leftovers at the target's own depth
                 // (`LEFTOVER_DEPTH`) bootstrap it once, from `LEFTOVER_MIN_READS` of them.
-                let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads {
+                let mut established_leftovers = false;
+                let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads && boot_used[t].is_empty() {
                     (picked, keys)
                 } else {
                     let Some(own) = depths.read[t]
@@ -2010,6 +2017,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         continue;
                     };
                     leftovers_judged[t] = true;
+                    established_leftovers = true;
                     // Established mitochondrial leftovers use the same nuclear-safe depth
                     // test as extension. The global 3x-nuclear threshold otherwise rejects
                     // a shallow second circle before its 0.5-2x target-depth test below.
@@ -2058,6 +2066,14 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     added[t] += bait.add_sequence_counted(t, seq);
                 }
                 bootstrapped[t] = picked.len() as u64;
+                if established_leftovers {
+                    leftover_rounds[t] += 1;
+                    leftover_boot_reads[t] = res.recruited[t].reads;
+                    if leftover_rounds[t] < 2 {
+                        leftovers_judged[t] = false;
+                    }
+                    warnings.push(format!("{}: mitochondrial leftover bootstrap round {} of 2 used {} reads", bait.targets[t].name, leftover_rounds[t], picked.len()));
+                }
                 boot_used[t].extend(keys);
                 // its bait changed: extend it again from what the next pass recruits, and its
                 // core depth is that of the reads it now recruits
@@ -2858,6 +2874,85 @@ mod tests {
         let pt = ids(&boot.outputs[c].output);
         assert_eq!(pt.len(), 2000);
         assert!(pt.iter().all(|id| id.starts_with('p')));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn successive_mitochondrial_leftovers_can_bootstrap_after_bait_growth() {
+        let main = pseudo_random(12_000, 307);
+        let mut second = pseudo_random(10_000, 341);
+        let mut third = pseudo_random(10_000, 342);
+        let mut nuclear = pseudo_random(300_000, 333);
+        let gene_a = pseudo_random(1_500, 345);
+        let gene_b = pseudo_random(1_500, 346);
+        second[2000..3500].copy_from_slice(&gene_a);
+        second[6000..7500].copy_from_slice(&gene_b);
+        third[4000..5500].copy_from_slice(&gene_b);
+        nuclear[150_000..151_500].copy_from_slice(&gene_b);
+        let mut fasta = circle_reads(&main, 30, "m");
+        fasta.push_str(&circle_reads(&second, 30, "s"));
+        fasta.push_str(&circle_reads(&third, 30, "t"));
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n"));
+        let dir = std::env::temp_dir().join(format!("ovasm-two-leftovers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene_a);
+        bait.targets[m].seed_length = 32_000;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.auto_shallow_edge_support = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
+        assert_eq!(rep.warnings.iter().filter(|w| w.contains("leftover bootstrap round")).count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shared_high_copy_blocks_ambiguous_leftover_without_misrecruitment() {
+        let main = pseudo_random(12_000, 307);
+        let mut second = pseudo_random(10_000, 341);
+        let mut third = pseudo_random(10_000, 342);
+        let mut nuclear = pseudo_random(300_000, 333);
+        let mut high_copy = pseudo_random(10_000, 343);
+        let gene_a = pseudo_random(1_500, 345);
+        let gene_b = pseudo_random(1_500, 346);
+        second[2000..3500].copy_from_slice(&gene_a);
+        second[6000..7500].copy_from_slice(&gene_b);
+        third[4000..5500].copy_from_slice(&gene_b);
+        nuclear[150_000..151_500].copy_from_slice(&gene_b);
+        high_copy[4000..5500].copy_from_slice(&gene_b);
+        let mut fasta = circle_reads(&main, 30, "m");
+        fasta.push_str(&circle_reads(&second, 30, "s"));
+        fasta.push_str(&circle_reads(&third, 30, "t"));
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n"));
+        fasta.push_str(&circle_reads(&high_copy, 10, "d"));
+        let dir = std::env::temp_dir().join(format!("ovasm-two-leftovers-high-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene_a);
+        bait.targets[m].seed_length = 32_000;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.auto_shallow_edge_support = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
+        assert_eq!(rep.outputs[m].stop_reason, "bait_complete");
+        assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'd'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
