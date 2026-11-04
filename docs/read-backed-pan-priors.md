@@ -1,0 +1,20 @@
+# Read-backed pan support for reconstruction
+
+`ovasm pan reconstruct` accepts repeated `--prior-reads ORGANELLE=SAMPLE=PATH` inputs. Each file is an already recruited long-read set for a pan sample, distinct from the target. Multiple files for one sample can be supplied under the same sample label. A sample must not use the target label, and a file cannot be reused as target reads or as more than one prior input. On Unix this includes hard links; on other platforms canonical paths are checked. Copied reads and biological relatedness cannot be detected from paths.
+
+Example (paths are placeholders):
+
+```sh
+ovasm pan reconstruct --sample target --reads target_1.fq.gz --reads target_2.fq.gz \
+  --reference mitochondrion=mt.gfa --reference plastid=pt.gfa --out output \
+  --prior-reads mitochondrion=sample1=sample1.mt.fastq \
+  --prior-reads mitochondrion=sample2=sample2.mt.fastq
+```
+
+When an unresolved configuration is enumerated, the assembler tests each prior sample's reads against the target's de novo assembly graph. It retains a separate `prior-read-evidence-SAMPLE.json` with read counts, direct three-segment traversals, and phased paths. Direct traversals count a read once and do not depend on whether the prior sample classifies the shared target repeat as a repeat. For each candidate pairing, a sample contributes one support observation if at least three reads phase that oriented path. The read-backed score is the mean support fraction across distinct candidate pairings and supplied samples. The target path score with its copy-number deviation penalty, reference-path prior score, and this score are added with unit weight as an exploratory ranking. When the combined scores are equal at 1e-9 resolution, direct single-read chains spanning at least two repeat nodes serve as a tiebreak; the number of supporting samples and chains are reported separately. They are not multiplied into relative weights because the same reads may also support individual pairings. `equally_ranked_candidates` reports how many enumerated candidates still share both the combined score and the joint-walk tiebreak; a deterministic representative is not proof of one physical structure. The target score can include synthetic topological bridge weights, so it is not a calibrated likelihood of the observed reads. Reference paths whose sample labels match a supplied read-prior sample are excluded from the path prior to avoid counting the same sample twice; other trusted paths remain in the combined score. Reference paths remain available for graph recruitment and for separate provenance reporting.
+
+`relative_weight` is obtained by normalizing the exponentials of these heuristic scores across the enumerated candidates. It is **not a calibrated posterior probability**. The scale and threshold are not calibrated, a lack of support can reflect sequencing depth, related individuals and pairings can be correlated, a sample can contain multiple conformations, the target graph can bias detection, and omitted configurations are outside the normalization. The JSON retains each score, per-sample counts, and search truncation/cover-size indicators. `reads_decide=false` remains set and an unresolved path is not written back as independent pan truth.
+
+Legacy graphs may omit uncertainty tags even when source assemblies were unresolved. Check source manifests and mark such paths untrusted before relying on path-based priors. The explicitly supplied reads provide direct junction support, not proof of the target specimen's physical topology. Supplying a sample under a different name or a byte-for-byte copy of target reads cannot be ruled out automatically.
+
+A closed graph whose target reads do not resolve its configuration is reported as `closed_configuration_uncertain` (or `closed_configuration_and_length_uncertain` if repeat lengths are also uncertain). An existing read-pair or reference-filled closure is kept; candidates are reported separately, and the graph is not written back as independently resolved. A reference-filled closure uses `closed_reference_fill_configuration_uncertain`.

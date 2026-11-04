@@ -929,9 +929,10 @@ fn configurations(
     gfa_out: &Path,
     ref_walks: &[(Vec<u8>, bool)],
     ref_names: &[String],
+    prior_reads: &BTreeMap<String, Vec<PathBuf>>,
 ) -> Result<(Value, Option<Representative>)> {
     let d = dir.join("de-novo");
-    let rep = crate::linearize::run(
+    let mut rep = crate::linearize::run(
         &d.join("assembly.gfa"),
         &d.join("evidence.json"),
         crate::linearize::LinearizeParams {
@@ -946,6 +947,23 @@ fn configurations(
         Some(&d.join("configurations.partial.fasta")),
         &d.join("configurations.json"),
     )?;
+    // For compact graphs, attempt every possible cover size after the automatic envelope.
+    // Keep the same hard per-size search budget and expose any truncation; a 12-anchor cap
+    // prevents this retry from silently multiplying work on large organelles.
+    let max_anchors = rep.components.iter().map(|c| c.anchors.len()).max().unwrap_or(0);
+    if rep.components.iter().any(|c| c.cover_size_limited)
+        && !rep.components.iter().any(|c| c.search_truncated || c.adaptive_retry)
+        && max_anchors > 0 && max_anchors <= 12
+    {
+        eprintln!("[ovasm] reconstruct {organelle}: expanding compact-graph cover search to {max_anchors} molecules");
+        rep = crate::linearize::run(
+            &d.join("assembly.gfa"), &d.join("evidence.json"),
+            crate::linearize::LinearizeParams { min_reads: 2, max_steps: 5_000_000, adaptive_steps: false,
+                max_molecules: max_anchors, max_alternatives: MAX_CONFIGURATIONS, optional_below: 0.5 },
+            &d.join("configurations.best.fasta"), Some(&d.join("configurations.partial.fasta")),
+            &d.join("configurations.json"),
+        )?;
+    }
     let repeats: BTreeSet<String> = rep.repeats.iter().cloned().collect();
     // the component holding most of the organelle
     let Some(component) = rep.components.iter().max_by_key(|c| {
@@ -954,6 +972,7 @@ fn configurations(
         return Ok((json!({"configurations": 0, "reason": "no component"}), None));
     };
     let covers: Vec<_> = component.best.iter().chain(&component.alternatives).collect();
+    let candidate_list_limited = component.candidates > covers.len();
     // segments of the organelle graph by the assembly segment they came from, in order
     let text = fs::read_to_string(gfa_out)?;
     let sample = text
@@ -1014,7 +1033,7 @@ fn configurations(
     // (reads' score, molecules: (linearize molecule, steps, organelle-graph steps, sequence,
     // what the GFA walk spells))
     type Molecule<'a> = (&'a crate::linearize::Linearization, Vec<(String, bool)>, Vec<String>, Vec<u8>, usize);
-    let mut found: Vec<(f64, Vec<Molecule>)> = Vec::new();
+    let mut found: Vec<(f64, f64, usize, Vec<Molecule>)> = Vec::new();
     'covers: for cover in covers {
         let mut key = Vec::new();
         let mut molecules = Vec::new();
@@ -1047,7 +1066,7 @@ fn configurations(
         }
         key.sort();
         if seen.insert(key) {
-            found.push((cover.score, molecules));
+            found.push((cover.score, cover.ranked_score(), cover.copy_deviation, molecules));
         }
     }
     // The reads leave the pairings open; the reference runs' assemblies show which pairings
@@ -1055,30 +1074,68 @@ fn configurations(
     // the pairings it makes (`reference_prior`), first the one most like them.
     let pairings: Vec<Vec<Pairing>> = found
         .iter()
-        .map(|(_, ms)| ms.iter().flat_map(|m| pairings_of(&m.1, m.0.circular, &repeats)).collect())
+        .map(|(_, _, _, ms)| ms.iter().flat_map(|m| pairings_of(&m.1, m.0.circular, &repeats)).collect())
         .collect();
-    let prior = reference_prior(&asm, &index, &overlap, &pairings, ref_walks, ref_names);
+    // Exclude paths from runs also supplied as reads; retain other trusted paths.
+    // A renamed or biologically related run cannot be detected from its label.
+    let eligible: Vec<usize> = eligible_path_prior_indices(ref_names, prior_reads);
+    let independent_walks: Vec<_> = eligible.iter().map(|&i| ref_walks[i].clone()).collect();
+    let independent_names: Vec<_> = eligible.iter().map(|&i| ref_names[i].clone()).collect();
+    let prior = reference_prior(&asm, &index, &overlap, &pairings, &independent_walks, &independent_names);
+    let mut support: BTreeMap<Pairing, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut joint_support: BTreeMap<Vec<(String, bool)>, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut read_reports = Vec::new();
+    for (sample, files) in prior_reads {
+        let report_path = dir.join(format!("prior-read-evidence-{sample}.json"));
+        let params = crate::evidence::EvidenceParams { short_read_adjacency: false, k: 21, flank: 2000, min_anchor: 500, diag_tol: 30, min_side_hits: 10, spacing_tol: 0.05, bootstrap: 0, seed: 0, max_repeat_len: 20_000 };
+        let report = crate::evidence::run(&d.join("assembly.gfa"), files.clone(), params, &report_path)?;
+        add_prior_traversals(sample, &report.traversals, &repeats, &mut support);
+        add_prior_joint_walks(sample, &report.observed_walks, &repeats, &mut joint_support);
+        read_reports.push(json!({"sample":sample, "inputs":files, "report":report_path, "reads_scanned":report.reads_scanned, "reads_with_support":report.reads_with_support}));
+    }
+    // A bounded exploratory support score, not a likelihood; absence can reflect low coverage.
+    // Path priors from these read samples were excluded above to avoid double counting.
+    // Multiple conformations may coexist in one sample.
+    let support_scores: Vec<f64> = pairings.iter().map(|ps| {
+        read_backed_score(ps, &support, prior_reads.len())
+    }).collect();
+    let combined: Vec<f64> = found.iter().enumerate().map(|(i, f)| f.1 + prior.scores[i] + support_scores[i]).collect();
+    let weights = relative_weights(&combined);
+    // Bound candidate/walk comparisons. Prefer chains supported by more samples, then by
+    // read count, then a deterministic path key. The limit is exposed in the report.
+    let mut joint_walks: Vec<_> = joint_support.iter().collect();
+    joint_walks.sort_by(|(a, am), (b, bm)| bm.len().cmp(&am.len())
+        .then_with(|| bm.values().sum::<u64>().cmp(&am.values().sum::<u64>())).then_with(|| a.cmp(b)));
+    let joint_evidence_limit = 1000usize.min((1_000_000usize / found.len().max(1)).max(1));
+    let joint_evidence_truncated = joint_walks.len() > joint_evidence_limit;
+    joint_walks.truncate(joint_evidence_limit);
+    let joint_matches: Vec<Vec<usize>> = found.iter().map(|(_, _, _, molecules)| {
+        joint_walks.iter().enumerate().filter_map(|(i, (path, _))| {
+            molecules.iter().any(|m| contains_joint_walk(&m.1, m.0.circular, path)).then_some(i)
+        }).collect()
+    }).collect();
+    let joint_scores: Vec<usize> = joint_matches.iter().map(|matches| matches.iter().map(|&i| joint_walks[i].1.len()).sum()).collect();
+    let rank_keys: Vec<_> = combined.iter().zip(&joint_scores).map(|(&score, &joint)| (score_bucket(score), joint)).collect();
+    let mut tie_counts = BTreeMap::new();
+    for key in &rank_keys { *tie_counts.entry(*key).or_insert(0usize) += 1; }
     let mut order: Vec<usize> = (0..found.len()).collect();
-    order.sort_by(|&a, &b| {
-        prior.scores[b]
-            .total_cmp(&prior.scores[a])
-            .then(found[b].0.total_cmp(&found[a].0))
-            .then(a.cmp(&b))
-    });
+    // Scores at 1e-9 resolution are tied; linked reads then break ties without adding
+    // a second likelihood for the same reads. Remaining ties use deterministic order.
+    order.sort_by(|&a, &b| rank_keys[b].cmp(&rank_keys[a]).then(a.cmp(&b)));
     // the circular representative: of the configurations whose molecules of at least
-    // `pipeline::MIN_PIECE` are all circular, the one with fewest of them (a master circle when
-    // there is one), the best ranked of those
+    // `pipeline::MIN_PIECE` are all circular, the best ranked by combined score; this is a representative, not a resolved call
     let mut circular: Option<Representative> = None;
     for (rank, &c) in order.iter().enumerate() {
-        let (score, molecules) = &found[c];
+        let (score, target_rank_score, copy_deviation, molecules) = &found[c];
         let n = rank + 1;
         let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
         if !big.is_empty()
             && big.iter().all(|m| m.0.circular)
-            && circular.as_ref().map_or(true, |r| big.len() < r.pieces)
+            && circular.is_none()
         {
             circular = Some(Representative {
                 configuration: n,
+                equally_ranked: tie_counts[&rank_keys[c]],
                 pieces: big.len(),
                 molecules: molecules
                     .iter()
@@ -1120,33 +1177,103 @@ fn configurations(
                 let (seen_in, informative) = prior.observed.get(p).cloned().unwrap_or_default();
                 json!({"repeat": p.1 .0, "from": format!("{}{}", p.0 .0, if p.0 .1 {'+'} else {'-'}),
                     "to": format!("{}{}", p.2 .0, if p.2 .1 {'+'} else {'-'}),
-                    "runs_with_it": seen_in.len(), "runs_with_its_flanks": informative.len(), "runs": seen_in})
+                    "runs_with_it": seen_in.len(), "runs_with_its_flanks": informative.len(), "runs": seen_in,
+                    "repeat_orientation": if p.1.1 {"+"} else {"-"}, "prior_read_counts": support.get(p)})
             })
             .collect();
         listed.push(json!({"configuration": n, "reads_score_ln": score, "reference_prior_ln": prior.scores[c],
+            "target_rank_score": target_rank_score, "copy_number_deviation": copy_deviation, "combined_score": combined[c], "relative_weight": weights[c], "prior_read_support_score": support_scores[c],
+            "joint_walk_sample_support": joint_scores[c], "equally_ranked_candidates": tie_counts[&rank_keys[c]], "joint_walks": joint_matches[c].iter().map(|&i| json!({"path":joint_walks[i].0.iter().map(|(n,o)| format!("{}{}",n,if *o {'+'} else {'-'})).collect::<Vec<_>>().join(" "), "read_counts":joint_walks[i].1})).collect::<Vec<_>>(),
             "reference_runs_with_all_pairings": runs, "pairings": detail, "molecules": lengths}));
     }
     let path = out.join(format!("{organelle}.configurations.fasta"));
     fs::write(&path, fasta)?;
     fs::write(gfa_out, text + &walks)?;
-    let best = found.iter().map(|f| f.0).fold(f64::NEG_INFINITY, f64::max);
-    let tied = found.iter().filter(|f| best - f.0 < 1e-9).count();
+    let best = found.iter().map(|f| f.1).fold(f64::NEG_INFINITY, f64::max);
+    let tied = found.iter().filter(|f| best - f.1 < 1e-9).count();
+    let raw_best = found.iter().map(|f| f.0).fold(f64::NEG_INFINITY, f64::max);
+    let raw_tied = found.iter().filter(|f| raw_best - f.0 < 1e-9).count();
     eprintln!(
-        "[ovasm] reconstruct {organelle}: {} configurations ({tied} as well supported by the reads as the best), ranked by {} reference runs",
-        listed.len(),
-        prior.runs
+        "[ovasm] reconstruct {organelle}: {} configurations ({tied} as well ranked by target evidence as the best); {} reference path runs, {} read-prior runs",
+        listed.len(), prior.runs, prior_reads.len()
     );
     Ok((
-        json!({"configurations": listed.len(), "as_well_supported_by_reads_as_the_best": tied,
+        json!({"configurations": listed.len(), "as_well_ranked_by_target_evidence_as_the_best": tied, "as_well_supported_by_reads_as_the_best": raw_tied,
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
-        "cover_size_limited": component.cover_size_limited, "skipped_covers": skipped,
+        "cover_size_limited": component.cover_size_limited, "candidate_list_limited": candidate_list_limited, "skipped_covers": skipped,
         "reference_runs": prior.runs, "fasta": path, "list": listed,
+        "prior_read_evidence": read_reports, "joint_evidence_truncated": joint_evidence_truncated, "joint_evidence_limit": joint_evidence_limit, "joint_tiebreak_basis": "At equal combined score to 1e-9, count samples with at least three reads supporting a single chain spanning two or more repeat nodes. This is an uncalibrated tiebreak, not independent evidence multiplied into relative weights.", "prior_scoring": "reference paths excluding read-prior sample labels plus read-backed presence mean", "reference_path_runs_excluded_for_read_prior": ref_names.iter().map(|n| n.split('#').next().unwrap_or("")).filter(|n| prior_reads.contains_key(*n)).collect::<BTreeSet<_>>(),
+        "weight_interpretation": "Normalized heuristic weights within enumerated candidates, not posterior probabilities. They exclude the linked-walk tiebreak. The target score includes copy-number penalties and can include synthetic topological bridge weights; it is not a calibrated data likelihood. The read-backed score is an uncalibrated mean fraction of samples with at least three spanning reads per pairing, added to the target read score with unit weight; samples and pairings may be correlated, absence may reflect low coverage, and the search may be incomplete.",
         "circular_representative": circular.as_ref().map(|r| r.configuration),
-        "basis": "every cover of the anchor graph linearize finds; the reads do not decide between \
-                  them; ranked by how often the reference runs hold each repeat pairing (a prior \
-                  from other individuals, not evidence of this one)"}),
+        "basis": "enumerated covers of the anchor graph; the reads do not decide between \
+                  them; ranked by the target score including copy-number penalties plus trusted reference pairing score and the explicitly supplied read-backed sample score; these do not establish target topology"}),
         circular,
     ))
+}
+
+// Traversals are per-read-deduplicated, unique three-step chains of two supported
+// junctions. Unlike phased_paths they do not discard a target repeat just because
+// the prior sample's depth heuristic classifies the shared segment as single copy.
+fn add_prior_traversals(sample: &str, traversals: &[crate::evidence::Traversal], repeats: &BTreeSet<String>, support: &mut BTreeMap<Pairing, BTreeMap<String, u64>>) {
+    for traversal in traversals {
+        let steps: Vec<(String, bool)> = traversal.path.split_whitespace().filter_map(|x| {
+            let (name, sign) = x.split_at(x.len().checked_sub(1)?);
+            match sign { "+" => Some((name.to_string(), true)), "-" => Some((name.to_string(), false)), _ => None }
+        }).collect();
+        if steps.len() != 3 { continue; }
+        for pairing in pairings_of(&steps, false, repeats) {
+            *support.entry(pairing).or_default().entry(sample.to_string()).or_default() += traversal.reads;
+        }
+    }
+}
+
+fn add_prior_joint_walks(sample: &str, walks: &[crate::evidence::Traversal], repeats: &BTreeSet<String>, support: &mut BTreeMap<Vec<(String, bool)>, BTreeMap<String, u64>>) {
+    for walk in walks {
+        if walk.reads < 3 { continue; }
+        let steps: Vec<(String, bool)> = walk.path.split_whitespace().filter_map(|x| {
+            let (name, sign) = x.split_at(x.len().checked_sub(1)?);
+            match sign { "+" => Some((name.to_string(), true)), "-" => Some((name.to_string(), false)), _ => None }
+        }).collect();
+        if steps.len() < 3 || steps.iter().filter(|(n,_)| repeats.contains(n)).count() < 2 { continue; }
+        let key = walk_key(&steps, false);
+        *support.entry(key).or_default().entry(sample.to_string()).or_default() += walk.reads;
+    }
+}
+
+fn contains_joint_walk(steps: &[(String, bool)], circular: bool, target: &[(String, bool)]) -> bool {
+    if steps.is_empty() || target.is_empty() || target.len() > steps.len() { return false; }
+    let starts = if circular { steps.len() } else { steps.len() + 1 - target.len() };
+    (0..starts).any(|start| {
+        let window: Vec<_> = (0..target.len()).map(|i| steps[(start + i) % steps.len()].clone()).collect();
+        walk_key(&window, false).as_slice() == target
+    })
+}
+
+fn eligible_path_prior_indices(names: &[String], prior_reads: &BTreeMap<String, Vec<PathBuf>>) -> Vec<usize> {
+    names.iter().enumerate().filter_map(|(i, n)|
+        (!prior_reads.contains_key(n.split('#').next().unwrap_or(""))).then_some(i)
+    ).collect()
+}
+
+fn read_backed_score(pairings: &[Pairing], support: &BTreeMap<Pairing, BTreeMap<String, u64>>, samples: usize) -> f64 {
+    if pairings.is_empty() || samples == 0 { return 0.0; }
+    let unique: BTreeSet<&Pairing> = pairings.iter().collect();
+    let count: usize = unique.iter().map(|p| support.get(*p).map_or(0, |m| m.values().filter(|&&n| n >= 3).count())).sum();
+    count as f64 / (unique.len() * samples) as f64
+}
+
+// Stable normalization of heuristic scores. This does not calibrate them as probabilities.
+fn score_bucket(score: f64) -> i128 {
+    (score * 1e9).round() as i128
+}
+
+fn relative_weights(scores: &[f64]) -> Vec<f64> {
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() { return vec![0.0; scores.len()]; }
+    let mut weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    let sum: f64 = weights.iter().sum();
+    for w in &mut weights { *w /= sum; }
+    weights
 }
 
 /// A configuration taken as the organelle's representative molecules (`configurations`):
@@ -1154,6 +1281,7 @@ fn configurations(
 /// (configuration walk name, sequence, circular).
 struct Representative {
     configuration: usize,
+    equally_ranked: usize,
     pieces: usize,
     molecules: Vec<(String, Vec<u8>, bool)>,
 }
@@ -1305,6 +1433,10 @@ fn mark_paths_untrusted(text: &str) -> String {
 /// named. Whether the reads decide every repeat pairing is reported beside it (`decisive`):
 /// short reads cannot decide a repeat longer than their fragments.
 /// `individual.gfa` stays the graph for a species pan graph (reference intervals and de novo).
+fn should_evaluate_configurations(decisive: bool, major_pieces: usize) -> bool {
+    !decisive && major_pieces > 0
+}
+
 fn final_outputs(
     dir: &Path,
     out: &Path,
@@ -1313,6 +1445,7 @@ fn final_outputs(
     reads: &[PathBuf],
     walks: &[(Vec<u8>, bool)],
     walk_names: &[String],
+    prior_reads: &BTreeMap<String, Vec<PathBuf>>,
 ) -> Result<Value> {
     let graph = dir.join("de-novo/organelle.gfa");
     let fasta = dir.join("de-novo/molecules.fasta");
@@ -1438,25 +1571,32 @@ fn final_outputs(
         (true, _) => "complete_with_reference_fill",
     };
     // the reads leave the configuration open: every one the graph allows
-    let (configurations_found, chosen) = if status == "incomplete" && !decisive && !pieces.is_empty() {
-        configurations(dir, out, organelle, &gfa_out, walks, walk_names)?
+    let (configurations_found, chosen) = if should_evaluate_configurations(decisive, pieces.len()) {
+        configurations(dir, out, organelle, &gfa_out, walks, walk_names, prior_reads)?
     } else {
         (Value::Null, None)
     };
+    let was_incomplete = status == "incomplete";
     let mut status = status.to_string();
+    if !decisive && !was_incomplete {
+        status = if reference_bp == 0 { "closed_configuration_uncertain" } else { "closed_reference_fill_configuration_uncertain" }.to_string();
+        reasons.push("the graph is closed but target reads do not resolve its configuration".to_string());
+    }
     let mut representative = Value::Null;
     let (mut lengths, mut circular) = (molecules.iter().map(|m| m.1.len()).collect::<Vec<_>>(), circular);
     // A configuration of circular molecules, when the reads leave one open, is the representative:
     // as `run` gives a circle for a molecule of the graph, not the linear walk that ends on short
     // tips beside a repeat (ZM4: two dead-end tips of 177 and 168 bp at its 360 bp repeat).
-    if let Some(r) = &chosen {
+    // Keep a read-pair or reference-filled closure intact. The candidate enumeration is
+    // reported for closed but unresolved graphs, without replacing their sequence.
+    if let Some(r) = chosen.as_ref().filter(|_| was_incomplete) {
         let total = configurations_found["configurations"].as_u64().unwrap_or(0);
         let mut text = String::new();
         for (name, seq, circ) in &r.molecules {
             let unplaced = (seq.len() as u64) < pipeline::MIN_PIECE;
             writeln!(
                 text,
-                ">{name} circular={circ} length={} configuration={} of={total} chosen_by=fewest_circular_molecules reads_decide=false{}",
+                ">{name} circular={circ} length={} configuration={} of={total} chosen_by=combined_score_then_joint_walk_support reads_decide=false{}",
                 seq.len(),
                 r.configuration,
                 if unplaced { " unplaced=true" } else { "" }
@@ -1470,15 +1610,15 @@ fn final_outputs(
         circular = r.molecules.iter().map(|m| m.2).collect();
         let small = r.molecules.iter().filter(|m| (m.1.len() as u64) < pipeline::MIN_PIECE).count();
         reasons = vec![format!(
-            "the reads leave the repeat pairings open: configuration {} of {total}, the fewest circular molecules ({}), is the representative; all are in {organelle}.configurations.fasta",
-            r.configuration, r.pieces
+            "the reads leave the repeat pairings open: configuration {} of {total}, ranked by combined score then joint read-chain support among circular candidates ({} molecules), is the representative; {} candidates share that score and tiebreak; all are in {organelle}.configurations.fasta",
+            r.configuration, r.pieces, r.equally_ranked
         )];
         if small > 0 {
             reasons.push(format!("{small} piece(s) under {} bp not placed: the graph's short dead-end tips", pipeline::MIN_PIECE));
         }
         status = "circular_configuration_chosen".to_string();
-        representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces,
-            "chosen_by": "fewest circular molecules, then the reference runs' ranking"});
+        representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
+            "chosen_by": "highest combined score, then joint read-chain support among tied candidates whose major molecules are circular"});
     }
     // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
     let uncertain = if fasta_out.exists() {
@@ -1495,8 +1635,10 @@ fn final_outputs(
     if uncertain["marked"].as_u64().unwrap_or(0) > 0 {
         if status == "complete" {
             status = "closed_length_uncertain".to_string();
-            reasons.push("the graph is closed but reads do not establish lengths of all repeat regions".to_string());
+        } else if status == "closed_configuration_uncertain" {
+            status = "closed_configuration_and_length_uncertain".to_string();
         }
+        reasons.push("reads do not establish lengths of all repeat regions".to_string());
         // Keep uncertainty when a FASTA, rather than its JSON sidecar, is passed to
         // an external pan builder. No sequence bases or ordering are changed.
         let text = fs::read_to_string(&fasta_out)?;
@@ -1578,9 +1720,30 @@ fn write_back(
         "basis": "pan merge (k 63) of the reference graph and the individual's representative molecules"}))
 }
 
+// Compare actual files on Unix, so aliases and hard links cannot bypass target/prior
+// separation. Other platforms use canonical paths and cannot detect hard links.
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct ReadFileIdentity {
+    #[cfg(unix)] dev: u64,
+    #[cfg(unix)] ino: u64,
+    #[cfg(not(unix))] path: PathBuf,
+}
+fn read_file_identity(path: &Path) -> Result<ReadFileIdentity> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() { bail!("read input is not a regular file: {}", path.display()); }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        Ok(ReadFileIdentity { dev: metadata.dev(), ino: metadata.ino() })
+    }
+    #[cfg(not(unix))] {
+        Ok(ReadFileIdentity { path: fs::canonicalize(path)? })
+    }
+}
+
 pub struct Config {
     pub reads: Vec<PathBuf>,
     pub target_reads: BTreeMap<String, Vec<PathBuf>>,
+    pub prior_reads: BTreeMap<String, BTreeMap<String, Vec<PathBuf>>>,
     pub references: BTreeMap<String, PathBuf>,
     pub sample: String,
     pub out: PathBuf,
@@ -1594,6 +1757,24 @@ pub struct Config {
 pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
+    }
+    if !cfg.prior_reads.is_empty() {
+        // Reject direct reuse of a read file as target or as two differently labelled samples.
+        // Renamed/copy-identical files and related samples cannot be detected this way.
+        let mut prior_paths = BTreeMap::<ReadFileIdentity, String>::new();
+        let targets: BTreeSet<ReadFileIdentity> = cfg.reads.iter().chain(cfg.target_reads.values().flatten()).map(|p| read_file_identity(p)).collect::<Result<_>>()?;
+        for (organelle, samples) in &cfg.prior_reads {
+            for (sample, paths) in samples {
+                if sample == &cfg.sample { bail!("target sample cannot be its own read prior"); }
+                for path in paths {
+                    let resolved = read_file_identity(path).with_context(|| format!("prior reads not accessible: {}", path.display()))?;
+                    if targets.contains(&resolved) { bail!("target reads cannot be reused as independent prior reads"); }
+                    if prior_paths.insert(resolved, format!("{organelle}={sample}")).is_some() {
+                        bail!("same prior read file supplied more than once");
+                    }
+                }
+            }
+        }
     }
     let targeted = !cfg.target_reads.is_empty();
     if targeted {
@@ -1800,7 +1981,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             let walks: Vec<(Vec<u8>, bool)> =
                 r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| (w.sequence.clone(), w.circular)).collect();
             let names: Vec<String> = r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| w.name.clone()).collect();
-            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names)?
+            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names, cfg.prior_reads.get(o).unwrap_or(&BTreeMap::new()))?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
@@ -1852,6 +2033,86 @@ pub fn run(cfg: &Config) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn score_bucket_does_not_break_a_tie_on_float_noise() {
+        assert_eq!(score_bucket(-6.0), score_bucket(-6.0 + 1e-15));
+        assert_ne!(score_bucket(-6.0), score_bucket(-6.0 + 2e-9));
+    }
+
+    #[test]
+    fn joint_walk_matches_both_strands_and_wraps_only_for_circular_paths() {
+        let n = |s: &str| (s.to_string(), true);
+        let path = vec![n("a"), n("r1"), n("b"), n("r2")];
+        let forward = walk_key(&[n("r2"), n("a"), n("r1")], false);
+        assert!(contains_joint_walk(&path, true, &forward));
+        assert!(!contains_joint_walk(&path, false, &forward));
+        let reversed = walk_key(&[("r1".into(), false), ("a".into(), false), ("r2".into(), false)], false);
+        assert_eq!(forward, reversed);
+        assert!(contains_joint_walk(&path, true, &reversed));
+    }
+
+    #[test]
+    fn closed_nondecisive_graph_still_evaluates_configurations() {
+        assert!(should_evaluate_configurations(false, 1));
+        assert!(should_evaluate_configurations(false, 2));
+        assert!(!should_evaluate_configurations(true, 1));
+        assert!(!should_evaluate_configurations(false, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_identity_detects_hardlinks() {
+        let dir = std::env::temp_dir().join(format!("ovasm-prior-identity-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("original"); let b = dir.join("hardlink");
+        fs::write(&a, b"test").unwrap();
+        if b.exists() { fs::remove_file(&b).unwrap(); }
+        fs::hard_link(&a, &b).unwrap();
+        assert!(read_file_identity(&a).unwrap() == read_file_identity(&b).unwrap());
+        fs::remove_file(a).unwrap(); fs::remove_file(b).unwrap(); fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn prior_traversal_uses_target_repeat_even_without_prior_sample_repeat_classification() {
+        let traversals = vec![crate::evidence::Traversal { path: "u6- u13- u11-".into(), reads: 124 }];
+        let repeats = ["u13".to_string()].into();
+        let mut counts = BTreeMap::new();
+        add_prior_traversals("prior", &traversals, &repeats, &mut counts);
+        let walk = vec![("u11".to_string(), true), ("u13".to_string(), true), ("u6".to_string(), true)];
+        let key = pairings_of(&walk, false, &repeats);
+        assert_eq!(counts[&key[0]]["prior"], 124);
+    }
+
+    #[test]
+    fn prior_read_samples_are_excluded_from_path_priors_but_other_paths_remain() {
+        let names = vec!["a#1#mt".into(), "a#2#mt".into(), "b#1#mt".into()];
+        let reads = [("a".to_string(), vec![PathBuf::from("reads.fq")])].into();
+        assert_eq!(eligible_path_prior_indices(&names, &reads), vec![2]);
+        assert_eq!(eligible_path_prior_indices(&names, &BTreeMap::new()), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn read_backed_prior_counts_samples_not_read_depth_and_ignores_weak_support() {
+        let node = |s: &str| (s.to_string(), true);
+        let a = (node("a"), node("r"), node("b"));
+        let b = (node("a"), node("r"), node("c"));
+        let mut support = BTreeMap::new();
+        support.insert(a.clone(), [("s1".to_string(), 100), ("s2".to_string(), 2)].into());
+        support.insert(b.clone(), [("s2".to_string(), 3)].into());
+        assert_eq!(read_backed_score(&[a.clone()], &support, 2), 0.5);
+        assert_eq!(read_backed_score(&[b], &support, 2), 0.5);
+        assert_eq!(read_backed_score(&[a.clone(), a.clone()], &support, 2), 0.5);
+        assert_eq!(read_backed_score(&[a], &support, 0), 0.0);
+        assert_eq!(read_backed_score(&[], &support, 2), 0.0);
+    }
+
+    #[test]
+    fn relative_weights_are_stable_and_normalized() {
+        let w = super::relative_weights(&[-1001.0, -1000.0]);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((w[1] / w[0] - std::f64::consts::E).abs() < 1e-12);
+        assert!(super::relative_weights(&[]).is_empty());
+    }
     use super::*;
     fn reference(text: &str) -> Reference {
         let p = std::env::temp_dir().join(format!(
