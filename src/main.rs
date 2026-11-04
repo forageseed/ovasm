@@ -365,6 +365,9 @@ struct ReconstructArgs {
     /// Explicit target-input mode preserves an earlier recruitment without rescanning WGS.
     #[arg(long = "target-reads", conflicts_with = "target_depth")]
     target_reads: Vec<String>,
+    /// Recruited HiFi reads as ORGANELLE=SAMPLE=PATH; repeat for prior samples.
+    #[arg(long = "prior-reads")]
+    prior_reads: Vec<String>,
     /// Blunt reference pan GFA as mitochondrion=PATH or plastid=PATH; both required.
     #[arg(long = "reference", required = true)]
     references: Vec<String>,
@@ -419,6 +422,15 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
             .or_default()
             .push(PathBuf::from(p));
     }
+    let mut prior_reads = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Vec<PathBuf>>>::new();
+    for spec in args.prior_reads {
+        let (organelle, rest) = spec.split_once('=').context("prior reads must be ORGANELLE=SAMPLE=PATH")?;
+        let (sample, path) = rest.split_once('=').context("prior reads must be ORGANELLE=SAMPLE=PATH")?;
+        if !["mitochondrion", "plastid"].contains(&organelle) || sample.is_empty() || sample == args.sample || path.is_empty() || !sample.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+            bail!("invalid prior sample, organelle, path, or target sample used as its own prior");
+        }
+        prior_reads.entry(organelle.to_string()).or_default().entry(sample.to_string()).or_default().push(PathBuf::from(path));
+    }
     if let Some(n) = args.threads {
         if n == 0 {
             bail!("threads must be positive");
@@ -430,6 +442,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
     reconstruct::run(&reconstruct::Config {
         reads: args.reads,
         target_reads,
+        prior_reads,
         references,
         sample: args.sample,
         out: args.out,

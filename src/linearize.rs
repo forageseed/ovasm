@@ -1114,7 +1114,7 @@ impl CoverReport {
     }
 
     /// Score the ranking uses: the likelihood less the copy-number penalty.
-    fn ranked_score(&self) -> f64 {
+    pub(crate) fn ranked_score(&self) -> f64 {
         self.score - COPY_PENALTY_LN * self.copy_deviation as f64
     }
 
