@@ -45,7 +45,7 @@ use crate::pipeline::{
 };
 use crate::bait::BaitSet;
 use crate::kmer::CanonicalKmers;
-use crate::recruit::{classify, peak_rss_mb, unit_hash, Call, ClassifyParams};
+use crate::recruit::{classify, peak_rss_mb, Call, ClassifyParams};
 
 /// k of long-read recruitment. `find recruit --preset ont` defaults to 15, which with the
 /// built-in seed library (tens of Mb of k-mers, a twentieth of all 15-mers) covers every read
@@ -399,6 +399,24 @@ fn mask_tandem_fasta(src: &Path, dst: &Path) -> Result<u64> {
     Ok(masked)
 }
 
+/// A number in [0, 1) for a read name and a salt, uniform over the names of real runs: FNV-1a over
+/// the name, then the splitmix64 finaliser. Samples the reads a share is kept of (`cap_depth`,
+/// the partial reads' cap). `recruit::unit_hash` does not do this for Nanopore names
+/// (`SRR25241091.96/1 <uuid> length=37207`): over the 32,383 reads of Nipponbare ONT's plastid
+/// its values lay in [0, 0.3), so keeping a share of 0.16 kept 75% of the reads, the plastid
+/// went into correction at 2,240x and its graph came out empty.
+fn read_share(id: &[u8], salt: u64) -> f64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in id {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut z = h ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// `reads` down to `CORRECT_MAX_DEPTH`: when their median depth (see `read_depths`) is above it,
 /// the reads whose id hashes below the share are written to `out` and it is returned in their
 /// place. Also the record of it: depth, kept share, reads and bases kept.
@@ -424,7 +442,7 @@ fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, 
     let fraction = CORRECT_MAX_DEPTH / d;
     let mut w = BufWriter::new(fs::File::create(out)?);
     let (mut n, mut b) = (0u64, 0u64);
-    for (id, seq) in records.iter().filter(|r| unit_hash(&r.0, salt) < fraction) {
+    for (id, seq) in records.iter().filter(|r| read_share(&r.0, salt) < fraction) {
         w.write_all(b">")?;
         w.write_all(id)?;
         w.write_all(b"\n")?;
@@ -544,7 +562,7 @@ fn split_partial(
         let mut w = BufWriter::new(fs::File::create(&fasta)?);
         let (mut n, mut b) = (0u64, 0u64);
         for (id, seq, _) in calls.iter().filter(|c| c.2 == t) {
-            if fraction < 1.0 && unit_hash(id, salt) >= fraction {
+            if fraction < 1.0 && read_share(id, salt) >= fraction {
                 continue;
             }
             w.write_all(b">")?;
@@ -1213,6 +1231,45 @@ mod tests {
         assert!(super::require_self_correction(1, &p).is_err());
         assert!(super::use_hybrid_correction(0, &p, &p, &mut serde_json::json!({})).is_err());
         assert!(super::use_hybrid_correction(1, &p, &p, &mut serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn a_read_share_follows_its_fraction_for_nanopore_and_other_read_names() {
+        // names as the SRA writes Nanopore reads, a plain counter, and Illumina-like names
+        let formats: [fn(u64) -> String; 3] = [
+            |i| {
+                let x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                format!(
+                    "SRR25241091.{}/1 {:08x}-{:04x}-{:04x}-{:04x}-{:012x} length={}",
+                    96 + 7 * i,
+                    x >> 32,
+                    (x >> 16) & 0xffff,
+                    x & 0xffff,
+                    (x >> 8) & 0xffff,
+                    x >> 4,
+                    500 + (x >> 40) % 30_000
+                )
+            },
+            |i| format!("read{i}"),
+            |i| format!("A00123:45:HXXXXDSXX:1:{}:{}:{} 1:N:0:ACGT", 1101 + i % 4, i % 30_000, i / 4),
+        ];
+        for f in formats {
+            let ids: Vec<Vec<u8>> = (0..40_000u64).map(|i| f(i).into_bytes()).collect();
+            for fraction in [0.12, 0.16, 0.5] {
+                let kept = ids.iter().filter(|id| read_share(id, 0) < fraction).count() as f64;
+                let share = kept / ids.len() as f64;
+                assert!((share - fraction).abs() < 0.02, "{share} kept for {fraction}");
+            }
+        }
+        // the three real names the shortfall was seen on
+        for (id, salt) in [
+            ("SRR25241091.96/1 38fdbf00-5340-417f-a18c-139e14d2055a length=37207", 0),
+            ("SRR25241091.291/1 bf1054c5-a549-4c41-9b8e-7d95d46366d0 length=33228", 0),
+        ] {
+            let v = read_share(id.as_bytes(), salt);
+            assert!((0.0..1.0).contains(&v));
+        }
+        assert_ne!(read_share(b"a", 0), read_share(b"a", 1), "the salt changes the draw");
     }
 
     #[test]
