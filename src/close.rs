@@ -61,7 +61,8 @@ pub struct Closure {
 }
 
 fn name_of(id: &[u8]) -> Vec<u8> {
-    id.split(|&b| b == b' ' || b == b'\t').next().unwrap_or(id).to_vec()
+    let name = id.split(|&b| b == b' ' || b == b'\t').next().unwrap_or(id);
+    name.strip_suffix(b"/1").or_else(|| name.strip_suffix(b"/2")).unwrap_or(name).to_vec()
 }
 
 /// Close `molecule` (linear) with the read pairs of `reads`; `Closure::fill` is Some when the
@@ -414,6 +415,34 @@ mod tests {
         let c = close(&half, &[reads]).unwrap();
         assert_eq!(c.fill, None);
         assert!(c.joining_pairs < MIN_JOINING_PAIRS, "{c:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn slash_mate_names_preserve_closure_and_pair_evidence() {
+        let genome = random(5000, 103);
+        let dir = std::env::temp_dir().join(format!("ovasm-close-suffixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("original.fq");
+        let suffixed = dir.join("suffixed.fq");
+        pairs(&genome, 4, (4900, 5000), &original);
+        let input = std::fs::read_to_string(&original).unwrap();
+        let mut rewritten = String::new();
+        for (i, line) in input.lines().enumerate() {
+            if i % 4 == 0 {
+                let (id, mate) = line.split_once(' ').unwrap();
+                writeln!(rewritten, "{id}/{mate} instrument").unwrap();
+            } else {
+                writeln!(rewritten, "{line}").unwrap();
+            }
+        }
+        std::fs::write(&suffixed, rewritten).unwrap();
+        let ordinary = close(&genome[..4880], &[original]).unwrap();
+        let normalized = close(&genome[..4880], &[suffixed]).unwrap();
+        assert!(ordinary.joining_pairs >= MIN_JOINING_PAIRS, "{ordinary:?}");
+        assert_eq!(normalized.joining_pairs, ordinary.joining_pairs);
+        assert_eq!(normalized.fill, Some(120));
+        assert_eq!(normalized.sequence, genome[4880..].to_vec());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
