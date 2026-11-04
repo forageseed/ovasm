@@ -23,10 +23,15 @@ pub struct ReadFit {
     /// Each adjacency counts at most once per record and once per candidate cover.
     /// A record can support several adjacencies; this is NOT independent sample size.
     pub adjacency_record_occurrences_explained: u64,
+    pub unexplained_adjacency_record_occurrences: u64,
+    /// A branching segment's entrance/exit pairing needs a same-record witness.
+    pub unphased_branch_visits: usize,
     pub unobserved_junctions: usize,
     pub weak_junctions: usize,
     #[serde(skip)]
     pub matched_paths: Vec<usize>,
+    #[serde(skip)]
+    pub matched_adjacencies: Vec<usize>,
 }
 
 impl ReadFit {
@@ -41,6 +46,7 @@ impl ReadFit {
     pub fn complete(&self) -> bool {
         self.unexplained_thread_records == 0 && self.unobserved_junctions == 0
             && self.weak_junctions == 0 && self.adjacency_record_occurrences_explained > 0
+            && self.unexplained_adjacency_record_occurrences == 0 && self.unphased_branch_visits == 0
     }
 }
 
@@ -59,8 +65,39 @@ pub struct ReadPathCover {
     pub represented_thread_records: u64,
     pub unrepresentable_thread_records: u64,
     pub low_support_thread_records: u64,
+    pub supported_local_adjacencies: usize,
+    pub represented_local_adjacencies: usize,
+    pub unrepresentable_local_adjacencies: usize,
     pub minimum_family_size_proven: bool,
     pub budget_exhausted: bool,
+    /// Union of candidates participating in all found minimum explanatory families.
+    /// This prevents an arbitrary minimum-family tiebreak from erasing ambiguity.
+    pub equivalent_candidate_indices: Vec<usize>,
+    pub equivalent_minimum_families: u64,
+    pub equivalent_families_complete: bool,
+}
+
+fn cover_envelope(masks:&[u64],target:u64,size:usize,budget:&mut u64)->(Vec<usize>,u64,bool) {
+    let mut suffix=vec![0u64;masks.len()+1];
+    for i in (0..masks.len()).rev(){suffix[i]=suffix[i+1]|masks[i];}
+    struct Envelope<'a>{masks:&'a [u64],suffix:&'a [u64],size:usize,members:BTreeSet<usize>,families:u64,exhausted:bool}
+    fn visit(e:&mut Envelope,start:usize,remaining:u64,path:&mut Vec<usize>,budget:&mut u64){
+        if !spend(budget,1){e.exhausted=true;return;}
+        if path.len()==e.size {
+            if remaining==0 {e.families=e.families.saturating_add(1);e.members.extend(path.iter().copied());}
+            return;
+        }
+        if remaining==0 || e.masks.len()-start<e.size-path.len() || remaining&!e.suffix[start]!=0 {return;}
+        for i in start..e.masks.len(){
+            if !spend(budget,1){e.exhausted=true;return;}
+            if e.masks[i]&remaining==0 {continue;}
+            path.push(i);visit(e,i+1,remaining&!e.masks[i],path,budget);path.pop();
+            if e.exhausted{return;}
+        }
+    }
+    let mut e=Envelope{masks,suffix:&suffix,size,members:BTreeSet::new(),families:0,exhausted:false};
+    visit(&mut e,0,target,&mut Vec::new(),budget);
+    (e.members.into_iter().collect(),e.families,!e.exhausted)
 }
 
 fn exact_cover(masks: &[u64], target: u64, initial: Vec<usize>, budget: &mut u64) -> (Vec<usize>,bool) {
@@ -152,44 +189,71 @@ impl ReadModel {
 
     pub fn for_anchors(&self, anchors: &[usize], repeats: &[bool]) -> Self {
         let belongs:BTreeSet<_>=anchors.iter().copied().collect();
+        let mut nodes=belongs.clone();
+        let mut adjacency:BTreeMap<usize,Vec<usize>>=BTreeMap::new();
+        for &(a,b) in self.links.keys(){adjacency.entry(a.0).or_default().push(b.0);adjacency.entry(b.0).or_default().push(a.0);}
+        let mut queue:Vec<_>=belongs.iter().copied().collect();
+        while let Some(a)=queue.pop(){
+            for &b in adjacency.get(&a).into_iter().flatten(){
+                if (repeats[b] || belongs.contains(&b)) && nodes.insert(b){queue.push(b);}
+            }
+        }
         Self {paths:self.paths.iter().filter(|(w,_,_)|
             w.iter().any(|o|!repeats[o.0] && belongs.contains(&o.0))).cloned().collect(),
-            links:self.links.clone(),min_reads:self.min_reads}
+            links:self.links.iter().filter(|((a,b),_)|nodes.contains(&a.0)&&nodes.contains(&b.0)).map(|(&e,&n)|(e,n)).collect(),min_reads:self.min_reads}
     }
 
     /// A minimal explanatory family is a representation of observed paths, not a count
     /// or identification of physical isoforms. Exact cardinality search is bounded.
     pub fn path_cover(&self, fits: &[&ReadFit], mut budget: u64) -> ReadPathCover {
-        let eligible:BTreeSet<_>=self.paths.iter().enumerate().filter(|(_,(_,n,_))|*n>=self.min_reads).map(|(i,_)|i).collect();
-        let target:BTreeSet<_>=fits.iter().flat_map(|f|f.matched_paths.iter().copied()).filter(|i|eligible.contains(i)).collect();
+        let offset=self.paths.len();
+        let mut eligible:BTreeSet<_>=self.paths.iter().enumerate().filter(|(_,(_,n,_))|*n>=self.min_reads).map(|(i,_)|i).collect();
+        eligible.extend(self.links.values().enumerate().filter(|(_,n)|**n>=self.min_reads).map(|(i,_)|offset+i));
+        // Local links constrain representation but do not establish a repeat pairing.
+        let matched:Vec<BTreeSet<usize>>=fits.iter().map(|f|f.matched_paths.iter().copied()
+            .chain(f.matched_adjacencies.iter().map(|&i|offset+i)).filter(|i|eligible.contains(i)).collect()).collect();
+        let target:BTreeSet<_>=matched.iter().flat_map(|f|f.iter().copied()).collect();
         let mut remaining=target.clone();let mut selected=Vec::new();let mut exhausted=false;
         while !remaining.is_empty() {
             let mut best=None;
-            for (i,fit) in fits.iter().enumerate() {
-                if !spend(&mut budget,fit.matched_paths.len()+1) {exhausted=true;break;}
-                let gain=fit.matched_paths.iter().filter(|i|remaining.contains(i)).count();
+            for (i,fit) in matched.iter().enumerate() {
+                if !spend(&mut budget,fit.len()+1) {exhausted=true;break;}
+                let gain=fit.iter().filter(|i|remaining.contains(i)).count();
                 if gain>0 && best.map_or(true,|(_,old)|gain>old) {best=Some((i,gain));}
             }
             if exhausted {break;}
             let Some((i,_))=best else {break;};
-            selected.push(i);for j in &fits[i].matched_paths {remaining.remove(j);}
+            selected.push(i);for j in &matched[i] {remaining.remove(j);}
         }
         let mut proven=target.is_empty();
         if !target.is_empty() && remaining.is_empty() && target.len()<=64 && !exhausted {
             let bit:BTreeMap<_,_>=target.iter().enumerate().map(|(i,&j)|(j,i)).collect();
-            let masks:Vec<u64>=fits.iter().map(|f|f.matched_paths.iter().filter_map(|j|bit.get(j)).fold(0u64,|mask,i|mask|(1u64<<i))).collect();
+            let masks:Vec<u64>=matched.iter().map(|f|f.iter().filter_map(|j|bit.get(j)).fold(0u64,|mask,i|mask|(1u64<<i))).collect();
             let all=masks.iter().fold(0,|a,m|a|m);
             (selected,proven)=exact_cover(&masks,all,selected,&mut budget);
             exhausted=!proven;
         }
         selected.sort_unstable();
-        let represented:BTreeSet<_>=selected.iter().flat_map(|&i|fits[i].matched_paths.iter().copied()).collect();
-        let count=|indices:&BTreeSet<usize>|indices.iter().map(|&i|self.paths[i].1).sum::<u64>();
-        ReadPathCover {scope:"minimum explanatory family within enumerated candidates; not physical isoform count or abundance",
+        let mut equivalent=selected.clone();let mut families=0;let mut envelope_complete=false;
+        if proven && target.len()<=64 {
+            let bit:BTreeMap<_,_>=target.iter().enumerate().map(|(i,&j)|(j,i)).collect();
+            let masks:Vec<u64>=matched.iter().map(|f|f.iter().filter_map(|j|bit.get(j)).fold(0u64,|mask,i|mask|(1u64<<i))).collect();
+            let all=masks.iter().fold(0,|a,m|a|m);
+            let (members,n,complete)=cover_envelope(&masks,all,selected.len(),&mut budget);
+            equivalent.extend(members);equivalent.sort_unstable();equivalent.dedup();
+            families=n;envelope_complete=complete;
+        }
+        let represented:BTreeSet<_>=selected.iter().flat_map(|&i|matched[i].iter().copied()).collect();
+        let count=|indices:&BTreeSet<usize>|indices.iter().filter(|&&i|i<offset).map(|&i|self.paths[i].1).sum::<u64>();
+        let local=|indices:&BTreeSet<usize>|indices.iter().filter(|&&i|i>=offset).count();
+        ReadPathCover {scope:"minimum family representing supported record paths and local adjacencies within enumerated candidates; not physical isoform count or abundance",
             candidate_indices:selected,supported_thread_records:count(&eligible),represented_thread_records:count(&represented),
             unrepresentable_thread_records:count(&eligible)-count(&target),
             low_support_thread_records:self.paths.iter().filter(|(_,n,_)|*n<self.min_reads).map(|(_,n,_)|*n).sum(),
-            minimum_family_size_proven:proven,budget_exhausted:exhausted}
+            supported_local_adjacencies:local(&eligible),represented_local_adjacencies:local(&represented),
+            unrepresentable_local_adjacencies:local(&eligible)-local(&target),
+            minimum_family_size_proven:proven,budget_exhausted:exhausted,
+            equivalent_candidate_indices:equivalent,equivalent_minimum_families:families,equivalent_families_complete:envelope_complete}
     }
 
     /// None means budget exhausted: callers must discard ALL partial new-model ranks.
@@ -201,12 +265,42 @@ impl ReadModel {
             for pair in path.windows(2) {used.insert(edge(pair[0],pair[1]));}
             if closed && !path.is_empty() {used.insert(edge(*path.last().unwrap(),path[0]));}
         }
-        for e in used {
+        for &e in &used {
             let n=self.links.get(&e).copied().unwrap_or(0);
             if n==0 {fit.unobserved_junctions+=1;}
             else if n<self.min_reads {fit.weak_junctions+=1;}
             else {fit.adjacency_record_occurrences_explained+=n;}
         }
+        let mut successors:BTreeMap<Oriented,BTreeSet<Oriented>>=BTreeMap::new();
+        for (index,(&(a,b),&n)) in self.links.iter().enumerate() {
+            if !spend(budget,1){return None;}
+            if n<self.min_reads {continue;}
+            successors.entry(a).or_default().insert(b);
+            successors.entry(flip(b)).or_default().insert(flip(a));
+            if used.contains(&edge(a,b)){fit.matched_adjacencies.push(index);}
+            else{fit.unexplained_adjacency_record_occurrences+=n;}
+        }
+        let canonical_triple=|t:[Oriented;3]|t.min([flip(t[2]),flip(t[1]),flip(t[0])]);
+        let mut pairings:BTreeMap<[Oriented;3],u64>=BTreeMap::new();
+        for (w,n,_) in &self.paths {
+            if !spend(budget,w.len()){return None;}
+            let distinct:BTreeSet<_>=w.windows(3).map(|t|canonical_triple([t[0],t[1],t[2]])).collect();
+            for t in distinct {*pairings.entry(t).or_default()+=n;}
+        }
+        let mut unresolved=BTreeSet::new();
+        for (p,&closed) in walks.iter().zip(circular) {
+            let starts=if closed {p.len()}else{p.len().saturating_sub(2)};
+            for i in 0..starts {
+                if !spend(budget,1){return None;}
+                let t=[p[i],p[(i+1)%p.len()],p[(i+2)%p.len()]];
+                if successors.get(&t[1]).map_or(0,BTreeSet::len)>1
+                    && successors.get(&flip(t[1])).map_or(0,BTreeSet::len)>1
+                    && pairings.get(&canonical_triple(t)).copied().unwrap_or(0)<self.min_reads {
+                    unresolved.insert(canonical_triple(t));
+                }
+            }
+        }
+        fit.unphased_branch_visits=unresolved.len();
         for (index,(w,n,joint)) in self.paths.iter().enumerate() {
             let mut matched=false;
             for (p,&c) in walks.iter().zip(circular) {
@@ -269,6 +363,19 @@ mod tests {
         assert_eq!(closed.order(&open),Ordering::Less);
     }
     #[test]
+    fn local_edges_cannot_phase_a_long_branching_segment() {
+        let links=[(edge((0,true),(1,true)),20),(edge((1,true),(0,true)),25),
+            (edge((0,true),(2,true)),24),(edge((2,true),(0,true)),28)].into_iter().collect();
+        let model=ReadModel{paths:vec![],links,min_reads:2};let mut b=10000;
+        let a=model.score(&[w(&[0,1]),w(&[2])],&[true,false],&mut b).unwrap();
+        let z=model.score(&[w(&[0,2]),w(&[1])],&[true,false],&mut b).unwrap();
+        assert!(a.unphased_branch_visits>0 && a.unexplained_adjacency_record_occurrences>0);
+        assert!(!a.complete());assert!(!z.complete());
+        let family=model.path_cover(&[&a,&z],10000);
+        assert_eq!(family.candidate_indices.len(),2);assert!(family.minimum_family_size_proven);
+        assert_eq!((family.supported_local_adjacencies,family.represented_local_adjacencies),(4,4));
+    }
+    #[test]
     fn repeat_loops_do_not_recount_the_same_edge_or_record() {
         let model=ReadModel{paths:vec![(w(&[0,1,0]),10,false)],links:[(edge((0,true),(1,true)),10),(edge((1,true),(0,true)),10)].into_iter().collect(),min_reads:2};
         let mut b=1000;
@@ -320,5 +427,15 @@ mod tests {
         let model=ReadModel{paths:vec![(w(&[0]),10,false)],links:BTreeMap::new(),min_reads:2};
         let fit=ReadFit{matched_paths:vec![0],..ReadFit::default()};let c=model.path_cover(&[&fit],0);
         assert!(c.budget_exhausted);assert!(!c.minimum_family_size_proven);assert_eq!(c.represented_thread_records,0);
+    }
+    #[test]
+    fn equivalent_minimum_families_preserve_their_entire_ambiguity_envelope() {
+        let model=ReadModel{paths:(0..4).map(|i|(w(&[i]),10,false)).collect(),links:BTreeMap::new(),min_reads:2};
+        let f=|xs:&[usize]|ReadFit{matched_paths:xs.to_vec(),..ReadFit::default()};
+        let fits=[f(&[0,1]),f(&[2,3]),f(&[0,2]),f(&[1,3])];
+        let cover=model.path_cover(&fits.iter().collect::<Vec<_>>(),10000);
+        assert_eq!(cover.candidate_indices.len(),2);assert!(cover.minimum_family_size_proven);
+        assert_eq!(cover.equivalent_candidate_indices,vec![0,1,2,3]);
+        assert_eq!(cover.equivalent_minimum_families,2);assert!(cover.equivalent_families_complete);
     }
 }

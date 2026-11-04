@@ -638,6 +638,12 @@ pub fn run(
         let lin = read_json(lin)?;
         let near = |best: &Value, a: &Value| {
             if best["read_support"].is_object() && a["read_support"].is_object() {
+                // Local coverage fluctuations cannot resolve entrance/exit pairing
+                // when no original record spans a branching segment.
+                if best["read_support"]["unphased_branch_visits"].as_u64().unwrap_or(0)>0 {
+                    return ["joint_records_explained","thread_records_explained"].iter()
+                        .all(|key|best["read_support"][*key]==a["read_support"][*key]);
+                }
                 return ["joint_records_explained","thread_records_explained","adjacency_record_occurrences_explained"]
                     .iter().all(|key|best["read_support"][*key]==a["read_support"][*key]);
             }
@@ -669,7 +675,8 @@ pub fn run(
                         let mut seen=BTreeSet::from([key(&c["best"])]);
                         // Preserve the explanatory family even when generic alternatives are
                         // capped. These paths carry explicit unresolved provenance below.
-                        for witness in c["witness_configurations"].as_array().into_iter().flatten() {
+                        for witness in c["witness_configurations"].as_array().into_iter().flatten()
+                            .chain(c["ambiguity_configurations"].as_array().into_iter().flatten()) {
                             if seen.insert(key(witness)) {covers.push(witness);}
                         }
                         if c["decisive"] == Value::Bool(false) {
@@ -1029,16 +1036,16 @@ mod tests {
     fn read_path_family_survives_generic_alternative_cap_and_stays_unresolved() {
         let dir=std::env::temp_dir().join(format!("ovasm-unify-read-cover-{}",std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("g.gfa"),"S\tA\tACGT\nS\tB\tTGCA\nS\tC\tCCCC\nL\tA\t+\tB\t+\t0M\n").unwrap();
+        fs::write(dir.join("g.gfa"),"S\tA\tACGT\nS\tB\tTGCA\nS\tC\tCCCC\nS\tD\tGGGG\nL\tA\t+\tB\t+\t0M\n").unwrap();
         let mol=|path:&str|serde_json::json!({"path":path,"circular":false});
         let cover=|path:&str|serde_json::json!({"molecules":[mol(path)],"score":0.0});
         let lin=serde_json::json!({"components":[{"best":cover("A+ B+"),"decisive":false,
-            "witness_configurations":[cover("A+ B+"),cover("C+")],"alternatives":[]}]});
+            "witness_configurations":[cover("A+ B+"),cover("C+")],"ambiguity_configurations":[cover("D+")],"alternatives":[]}]});
         fs::write(dir.join("lin.json"),lin.to_string()).unwrap();
         let report=run(&dir.join("g.gfa"),None,Some(&dir.join("lin.json")),
             &UnifyParams{sample:"sample",backend:"ovasm",organelle:"mitochondrion",molecule:"mt",max_alternatives:0},
             &dir.join("out.gfa"),&dir.join("out.json")).unwrap();
-        assert_eq!(report.paths.len(),2);
+        assert_eq!(report.paths.len(),3);
         let text=fs::read_to_string(dir.join("out.gfa")).unwrap();
         assert!(text.lines().filter(|l|l.starts_with("P\t")).all(|l|l.contains("st:Z:unresolved_configuration")));
         fs::remove_dir_all(dir).unwrap();
