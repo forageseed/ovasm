@@ -21,6 +21,7 @@ def canonical(a, ao, b, bo):
 def parse_graph(path):
     lengths = {}
     links = set()
+    adjacency = defaultdict(list)
     with path.open() as file:
         for line in file:
             f = line.rstrip("\n").split("\t")
@@ -32,16 +33,42 @@ def parse_graph(path):
                 if len(f) < 6 or not f[5].endswith("M") or not f[5][:-1].isdigit():
                     raise ValueError("only GFA links with a single M overlap are supported")
                 links.add(canonical(f[1], f[2], f[3], f[4]))
+                a, b, overlap = (f[1], f[2]), (f[3], f[4]), int(f[5][:-1])
+                adjacency[a].append((b, overlap))
+                adjacency[(b[0], flip(b[1]))].append(((a[0], flip(a[1])), overlap))
     if not lengths:
         raise ValueError("empty graph")
     if any(a not in lengths or b not in lengths for a, _, b, _ in links):
         raise ValueError("link references missing segment")
-    return lengths, links
+    return lengths, links, adjacency
+
+def possible_routes(edge, lengths, adjacency, gap_min, gap_max, tolerance, max_intermediates=4, max_states=5000):
+    start, target = (edge[0], edge[1]), (edge[2], edge[3])
+    stack = [(start, (start,), 0)]
+    routes, explored, depth_limited = [], 0, False
+    while stack and explored < max_states:
+        node, path, distance = stack.pop()
+        explored += 1
+        for nxt, overlap in adjacency.get(node, []):
+            if nxt in path:
+                continue
+            cost = distance - overlap + (0 if nxt == target else lengths[nxt[0]])
+            next_path = path + (nxt,)
+            if nxt == target:
+                if len(next_path) > 2 and gap_min - tolerance <= cost <= gap_max + tolerance:
+                    routes.append({"path": [n + o for n, o in next_path], "expected_gap": cost})
+            elif len(next_path) <= max_intermediates + 1:
+                stack.append((nxt, next_path, cost))
+            else:
+                depth_limited = True
+    routes.sort(key=lambda x: (abs(x["expected_gap"] - (gap_min + gap_max) / 2), x["path"]))
+    return routes[:5], bool(stack), depth_limited, len(routes)
+
 
 def audit(gfa, paf, min_align=300, min_identity=0.98, end_slop=50, max_gap=100, max_overlap=50):
     if min_align < 1 or not 0 < min_identity <= 1 or min(end_slop, max_gap, max_overlap) < 0:
         raise ValueError("invalid alignment thresholds")
-    lengths, links = parse_graph(gfa)
+    lengths, links, adjacency = parse_graph(gfa)
     reads = defaultdict(list)
     query_lengths = {}
     with paf.open() as file:
@@ -85,9 +112,16 @@ def audit(gfa, paf, min_align=300, min_identity=0.98, end_slop=50, max_gap=100, 
                    "reads_near_gap_limit": sum(g >= max_gap - 5 for g in hits.values()),
                    "near_gap_limit": sum(g >= max_gap - 5 for g in hits.values()) * 2 >= len(hits)}
                   for edge, hits in support.items()]
+    for c in candidates:
+        edge = (c["from"], c["from_orientation"], c["to"], c["to_orientation"])
+        routes, truncated, depth_limited, route_count = possible_routes(edge, lengths, adjacency, c["gap_min"], c["gap_max"], max(10, 2 * end_slop))
+        c["possible_existing_routes"] = routes
+        c["matching_routes_found"] = route_count
+        c["route_search_truncated"] = truncated
+        c["route_depth_limited"] = depth_limited
     candidates.sort(key=lambda x: (-x["distinct_reads"], x["from"], x["from_orientation"], x["to"], x["to_orientation"]))
-    return {"scope": "Candidate graph-discordant links from split alignments; not physical topology or certified organelle origin. Competing loci, repeat ambiguity, mapping errors, structural divergence and chimeras are not ruled out.",
-            "parameters": {"min_align": min_align, "min_identity": min_identity, "end_slop": end_slop, "max_gap": max_gap, "max_overlap": max_overlap},
+    return {"scope": "Candidate graph-discordant links from split alignments; not physical topology or certified organelle origin. Competing loci, repeat ambiguity, mapping errors, structural divergence and chimeras are not ruled out. Possible existing routes are bounded graph-only length checks, not proof that an alignment follows a route.",
+            "parameters": {"min_align": min_align, "min_identity": min_identity, "end_slop": end_slop, "max_gap": max_gap, "max_overlap": max_overlap, "route_max_intermediates": 4, "route_max_states": 5000, "route_gap_tolerance": max(10, 2 * end_slop)},
             "reads_with_qualifying_alignments": len(reads), "candidates": candidates}
 
 def main():

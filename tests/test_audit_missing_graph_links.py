@@ -52,6 +52,20 @@ class MissingLinks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inconsistent lengths"):
             model.audit(self.graph, self.paf)
 
+    def test_existing_short_intermediate_route_is_flagged(self):
+        self.graph.write_text("S\ta\t" + "A"*600 + "\nS\tb\t" + "A"*100 + "\nS\tc\t" + "A"*600 + "\nL\ta\t+\tb\t+\t0M\nL\tb\t+\tc\t+\t0M\n")
+        left = "r\t1200\t0\t500\t+\ta\t600\t100\t600\t500\t500\t60\n"
+        right = "r\t1200\t600\t1100\t+\tc\t600\t0\t500\t500\t500\t60\n"
+        self.paf.write_text(left + right)
+        candidate = model.audit(self.graph, self.paf)["candidates"][0]
+        self.assertEqual(candidate["possible_existing_routes"][0], {"path": ["a+", "b+", "c+"], "expected_gap": 100})
+        self.assertFalse(candidate["route_search_truncated"])
+
+    def test_route_depth_cutoff_is_reported(self):
+        adj = {("a", "+"): [(("b", "+"), 0)], ("b", "+"): [(("c", "+"), 0)], ("c", "+"): [(("d", "+"), 0)]}
+        routes, truncated, depth_limited, count = model.possible_routes(("a", "+", "d", "+"), {"a": 100, "b": 100, "c": 100, "d": 100}, adj, 200, 200, 1, max_intermediates=1)
+        self.assertEqual((routes, truncated, depth_limited, count), ([], False, True, 0))
+
     def test_rejects_inconsistent_graph_and_paf(self):
         self.paf.write_text(paf("r1", 0, 600, "+", "missing"))
         with self.assertRaisesRegex(ValueError, "inconsistent"):
