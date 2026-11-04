@@ -34,6 +34,7 @@ mod replicate;
 mod retained;
 mod seeddb;
 mod seedfree;
+mod thread_evidence;
 mod uncertain;
 mod unify;
 mod unzip;

@@ -1197,6 +1197,9 @@ pub struct RepeatPairing {
 #[derive(Serialize)]
 pub struct EvidenceReport {
     pub graph: String,
+    /// Graph-bound, contributing-record-deduplicated continuous linkage. Legacy local
+    /// counts below retain their original semantics for comparison and compatibility.
+    pub thread_evidence: crate::thread_evidence::ThreadEvidence,
     pub reads_scanned: u64,
     /// Longest supplied read, including reads without informative graph alignments.
     /// Length eligibility does not establish support at a particular repeat locus.
@@ -1305,6 +1308,7 @@ pub fn run(
     // Walks of each informative read; phased paths need the repeats, and the repeats need the
     // link support of the whole scan.
     let mut read_walks: Vec<Vec<Vec<Oriented>>> = Vec::new();
+    let mut thread_counter = crate::thread_evidence::ThreadCounter::default();
     for batch in rx {
         scanned += batch.len() as u64;
         maximum_read_length =
@@ -1323,7 +1327,10 @@ pub fn run(
                 (cs, ambiguous, tr, ws, adj, adj_ambiguous)
             })
             .collect();
-        for (cs, ambiguous, tr, ws, adj, adj_ambiguous) in per_read {
+        for (record, (cs, ambiguous, tr, ws, adj, adj_ambiguous)) in batch.iter().zip(per_read) {
+            let local_adjacencies: Vec<_> = adj.iter().map(|&i| g.links[i]).collect();
+            thread_counter.observe(&record.id, &record.seq, &read_steps(&g, &cs),
+                !ambiguous.is_empty(), &ws, &local_adjacencies, p.short_read_adjacency)?;
             for link in adj {
                 adjacency_reads[link] += 1;
             }
@@ -1530,6 +1537,7 @@ pub fn run(
         .collect();
     let report = EvidenceReport {
         graph: gfa.display().to_string(),
+        thread_evidence: thread_counter.report(&g, p.short_read_adjacency),
         reads_scanned: scanned,
         maximum_read_length,
         reads_with_support: supported,
