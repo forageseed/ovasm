@@ -342,9 +342,17 @@ pub const MIN_PIECE: u64 = 1000;
 /// result is the accepted attempt with the fewest pieces, then the most molecule bases (a smaller
 /// k collapses repeats it no longer spans), then the larger k.
 pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
+    sr_ladder_with_evidence_floor(a, None)
+}
+
+/// The optional floor is a conservative retry guard from target-read-covered
+/// reference sequence, not an expected genome size or evidence of molecule origin.
+fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> Result<Ladder> {
+    let floor = floor.unwrap_or(0);
+    let qualifies = |o: &Outcome| o.accepted() && o.total_length >= floor;
     let better = |o: &Outcome, b: &Outcome| {
-        (o.accepted(), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
-            > (b.accepted(), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
+        (qualifies(o), o.accepted(), o.total_length.min(floor), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
+            > (qualifies(b), b.accepted(), b.total_length.min(floor), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
     };
     let mut tried: Vec<Outcome> = Vec::new();
     let mut best = 0usize;
@@ -352,7 +360,7 @@ pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
     loop {
         let o = a.attempt(k)?;
         let i = tried.len();
-        let single = o.accepted() && o.molecules == 1;
+        let single = qualifies(&o) && o.molecules == 1;
         if i == 0 || better(&o, &tried[best]) {
             best = i;
             a.stash()?;
@@ -364,7 +372,7 @@ pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
         }
     }
     a.restore()?;
-    let accepted = tried[best].accepted();
+    let accepted = qualifies(&tried[best]);
     Ok(Ladder {
         tried,
         chosen: best,
@@ -1575,6 +1583,7 @@ fn assemble_organelle(
     recruited: &Recruited,
     dir: &Path,
     mut files: BTreeMap<String, String>,
+    sr_min_graph_bases: Option<u64>,
 ) -> Result<Value> {
     let t0 = Instant::now();
     fs::create_dir_all(dir)?;
@@ -1603,8 +1612,17 @@ fn assemble_organelle(
     };
     let ladder = match cfg.read_type {
         ReadType::Hifi => k_ladder(&mut attempts, true, start)?,
-        ReadType::Sr => sr_ladder(&mut attempts)?,
+        ReadType::Sr => sr_ladder_with_evidence_floor(&mut attempts, sr_min_graph_bases)?,
     };
+    if let Some(floor) = sr_min_graph_bases {
+        write_json(&dir.join("pan_retry_floor.json"), &json!({
+            "floor_bases": floor, "chosen": ladder.chosen, "accepted": ladder.accepted,
+            "basis": "half the uniquely placed reference bases covered by complete target reads; a retry guard, not a genome size, proof of origin or completeness",
+            "attempts": ladder.tried.iter().map(|o| json!({"k": o.k, "graph_bases": o.total_length,
+                "molecules": o.molecules, "molecule_bases": o.molecule_bases,
+                "passes_floor": o.total_length >= floor})).collect::<Vec<_>>(),
+        }))?;
+    }
     let assembly = read_json(&dir.join("assembly.json"))?;
     let evidence = read_json(&dir.join("evidence.json"))?;
     let linear = read_json(&dir.join("linearization.json"))?;
@@ -1928,6 +1946,10 @@ fn validate(cfg: &RunConfig) -> Result<()> {
 /// that is `{"organelles": {name: summary or {"error": ...}}}` and each organelle's own
 /// summary is in its directory.
 pub fn run(cfg: &RunConfig) -> Result<Value> {
+    run_with_sr_evidence_floor(cfg, None)
+}
+
+pub(crate) fn run_with_sr_evidence_floor(cfg: &RunConfig, sr_min_graph_bases: Option<u64>) -> Result<Value> {
     let t0 = Instant::now();
     validate(cfg)?;
     fs::create_dir_all(&cfg.out)?;
@@ -1970,7 +1992,7 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
         let r = recruited
             .remove(organelle)
             .expect("one entry per organelle")?;
-        return assemble_organelle(cfg, organelle, &r, &cfg.out, files);
+        return assemble_organelle(cfg, organelle, &r, &cfg.out, files, sr_min_graph_bases);
     }
     let mut results = Map::new();
     let mut failed = Vec::new();
@@ -1979,7 +2001,7 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
             .remove(organelle)
             .expect("one entry per organelle")
             .and_then(|r| {
-                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone())
+                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone(), sr_min_graph_bases)
             });
         match result {
             Ok(report) => {
@@ -2279,6 +2301,30 @@ mod tests {
         // Scripted counts every molecule a piece: 55 has the fewest
         assert_eq!((l.chosen, l.accepted), (3, true));
         assert_eq!(a.events.last(), Some(&"restore"));
+    }
+
+    #[test]
+    fn pan_read_covered_reference_floor_retries_a_tiny_single_graph() {
+        struct Sized { outcomes: Vec<Outcome>, calls: Vec<usize> }
+        impl Attempts for Sized {
+            fn attempt(&mut self, k: Option<usize>) -> Result<Outcome> {
+                let k = k.unwrap_or(127); self.calls.push(k);
+                Ok(*self.outcomes.iter().find(|v| v.k == k).unwrap())
+            }
+            fn stash(&mut self) -> Result<()> { Ok(()) }
+            fn restore(&mut self) -> Result<()> { Ok(()) }
+            fn drop_stash(&mut self) -> Result<()> { Ok(()) }
+        }
+        let o = |k, graph, molecules, bases| Outcome { k, total_length: graph, molecules, molecule_bases: bases, pieces: molecules };
+        let candidates = vec![o(127, 8931, 1, 5006), o(99, 220562, 3, 224833), o(77, 224785, 2, 230798), o(55, 226854, 1, 232196)];
+        let mut a = Sized { outcomes: candidates.clone(), calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut a, Some(122477)).unwrap();
+        assert_eq!(a.calls, [127, 99, 77, 55]); assert_eq!(r.result().k, 55); assert!(r.accepted);
+        let mut b = Sized { outcomes: candidates.clone(), calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut b, Some(300000)).unwrap();
+        assert_eq!(b.calls, [127, 99, 77, 55]); assert!(!r.accepted);
+        let mut c = Sized { outcomes: candidates, calls: vec![] };
+        let r = sr_ladder(&mut c).unwrap(); assert_eq!(c.calls, [127]); assert!(r.accepted);
     }
 
     #[test]
@@ -2773,7 +2819,7 @@ mod tests {
             discovered: true,
             recruitment: Value::Null,
         };
-        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new())
+        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new(), None)
             .unwrap();
         let filter = &s["component_filter"];
         assert_eq!(filter["kept_components"], json!(1), "{filter}");
