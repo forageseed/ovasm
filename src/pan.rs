@@ -88,6 +88,12 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
         let f: Vec<_> = line.split('\t').collect();
         (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("rf:"))).then(|| f[1])
     }).collect();
+    // Segment tags are lost during graph resegmentation, so transfer uncertain
+    // segment provenance to every input path traversing that segment.
+    let uncertain_segments: FxHashSet<&str> = text.lines().filter_map(|line| {
+        let f: Vec<_> = line.split('\t').collect();
+        (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("up:") || *t == "st:Z:unresolved_configuration")).then(|| f[1])
+    }).collect();
     let mut sample = None;
     let mut paths = Vec::new();
     let mut path_tags = BTreeMap::new();
@@ -118,6 +124,9 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
                     .filter(|t| !t.starts_with("TP:" )).map(|t| t.to_string()).collect();
                 if steps.iter().any(|s| filled_segments.contains(&s[..s.len()-1])) && !tags.iter().any(|t| t.starts_with("rf:")) {
                     tags.push("rf:Z:contains_reference_fill".into());
+                }
+                if steps.iter().any(|s| uncertain_segments.contains(&s[..s.len()-1])) && !tags.iter().any(|t| t.starts_with("up:")) {
+                    tags.push("up:Z:unresolved_segment".into());
                 }
                 path_tags.insert(f[1].to_string(), tags);
                 paths.push((f[1].to_string(), walk, circular));
