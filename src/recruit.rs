@@ -306,6 +306,8 @@ struct ScanResult {
     /// Each extending target's NUMT candidates that this pass classified anew: the partial reads
     /// at the edges its bait last grew to (`FRONTIER_STEPS`).
     frontier: Vec<Sample<FRONTIER_READS>>,
+    /// Accepted short reads partially explained by gap-bridged bait, per target.
+    accepted_partial: Vec<AcceptedPartialAudit>,
     numt: TargetCounts,
     reads: u64,
     bases: u64,
@@ -318,6 +320,26 @@ struct ScanResult {
 /// Reads per depth estimate. A median of 2,000 read depths is within a few percent, and the
 /// sample costs one pass's memory for about 2,000 reads per target.
 const DEPTH_SAMPLE: usize = 2000;
+
+/// Count all partially covered accepted reads, retaining at most 100 deterministic examples.
+#[derive(Default)]
+struct AcceptedPartialAudit {
+    total: u64,
+    samples: Vec<(u64, Vec<u8>, Vec<u8>)>,
+    bound: Option<u64>,
+}
+impl AcceptedPartialAudit {
+    fn offer(&mut self, key: u64, id: &[u8], seq: &[u8]) {
+        self.total += 1;
+        if self.bound.is_some_and(|bound| key > bound) { return; }
+        self.samples.push((key, id.to_vec(), seq.to_vec()));
+        if self.samples.len() >= 200 {
+            self.samples.sort_unstable();
+            self.samples.truncate(100);
+            self.bound = self.samples.last().map(|(key, _, _)| *key);
+        }
+    }
+}
 
 /// Most frontier reads a pass keeps per target (`ScanResult::frontier`): about 150 Mb of HiFi
 /// reads, a few hundred at each of dozens of edges; a deep target's are a uniform subsample.
@@ -682,6 +704,7 @@ fn scan(
         all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         frontier: (0..n_targets).map(|_| Sample::default()).collect(),
+        accepted_partial: (0..n_targets).map(|_| AcceptedPartialAudit::default()).collect(),
         numt: TargetCounts::default(),
         reads: 0,
         bases: 0,
@@ -834,6 +857,13 @@ fn scan(
                     }
                     let key = name_key(&rec.id);
                     for t in (0..8).filter(|t| mask & (1 << t) != 0) {
+                        // Bound is exact for accepted short reads (cached replay retains the
+                        // accepted call's coverage). No extra full-input scan is needed.
+                        if p.numt_min_block == usize::MAX && rec.seq.len() <= 1000
+                            && (!replaying || final_outputs)
+                            && usize::from(bound) < rec.seq.len() {
+                            out.accepted_partial[t].offer(key, &rec.id, &rec.seq);
+                        }
                         let fresh = !w.used[t].contains(&key);
                         let write = match w.keep.map(|k| k[t]) {
                             None | Some(Keep::All) => true,
@@ -2140,8 +2170,48 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         res = final_res;
     }
 
-    let source_candidates =
+    let mut source_candidates =
         crate::retained::recruitment(&cfg.out_dir, &numt_path, &bait, &cfg.params)?;
+    // This is a bounded audit, not evidence of nuclear origin. The existing candidate pool
+    // excludes reads shorter than numt_min_block, including all ordinary short reads.
+    if cfg.params.numt_min_block == usize::MAX {
+        let mut targets = Vec::new();
+        for (t, audit) in res.accepted_partial.iter_mut().enumerate() {
+            audit.samples.sort_unstable();
+            audit.samples.truncate(100);
+            let samples: Vec<_> = audit.samples.iter().map(|(_, id, seq)| {
+                let blocks = crate::retained::blocks(seq, &bait, cfg.params.block_gap);
+                let compatible = &blocks[t];
+                let mut unexplained = Vec::new();
+                let mut pos = 0;
+                for &(start, end) in compatible {
+                    if pos < start { unexplained.push((pos, start)); }
+                    pos = pos.max(end);
+                }
+                if pos < seq.len() { unexplained.push((pos, seq.len())); }
+                let covered: usize = compatible.iter().map(|(a,b)| b-a).sum();
+                serde_json::json!({"read_id":String::from_utf8_lossy(id),"read_length":seq.len(),
+                    "compatible_blocks":compatible,"unexplained_intervals":unexplained,
+                    "gap_bridged_coverage_fraction":covered as f64 / seq.len() as f64,
+                    "flank_origin":"unknown"})
+            }).collect();
+            targets.push(serde_json::json!({"target":bait.targets[t].name,"total":audit.total,
+                "sampled":samples.len(),"truncated":audit.total > samples.len() as u64,
+                "sampling":"lowest 100 read-name hashes, with name and sequence tie-break",
+                "samples":samples}));
+        }
+        let audit = serde_json::json!({"scope":"recruited read records before downsampling, at most 1000 bp, with less than full gap-bridged bait coverage; no nuclear-origin certification",
+            "counting":"records, including duplicate read names; tied target assignments are counted once per target and must not be summed across targets",
+            "sampling_limitations":"name-hash selection can correlate mates and repeated names; samples are not independent molecules or a uniform sample of biological fragments",
+            "short_read_limit":"reads over 1000 bp and fully gap-covered reads are not included; absence does not exclude NUMTs or NUPTs",
+            "coordinates":"0-based half-open; gaps within block_gap may be bridged, not an alignment",
+            "targets":targets});
+        let path = cfg.out_dir.join("source_candidates/accepted-partial.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&audit)? + "\n")?;
+        source_candidates["accepted_partial_audit"] = serde_json::json!({"path":path,"targets":audit["targets"]});
+        std::fs::write(cfg.out_dir.join("source_candidates/summary.json"),
+            serde_json::to_string_pretty(&source_candidates)? + "\n")?;
+    }
     let final_depths = pass_depths(gate.as_ref(), &res);
     // Final outputs from the last pass's files, downsampled to `target_depth`, `max_read_depth`
     // and `max_bases`, whichever keeps fewest.
@@ -2276,6 +2346,59 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_short_partial_reads_are_audited_without_source_claims() {
+        let mt = pseudo_random(1000, 41); let pt = pseudo_random(1000, 42);
+        let shared = pseudo_random(120, 43); let nuc = pseudo_random(30, 44);
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap(); let q = bait.target("plastid").unwrap();
+        bait.add_sequence(m, &mt); bait.add_sequence(q, &pt);
+        bait.add_sequence(m, &shared); bait.add_sequence(q, &shared);
+        let junction = [&mt[880..1000], nuc.as_slice()].concat();
+        let tied = [shared.as_slice(), nuc.as_slice()].concat();
+        let dir = std::env::temp_dir().join(format!("ovasm-partial-audit-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); let input = dir.join("reads.fa");
+        let mut data = String::new();
+        for i in 0..5 { data.push_str(&format!(">n{i}\n{}\n",String::from_utf8_lossy(&junction))); }
+        data.push_str(&format!(">shared\n{}\n",String::from_utf8_lossy(&tied)));
+        std::fs::write(&input,data).unwrap();
+        let make_cfg = |label:&str, iterations, replay: bool| RecruitConfig {
+            bait_growth_guard:false,replay_dir:replay.then(|| dir.join(format!("cache-{label}"))),inputs:vec![input.clone()],
+            params:ClassifyParams {min_cover:0.8,min_hit_frac:0.2,numt_min_block:usize::MAX,block_gap:40,min_distinct:0.0},
+            iterations,extend_min_count:3,auto_shallow_edge_support:false,extend_depth:200.0,saturation:0.05,
+            target_depth:None,salt:0,out_dir:dir.join(label),bootstrap:false,extend_gate:false,max_read_depth:None,
+            max_bases:None,mates_together:false,kmer_gate:false,gate_fold:None,nuclear_depth:None,genome_size:None
+        };
+        let report = run(bait.clone(), make_cfg("one",1,false)).unwrap();
+        assert_eq!(report.outputs[0].recruited_reads,6); assert_eq!(report.outputs[1].recruited_reads,1);
+        let read_audit = |label:&str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join(label).join("source_candidates/accepted-partial.json")).unwrap()).unwrap()
+        };
+        let audit = read_audit("one");
+        assert_eq!(audit["targets"][0]["total"],6); assert_eq!(audit["targets"][1]["total"],1);
+        assert_eq!(audit["targets"][0]["samples"][0]["unexplained_intervals"],serde_json::json!([[120,150]]));
+        assert_eq!(audit["targets"][0]["samples"][0]["flank_origin"],"unknown");
+        assert_eq!(report.numt_candidates,0);
+        run(bait.clone(),make_cfg("one-replay",1,true)).unwrap();
+        assert_eq!(audit,read_audit("one-replay"));
+        let uncached = run(bait.clone(),make_cfg("multi",3,false)).unwrap();
+        let replayed = run(bait,make_cfg("multi-replay",3,true)).unwrap();
+        assert!(uncached.iterations_run > 1 && replayed.iterations_run > 1);
+        assert_eq!(read_audit("multi"),read_audit("multi-replay"));
+    }
+
+    #[test]
+    fn accepted_partial_sample_is_bounded_and_order_independent() {
+        let mut a = AcceptedPartialAudit::default(); let mut b = AcceptedPartialAudit::default();
+        let rows:Vec<_> = (0..1001).map(|i|(format!("read{}",i % 401),format!("ACGT{}",i))).collect();
+        for (id,seq) in &rows { a.offer(name_key(id.as_bytes()),id.as_bytes(),seq.as_bytes()); }
+        for (id,seq) in rows.iter().rev() { b.offer(name_key(id.as_bytes()),id.as_bytes(),seq.as_bytes()); }
+        assert_eq!(a.total,1001); assert_eq!(b.total,1001);
+        a.samples.sort_unstable();a.samples.truncate(100);
+        b.samples.sort_unstable();b.samples.truncate(100);
+        assert_eq!(a.samples,b.samples); assert_eq!(a.samples.len(),100);
+    }
 
     #[test]
     fn runaway_gain_detects_jnl_but_keeps_closing_organelle_frontiers() {
