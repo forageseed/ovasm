@@ -36,6 +36,10 @@ def compute(data, target, strength, cap, minimum_depth):
             if path in paths and paths[path] != counts:
                 raise ValueError("inconsistent counts for duplicate pairing")
             paths[path] = counts
+    for path in paths:
+        reverse = " ".join(flip(step) for step in reversed(path.split()))
+        if reverse in paths and reverse != path:
+            raise ValueError("reverse-complement duplicate pairing may double-count read support")
     samples = sorted({s for counts in paths.values() for s in counts})
     if target not in samples:
         raise ValueError("target sample is absent from input")

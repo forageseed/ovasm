@@ -60,6 +60,12 @@ class ConditionalModelTest(unittest.TestCase):
         self.assertEqual(g["panel_runs_used"], [])
         self.assertEqual(g["prior_status"], "insufficient_panel_runs_base_prior_only")
 
+    def test_reverse_complement_duplicate_is_rejected(self):
+        d = dataset()
+        d["candidates"].append({"pairings": [{"path": "u2- r- u1-", "read_counts": {"target": 9, "panel_a": 8, "panel_b": 2}}]})
+        with self.assertRaises(ValueError):
+            module.compute(d, "target", 2, 0, 1)
+
     def test_invalid_target_and_nonfinite_strength_rejected(self):
         with self.assertRaises(ValueError):
             module.compute(dataset(), "missing", 2, 0, 1)
