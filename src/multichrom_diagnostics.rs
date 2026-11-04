@@ -109,6 +109,7 @@ fn all_circular_covers(g: &Graph, ev: &Value) -> Vec<CoverReport> {
                     .filter(|&&i| br[i].topological)
                     .count(),
                 copy_deviation: copy_deviation(&[None, None, Some(2)], &br, &cover),
+                read_support: None,
             });
         }
     }
@@ -384,6 +385,7 @@ fn audit_existing_graphs_across_cover_sizes() {
                             .filter(|&&i| br[i].topological)
                             .count(),
                         copy_deviation: copy_deviation(&expected, &br, &cover),
+                        read_support: None,
                     };
                     ranked.push((report, cover));
                 }

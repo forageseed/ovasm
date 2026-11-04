@@ -637,25 +637,41 @@ pub fn run(
     if let Some(lin) = linearization {
         let lin = read_json(lin)?;
         let near = |best: &Value, a: &Value| {
+            if best["read_support"].is_object() && a["read_support"].is_object() {
+                return ["joint_records_explained","thread_records_explained","adjacency_record_occurrences_explained"]
+                    .iter().all(|key|best["read_support"][*key]==a["read_support"][*key]);
+            }
             best["score"].as_f64().unwrap_or(f64::NEG_INFINITY)
                 - a["score"].as_f64().unwrap_or(f64::NEG_INFINITY)
                 < std::f64::consts::LN_2
         };
         // (haplotype, molecule number, molecule) in output order
-        let mut chosen: Vec<(usize, usize, &Value)> = Vec::new();
+        let mut chosen: Vec<(usize, usize, &Value, bool)> = Vec::new();
         if lin["representation"] == "primary_path_and_unplaced_segments" {
             let records = lin["records"]
                 .as_array()
                 .context("primary representation without records")?;
-            chosen.extend(records.iter().enumerate().map(|(i, r)| (0, i, r)));
+            chosen.extend(records.iter().enumerate().map(|(i, r)| (0, i, r, lin["decisive"]!=Value::Bool(true))));
         } else {
             match lin["components"].as_array() {
                 // unringing: each component's best cover is one set of molecules; its near-tied
                 // alternative covers (same molecule count) are further haplotypes of them
                 Some(comps) => {
                     let mut offset = 0;
+                    let mut next_alternative_hap = 1;
                     for c in comps.iter().filter(|c| c["best"].is_object()) {
                         let mut covers = vec![&c["best"]];
+                        let key=|v:&Value| {
+                            let mut paths:Vec<_>=v["molecules"].as_array().into_iter().flatten()
+                                .map(|m|(m["path"].as_str().unwrap_or("").to_string(),m["circular"].as_bool().unwrap_or(false))).collect();
+                            paths.sort();paths
+                        };
+                        let mut seen=BTreeSet::from([key(&c["best"])]);
+                        // Preserve the explanatory family even when generic alternatives are
+                        // capped. These paths carry explicit unresolved provenance below.
+                        for witness in c["witness_configurations"].as_array().into_iter().flatten() {
+                            if seen.insert(key(witness)) {covers.push(witness);}
+                        }
                         if c["decisive"] == Value::Bool(false) {
                             covers.extend(
                                 c["alternatives"]
@@ -663,17 +679,19 @@ pub fn run(
                                     .into_iter()
                                     .flatten()
                                     .filter(|a| near(&c["best"], a))
+                                    .filter(|a| seen.insert(key(a)))
                                     .take(p.max_alternatives),
                             );
                         }
                         for (hap, cover) in covers.iter().enumerate() {
+                            let assigned_hap=if hap==0 {0} else {let h=next_alternative_hap;next_alternative_hap+=1;h};
                             for (j, m) in cover["molecules"]
                                 .as_array()
                                 .into_iter()
                                 .flatten()
                                 .enumerate()
                             {
-                                chosen.push((hap, offset + j, m));
+                                chosen.push((assigned_hap, offset + j, m, hap>0 || c["decisive"]!=Value::Bool(true)));
                             }
                         }
                         offset += c["best"]["molecules"].as_array().map_or(0, Vec::len);
@@ -682,7 +700,7 @@ pub fn run(
                 // a report from before unringing: one path and its alternatives
                 None => {
                     if lin["best"].is_object() {
-                        chosen.push((0, 0, &lin["best"]));
+                        chosen.push((0, 0, &lin["best"],lin["decisive"]!=Value::Bool(true)));
                         if lin["decisive"] == Value::Bool(false) {
                             let alts = lin["alternatives"]
                                 .as_array()
@@ -690,14 +708,14 @@ pub fn run(
                                 .flatten()
                                 .filter(|a| near(&lin["best"], a))
                                 .take(p.max_alternatives);
-                            chosen.extend(alts.enumerate().map(|(h, a)| (h + 1, 0, a)));
+                            chosen.extend(alts.enumerate().map(|(h, a)| (h + 1, 0, a,true)));
                         }
                     }
                 }
             }
         }
-        let several = chosen.iter().any(|&(_, m, _)| m > 0);
-        for &(hap, mol, c) in &chosen {
+        let several = chosen.iter().any(|&(_, m, _, _)| m > 0);
+        for &(hap, mol, c, unresolved) in &chosen {
             let walk = parse_walk(
                 &g,
                 c["path"].as_str().context("linearization without a path")?,
@@ -728,6 +746,7 @@ pub fn run(
             if let Some(kind @ ("primary_path" | "unplaced_segment")) = c["kind"].as_str() {
                 write!(gfa_out, "\trk:Z:{kind}\tcf:Z:unresolved")?;
             }
+            if unresolved {gfa_out.push_str("\tst:Z:unresolved_configuration");}
             gfa_out.push('\n');
             paths.push(path_name);
         }
@@ -1005,5 +1024,23 @@ mod tests {
         assert!(valid_pansn_field("NIP_hifi.v1-2"));
         assert!(!valid_pansn_field("a#b"));
         assert!(!valid_pansn_field(""));
+    }
+    #[test]
+    fn read_path_family_survives_generic_alternative_cap_and_stays_unresolved() {
+        let dir=std::env::temp_dir().join(format!("ovasm-unify-read-cover-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("g.gfa"),"S\tA\tACGT\nS\tB\tTGCA\nS\tC\tCCCC\nL\tA\t+\tB\t+\t0M\n").unwrap();
+        let mol=|path:&str|serde_json::json!({"path":path,"circular":false});
+        let cover=|path:&str|serde_json::json!({"molecules":[mol(path)],"score":0.0});
+        let lin=serde_json::json!({"components":[{"best":cover("A+ B+"),"decisive":false,
+            "witness_configurations":[cover("A+ B+"),cover("C+")],"alternatives":[]}]});
+        fs::write(dir.join("lin.json"),lin.to_string()).unwrap();
+        let report=run(&dir.join("g.gfa"),None,Some(&dir.join("lin.json")),
+            &UnifyParams{sample:"sample",backend:"ovasm",organelle:"mitochondrion",molecule:"mt",max_alternatives:0},
+            &dir.join("out.gfa"),&dir.join("out.json")).unwrap();
+        assert_eq!(report.paths.len(),2);
+        let text=fs::read_to_string(dir.join("out.gfa")).unwrap();
+        assert!(text.lines().filter(|l|l.starts_with("P\t")).all(|l|l.contains("st:Z:unresolved_configuration")));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

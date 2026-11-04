@@ -22,6 +22,7 @@ pub struct ThreadLink {
 #[derive(Serialize)]
 pub struct ThreadEvidence {
     pub schema: &'static str,
+    pub inputs: Vec<String>,
     pub graph_fingerprint: String,
     pub record_identity: &'static str,
     pub contributing_records: u64,
@@ -96,9 +97,10 @@ impl ThreadCounter {
         Ok(())
     }
 
-    pub fn report(self, graph: &crate::evidence::Graph, short_reads: bool) -> ThreadEvidence {
+    pub fn report(self, graph: &crate::evidence::Graph, short_reads: bool, inputs: &[std::path::PathBuf]) -> ThreadEvidence {
         ThreadEvidence {
             schema: SCHEMA,
+            inputs: inputs.iter().map(|p|p.display().to_string()).collect(),
             graph_fingerprint: crate::unzip::graph_fingerprint(graph),
             record_identity: if short_reads {
                 "contributing original ID plus complete sequence fingerprint; same-name mates may be distinct records"

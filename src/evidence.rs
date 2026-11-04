@@ -1537,7 +1537,7 @@ pub fn run(
         .collect();
     let report = EvidenceReport {
         graph: gfa.display().to_string(),
-        thread_evidence: thread_counter.report(&g, p.short_read_adjacency),
+        thread_evidence: thread_counter.report(&g, p.short_read_adjacency, &inputs),
         reads_scanned: scanned,
         maximum_read_length,
         reads_with_support: supported,
