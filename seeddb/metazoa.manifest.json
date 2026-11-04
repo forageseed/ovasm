@@ -1,0 +1,1073 @@
+{
+  "name": "OVASM SeedDB",
+  "version": "v20261104",
+  "format_version": 1,
+  "lineage": "metazoa",
+  "scope": "representative metazoa whole mitochondrial genome recruitment seeds (RefSeq)",
+  "excluded_benchmark_species": [],
+  "databases": {
+    "mitochondrion": {
+      "file": "metazoa.mitochondrion.fasta",
+      "reference_count": 32,
+      "sequence_count": 32,
+      "total_bases": 523407,
+      "references": [
+        {
+          "accession": "NC_012920.1",
+          "organism": "Homo sapiens",
+          "group": "Mammalia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Mammalia",
+            "Eutheria",
+            "Euarchontoglires",
+            "Primates",
+            "Haplorrhini",
+            "Catarrhini",
+            "Hominidae",
+            "Homo"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_012920.1",
+          "genome_length_bp": 16569,
+          "seeds": [
+            {
+              "id": "NC_012920.1",
+              "start_1based": 1,
+              "end_1based": 16569,
+              "strand": 1,
+              "length_bp": 16569
+            }
+          ]
+        },
+        {
+          "accession": "NC_005089.1",
+          "organism": "Mus musculus",
+          "group": "Mammalia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Mammalia",
+            "Eutheria",
+            "Euarchontoglires",
+            "Glires",
+            "Rodentia",
+            "Myomorpha",
+            "Muroidea",
+            "Muridae",
+            "Murinae",
+            "Mus",
+            "Mus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_005089.1",
+          "genome_length_bp": 16299,
+          "seeds": [
+            {
+              "id": "NC_005089.1",
+              "start_1based": 1,
+              "end_1based": 16299,
+              "strand": 1,
+              "length_bp": 16299
+            }
+          ]
+        },
+        {
+          "accession": "NC_006853.1",
+          "organism": "Bos taurus",
+          "group": "Mammalia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Mammalia",
+            "Eutheria",
+            "Laurasiatheria",
+            "Artiodactyla",
+            "Ruminantia",
+            "Pecora",
+            "Bovidae",
+            "Bovinae",
+            "Bos"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006853.1",
+          "genome_length_bp": 16338,
+          "seeds": [
+            {
+              "id": "NC_006853.1",
+              "start_1based": 1,
+              "end_1based": 16338,
+              "strand": 1,
+              "length_bp": 16338
+            }
+          ]
+        },
+        {
+          "accession": "NC_002008.4",
+          "organism": "Canis lupus familiaris",
+          "group": "Mammalia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Mammalia",
+            "Eutheria",
+            "Laurasiatheria",
+            "Carnivora",
+            "Caniformia",
+            "Canidae",
+            "Canis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002008.4",
+          "genome_length_bp": 16727,
+          "seeds": [
+            {
+              "id": "NC_002008.4",
+              "start_1based": 1,
+              "end_1based": 16727,
+              "strand": 1,
+              "length_bp": 16727
+            }
+          ]
+        },
+        {
+          "accession": "NC_040902.1",
+          "organism": "Gallus gallus spadiceus",
+          "group": "Aves",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Archelosauria",
+            "Archosauria",
+            "Dinosauria",
+            "Saurischia",
+            "Theropoda",
+            "Coelurosauria",
+            "Aves",
+            "Neognathae",
+            "Galloanserae",
+            "Galliformes",
+            "Phasianidae",
+            "Phasianinae",
+            "Gallus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_040902.1",
+          "genome_length_bp": 16784,
+          "seeds": [
+            {
+              "id": "NC_040902.1",
+              "start_1based": 1,
+              "end_1based": 16784,
+              "strand": 1,
+              "length_bp": 16784
+            }
+          ]
+        },
+        {
+          "accession": "NC_007897.1",
+          "organism": "Taeniopygia guttata",
+          "group": "Aves",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Archelosauria",
+            "Archosauria",
+            "Dinosauria",
+            "Saurischia",
+            "Theropoda",
+            "Coelurosauria",
+            "Aves",
+            "Neognathae",
+            "Neoaves",
+            "Telluraves",
+            "Australaves",
+            "Passeriformes",
+            "Passeroidea",
+            "Estrildidae",
+            "Estrildinae",
+            "Taeniopygia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_007897.1",
+          "genome_length_bp": 16853,
+          "seeds": [
+            {
+              "id": "NC_007897.1",
+              "start_1based": 1,
+              "end_1based": 16853,
+              "strand": 1,
+              "length_bp": 16853
+            }
+          ]
+        },
+        {
+          "accession": "NC_006922.1",
+          "organism": "Pogona vitticeps",
+          "group": "Reptilia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Lepidosauria",
+            "Squamata",
+            "Bifurcata",
+            "Unidentata",
+            "Episquamata",
+            "Toxicofera",
+            "Iguania",
+            "Acrodonta",
+            "Agamidae",
+            "Amphibolurinae",
+            "Pogona"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006922.1",
+          "genome_length_bp": 16751,
+          "seeds": [
+            {
+              "id": "NC_006922.1",
+              "start_1based": 1,
+              "end_1based": 16751,
+              "strand": 1,
+              "length_bp": 16751
+            }
+          ]
+        },
+        {
+          "accession": "NC_000886.1",
+          "organism": "Chelonia mydas",
+          "group": "Reptilia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Archelosauria",
+            "Testudinata",
+            "Testudines",
+            "Cryptodira",
+            "Durocryptodira",
+            "Americhelydia",
+            "Chelonioidea",
+            "Cheloniidae",
+            "Chelonia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_000886.1",
+          "genome_length_bp": 16497,
+          "seeds": [
+            {
+              "id": "NC_000886.1",
+              "start_1based": 1,
+              "end_1based": 16497,
+              "strand": 1,
+              "length_bp": 16497
+            }
+          ]
+        },
+        {
+          "accession": "NC_001922.1",
+          "organism": "Alligator mississippiensis",
+          "group": "Reptilia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Archelosauria",
+            "Archosauria",
+            "Crocodylia",
+            "Alligatoridae",
+            "Alligatorinae",
+            "Alligator"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001922.1",
+          "genome_length_bp": 16646,
+          "seeds": [
+            {
+              "id": "NC_001922.1",
+              "start_1based": 1,
+              "end_1based": 16646,
+              "strand": 1,
+              "length_bp": 16646
+            }
+          ]
+        },
+        {
+          "accession": "NC_006839.1",
+          "organism": "Xenopus tropicalis",
+          "group": "Amphibia",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Amphibia",
+            "Batrachia",
+            "Anura",
+            "Pipoidea",
+            "Pipidae",
+            "Xenopodinae",
+            "Xenopus",
+            "Silurana"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006839.1",
+          "genome_length_bp": 17610,
+          "seeds": [
+            {
+              "id": "NC_006839.1",
+              "start_1based": 1,
+              "end_1based": 17610,
+              "strand": 1,
+              "length_bp": 17610
+            }
+          ]
+        },
+        {
+          "accession": "NC_002333.2",
+          "organism": "Danio rerio",
+          "group": "Actinopterygii",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Actinopterygii",
+            "Neopterygii",
+            "Teleostei",
+            "Ostariophysi",
+            "Cypriniformes",
+            "Danionidae",
+            "Danioninae",
+            "Danio"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002333.2",
+          "genome_length_bp": 16596,
+          "seeds": [
+            {
+              "id": "NC_002333.2",
+              "start_1based": 1,
+              "end_1based": 16596,
+              "strand": 1,
+              "length_bp": 16596
+            }
+          ]
+        },
+        {
+          "accession": "NC_004387.1",
+          "organism": "Oryzias latipes",
+          "group": "Actinopterygii",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Actinopterygii",
+            "Neopterygii",
+            "Teleostei",
+            "Neoteleostei",
+            "Acanthomorphata",
+            "Ovalentaria",
+            "Atherinomorphae",
+            "Beloniformes",
+            "Adrianichthyidae",
+            "Oryziinae",
+            "Oryzias"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_004387.1",
+          "genome_length_bp": 16714,
+          "seeds": [
+            {
+              "id": "NC_004387.1",
+              "start_1based": 1,
+              "end_1based": 16714,
+              "strand": 1,
+              "length_bp": 16714
+            }
+          ]
+        },
+        {
+          "accession": "NC_001960.1",
+          "organism": "Salmo salar",
+          "group": "Actinopterygii",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Euteleostomi",
+            "Actinopterygii",
+            "Neopterygii",
+            "Teleostei",
+            "Protacanthopterygii",
+            "Salmoniformes",
+            "Salmonidae",
+            "Salmoninae",
+            "Salmo"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001960.1",
+          "genome_length_bp": 16665,
+          "seeds": [
+            {
+              "id": "NC_001960.1",
+              "start_1based": 1,
+              "end_1based": 16665,
+              "strand": 1,
+              "length_bp": 16665
+            }
+          ]
+        },
+        {
+          "accession": "NC_001950.1",
+          "organism": "Scyliorhinus canicula",
+          "group": "Chondrichthyes",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Craniata",
+            "Vertebrata",
+            "Chondrichthyes",
+            "Elasmobranchii",
+            "Galeomorphii",
+            "Galeoidea",
+            "Carcharhiniformes",
+            "Scyliorhinidae",
+            "Scyliorhinus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001950.1",
+          "genome_length_bp": 16697,
+          "seeds": [
+            {
+              "id": "NC_001950.1",
+              "start_1based": 1,
+              "end_1based": 16697,
+              "strand": 1,
+              "length_bp": 16697
+            }
+          ]
+        },
+        {
+          "accession": "NC_017929.1",
+          "organism": "Ciona intestinalis B CG-2006",
+          "group": "Tunicata",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Chordata",
+            "Tunicata",
+            "Ascidiacea",
+            "Phlebobranchia",
+            "Cionidae",
+            "Ciona"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_017929.1",
+          "genome_length_bp": 14591,
+          "seeds": [
+            {
+              "id": "NC_017929.1",
+              "start_1based": 1,
+              "end_1based": 14591,
+              "strand": 1,
+              "length_bp": 14591
+            }
+          ]
+        },
+        {
+          "accession": "NC_001453.1",
+          "organism": "Strongylocentrotus purpuratus",
+          "group": "Echinodermata",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Echinodermata",
+            "Eleutherozoa",
+            "Echinozoa",
+            "Echinoidea",
+            "Euechinoidea",
+            "Echinacea",
+            "Camarodonta",
+            "Echinidea",
+            "Strongylocentrotidae",
+            "Strongylocentrotus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001453.1",
+          "genome_length_bp": 15650,
+          "seeds": [
+            {
+              "id": "NC_001453.1",
+              "start_1based": 1,
+              "end_1based": 15650,
+              "strand": 1,
+              "length_bp": 15650
+            }
+          ]
+        },
+        {
+          "accession": "NC_024511.2",
+          "organism": "Drosophila melanogaster",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Aparaglossata",
+            "Panorpida",
+            "Diptera",
+            "Brachycera",
+            "Muscomorpha",
+            "Ephydroidea",
+            "Drosophilidae",
+            "Drosophila",
+            "Sophophora"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_024511.2",
+          "genome_length_bp": 19524,
+          "seeds": [
+            {
+              "id": "NC_024511.2",
+              "start_1based": 1,
+              "end_1based": 19524,
+              "strand": 1,
+              "length_bp": 19524
+            }
+          ]
+        },
+        {
+          "accession": "NC_005781.1",
+          "organism": "Drosophila simulans",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Aparaglossata",
+            "Panorpida",
+            "Diptera",
+            "Brachycera",
+            "Muscomorpha",
+            "Ephydroidea",
+            "Drosophilidae",
+            "Drosophila",
+            "Sophophora"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_005781.1",
+          "genome_length_bp": 14972,
+          "seeds": [
+            {
+              "id": "NC_005781.1",
+              "start_1based": 1,
+              "end_1based": 14972,
+              "strand": 1,
+              "length_bp": 14972
+            }
+          ]
+        },
+        {
+          "accession": "NC_064603.1",
+          "organism": "Anopheles funestus",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Aparaglossata",
+            "Panorpida",
+            "Diptera",
+            "Nematocera",
+            "Culicoidea",
+            "Culicidae",
+            "Anophelinae",
+            "Anopheles"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_064603.1",
+          "genome_length_bp": 15406,
+          "seeds": [
+            {
+              "id": "NC_064603.1",
+              "start_1based": 1,
+              "end_1based": 15406,
+              "strand": 1,
+              "length_bp": 15406
+            }
+          ]
+        },
+        {
+          "accession": "NC_035883.1",
+          "organism": "Apis mellifera sahariensis",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Hymenoptera",
+            "Apocrita",
+            "Aculeata",
+            "Apoidea",
+            "Anthophila",
+            "Apidae",
+            "Apis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_035883.1",
+          "genome_length_bp": 16569,
+          "seeds": [
+            {
+              "id": "NC_035883.1",
+              "start_1based": 1,
+              "end_1based": 16569,
+              "strand": 1,
+              "length_bp": 16569
+            }
+          ]
+        },
+        {
+          "accession": "NC_002355.1",
+          "organism": "Bombyx mori",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Aparaglossata",
+            "Panorpida",
+            "Lepidoptera",
+            "Glossata",
+            "Ditrysia",
+            "Bombycoidea",
+            "Bombycidae",
+            "Bombycinae",
+            "Bombyx"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002355.1",
+          "genome_length_bp": 15643,
+          "seeds": [
+            {
+              "id": "NC_002355.1",
+              "start_1based": 1,
+              "end_1based": 15643,
+              "strand": 1,
+              "length_bp": 15643
+            }
+          ]
+        },
+        {
+          "accession": "NC_003081.2",
+          "organism": "Tribolium castaneum",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Endopterygota",
+            "Aparaglossata",
+            "Neuropteroidea",
+            "Coleoptera",
+            "Polyphaga",
+            "Cucujiformia",
+            "Tenebrionidae",
+            "Tenebrionidae incertae sedis",
+            "Tribolium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_003081.2",
+          "genome_length_bp": 15881,
+          "seeds": [
+            {
+              "id": "NC_003081.2",
+              "start_1based": 1,
+              "end_1based": 15881,
+              "strand": 1,
+              "length_bp": 15881
+            }
+          ]
+        },
+        {
+          "accession": "NC_011594.1",
+          "organism": "Acyrthosiphon pisum",
+          "group": "Insecta",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Hexapoda",
+            "Insecta",
+            "Pterygota",
+            "Neoptera",
+            "Eumetabola",
+            "Paraneoptera",
+            "Hemiptera",
+            "Sternorrhyncha",
+            "Aphidomorpha",
+            "Aphidoidea",
+            "Aphididae",
+            "Macrosiphini",
+            "Acyrthosiphon"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_011594.1",
+          "genome_length_bp": 16971,
+          "seeds": [
+            {
+              "id": "NC_011594.1",
+              "start_1based": 1,
+              "end_1based": 16971,
+              "strand": 1,
+              "length_bp": 16971
+            }
+          ]
+        },
+        {
+          "accession": "NC_000844.1",
+          "organism": "Daphnia pulex",
+          "group": "Crustacea",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Altocrustacea",
+            "Allotriocarida",
+            "Branchiopoda",
+            "Diplostraca",
+            "Cladocera",
+            "Anomopoda",
+            "Daphniidae",
+            "Daphnia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_000844.1",
+          "genome_length_bp": 15333,
+          "seeds": [
+            {
+              "id": "NC_000844.1",
+              "start_1based": 1,
+              "end_1based": 15333,
+              "strand": 1,
+              "length_bp": 15333
+            }
+          ]
+        },
+        {
+          "accession": "NC_067904.1",
+          "organism": "Ixodes scapularis",
+          "group": "Arachnida",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Arthropoda",
+            "Chelicerata",
+            "Arachnida",
+            "Acari",
+            "Parasitiformes",
+            "Ixodida",
+            "Ixodoidea",
+            "Ixodidae",
+            "Ixodinae",
+            "Ixodes"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_067904.1",
+          "genome_length_bp": 14543,
+          "seeds": [
+            {
+              "id": "NC_067904.1",
+              "start_1based": 1,
+              "end_1based": 14543,
+              "strand": 1,
+              "length_bp": 14543
+            }
+          ]
+        },
+        {
+          "accession": "NC_001328.1",
+          "organism": "Caenorhabditis elegans",
+          "group": "Nematoda",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Ecdysozoa",
+            "Nematoda",
+            "Chromadorea",
+            "Rhabditida",
+            "Rhabditina",
+            "Rhabditomorpha",
+            "Rhabditoidea",
+            "Rhabditidae",
+            "Peloderinae",
+            "Caenorhabditis"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001328.1",
+          "genome_length_bp": 13794,
+          "seeds": [
+            {
+              "id": "NC_001328.1",
+              "start_1based": 1,
+              "end_1based": 13794,
+              "strand": 1,
+              "length_bp": 13794
+            }
+          ]
+        },
+        {
+          "accession": "NC_001276.1",
+          "organism": "Magallana gigas",
+          "group": "Mollusca",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Spiralia",
+            "Lophotrochozoa",
+            "Mollusca",
+            "Bivalvia",
+            "Autobranchia",
+            "Pteriomorphia",
+            "Ostreida",
+            "Ostreoidea",
+            "Ostreidae",
+            "Magallana"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001276.1",
+          "genome_length_bp": 18224,
+          "seeds": [
+            {
+              "id": "NC_001276.1",
+              "start_1based": 1,
+              "end_1based": 18224,
+              "strand": 1,
+              "length_bp": 18224
+            }
+          ]
+        },
+        {
+          "accession": "NC_006353.1",
+          "organism": "Octopus vulgaris",
+          "group": "Mollusca",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Spiralia",
+            "Lophotrochozoa",
+            "Mollusca",
+            "Cephalopoda",
+            "Coleoidea",
+            "Octopodiformes",
+            "Octopoda",
+            "Incirrata",
+            "Octopodidae",
+            "Octopus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006353.1",
+          "genome_length_bp": 15744,
+          "seeds": [
+            {
+              "id": "NC_006353.1",
+              "start_1based": 1,
+              "end_1based": 15744,
+              "strand": 1,
+              "length_bp": 15744
+            }
+          ]
+        },
+        {
+          "accession": "NC_001673.1",
+          "organism": "Lumbricus terrestris",
+          "group": "Annelida",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Spiralia",
+            "Lophotrochozoa",
+            "Annelida",
+            "Clitellata",
+            "Oligochaeta",
+            "Crassiclitellata",
+            "Lumbricina",
+            "Lumbricidae",
+            "Lumbricinae",
+            "Lumbricus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001673.1",
+          "genome_length_bp": 14998,
+          "seeds": [
+            {
+              "id": "NC_001673.1",
+              "start_1based": 1,
+              "end_1based": 14998,
+              "strand": 1,
+              "length_bp": 14998
+            }
+          ]
+        },
+        {
+          "accession": "NC_002545.1",
+          "organism": "Schistosoma mansoni",
+          "group": "Platyhelminthes",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Spiralia",
+            "Lophotrochozoa",
+            "Platyhelminthes",
+            "Rhabditophora",
+            "Neodermata",
+            "Trematoda",
+            "Digenea",
+            "Strigeidida",
+            "Schistosomatoidea",
+            "Schistosomatidae",
+            "Schistosoma"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002545.1",
+          "genome_length_bp": 14415,
+          "seeds": [
+            {
+              "id": "NC_002545.1",
+              "start_1based": 1,
+              "end_1based": 14415,
+              "strand": 1,
+              "length_bp": 14415
+            }
+          ]
+        },
+        {
+          "accession": "NC_000933.1",
+          "organism": "Metridium senile",
+          "group": "Cnidaria",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Cnidaria",
+            "Anthozoa",
+            "Hexacorallia",
+            "Actiniaria",
+            "Nynantheae",
+            "Metridiidae",
+            "Metridium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_000933.1",
+          "genome_length_bp": 17443,
+          "seeds": [
+            {
+              "id": "NC_000933.1",
+              "start_1based": 1,
+              "end_1based": 17443,
+              "strand": 1,
+              "length_bp": 17443
+            }
+          ]
+        },
+        {
+          "accession": "NC_008944.1",
+          "organism": "Amphimedon queenslandica",
+          "group": "Porifera",
+          "taxonomy": [
+            "Eukaryota",
+            "Metazoa",
+            "Porifera",
+            "Demospongiae",
+            "Heteroscleromorpha",
+            "Haplosclerida",
+            "Niphatidae",
+            "Amphimedon"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008944.1",
+          "genome_length_bp": 19960,
+          "seeds": [
+            {
+              "id": "NC_008944.1",
+              "start_1based": 1,
+              "end_1based": 19960,
+              "strand": 1,
+              "length_bp": 19960
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

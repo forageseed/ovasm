@@ -1,0 +1,542 @@
+{
+  "name": "OVASM SeedDB",
+  "version": "v20261104",
+  "format_version": 1,
+  "lineage": "fungi",
+  "scope": "representative fungi whole mitochondrial genome recruitment seeds (RefSeq)",
+  "excluded_benchmark_species": [],
+  "databases": {
+    "mitochondrion": {
+      "file": "fungi.mitochondrion.fasta",
+      "reference_count": 19,
+      "sequence_count": 19,
+      "total_bases": 1146500,
+      "references": [
+        {
+          "accession": "NC_001224.1",
+          "organism": "Saccharomyces cerevisiae S288C",
+          "group": "Saccharomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Saccharomycotina",
+            "Saccharomycetes",
+            "Saccharomycetales",
+            "Saccharomycetaceae",
+            "Saccharomyces"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001224.1",
+          "genome_length_bp": 85779,
+          "seeds": [
+            {
+              "id": "NC_001224.1",
+              "start_1based": 1,
+              "end_1based": 85779,
+              "strand": 1,
+              "length_bp": 85779
+            }
+          ]
+        },
+        {
+          "accession": "NC_018044.1",
+          "organism": "Saccharomyces paradoxus",
+          "group": "Saccharomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Saccharomycotina",
+            "Saccharomycetes",
+            "Saccharomycetales",
+            "Saccharomycetaceae",
+            "Saccharomyces"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_018044.1",
+          "genome_length_bp": 71355,
+          "seeds": [
+            {
+              "id": "NC_018044.1",
+              "start_1based": 1,
+              "end_1based": 71355,
+              "strand": 1,
+              "length_bp": 71355
+            }
+          ]
+        },
+        {
+          "accession": "NC_002653.1",
+          "organism": "Candida albicans SC5314",
+          "group": "Saccharomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Saccharomycotina",
+            "Pichiomycetes",
+            "Debaryomycetaceae",
+            "Candida"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_002653.1",
+          "genome_length_bp": 40420,
+          "seeds": [
+            {
+              "id": "NC_002653.1",
+              "start_1based": 1,
+              "end_1based": 40420,
+              "strand": 1,
+              "length_bp": 40420
+            }
+          ]
+        },
+        {
+          "accession": "NC_006077.1",
+          "organism": "Kluyveromyces lactis",
+          "group": "Saccharomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Saccharomycotina",
+            "Saccharomycetes",
+            "Saccharomycetales",
+            "Saccharomycetaceae",
+            "Kluyveromyces"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006077.1",
+          "genome_length_bp": 40291,
+          "seeds": [
+            {
+              "id": "NC_006077.1",
+              "start_1based": 1,
+              "end_1based": 40291,
+              "strand": 1,
+              "length_bp": 40291
+            }
+          ]
+        },
+        {
+          "accession": "NC_088682.1",
+          "organism": "Schizosaccharomyces pombe",
+          "group": "Schizosaccharomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Taphrinomycotina",
+            "Schizosaccharomycetes",
+            "Schizosaccharomycetales",
+            "Schizosaccharomycetaceae",
+            "Schizosaccharomyces"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_088682.1",
+          "genome_length_bp": 19433,
+          "seeds": [
+            {
+              "id": "NC_088682.1",
+              "start_1based": 1,
+              "end_1based": 19433,
+              "strand": 1,
+              "length_bp": 19433
+            }
+          ]
+        },
+        {
+          "accession": "NC_026614.1",
+          "organism": "Neurospora crassa OR74A",
+          "group": "Sordariomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Sordariomycetes",
+            "Sordariomycetidae",
+            "Sordariales",
+            "Sordariaceae",
+            "Neurospora"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_026614.1",
+          "genome_length_bp": 64840,
+          "seeds": [
+            {
+              "id": "NC_026614.1",
+              "start_1based": 1,
+              "end_1based": 64840,
+              "strand": 1,
+              "length_bp": 64840
+            }
+          ]
+        },
+        {
+          "accession": "NC_009493.1",
+          "organism": "Fusarium graminearum",
+          "group": "Sordariomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Sordariomycetes",
+            "Hypocreomycetidae",
+            "Hypocreales",
+            "Nectriaceae",
+            "Fusarium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_009493.1",
+          "genome_length_bp": 95676,
+          "seeds": [
+            {
+              "id": "NC_009493.1",
+              "start_1based": 1,
+              "end_1based": 95676,
+              "strand": 1,
+              "length_bp": 95676
+            }
+          ]
+        },
+        {
+          "accession": "NC_066489.1",
+          "organism": "Pyricularia oryzae",
+          "group": "Sordariomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Sordariomycetes",
+            "Sordariomycetidae",
+            "Magnaporthales",
+            "Pyriculariaceae",
+            "Pyricularia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_066489.1",
+          "genome_length_bp": 34865,
+          "seeds": [
+            {
+              "id": "NC_066489.1",
+              "start_1based": 1,
+              "end_1based": 34865,
+              "strand": 1,
+              "length_bp": 34865
+            }
+          ]
+        },
+        {
+          "accession": "NC_017896.1",
+          "organism": "Aspergillus nidulans FGSC A4",
+          "group": "Eurotiomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Eurotiomycetes",
+            "Eurotiomycetidae",
+            "Eurotiales",
+            "Aspergillaceae",
+            "Aspergillus",
+            "Aspergillus subgen. Nidulantes"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_017896.1",
+          "genome_length_bp": 33227,
+          "seeds": [
+            {
+              "id": "NC_017896.1",
+              "start_1based": 1,
+              "end_1based": 33227,
+              "strand": 1,
+              "length_bp": 33227
+            }
+          ]
+        },
+        {
+          "accession": "NC_015080.1",
+          "organism": "Penicillium digitatum",
+          "group": "Eurotiomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Eurotiomycetes",
+            "Eurotiomycetidae",
+            "Eurotiales",
+            "Aspergillaceae",
+            "Penicillium"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_015080.1",
+          "genome_length_bp": 28978,
+          "seeds": [
+            {
+              "id": "NC_015080.1",
+              "start_1based": 1,
+              "end_1based": 28978,
+              "strand": 1,
+              "length_bp": 28978
+            }
+          ]
+        },
+        {
+          "accession": "NC_010222.1",
+          "organism": "Zymoseptoria tritici",
+          "group": "Dothideomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Dothideomycetes",
+            "Dothideomycetidae",
+            "Mycosphaerellales",
+            "Mycosphaerellaceae",
+            "Zymoseptoria"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_010222.1",
+          "genome_length_bp": 43964,
+          "seeds": [
+            {
+              "id": "NC_010222.1",
+              "start_1based": 1,
+              "end_1based": 43964,
+              "strand": 1,
+              "length_bp": 43964
+            }
+          ]
+        },
+        {
+          "accession": "NC_035155.1",
+          "organism": "Sclerotinia sclerotiorum 1980 UF-70",
+          "group": "Leotiomycetes",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Ascomycota",
+            "Pezizomycotina",
+            "Leotiomycetes",
+            "Helotiales",
+            "Sclerotiniaceae",
+            "Sclerotinia"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_035155.1",
+          "genome_length_bp": 128852,
+          "seeds": [
+            {
+              "id": "NC_035155.1",
+              "start_1based": 1,
+              "end_1based": 128852,
+              "strand": 1,
+              "length_bp": 128852
+            }
+          ]
+        },
+        {
+          "accession": "NC_008368.1",
+          "organism": "Mycosarcoma maydis",
+          "group": "Basidiomycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Basidiomycota",
+            "Ustilaginomycotina",
+            "Ustilaginomycetes",
+            "Ustilaginales",
+            "Ustilaginales incertae sedis",
+            "Mycosarcoma"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_008368.1",
+          "genome_length_bp": 56814,
+          "seeds": [
+            {
+              "id": "NC_008368.1",
+              "start_1based": 1,
+              "end_1based": 56814,
+              "strand": 1,
+              "length_bp": 56814
+            }
+          ]
+        },
+        {
+          "accession": "NC_018792.1",
+          "organism": "Cryptococcus neoformans H99",
+          "group": "Basidiomycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Basidiomycota",
+            "Agaricomycotina",
+            "Tremellomycetes",
+            "Tremellales",
+            "Cryptococcaceae",
+            "Cryptococcus",
+            "Cryptococcus neoformans species complex"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_018792.1",
+          "genome_length_bp": 24919,
+          "seeds": [
+            {
+              "id": "NC_018792.1",
+              "start_1based": 1,
+              "end_1based": 24919,
+              "strand": 1,
+              "length_bp": 24919
+            }
+          ]
+        },
+        {
+          "accession": "NC_018365.1",
+          "organism": "Lentinula edodes",
+          "group": "Basidiomycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Basidiomycota",
+            "Agaricomycotina",
+            "Agaricomycetes",
+            "Agaricomycetidae",
+            "Agaricales",
+            "Marasmiineae",
+            "Omphalotaceae",
+            "Lentinula"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_018365.1",
+          "genome_length_bp": 121394,
+          "seeds": [
+            {
+              "id": "NC_018365.1",
+              "start_1based": 1,
+              "end_1based": 121394,
+              "strand": 1,
+              "length_bp": 121394
+            }
+          ]
+        },
+        {
+          "accession": "NC_009905.1",
+          "organism": "Pleurotus ostreatus",
+          "group": "Basidiomycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Dikarya",
+            "Basidiomycota",
+            "Agaricomycotina",
+            "Agaricomycetes",
+            "Agaricomycetidae",
+            "Agaricales",
+            "Pleurotineae",
+            "Pleurotaceae",
+            "Pleurotus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_009905.1",
+          "genome_length_bp": 73242,
+          "seeds": [
+            {
+              "id": "NC_009905.1",
+              "start_1based": 1,
+              "end_1based": 73242,
+              "strand": 1,
+              "length_bp": 73242
+            }
+          ]
+        },
+        {
+          "accession": "NC_014489.1",
+          "organism": "Rhizophagus irregularis",
+          "group": "Mucoromycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Fungi incertae sedis",
+            "Glomeromycota",
+            "Glomeromycotina",
+            "Glomeromycetes",
+            "Glomerales",
+            "Glomeraceae",
+            "Rhizophagus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_014489.1",
+          "genome_length_bp": 70800,
+          "seeds": [
+            {
+              "id": "NC_014489.1",
+              "start_1based": 1,
+              "end_1based": 70800,
+              "strand": 1,
+              "length_bp": 70800
+            }
+          ]
+        },
+        {
+          "accession": "NC_006836.1",
+          "organism": "Rhizopus arrhizus",
+          "group": "Mucoromycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Fungi incertae sedis",
+            "Mucoromycota",
+            "Mucoromycotina",
+            "Mucoromycetes",
+            "Mucorales",
+            "Mucorineae",
+            "Rhizopodaceae",
+            "Rhizopus"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_006836.1",
+          "genome_length_bp": 54178,
+          "seeds": [
+            {
+              "id": "NC_006836.1",
+              "start_1based": 1,
+              "end_1based": 54178,
+              "strand": 1,
+              "length_bp": 54178
+            }
+          ]
+        },
+        {
+          "accession": "NC_001715.1",
+          "organism": "Allomyces macrogynus",
+          "group": "Blastocladiomycota",
+          "taxonomy": [
+            "Eukaryota",
+            "Fungi",
+            "Fungi incertae sedis",
+            "Blastocladiomycota",
+            "Blastocladiomycetes",
+            "Blastocladiales",
+            "Blastocladiaceae",
+            "Allomyces"
+          ],
+          "source_url": "https://www.ncbi.nlm.nih.gov/nuccore/NC_001715.1",
+          "genome_length_bp": 57473,
+          "seeds": [
+            {
+              "id": "NC_001715.1",
+              "start_1based": 1,
+              "end_1based": 57473,
+              "strand": 1,
+              "length_bp": 57473
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

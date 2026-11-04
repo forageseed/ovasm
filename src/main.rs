@@ -509,11 +509,15 @@ struct RunArgs {
     read_set: pipeline::ReadSet,
     /// Seed FASTA as ORGANELLE=PATH (mitochondrion=mt.fa, plastid=pt.fa; repeat for more
     /// files); a bare PATH seeds the --organelle. Optional: an organelle without --seeds uses
-    /// the built-in land-plant seed library (seeddb/, compiled in; it includes Arabidopsis
-    /// thaliana), written to <out>/seeds/. Both organelles are always seeded unless
-    /// --single-seed, so that each claims its own reads.
+    /// the built-in seed library of --lineage (seeddb/, compiled in), written to <out>/seeds/.
+    /// Both organelles are always seeded unless --single-seed, so that each claims its own reads.
     #[arg(long = "seeds")]
     seeds: Vec<String>,
+    /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
+    /// plastid; includes Arabidopsis thaliana), metazoa or fungi (mitochondrion only: use
+    /// --organelle mitochondrion).
+    #[arg(long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
+    lineage: seeddb::Lineage,
     /// How whole-genome reads are recruited: seeds; discover (no seeds: depth clusters called
     /// by their organelle proteins, HiFi only); both (seed reads plus the clusters called as
     /// the target, each read once). With discovery each assembly graph first loses the
@@ -670,16 +674,18 @@ fn run(args: RunArgs) -> Result<()> {
         && args.recruit != pipeline::RecruitBy::Discover
     {
         let dir = args.out.join("seeds");
-        builtin_seeds = seeddb::fill_missing(&mut seeds, &dir, single, args.single_seed)?;
+        builtin_seeds =
+            seeddb::fill_missing(&mut seeds, &dir, single, args.single_seed, args.lineage)?;
         if !builtin_seeds.is_empty() {
             eprintln!(
-                "[ovasm] run: no --seeds for {}: using the built-in seed library {} ({})",
+                "[ovasm] run: no --seeds for {}: using the built-in {} seed library {} ({})",
                 builtin_seeds
                     .iter()
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(" and "),
-                seeddb::VERSION,
+                args.lineage.name(),
+                args.lineage.version(),
                 dir.display()
             );
         }
@@ -692,6 +698,7 @@ fn run(args: RunArgs) -> Result<()> {
         read_set: args.read_set,
         seeds,
         builtin_seeds,
+        seed_lineage: args.lineage,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
         recruit_cache: args.recruit_cache,

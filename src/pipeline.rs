@@ -108,6 +108,8 @@ pub struct RunConfig {
     pub seeds: BTreeMap<String, Vec<PathBuf>>,
     /// The organelles whose `seeds` are the built-in library (`summary.json` says `builtin`).
     pub builtin_seeds: BTreeSet<String>,
+    /// The built-in library `builtin_seeds` came from (`summary.json` records it).
+    pub seed_lineage: crate::seeddb::Lineage,
     pub recruit: RecruitBy,
     /// `ovasm find recruit --target-depth` (None: keep every recruited read).
     pub recruit_depth: Option<f64>,
@@ -1069,7 +1071,8 @@ fn recruit_all(
                 };
                 seed_info.insert("source".into(), seed_source(organelle).into());
                 if cfg.builtin_seeds.contains(organelle) {
-                    seed_info.insert("version".into(), crate::seeddb::VERSION.into());
+                    seed_info.insert("version".into(), cfg.seed_lineage.version().into());
+                    seed_info.insert("lineage".into(), cfg.seed_lineage.name().into());
                 }
                 seed_info.insert("file".into(), own.first().cloned().into());
                 seed_info.insert("files".into(), own.into());
@@ -1910,7 +1913,9 @@ fn validate(cfg: &RunConfig) -> Result<()> {
             );
         }
     }
-    if wanted.len() == 1 && !cfg.single_seed {
+    // Only lineages with a plastid need the competing seed: an animal or fungal mitochondrion
+    // has no plastid genome to run into.
+    if wanted.len() == 1 && !cfg.single_seed && cfg.seed_lineage.has_plastid() {
         let other = other_organelle(wanted[0]);
         if !cfg.seeds.contains_key(other) {
             bail!(
@@ -2402,6 +2407,7 @@ mod tests {
             read_set: ReadSet::Target,
             seeds: BTreeMap::new(),
             builtin_seeds: BTreeSet::new(),
+            seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
