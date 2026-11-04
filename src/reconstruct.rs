@@ -1441,6 +1441,10 @@ fn mark_paths_untrusted(text: &str) -> String {
 /// named. Whether the reads decide every repeat pairing is reported beside it (`decisive`):
 /// short reads cannot decide a repeat longer than their fragments.
 /// `individual.gfa` stays the graph for a species pan graph (reference intervals and de novo).
+fn assembly_is_decisive(graph_solver_decisive: bool, k_attempt_accepted: bool) -> bool {
+    graph_solver_decisive && k_attempt_accepted
+}
+
 fn should_evaluate_configurations(decisive: bool, major_pieces: usize) -> bool {
     !decisive && major_pieces > 0
 }
@@ -1556,9 +1560,14 @@ fn final_outputs(
         }
         fs::write(&fasta_out, text)?;
     }
-    let decisive = de_novo["decisive"].as_bool().unwrap_or(false);
+    let solver_decisive = de_novo["decisive"].as_bool().unwrap_or(false);
+    let k_accepted = de_novo["k_accepted"].as_bool().unwrap_or(false);
+    let decisive = assembly_is_decisive(solver_decisive, k_accepted);
     let loose = dead_ends(&parse_gfa(&gfa_out)?);
     let mut reasons = Vec::new();
+    if !k_accepted {
+        reasons.push("no short-read k attempt met its assembly acceptance and read-covered reference retry floor".to_string());
+    }
     if pieces.len() != 1 {
         reasons.push(format!(
             "{} molecules of at least {} bp",
@@ -1624,6 +1633,9 @@ fn final_outputs(
         if small > 0 {
             reasons.push(format!("{small} piece(s) under {} bp not placed: the graph's short dead-end tips", pipeline::MIN_PIECE));
         }
+        if !k_accepted {
+            reasons.push("no short-read k attempt met its assembly acceptance and read-covered reference retry floor".to_string());
+        }
         status = "circular_configuration_chosen".to_string();
         representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
             "chosen_by": "highest combined score, then joint read-chain support among tied candidates whose major molecules are circular"});
@@ -1668,7 +1680,7 @@ fn final_outputs(
         "configurations": configurations_found, "representative": representative,
         "uncertain_regions": uncertain,
         "graph_loose_ends": loose, "status": status,
-        "reasons": reasons, "decisive": decisive,
+        "reasons": reasons, "decisive": decisive, "graph_solver_decisive": solver_decisive, "k_attempt_accepted": k_accepted,
         "repeats": if decisive {"every pairing decided by reads"} else {
             "some repeat pairings not decided by reads (a repeat longer than the fragments, or too few spanning reads): the molecule is one configuration the graph allows"}}))
 }
@@ -1940,7 +1952,11 @@ pub fn run(cfg: &Config) -> Result<Value> {
             "[ovasm] reconstruct {o}: {} sites, {} called, {} heteroplasmic; segments {}",
             genotypes["sites"], genotypes["called"], genotypes["heteroplasmic_sites"], genotypes["segments"]
         );
-        let assembly = pipeline::run(&pipeline::RunConfig {
+        // Complete target reads cover these reference graph bases directly. This is
+        // only a conservative k-ladder retry guard: it does not add reference bases,
+        // certify organelle origin, or define the target's genome size.
+        let retry_floor = projection["certain_exact_reference_bases"].as_u64().map(|n| n / 2).filter(|&n| n > 0);
+        let assembly = pipeline::run_with_sr_evidence_floor(&pipeline::RunConfig {
             reads: reads.clone(),
             organelle: if o == "mitochondrion" {
                 pipeline::OrganelleChoice::Mitochondrion
@@ -1973,7 +1989,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             salt: cfg.salt,
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
-        });
+        }, retry_floor);
         let denovo_path = dir.join("de-novo/organelle.gfa");
         let integration = export_individual(
             &dir.join("observed-reference.gfa"),
@@ -2041,6 +2057,14 @@ pub fn run(cfg: &Config) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_k_attempt_cannot_make_the_reconstruction_decisive() {
+        assert!(!assembly_is_decisive(true, false));
+        assert!(!assembly_is_decisive(false, true));
+        assert!(!assembly_is_decisive(false, false));
+        assert!(assembly_is_decisive(true, true));
+    }
+
     #[test]
     fn joint_tiebreak_counts_each_sample_only_once() {
         let a = [("s1".to_string(), 20), ("s2".to_string(), 3)].into();
