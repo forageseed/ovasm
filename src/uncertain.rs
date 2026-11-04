@@ -236,6 +236,11 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
             let discordant = spans[i].iter().filter(|&&length| length != d as i64).count();
             let reason = if observed >= 3 && discordant * 5 >= observed * 4 {
                 Some("spanning reads disagree with assembled repeat length")
+            // Do not call a repeat resolved when both its assembled length and a
+            // different length have substantial spanning-read support. This is
+            // a conservative warning, not a heteroplasmy or allele call.
+            } else if discordant >= 3 && discordant * 5 >= observed && observed - discordant >= 3 {
+                Some("spanning reads support multiple repeat lengths")
             } else if room <= 0.0 {
                 Some("no read can span it")
             } else if (observed as f64) < SPANNING_SHARE * expected {
@@ -271,7 +276,7 @@ pub fn run(molecules: &[(String, Vec<u8>, bool)], reads: &[PathBuf], min_len: us
     fs::write(out.join("uncertain_regions.tsv"), tsv)?;
     Ok(json!({"marked": marked_total, "regions": listed, "table": out.join("uncertain_regions.tsv"),
         "coordinates": "zero-based half-open; wraps_origin=true means [start,length) plus [0,end)",
-        "basis": "local repeats (20-mers repeated within 500 bp) between unique anchors: marked when no read can span them or far fewer do than their assembled length allows; pair_longer_bp (pairs across against pairs 1.5 kb away) is an estimate only; lengths not corrected"}))
+        "basis": "local repeats (20-mers repeated within 500 bp) between unique anchors: marked when no read can span them, far fewer do than expected, or spanning reads support different lengths; pair_longer_bp (pairs across against pairs 1.5 kb away) is an estimate only; lengths not corrected"}))
 }
 
 #[cfg(test)]
@@ -309,6 +314,30 @@ mod tests {
                 assert_eq!((a.start,a.end,a.left_end,a.right_start),(b.start,b.end,b.left_end,b.right_start));
             }
         }
+    }
+
+    #[test]
+    fn mixed_spanning_lengths_are_not_called_certain() {
+        let unit = random(21, 33);
+        let molecule = [random(700, 11), unit.repeat(3), random(700, 12)].concat();
+        let st = stretches(&molecule);
+        assert_eq!(st.len(), 1);
+        let s = &st[0];
+        let exact = molecule[s.left_end-W..s.right_start+W].to_vec();
+        let variant = [molecule[s.left_end-W..s.start+21].to_vec(), unit.clone(),
+                       molecule[s.start+21..s.right_start+W].to_vec()].concat();
+        let dir = std::env::temp_dir().join(format!("ovasm-mixed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut fq = String::new();
+        for (i, read) in [exact, variant].iter().cycle().take(12).enumerate() {
+            writeln!(fq, "@r{i}\n{}\n+\n{}", String::from_utf8_lossy(read), "I".repeat(read.len())).unwrap();
+        }
+        let reads = dir.join("reads.fq");
+        fs::write(&reads, fq).unwrap();
+        let result = run(&[("m".to_string(), molecule, false)], &[reads], 1000, &dir).unwrap();
+        assert_eq!(result["marked"], 1, "{result}");
+        assert_eq!(result["regions"][0]["reason"], "spanning reads support multiple repeat lengths");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
