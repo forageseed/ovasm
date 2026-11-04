@@ -389,6 +389,19 @@ fn settled(now: u64, previous: u64, last_growth: u64, saturation: f64, gated: bo
     previous > 0 && (grown as f64) < saturation * previous as f64 && !steady
 }
 
+/// A small percentage read increase can still extend a k-mer-gated short-read bait. Only
+/// apply fractional saturation once the preceding extension added no bait k-mers.
+fn can_stop_after_read_saturation(
+    recount: bool,
+    reads_settled: bool,
+    size_settled: bool,
+    kmer_gate: bool,
+    previous_bait_gain: Option<usize>,
+) -> bool {
+    !recount && reads_settled && size_settled
+        && (!kmer_gate || previous_bait_gain == Some(0))
+}
+
 /// Whether the genome a gated target's reads stand for has settled over a pass: `settled`, and
 /// grown by less than a read length (`read_len`, its reads' mean). Growth falls by half or more
 /// from one pass to the next when edges meet or reach the end of a linear piece, and a genome
@@ -1734,7 +1747,13 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     let (before, grew) = (previous_size[t], last_size_growth[t]);
                     genome_settled(s, before, grew, cfg.saturation, read_len)
                 });
-                if !recount && reads_settled && size_settled {
+                // Short-read k-mer-gated extension can still discover new sequence even when
+                // its read count grows by a small fraction of a deep target. Do not stop
+                // before processing those fresh reads while the previous bait was growing.
+                // The independent bait-growth guard and iteration limit still apply.
+                let prior_bait_gain = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                if can_stop_after_read_saturation(recount, reads_settled, size_settled,
+                    cfg.kmer_gate, prior_bait_gain) {
                     saturated[t] = true;
                     stopped[t] = Some("saturated");
                 }
@@ -3500,6 +3519,16 @@ mod tests {
         g.set_nuclear_depth(40, "given");
         assert_eq!(extension_deep(&g, Some(72.0)), 54.0f64.min((40.0f64 * 72.0).sqrt()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn short_read_saturation_requires_bait_to_stop_growing() {
+        assert!(!can_stop_after_read_saturation(false, true, true, true, Some(3295)));
+        assert!(!can_stop_after_read_saturation(false, true, true, true, None));
+        assert!(can_stop_after_read_saturation(false, true, true, true, Some(0)));
+        assert!(!can_stop_after_read_saturation(false, false, true, true, Some(0)));
+        assert!(!can_stop_after_read_saturation(true, true, true, true, Some(0)));
+        assert!(can_stop_after_read_saturation(false, true, true, false, Some(3295)));
     }
 
     #[test]
