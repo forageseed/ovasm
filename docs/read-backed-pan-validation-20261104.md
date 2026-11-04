@@ -84,6 +84,20 @@ A further prior-strength sensitivity experiment formed a conditional Beta prior 
 
 The standalone experimental `scripts/assembly_benchmarks/experimental_branch_posterior.py` makes the conditional prior/update explicit for a candidate-derived branch. It uses an empirical mean of donor-run traversal fractions only when at least two donors meet the depth threshold, a base 0.5 concentration per alternative, and user-specified prior strength. The target is excluded from donors. `--target-effective-cap 0` uses all target traversal counts under an explicit iid multinomial working model; a positive cap rescales counts and is a fractional-likelihood generalized posterior. Counts for missing alternatives are not silently treated as zero, and donor runs missing an alternative are excluded. These are model-conditional traversal-fraction distributions with model-based variance, **not** calibrated topology probabilities, independent molecule frequencies, or certified origins. For ZM4 group `u2- u15-`, target HiFi traversal counts are 11 versus 1,577; three eligible panel runs have a mean fraction 0.932 for the first alternative. With an arbitrary effective target cap of 10, prior strengths 0, 2 and 10 yield first-alternative conditional means 0.052, 0.187 and 0.471 respectively. This illustrates sensitivity to the panel and cap; the resampling experiment above does not validate those numerical probabilities. Source, six targeted tests, source hash and complete results: `experimental_branch_posterior.py`, `tests/test_experimental_branch_posterior.py`, `experimental-branch-posterior-v2-source.sha256`, and `zm4-branch-posterior-v2-k{0,2,10}-cap10.json`.
 
+Both experimental tools require explicitly prepared inputs and write new files; they are not defaults in `pan reconstruct`. For example, with a single-record linearized reference, selected same-sample HiFi FASTQ and a PAF created against that exact reference using minimap2 `-x map-hifi --secondary=yes -N 20 -c`:
+
+```bash
+python3 -I scripts/assembly_benchmarks/recover_read_supported_insertions.py \
+  --reference reference.fa --paf hifi-to-reference.paf --reads hifi.fastq.gz \
+  --out candidate-prefix --min-reads 1000
+
+python3 -I scripts/assembly_benchmarks/experimental_branch_posterior.py \
+  --input panel-and-target-pairing-counts.json --target TARGET \
+  --prior-strength 2 --target-effective-cap 10 --out branch-model.json
+```
+
+The insertion tool writes `candidate-prefix.fasta` and `candidate-prefix.json` and refuses to overwrite either. The branch-model input follows the documented `candidates[].pairings[].path/read_counts` JSON shape; the numeric arguments above are sensitivity settings rather than calibrated constants.
+
 ## Low-coverage leave-one-run-out simulation
 
 A separate diagnostic sampled idealized 150-bp paired fragments from the first up-to-2,500 recruited HiFi reads per organelle, 15 fragments per source read and approximately 320-bp insert sizes. No additional Illumina error was simulated; the original HiFi base errors remain. For each of eight runs, its source P paths were removed from both organelle reference graphs, reference nodes and edges were restricted to the remaining seven runs' paths, and its HiFi read files were excluded from the prior. The held-out run's HiFi reads were then mapped to the resulting target graph. Because the simulated reads originate in those very long molecules, this is an internal reconstruction stress test, not independent ground truth.
