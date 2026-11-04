@@ -1212,6 +1212,7 @@ pub struct ComponentReport {
     pub read_path_cover: Option<crate::read_model::ReadPathCover>,
     /// An explanatory family of candidate configurations, not certified physical isoforms.
     pub witness_configurations: Vec<CoverReport>,
+    pub ambiguity_configurations: Vec<CoverReport>,
     pub anchors: Vec<String>,
     /// Length-weighted median depth of the anchors, when the evidence records depth.
     pub depth: Option<f64>,
@@ -1556,6 +1557,7 @@ pub fn run_phased(
             read_model_budget_exhausted: false,
             read_path_cover: None,
             witness_configurations: Vec::new(),
+            ambiguity_configurations: Vec::new(),
             anchors: comp.iter().map(|&a| g.names[a].clone()).collect(),
             depth,
             molecules: 0,
@@ -1705,6 +1707,7 @@ pub fn run_phased(
                 let fits:Vec<_>=ranked.iter().map(|(_,c,_)|c.read_support.as_ref().unwrap()).collect();
                 let path_cover=model.path_cover(&fits,1_000_000);
                 rep.witness_configurations=path_cover.candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
+                rep.ambiguity_configurations=path_cover.equivalent_candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
                 rep.read_path_cover=Some(path_cover);
             }
         }
@@ -1780,6 +1783,7 @@ pub fn run_phased(
             read_model_budget_exhausted: false,
             read_path_cover: None,
             witness_configurations: Vec::new(),
+            ambiguity_configurations: Vec::new(),
             anchors: vec![g.names[a].clone()],
             depth: None,
             molecules: 1,
