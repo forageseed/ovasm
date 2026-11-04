@@ -374,6 +374,10 @@ struct ReconstructArgs {
     /// Exploratory mean log(1 + count) target-HiFi ranking; not a posterior.
     #[arg(long, requires = "target_hifi")]
     target_hifi_strength: bool,
+    /// Experimental deep bubble protection as ORGANELLE=FRACTION in (0, 1].
+    /// Can retain errors and nuclear homologs; default disabled.
+    #[arg(long = "experimental-deep-bubble-fraction")]
+    experimental_deep_bubble_fraction: Vec<String>,
     /// Recruited HiFi reads as ORGANELLE=SAMPLE=PATH; repeat for prior samples.
     #[arg(long = "prior-reads")]
     prior_reads: Vec<String>,
@@ -437,6 +441,14 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
         if !["mitochondrion", "plastid"].contains(&o) || p.is_empty() { bail!("invalid target HiFi organelle or path"); }
         target_hifi.entry(o.to_string()).or_default().push(PathBuf::from(p));
     }
+    let mut experimental_deep_bubble_fraction = std::collections::BTreeMap::new();
+    for spec in args.experimental_deep_bubble_fraction {
+        let (o, v) = spec.split_once('=').context("experimental deep bubble fraction must be ORGANELLE=FRACTION")?;
+        let f: f64 = v.parse().context("invalid experimental deep bubble fraction")?;
+        if !["mitochondrion", "plastid"].contains(&o) || !(f > 0.0 && f <= 1.0) || experimental_deep_bubble_fraction.insert(o.to_string(), f).is_some() {
+            bail!("give each organelle at most once with a fraction in (0, 1]");
+        }
+    }
     let mut prior_reads = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Vec<PathBuf>>>::new();
     for spec in args.prior_reads {
         let (organelle, rest) = spec.split_once('=').context("prior reads must be ORGANELLE=SAMPLE=PATH")?;
@@ -459,6 +471,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
         target_reads,
         target_hifi,
         target_hifi_strength: args.target_hifi_strength,
+        experimental_deep_bubble_fraction,
         prior_reads,
         references,
         sample: args.sample,
@@ -849,6 +862,11 @@ struct AssembleArgs {
     /// Record cleaning proposals without deleting unitigs (diagnostic, default off).
     #[arg(long)]
     cleaning_audit_only: bool,
+    /// Experimental: skip the short-bubble removal rule at this fraction of graph depth.
+    /// Other cleaning rules may still remove a branch. Can retain errors or nuclear homologues;
+    /// requires explicit --k and --s 0.
+    #[arg(long, conflicts_with = "cleaning_audit_only")]
+    experimental_deep_bubble_fraction: Option<f64>,
     /// Organelle reads (e.g. from `ovasm find recruit`), FASTQ/FASTA, optionally .gz.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -917,6 +935,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
         args.reads,
         assemble::EngineParams {
             cleaning_audit_only: args.cleaning_audit_only,
+            experimental_deep_bubble_fraction: args.experimental_deep_bubble_fraction,
             coordinates,
             k: args.k,
             s: args.s,

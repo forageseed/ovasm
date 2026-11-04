@@ -1815,6 +1815,7 @@ pub struct Config {
     pub target_reads: BTreeMap<String, Vec<PathBuf>>,
     pub target_hifi: BTreeMap<String, Vec<PathBuf>>,
     pub target_hifi_strength: bool,
+    pub experimental_deep_bubble_fraction: BTreeMap<String, f64>,
     pub prior_reads: BTreeMap<String, BTreeMap<String, Vec<PathBuf>>>,
     pub references: BTreeMap<String, PathBuf>,
     pub sample: String,
@@ -1829,6 +1830,9 @@ pub struct Config {
 pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
+    }
+    for (organelle, &fraction) in &cfg.experimental_deep_bubble_fraction {
+        if !["mitochondrion", "plastid"].contains(&organelle.as_str()) || !(fraction > 0.0 && fraction <= 1.0) { bail!("invalid experimental deep bubble organelle or fraction"); }
     }
     if cfg.target_hifi_strength && cfg.target_hifi.is_empty() { bail!("target HiFi strength scoring needs target HiFi reads"); }
     let direct_hifi: BTreeSet<ReadFileIdentity> = cfg.target_hifi.values().flatten().map(|p| read_file_identity(p)).collect::<Result<_>>()?;
@@ -2012,7 +2016,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         // only a conservative k-ladder retry guard: it does not add reference bases,
         // certify organelle origin, or define the target's genome size.
         let retry_floor = projection["certain_exact_reference_bases"].as_u64().map(|n| n / 2).filter(|&n| n > 0);
-        let assembly = pipeline::run_with_sr_evidence_floor(&pipeline::RunConfig {
+        let assembly = pipeline::run_with_experimental_deep_bubble(&pipeline::RunConfig {
             reads: reads.clone(),
             organelle: if o == "mitochondrion" {
                 pipeline::OrganelleChoice::Mitochondrion
@@ -2045,7 +2049,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             salt: cfg.salt,
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
-        }, retry_floor);
+        }, retry_floor, cfg.experimental_deep_bubble_fraction.get(o).copied());
         let denovo_path = dir.join("de-novo/organelle.gfa");
         let integration = export_individual(
             &dir.join("observed-reference.gfa"),
@@ -2097,6 +2101,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         "workflow_completed":workflow_completed,
         "inputs":cfg.reads,"target_read_inputs":cfg.target_reads,
         "input_scope":if targeted {"explicit_target_reads"} else {"whole_genome_recruitment"},
+        "experimental_deep_bubble_fraction":cfg.experimental_deep_bubble_fraction,
         "reference_graphs":cfg.references,"frontier":frontier_info,"recruitment":recruitment,"organelles":organelles,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,
