@@ -279,6 +279,12 @@ fn chromosomes(args: ChromosomesArgs) -> Result<()> {
     std::fs::write(&args.out_json, serde_json::to_string_pretty(&report)? + "\n")?;
     match report.count {
         Some(n) => eprintln!("[ovasm] chromosomes: {n}"),
+        None if report.fragmented_components => eprintln!(
+            "[ovasm] chromosome count unresolved; represented graph groups: {} to {} ({})",
+            report.range.0,
+            report.range.1,
+            report.reasons.join("; ")
+        ),
         None => eprintln!(
             "[ovasm] chromosomes: {} to {} ({})",
             report.range.0,
