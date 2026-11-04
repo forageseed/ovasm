@@ -2036,6 +2036,14 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 core_depth[t] = None;
             }
         }
+        // Emit bounded per-pass progress so a long WGS run exposes both growing bait and
+        // the reason a target stopped before the final JSON report exists.
+        let progress = bait.targets.iter().enumerate().map(|(t, target)| {
+            format!("{}: reads={}, bait_added={}, {}", target.name, res.recruited[t].reads,
+                added[t], stopped[t].unwrap_or("active"))
+        }).collect::<Vec<_>>().join("; ");
+        eprintln!("[ovasm] recruit pass {}/{} ({:.1}s): {}",
+            it + 1, cfg.iterations.max(1), t0.elapsed().as_secs_f64(), progress);
         iterations.push(IterationStats {
             iteration: it + 1,
             seconds: t0.elapsed().as_secs_f64(),
