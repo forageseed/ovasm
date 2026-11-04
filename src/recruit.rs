@@ -1000,7 +1000,7 @@ pub struct TargetOutput {
     /// --saturation), bait_complete (extension added nothing), size_cap (stood for more than
     /// `size_cap`), iteration_limit (still growing when the passes ran out) or single_pass.
     pub stop_reason: &'static str,
-    /// False for iteration_limit, size_cap and growing: reads may be incomplete or hold others.
+    /// False for iteration_limit, size_cap, growing and bootstrap_limit: reads may be incomplete or hold others.
     pub converged: bool,
     pub sampling_fraction: f64,
     /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
@@ -1384,6 +1384,22 @@ fn bootstrap_candidates(
 }
 
 
+/// Identical sequences and their reverse complements are a single observation.
+fn unique_bootstrap_sequences(reads: &[Vec<u8>]) -> Vec<&[u8]> {
+    let mut seen = FxHashSet::default();
+    reads.iter().filter_map(|seq| {
+        let mut forward = FxHasher::default();
+        let mut reverse = FxHasher::default();
+        for &b in seq { forward.write_u8(b.to_ascii_uppercase()); }
+        for &b in seq.iter().rev() {
+            reverse.write_u8(match b.to_ascii_uppercase() {
+                b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', _ => b'N',
+            });
+        }
+        seen.insert(forward.finish().min(reverse.finish())).then_some(seq.as_slice())
+    }).collect()
+}
+
 /// Additional edge k-mers only from independently observed reads at a validated
 /// shallow mitochondrial circle's depth. Reads have already passed extension gates.
 fn shallow_edge_kmers(
@@ -1635,6 +1651,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // requires subsequent growth in recruited reads and always excludes used reads.
     let mut leftover_rounds = vec![0u8; n_targets];
     let mut leftover_boot_reads = vec![0u64; n_targets];
+    let mut leftover_boot_count = vec![0usize; n_targets];
+    let mut leftover_boot_bases = vec![0usize; n_targets];
+    let mut leftover_boot_gain = vec![0usize; n_targets];
     let mut shallow_leftover_depth: Vec<Option<f64>> = vec![None; n_targets];
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
@@ -1967,9 +1986,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     || added[t] > 0
                     || !others_complete
                     || (!boot_used[t].is_empty()
-                        && !(cfg.auto_shallow_edge_support && leftover_rounds[t] == 1
+                        && !(cfg.auto_shallow_edge_support && (1..3).contains(&leftover_rounds[t])
                             && res.recruited[t].reads > leftover_boot_reads[t]))
-                    || matches!(stopped[t], Some("size_cap" | "growing"))
+                    || matches!(stopped[t], Some("size_cap" | "growing" | "bootstrap_limit"))
                 {
                     continue;
                 }
@@ -2007,7 +2026,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // nad2 and nad9 at 1,434x beside the rest at 1,366x; Bellardia viscosa, 75 kb;
                 // Euphorbia lathyris, 41 and 86 kb). Leftovers at the target's own depth
                 // (`LEFTOVER_DEPTH`) bootstrap it from `LEFTOVER_MIN_READS` of them, with at most
-                // two rounds when the HiFi automatic policy permits and recruitment grows.
+                // three rounds when the HiFi automatic policy permits and recruitment grows.
                 let mut established_leftovers = false;
                 let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads && boot_used[t].is_empty() {
                     (picked, keys)
@@ -2063,17 +2082,48 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 if picked.is_empty() {
                     continue;
                 }
-                for seq in &picked {
-                    added[t] += bait.add_sequence_counted(t, seq);
+                let picked_bases: usize = picked.iter().map(Vec::len).sum();
+                if established_leftovers && leftover_rounds[t] == 2 {
+                    // A later retry is deliberately no larger than its predecessor and adds
+                    // only independently supported k-mers. Keep candidates on rejection.
+                    if picked.len() > leftover_boot_count[t] || picked_bases > leftover_boot_bases[t] {
+                        saturated[t] = true;
+                        stopped[t] = Some("bootstrap_limit");
+                        warnings.push(format!("{}: third leftover retry held by candidate count or base budget; candidate origins remain unresolved", bait.targets[t].name));
+                        continue;
+                    }
+                    let unique = unique_bootstrap_sequences(&picked);
+                    let kmers = bait.new_from_reads(t, unique, 2);
+                    if runaway_bait_gain(Some(leftover_boot_gain[t]), kmers.len()) {
+                        saturated[t] = true;
+                        stopped[t] = Some("bootstrap_limit");
+                        warnings.push(format!("{}: third leftover retry held by bait growth budget; candidate origins remain unresolved", bait.targets[t].name));
+                        continue;
+                    }
+                    if kmers.is_empty() {
+                        saturated[t] = true;
+                        stopped[t] = Some("bootstrap_limit");
+                        warnings.push(format!("{}: third leftover retry held: insufficient independent sequence support; candidate origins remain unresolved", bait.targets[t].name));
+                        continue;
+                    }
+                    added[t] += bait.add_kmers(t, &kmers);
+                    warnings.push(format!("{}: third leftover retry included candidates without nuclear-origin certification; same-depth nuclear repeats may be included", bait.targets[t].name));
+                } else {
+                    for seq in &picked {
+                        added[t] += bait.add_sequence_counted(t, seq);
+                    }
                 }
                 bootstrapped[t] = picked.len() as u64;
                 if established_leftovers {
                     leftover_rounds[t] += 1;
+                    leftover_boot_count[t] = picked.len();
+                    leftover_boot_bases[t] = picked_bases;
+                    leftover_boot_gain[t] = added[t];
                     leftover_boot_reads[t] = res.recruited[t].reads;
-                    if leftover_rounds[t] < 2 {
+                    if leftover_rounds[t] < 3 {
                         leftovers_judged[t] = false;
                     }
-                    eprintln!("[ovasm] {}: mitochondrial leftover bootstrap round {} of 2 used {} reads", bait.targets[t].name, leftover_rounds[t], picked.len());
+                    eprintln!("[ovasm] {}: mitochondrial leftover bootstrap round {} of 3 used {} reads", bait.targets[t].name, leftover_rounds[t], picked.len());
                 }
                 boot_used[t].extend(keys);
                 // its bait changed: extend it again from what the next pass recruits, and its
@@ -2284,7 +2334,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             read_depth: final_depths.read[t],
             implied_size: final_depths.implied_size[t],
             stop_reason,
-            converged: !matches!(stop_reason, "iteration_limit" | "size_cap" | "growing"),
+            converged: !matches!(stop_reason, "iteration_limit" | "size_cap" | "growing" | "bootstrap_limit"),
             sampling_fraction: fraction,
             sampled_by,
             kept_reads,
@@ -2911,6 +2961,178 @@ mod tests {
         let rep = run(bait, cfg).unwrap();
         assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
         assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
+        assert_eq!(rep.iterations.iter().filter(|it| it.bootstrapped_from_reads[m] > 0).count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bootstrap_sequence_dedup_rejects_duplicate_and_reverse_complement() {
+        let seq = b"AACCGTACGTAA".to_vec();
+        let reverse = b"TTACGTACGGTT".to_vec();
+        let reads = vec![seq.clone(), seq, reverse];
+        assert_eq!(unique_bootstrap_sequences(&reads).len(), 1);
+    }
+
+    #[test]
+    fn third_mitochondrial_leftover_retry_is_bounded_and_recovers_four_circles() {
+        let main = pseudo_random(12_000, 307);
+        let mut second = pseudo_random(10_000, 341);
+        let mut third = pseudo_random(10_000, 342);
+        let mut fourth = pseudo_random(10_000, 343);
+        let mut nuclear = pseudo_random(300_000, 333);
+        let gene_a = pseudo_random(1_500, 345);
+        let gene_b = pseudo_random(1_500, 346);
+        let gene_c = pseudo_random(1_500, 347);
+        second[2000..3500].copy_from_slice(&gene_a);
+        second[6000..7500].copy_from_slice(&gene_b);
+        third[2000..3500].copy_from_slice(&gene_b);
+        third[6000..7500].copy_from_slice(&gene_c);
+        fourth[4000..5500].copy_from_slice(&gene_c);
+        nuclear[150_000..151_500].copy_from_slice(&gene_b);
+        let mut fasta = circle_reads(&main, 30, "m");
+        fasta.push_str(&circle_reads(&second, 30, "s"));
+        fasta.push_str(&circle_reads(&third, 30, "t"));
+        // Keep all reads except four out of five reads fully spanning gene_c:
+        // this models uneven coverage while retaining target-depth flanks.
+        let circ = [&fourth[..], &fourth[..3000]].concat();
+        let mut fourth_count = 0usize;
+        let mut seed_seen = 0usize;
+        for (i, st) in (0..fourth.len()).step_by(30).enumerate() {
+            let overlaps = st.max(4000) < (st + 3000).min(5500);
+            let overlap = if overlaps { (st + 3000).min(5500) - st.max(4000) } else { 0 };
+            if overlap >= 1000 { seed_seen += 1; if seed_seen % 5 != 0 { continue; } }
+            fasta.push_str(&format!(">f{i}\n{}\n", std::str::from_utf8(&circ[st..st+3000]).unwrap()));
+            fourth_count += 1;
+        }
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n"));
+        let dir = std::env::temp_dir().join(format!("ovasm-three-leftovers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene_a);
+        bait.targets[m].seed_length = 42_000;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.auto_shallow_edge_support = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'f'), fourth_count);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
+        assert_eq!(rep.iterations.iter().filter(|it| it.bootstrapped_from_reads[m] > 0).count(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_only_third_retry_stays_unresolved() {
+        let main = pseudo_random(12_000, 307);
+        let mut second = pseudo_random(10_000, 341);
+        let mut third = pseudo_random(10_000, 342);
+        let mut fourth = pseudo_random(10_000, 343);
+        let mut nuclear = pseudo_random(300_000, 333);
+        let gene_a = pseudo_random(1_500, 345);
+        let gene_b = pseudo_random(1_500, 346);
+        let gene_c = pseudo_random(1_500, 347);
+        second[2000..3500].copy_from_slice(&gene_a);
+        second[6000..7500].copy_from_slice(&gene_b);
+        third[2000..3500].copy_from_slice(&gene_b);
+        third[6000..7500].copy_from_slice(&gene_c);
+        fourth[4000..5500].copy_from_slice(&gene_c);
+        nuclear[150_000..151_500].copy_from_slice(&gene_b);
+        let mut fasta = circle_reads(&main, 30, "m");
+        fasta.push_str(&circle_reads(&second, 30, "s"));
+        fasta.push_str(&circle_reads(&third, 30, "t"));
+        // Keep all reads except four out of five reads fully spanning gene_c:
+        // this models uneven coverage while retaining target-depth flanks.
+        let circ = [&fourth[..], &fourth[..3000]].concat();
+        let mut fourth_count = 0usize;
+        let mut seed_seen = 0usize;
+        for (i, st) in (0..fourth.len()).step_by(30).enumerate() {
+            let overlaps = st.max(4000) < (st + 3000).min(5500);
+            let overlap = if overlaps { (st + 3000).min(5500) - st.max(4000) } else { 0 };
+            if overlap >= 1000 { seed_seen += 1; if seed_seen % 5 != 0 { continue; } }
+            let seq = if overlap >= 1000 { &circ[3000..6000] } else { &circ[st..st+3000] };
+            fasta.push_str(&format!(">f{i}\n{}\n", std::str::from_utf8(seq).unwrap()));
+            fourth_count += 1;
+        }
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n"));
+        let dir = std::env::temp_dir().join(format!("ovasm-three-leftovers-duplicate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene_a);
+        bait.targets[m].seed_length = 42_000;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.auto_shallow_edge_support = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
+        assert!(count_reads(&rep.outputs[m].output, b'f') < fourth_count);
+        assert_eq!(rep.outputs[m].stop_reason, "bootstrap_limit");
+        assert!(!rep.outputs[m].converged);
+        assert_eq!(rep.iterations.last().unwrap().bait_kmers_added[m], 0);
+        assert!(rep.warnings.iter().any(|w| w.contains("insufficient independent sequence support")));
+        assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
+        assert_eq!(rep.iterations.iter().filter(|it| it.bootstrapped_from_reads[m] > 0).count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn oversized_third_retry_remains_unresolved_without_bait_growth() {
+        let main = pseudo_random(12_000, 307);
+        let mut second = pseudo_random(10_000, 341);
+        let mut third = pseudo_random(10_000, 342);
+        let mut fourth = pseudo_random(10_000, 343);
+        let mut nuclear = pseudo_random(300_000, 333);
+        let gene_a = pseudo_random(1_500, 345);
+        let gene_b = pseudo_random(1_500, 346);
+        let gene_c = pseudo_random(1_500, 347);
+        second[2000..3500].copy_from_slice(&gene_a);
+        second[6000..7500].copy_from_slice(&gene_b);
+        third[2000..3500].copy_from_slice(&gene_b);
+        third[6000..7500].copy_from_slice(&gene_c);
+        fourth[4000..5500].copy_from_slice(&gene_c);
+        nuclear[150_000..151_500].copy_from_slice(&gene_b);
+        let mut fasta = circle_reads(&main, 30, "m");
+        fasta.push_str(&circle_reads(&second, 30, "s"));
+        fasta.push_str(&circle_reads(&third, 30, "t"));
+        fasta.push_str(&circle_reads(&fourth, 30, "f"));
+        fasta.push_str(&linear_reads(&nuclear, 1500, "n"));
+        let dir = std::env::temp_dir().join(format!("ovasm-three-leftovers-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, fasta).unwrap();
+        let mut bait = BaitSet::new(21);
+        let m = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(m, &main);
+        bait.add_sequence(m, &gene_a);
+        bait.targets[m].seed_length = 42_000;
+        let mut cfg = test_config(&fa, dir.join("out"), 40, false);
+        cfg.bootstrap = true;
+        cfg.auto_shallow_edge_support = true;
+        cfg.extend_depth = 200.0;
+        cfg.saturation = 0.05;
+        let rep = run(bait, cfg).unwrap();
+        assert_eq!(count_reads(&rep.outputs[m].output, b's'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b't'), 334);
+        assert_eq!(count_reads(&rep.outputs[m].output, b'f'), 0);
+        assert!(count_reads(&rep.numt_output, b'f') > 0);
+        assert_eq!(rep.outputs[m].stop_reason, "bootstrap_limit");
+        assert!(!rep.outputs[m].converged);
+        assert_eq!(rep.iterations.last().unwrap().bait_kmers_added[m], 0);
+        assert!(rep.warnings.iter().any(|w| w.contains("origins remain unresolved")));
         assert_eq!(count_reads(&rep.outputs[m].output, b'n'), 0);
         assert_eq!(rep.iterations.iter().filter(|it| it.bootstrapped_from_reads[m] > 0).count(), 2);
         std::fs::remove_dir_all(&dir).ok();
