@@ -68,6 +68,9 @@ fn parse_path(f:&[&str])->Result<Walk> {
         let mut tags:Vec<String>=f[7..].iter().map(|x|x.to_string()).collect();
         tags.push(format!("wi:Z:{}:{}-{}",f[3],f[4],f[5]));
         if !tags.iter().any(|x|x.starts_with("st:")) { tags.push("st:Z:external_walk_interval".into()); }
+        // A W interval is never proof of a complete sample path, irrespective
+        // of any pre-existing status supplied by the external graph.
+        if !tags.iter().any(|x|x.starts_with("up:")) { tags.push("up:Z:external_walk_interval".into()); }
         Ok(Walk{name:format!("{}#{}#{}:{}-{}",f[1],f[2],f[3],f[4],f[5]),steps:wsteps(f[6])?,tags,expected,backbone:false})
     }
 }

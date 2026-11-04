@@ -63,7 +63,7 @@ impl Reference {
         let reference_text = fs::read_to_string(input)?;
         let inferred_segments: BTreeSet<&str> = reference_text.lines().filter_map(|line| {
             let f: Vec<_> = line.split('\t').collect();
-            (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration")).then(|| f[1])
+            (f.first() == Some(&"S") && f.len() >= 3 && f[3..].iter().any(|t| t.starts_with("rf:") || t.starts_with("up:") || *t == "st:Z:unresolved_configuration")).then(|| f[1])
         }).collect();
         for line in reference_text.lines() {
             let f: Vec<_> = line.split('\t').collect();
@@ -103,7 +103,7 @@ impl Reference {
                 bail!("circular reference path {} lacks its closing edge", f[1]);
             }
             sources.insert(f[1].split('#').next().unwrap().to_string());
-            let trusted_prior = !f[4..].iter().any(|t| t.starts_with("rf:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill" || *t == "st:Z:external_walk_interval" || *t == "st:Z:reference_backbone_only")
+            let trusted_prior = !f[4..].iter().any(|t| t.starts_with("rf:") || t.starts_with("up:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill" || *t == "st:Z:external_walk_interval" || *t == "st:Z:reference_backbone_only")
                 && steps.iter().all(|(id, _)| !inferred_segments.contains(graph.names[*id].as_str()));
             walks.push(Walk {
                 name: f[1].into(),
@@ -1265,7 +1265,9 @@ fn reference_prior(
         let mut all: BTreeSet<String> = all_runs.clone();
         for p in ps {
             let (with, flanked) = observed.get(p).cloned().unwrap_or_default();
-            s += ((with.len() as f64 + 0.5) / (flanked.len() as f64 + 1.0)).ln();
+            if !flanked.is_empty() {
+                s += ((with.len() as f64 + 0.5) / (flanked.len() as f64 + 1.0)).ln();
+            }
             let with: BTreeSet<String> = with.into_iter().collect();
             all = all.intersection(&with).cloned().collect();
         }
@@ -1278,6 +1280,20 @@ fn reference_prior(
         scores,
         runs_with_all,
     }
+}
+
+// Keep graph uncertainty across manual pan merges and external graph imports.
+fn independent_prior(w: &Walk, sample: &str) -> bool {
+    w.trusted_prior && w.name.split('#').next() != Some(sample)
+}
+
+fn mark_paths_untrusted(text: &str) -> String {
+    text.lines().map(|line| {
+        let f: Vec<_> = line.split('\t').collect();
+        if f.first() == Some(&"P") && !f.iter().any(|t| t.starts_with("up:")) {
+            format!("{line}\tup:Z:unresolved\n")
+        } else { format!("{line}\n") }
+    }).collect()
 }
 
 /// The organelle's result as `ovasm run` gives it, at the top of the output: `<organelle>.gfa`
@@ -1490,6 +1506,10 @@ fn final_outputs(
         }).collect::<String>();
         fs::write(&fasta_out, annotated)?;
     }
+    if status != "complete" || !decisive {
+        let text = fs::read_to_string(&gfa_out)?;
+        fs::write(&gfa_out, mark_paths_untrusted(&text))?;
+    }
     Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
@@ -1613,14 +1633,14 @@ pub fn run(cfg: &Config) -> Result<Value> {
     let mut bait = BaitSet::new(K);
     let mut reference_info = BTreeMap::new();
     for (&o, r) in &references {
-        reference_info.insert(
+        let mut info = r.add_bait(
+            &mut bait,
             o,
-            r.add_bait(
-                &mut bait,
-                o,
-                &cfg.out.join("reference").join(format!("{o}.fasta")),
-            )?,
-        );
+            &cfg.out.join("reference").join(format!("{o}.fasta")),
+        )?;
+        info["same_sample_paths_excluded_from_prior"] = json!(r.walks.iter().filter(|w| w.name.split('#').next() == Some(cfg.sample.as_str())).count());
+        info["prior_identity_limit"] = json!("PanSN sample labels identify exact matches only; renamed samples and shared reads cannot be detected");
+        reference_info.insert(o, info);
     }
     fs::write(
         cfg.out.join("reference.json"),
@@ -1777,8 +1797,8 @@ pub fn run(cfg: &Config) -> Result<Value> {
         };
         let final_output = if de_novo.get("error").is_none() {
             let walks: Vec<(Vec<u8>, bool)> =
-                r.walks.iter().filter(|w| w.trusted_prior).map(|w| (w.sequence.clone(), w.circular)).collect();
-            let names: Vec<String> = r.walks.iter().filter(|w| w.trusted_prior).map(|w| w.name.clone()).collect();
+                r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| (w.sequence.clone(), w.circular)).collect();
+            let names: Vec<String> = r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| w.name.clone()).collect();
             final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names)?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
@@ -1855,6 +1875,14 @@ mod tests {
             .collect()
     }
     #[test]
+    fn same_sample_never_contributes_a_reference_prior() {
+        let r = reference("S\ta\tACGTACGTACGT\nP\tsample#1#pt\ta+\t*\nP\tother#1#pt\ta+\t*\n");
+        let eligible: Vec<_> = r.walks.iter().filter(|w| independent_prior(w, "sample")).map(|w| w.name.as_str()).collect();
+        assert_eq!(eligible, vec!["other#1#pt"]);
+        assert_eq!(r.walks.len(), 2); // same-sample sequence remains available as bait
+    }
+
+    #[test]
     fn unresolved_paths_remain_bait_but_are_not_reference_priors() {
         let g = reference("S\ta\tACGTACGTACGT\nP\tknown#1#pt\ta+\t*\nP\tguess#1#pt\ta+\t*\tst:Z:unresolved_configuration\nP\tfilled#1#pt\ta+\t*\trf:Z:source\n");
         assert_eq!(g.walks.len(), 3);
@@ -1878,6 +1906,49 @@ mod tests {
         assert_eq!(r.walks[0].sequence, b"ACGTTTAA");
         assert!(!r.walks[0].trusted_prior);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn provenance_dir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ovasm-provenance-{label}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        fs::create_dir_all(&d).unwrap(); d
+    }
+    #[test]
+    fn uncertain_final_graph_stays_untrusted_after_merge() {
+        let d = provenance_dir("graph");
+        let input = d.join("input.gfa");
+        let g = format!("H\tVN:Z:1.0\tsn:Z:sample\nS\ta\t{}\nP\tsample#1#pt\ta+\t*\n", random(200));
+        fs::write(&input, mark_paths_untrusted(&g)).unwrap();
+        let out = d.join("merged.gfa");
+        crate::pan::run(&[input], &crate::pan::PanParams {k:31}, &out, &d.join("report.json")).unwrap();
+        assert!(!Reference::read(&out).unwrap().walks[0].trusted_prior);
+        fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn unresolved_segment_stays_untrusted_after_merge() {
+        let d = provenance_dir("segment");
+        let input = d.join("input.gfa");
+        let g = format!("H\tVN:Z:1.0\tsn:Z:sample\nS\ta\t{}\tst:Z:unresolved_configuration\nP\tsample#1#pt\ta+\t*\n", random(200));
+        fs::write(&input, g).unwrap();
+        assert!(!Reference::read(&input).unwrap().walks[0].trusted_prior);
+        let out = d.join("merged.gfa");
+        crate::pan::run(&[input], &crate::pan::PanParams {k:31}, &out, &d.join("report.json")).unwrap();
+        assert!(!Reference::read(&out).unwrap().walks[0].trusted_prior);
+        fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn external_walk_with_other_status_stays_untrusted_after_import_and_merge() {
+        let d = provenance_dir("walk");
+        let input = d.join("input.gfa");
+        let g = format!("S\ta\t{}\nW\tsample\t1\tpt\t0\t200\t>a\tst:Z:other\n", random(200));
+        fs::write(&input, g).unwrap();
+        let imported = d.join("imported");
+        crate::pan_external::run(&crate::pan_external::Config {input, extra_paths:None, out:imported.clone(), sample:"panel".into()}).unwrap();
+        let normalized = imported.join("normalized.gfa");
+        assert!(!Reference::read(&normalized).unwrap().walks[0].trusted_prior);
+        let merged = d.join("merged.gfa");
+        crate::pan::run(&[normalized], &crate::pan::PanParams {k:31}, &merged, &d.join("report.json")).unwrap();
+        assert!(!Reference::read(&merged).unwrap().walks[0].trusted_prior);
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -2041,6 +2112,9 @@ mod tests {
         assert_eq!(p.runs_with_all[1], vec!["two"]);
         assert!(p.scores[0] > p.scores[1]);
         assert!(p.runs_with_all[2].is_empty());
+        let without_independent_prior = reference_prior(&g.graph, &index, &BTreeMap::new(), &pairings, &[], &[]);
+        assert_eq!(without_independent_prior.runs, 0);
+        assert!(without_independent_prior.scores.iter().all(|&score| score == 0.0));
     }
 
     #[test]
