@@ -44,6 +44,15 @@ class ComparePanBranchModels(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inconsistent counts"):
             model.evaluate(data, 10)
 
+    def test_pseudocount_is_checked_and_changes_predictions(self):
+        with self.assertRaisesRegex(ValueError, "pseudocount"):
+            model.evaluate(example(), 10, 0)
+        a = model.evaluate(example(), 10, 0.5)
+        b = model.evaluate(example(), 10, 10.0)
+        e1 = next(e for e in a["events"] if e["heldout"] == "s1")
+        e2 = next(e for e in b["events"] if e["heldout"] == "s1")
+        self.assertNotEqual(e1["metrics"]["sample_mean_fraction"]["predicted"], e2["metrics"]["sample_mean_fraction"]["predicted"])
+
     def test_missing_and_negative_counts_are_rejected(self):
         data = example()
         del data["candidates"][0]["pairings"][0]["read_counts"]["s2"]
