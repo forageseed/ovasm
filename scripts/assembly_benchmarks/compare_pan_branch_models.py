@@ -25,7 +25,9 @@ def canonical(path):
     reverse = [flip(x) for x in reversed(steps)]
     return tuple(min(steps, reverse))
 
-def evaluate(data, minimum_depth):
+def evaluate(data, minimum_depth, pseudocount=0.5):
+    if not math.isfinite(pseudocount) or pseudocount <= 0:
+        raise ValueError("pseudocount must be positive and finite")
     if minimum_depth < 1:
         raise ValueError("minimum depth must be positive")
     paths = {}
@@ -70,9 +72,9 @@ def evaluate(data, minimum_depth):
             pooled = [sum(counts[i] for counts in training) for i in range(n)]
             probs = {
                 "uniform": [1 / n] * n,
-                "binary_presence": [(x + .5) / (sum(present) + n * .5) for x in present],
-                "sample_mean_fraction": [sum((c[i] + .5) / (sum(c) + n * .5) for c in training) / len(training) for i in range(n)],
-                "pooled_fraction": [(x + .5) / (sum(pooled) + n * .5) for x in pooled],
+                "binary_presence": [(x + pseudocount) / (sum(present) + n * pseudocount) for x in present],
+                "sample_mean_fraction": [sum((c[i] + pseudocount) / (sum(c) + n * pseudocount) for c in training) / len(training) for i in range(n)],
+                "pooled_fraction": [(x + pseudocount) / (sum(pooled) + n * pseudocount) for x in pooled],
             }
             metrics = {}
             for model, pred in probs.items():
@@ -90,7 +92,7 @@ def evaluate(data, minimum_depth):
     per_sample = {s: summarize([e for e in events if e["heldout"] == s])
                   for s in sorted(samples) if any(e["heldout"] == s for e in events)}
     return {"scope": "Held-out observed traversal fractions on fixed candidate-derived graph groups; not topology truth or a calibrated topology posterior. Runs, groups and reads may be correlated; unobserved and noncandidate paths are omitted.",
-            "minimum_depth": minimum_depth, "minimum_training_runs": 2, "pseudocount": .5,
+            "minimum_depth": minimum_depth, "minimum_training_runs": 2, "pseudocount": pseudocount,
             "event_count": len(events), "events_per_sample": dict(Counter(e["heldout"] for e in events)),
             "event_weighted_summary": summarize(events),
             "sample_weighted_summary": {model: {metric: sum(v[model][metric] for v in per_sample.values()) / len(per_sample)
@@ -102,8 +104,9 @@ def main():
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--minimum-depth", type=int, default=10)
+    parser.add_argument("--pseudocount", type=float, default=0.5)
     args = parser.parse_args()
-    result = evaluate(json.loads(args.input.read_text()), args.minimum_depth)
+    result = evaluate(json.loads(args.input.read_text()), args.minimum_depth, args.pseudocount)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k not in ("events", "per_sample_summary")}, indent=2))
 
