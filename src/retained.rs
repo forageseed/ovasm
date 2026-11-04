@@ -18,7 +18,7 @@ fn save(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Per-target compatible blocks use precisely the recruitment gap rule.
-fn blocks(seq: &[u8], bait: &BaitSet, gap: usize) -> Vec<Vec<(usize, usize)>> {
+pub(crate) fn blocks(seq: &[u8], bait: &BaitSet, gap: usize) -> Vec<Vec<(usize, usize)>> {
     let mut result: Vec<Vec<(usize, usize)>> = vec![Vec::new(); bait.targets.len()];
     for (pos, key) in CanonicalKmers::new(seq, bait.k) {
         let mask = bait.get(key);
