@@ -1098,11 +1098,13 @@ fn configurations(
     // Same-individual HiFi supplies target linkage, separate from panel votes.
     // Thresholded presence is a ranking heuristic; do not infer absence or topology.
     let mut target_support: BTreeMap<Pairing, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut target_joint_support: BTreeMap<Vec<(String, bool)>, BTreeMap<String, u64>> = BTreeMap::new();
     let target_report = if target_hifi.is_empty() { None } else {
         let path = dir.join("target-hifi-evidence.json");
         let params = crate::evidence::EvidenceParams { short_read_adjacency: false, k: 21, flank: 2000, min_anchor: 500, diag_tol: 30, min_side_hits: 10, spacing_tol: 0.05, bootstrap: 0, seed: 0, max_repeat_len: 20_000 };
         let report = crate::evidence::run(&d.join("assembly.gfa"), target_hifi.to_vec(), params, &path)?;
         add_prior_traversals("target", &report.traversals, &repeats, &mut target_support);
+        add_prior_joint_walks("target", &report.observed_walks, &repeats, &mut target_joint_support);
         // Preserve the native single-record explanatory family separately from the
         // short-read/pan candidate ranking: correlated evidence is not multiplied.
         let native_json = dir.join("target-hifi-native.json");
@@ -1123,6 +1125,13 @@ fn configurations(
             "native_physical_topology_identified": native.physical_topology_identified,
             "native_family_scope": "Explanatory family on this graph from the same target HiFi evidence, not independently validated physical isoforms or abundances."}))
     };
+    // Audit direct target chains without changing ranking or treating overlapping reads
+    // as independent likelihoods. Graph and path limitations can cause unmatched chains.
+    let mut target_joint_walks: Vec<_> = target_joint_support.iter().collect();
+    target_joint_walks.sort_by(|(a, am), (b, bm)| bm.get("target").cmp(&am.get("target")).then_with(|| a.cmp(b)));
+    let target_joint_limit = 1000usize.min((1_000_000usize / found.len().max(1)).max(1));
+    let target_joint_truncated = target_joint_walks.len() > target_joint_limit;
+    target_joint_walks.truncate(target_joint_limit);
     let target_presence_scores: Vec<f64> = pairings.iter().map(|ps| read_backed_score(ps, &target_support, 1)).collect();
     let target_strength_scores: Vec<f64> = pairings.iter().map(|ps| target_log_strength(ps, &target_support)).collect();
     let target_link_scores = if target_hifi_strength { &target_strength_scores } else { &target_presence_scores };
@@ -1218,7 +1227,13 @@ fn configurations(
                     "repeat_orientation": if p.1.1 {"+"} else {"-"}, "prior_read_counts": support.get(p), "target_hifi_read_counts": target_support.get(p).and_then(|m| m.get("target"))})
             })
             .collect();
-        listed.push(json!({"configuration": n, "reads_score_ln": score, "reference_prior_ln": prior.scores[c],
+        let target_joint_unmatched: Vec<Value> = target_joint_walks.iter().filter_map(|(path, counts)| {
+            (!molecules.iter().any(|m| contains_joint_walk(&m.1, m.0.circular, path))).then(|| json!({
+                "path": path.iter().map(|(n,o)| format!("{}{}", n, if *o {'+'} else {'-'})).collect::<Vec<_>>().join(" "),
+                "target_read_records": counts.get("target").copied().unwrap_or(0)
+            }))
+        }).collect();
+        listed.push(json!({"configuration": n, "target_hifi_unmatched_joint_walks": target_joint_unmatched, "reads_score_ln": score, "reference_prior_ln": prior.scores[c],
             "target_rank_score": target_rank_score, "target_hifi_support_score": target_presence_scores[c], "target_hifi_log_strength_score": target_strength_scores[c], "target_hifi_ranking_score": target_link_scores[c], "copy_number_deviation": copy_deviation, "combined_score": combined[c], "relative_weight": weights[c], "prior_read_support_score": support_scores[c],
             "joint_walk_sample_support": joint_scores[c], "equally_ranked_candidates": tie_counts[&rank_keys[c]], "joint_walks": joint_matches[c].iter().map(|&i| json!({"path":joint_walks[i].0.iter().map(|(n,o)| format!("{}{}",n,if *o {'+'} else {'-'})).collect::<Vec<_>>().join(" "), "read_counts":joint_walks[i].1})).collect::<Vec<_>>(),
             "reference_runs_with_all_pairings": runs, "pairings": detail, "molecules": lengths}));
@@ -1239,6 +1254,8 @@ fn configurations(
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
         "cover_size_limited": component.cover_size_limited, "candidate_list_limited": candidate_list_limited, "skipped_covers": skipped,
         "reference_runs": prior.runs, "fasta": path, "list": listed,
+        "target_hifi_joint_audit": {"walks_evaluated": target_joint_walks.len(), "walk_limit": target_joint_limit, "truncated": target_joint_truncated,
+            "interpretation": "Target HiFi walks supported by at least three read records and crossing at least two graph repeat nodes. Per-candidate unmatched means no exact contiguous match in its listed graph walks; it is not proof of absent sequence, false topology, independent molecules, or calibrated likelihood. Read records and walks can overlap; graph errors, mapping ambiguity and truncation apply. Audit does not change ranking."},
         "target_hifi_evidence": target_report, "target_hifi_ranking_method": if target_hifi.is_empty() { "none" } else if target_hifi_strength { "mean_log1p_read_count" } else { "pairing_presence_at_least_3_reads" }, "ranking_basis": if target_hifi.is_empty() { "combined target and pan heuristic score, then panel linked-walk tiebreak" } else { "target short-read graph score, then selected same-individual HiFi score, then pan combined score and linked-walk tiebreak; heuristic, not a posterior" }, "prior_read_evidence": read_reports, "prior_read_origin_certified": false, "prior_nuclear_competition": "not performed by this reconstruction; recruited reads may include nuclear organelle insertions or other homologous sequences", "joint_evidence_truncated": joint_evidence_truncated, "joint_evidence_limit": joint_evidence_limit, "joint_tiebreak_basis": "At equal combined score to 1e-9, count samples with at least three reads supporting a single chain spanning two or more repeat nodes. This is an uncalibrated tiebreak, not independent evidence multiplied into relative weights.", "prior_scoring": "reference paths excluding read-prior sample labels plus read-backed presence mean", "reference_path_runs_excluded_for_read_prior": ref_names.iter().map(|n| n.split('#').next().unwrap_or("")).filter(|n| prior_reads.contains_key(*n)).collect::<BTreeSet<_>>(),
         "weight_interpretation": "Normalized heuristic weights within enumerated candidates, not posterior probabilities. They exclude same-individual HiFi ranking and the linked-walk tiebreak and can disagree with the final ordering. The target score includes copy-number penalties and can include synthetic topological bridge weights; it is not a calibrated data likelihood. The read-backed score is an uncalibrated mean fraction of samples with at least three spanning reads per pairing, added to the target read score with unit weight; samples and pairings may be correlated, absence may reflect low coverage, and the search may be incomplete.",
         "circular_representative": circular.as_ref().map(|r| r.configuration),
