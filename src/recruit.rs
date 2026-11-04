@@ -678,6 +678,7 @@ fn scan(
     };
     let (mut t_wait, mut t_par, mut t_serial, mut t_check, mut n_batches) = (0f64, 0f64, 0f64, 0f64, 0u64);
     let scan_start = Instant::now();
+    let profile_reads = profiling();
     let _ = (prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS), prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS));
     let mut rx_iter = rx.into_iter();
     loop {
@@ -747,9 +748,11 @@ fn scan(
                     .map(|(i, rec)| {
                         let seq = &rec.rec.seq;
                         let classified = || {
-                            let tcl = Instant::now();
+                            let tcl = profile_reads.then(Instant::now);
                             let (call, score) = classify(seq, bait, p);
-                            PROF_CLASSIFY_NS.fetch_add(tcl.elapsed().as_nanos() as u64, Relaxed);
+                            if let Some(tcl) = tcl {
+                                PROF_CLASSIFY_NS.fetch_add(tcl.elapsed().as_nanos() as u64, Relaxed);
+                            }
                             let bound = u16::try_from(score.cover).unwrap_or(u16::MAX);
                             (call, true, score.tandem, bound)
                         };
@@ -761,7 +764,7 @@ fn scan(
                             return (call, false, false, bound);
                         }
                         let delta = delta.expect("replay has change set");
-                        let td = Instant::now();
+                        let td = profile_reads.then(Instant::now);
                         // cached ACGT-only reads are scanned in their packed form
                         let changed = match (on_gpu.as_ref().and_then(|v| v[i]), &rec.packed) {
                             (Some(changed), _) => changed,
@@ -778,7 +781,9 @@ fn scan(
                         } else {
                             None
                         };
-                        PROF_DELTA_NS.fetch_add(td.elapsed().as_nanos() as u64, Relaxed);
+                        if let Some(td) = td {
+                            PROF_DELTA_NS.fetch_add(td.elapsed().as_nanos() as u64, Relaxed);
+                        }
                         match kept {
                             Some(bound) => (call, false, false, bound),
                             None => classified(),
