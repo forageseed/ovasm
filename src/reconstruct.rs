@@ -1103,7 +1103,25 @@ fn configurations(
         let params = crate::evidence::EvidenceParams { short_read_adjacency: false, k: 21, flank: 2000, min_anchor: 500, diag_tol: 30, min_side_hits: 10, spacing_tol: 0.05, bootstrap: 0, seed: 0, max_repeat_len: 20_000 };
         let report = crate::evidence::run(&d.join("assembly.gfa"), target_hifi.to_vec(), params, &path)?;
         add_prior_traversals("target", &report.traversals, &repeats, &mut target_support);
-        Some(json!({"inputs": target_hifi, "report": path, "reads_scanned": report.reads_scanned, "reads_with_support": report.reads_with_support, "organelle_origin_certified": false}))
+        // Preserve the native single-record explanatory family separately from the
+        // short-read/pan candidate ranking: correlated evidence is not multiplied.
+        let native_json = dir.join("target-hifi-native.json");
+        let native_fasta = dir.join("target-hifi-native.fasta");
+        let native_partial = dir.join("target-hifi-native.partial.fasta");
+        let native = crate::linearize::run(
+            &d.join("assembly.gfa"), &path,
+            crate::linearize::LinearizeParams { min_reads: 2, max_steps: 5_000_000,
+                adaptive_steps: true, max_molecules: 0, max_alternatives: MAX_CONFIGURATIONS,
+                optional_below: 0.5 },
+            &native_fasta, Some(&native_partial), &native_json,
+        )?;
+        Some(json!({"inputs": target_hifi, "report": path, "reads_scanned": report.reads_scanned,
+            "reads_with_support": report.reads_with_support, "organelle_origin_certified": false,
+            "native_solve_report": native_json, "native_solve_fasta": native_fasta,
+            "native_decisive": native.decisive,
+            "native_decisive_scope": "Native solver flag is conditional on its input graph and evidence; it does not establish graph completeness, repeat lengths, physical topology or organelle origin.",
+            "native_physical_topology_identified": native.physical_topology_identified,
+            "native_family_scope": "Explanatory family on this graph from the same target HiFi evidence, not independently validated physical isoforms or abundances."}))
     };
     let target_presence_scores: Vec<f64> = pairings.iter().map(|ps| read_backed_score(ps, &target_support, 1)).collect();
     let target_strength_scores: Vec<f64> = pairings.iter().map(|ps| target_log_strength(ps, &target_support)).collect();
