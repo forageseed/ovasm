@@ -71,6 +71,8 @@ pub struct LinearizeParams {
     /// Upper bound on search expansions per component and cover size (the anchor graph is small,
     /// but stay bounded).
     pub max_steps: u64,
+    /// Automatic mode may retry a small, near-complete search once with a bounded budget.
+    pub adaptive_steps: bool,
     /// Explicit cover-size bound; zero uses the existing four-cover search envelope
     /// raised to the component's necessary path-end lower bound.
     pub max_molecules: usize,
@@ -1193,6 +1195,8 @@ pub struct ComponentReport {
     pub skipped: bool,
     pub candidates: usize,
     pub search_truncated: bool,
+    /// Whether a bounded retry was performed in automatic budget mode.
+    pub adaptive_retry: bool,
     /// Largest cover size enumerated for this component (zero when skipped).
     pub searched_max_molecules: usize,
     /// Larger cover sizes, up to one molecule per anchor, were excluded by the configured
@@ -1517,6 +1521,7 @@ pub fn run_phased(
             skipped: comp.iter().all(|&a| optional[a]),
             candidates: 0,
             search_truncated: false,
+            adaptive_retry: false,
             searched_max_molecules: 0,
             cover_size_limited: false,
             best: None,
@@ -1560,16 +1565,22 @@ pub fn run_phased(
         let mut last = envelope.min(comp.len());
         let mut m = rep.min_molecules;
         while m <= last {
-            let (found, truncated) = search_phased_indexed(
-                g.names.len(),
-                &comp,
-                &optional,
-                &br,
-                m,
-                p.max_steps,
-                &phases,
-                &search_out_of,
+            let (mut found, mut truncated) = search_phased_indexed(
+                g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of,
             );
+            // Automatic mode retries only compact graphs with a modest number of candidates.
+            // Explicit --max-steps remains a hard limit. Release the first batch before retrying
+            // so candidate vectors from the two searches never coexist. One retry per component.
+            if truncated && p.adaptive_steps && !rep.adaptive_retry && comp.len() <= 32
+                && br.len() <= 128 && found.len() <= 1_000_000
+            {
+                rep.adaptive_retry = true;
+                drop(found);
+                (found, truncated) = search_phased_indexed(
+                    g.names.len(), &comp, &optional, &br, m,
+                    p.max_steps.saturating_mul(2), &phases, &search_out_of,
+                );
+            }
             rep.search_truncated |= truncated;
             for cover in found {
                 let mut key: Vec<(bool, Vec<Oriented>)> = cover.iter()
@@ -1696,6 +1707,7 @@ pub fn run_phased(
             skipped: false,
             candidates: 1,
             search_truncated: false,
+            adaptive_retry: false,
             searched_max_molecules: 1,
             cover_size_limited: false,
             best: Some(CoverReport {
@@ -2206,7 +2218,7 @@ mod tests {
         std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
         let params = LinearizeParams {
             min_reads: 2,
-            max_steps: 1_000_000,
+            max_steps: 1_000_000, adaptive_steps: false,
             max_molecules: 4,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -2305,7 +2317,7 @@ mod tests {
         std::fs::write(dir.join("m.partial.fa"), ">partial.1 stale\nACGT\n").unwrap();
         let params = LinearizeParams {
             min_reads: 2,
-            max_steps: 1_000_000,
+            max_steps: 1_000_000, adaptive_steps: false,
             max_molecules,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -2740,7 +2752,7 @@ mod tests {
         std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
         let params = LinearizeParams {
             min_reads: 2,
-            max_steps: 1_000_000,
+            max_steps: 1_000_000, adaptive_steps: false,
             max_molecules: 4,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -2991,13 +3003,44 @@ mod tests {
             {"from":"C+", "to":"A+", "reads":10}
         ]});
         std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
-        let params = LinearizeParams { min_reads: 2, max_steps: 0, max_molecules: 0,
+        let params = LinearizeParams { min_reads: 2, max_steps: 0, adaptive_steps: false, max_molecules: 0,
             max_alternatives: 10, optional_below: 0.5 };
         let report = run(&dir.join("g.gfa"), &dir.join("e.json"), params,
             &dir.join("m.fa"), None, &dir.join("l.json")).unwrap();
         assert!(report.search_truncated);
         assert!(report.components.iter().all(|c| c.searched_max_molecules == 1));
         assert!(report.components.iter().all(|c| !c.decisive));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn automatic_retry_is_bounded_and_explicit_budget_is_respected() {
+        let dir = std::env::temp_dir().join(format!("ovasm-adaptive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.gfa"),
+            "H\tVN:Z:1.0\nS\tA\tACGTACGT\nS\tB\tGCTAGCTA\nS\tC\tTGCATGCA\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tC\t+\tA\t+\t0M\n").unwrap();
+        let ev = json!({"repeat_segments": [], "phased_paths": [], "links": [
+            {"from":"A+", "to":"B+", "reads":10},
+            {"from":"B+", "to":"C+", "reads":10},
+            {"from":"C+", "to":"A+", "reads":10}
+        ]});
+        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
+        let invoke = |steps, adaptive| run(&dir.join("g.gfa"), &dir.join("e.json"),
+            LinearizeParams { min_reads: 2, max_steps: steps, adaptive_steps: adaptive,
+                max_molecules: 1, max_alternatives: 10, optional_below: 0.5 },
+            &dir.join("m.fa"), None, &dir.join("l.json")).unwrap();
+        let mut checked = false;
+        for steps in 1..100 {
+            let explicit = invoke(steps, false);
+            let automatic = invoke(steps, true);
+            assert!(!explicit.components[0].adaptive_retry);
+            if explicit.search_truncated && !automatic.search_truncated {
+                assert!(automatic.components[0].adaptive_retry);
+                checked = true;
+                break;
+            }
+        }
+        assert!(checked, "a bounded retry must finish a search near its first limit");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3013,7 +3056,7 @@ mod tests {
         .unwrap();
         let params = LinearizeParams {
             min_reads: 2,
-            max_steps: 1000,
+            max_steps: 1000, adaptive_steps: false,
             max_molecules: 4,
             max_alternatives: 10,
             optional_below: 0.5,
