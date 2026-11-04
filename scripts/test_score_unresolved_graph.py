@@ -6,4 +6,7 @@ class ScoreTests(unittest.TestCase):
    return f'{q}\t1000\t0\t1000\t{strand}\ts\t3000\t{a}\t{b}\t{match}\t1000\t60\t{tags}'
   lines=[row('x','+',0,1000),row('x','-',0,1000),row('y','-',1000,2000),row('z','+',2000,3000,900),row('w','+',2000,3000,tags='tp:A:S\tcg:Z:1000M')]
   s=score(lines,{'s':3000})['s'];self.assertEqual(s['unique_reads'],2);self.assertEqual(s['covered_span_bp'],2000);self.assertEqual(s['minimum_span_depth'],0);self.assertEqual(s['reads_touching_left_window'],1);self.assertEqual(s['reads_touching_right_window'],0)
+ def test_exclusion_keeps_only_other_reads(self):
+  line=lambda q:f'{q}\t1000\t0\t1000\t+\ts\t1000\t0\t1000\t1000\t1000\t60\ttp:A:P\tcg:Z:1000M'
+  self.assertEqual(score([line('build'),line('other')],{'s':1000}, {'build'})['s']['unique_reads'],1)
 if __name__=='__main__':unittest.main()
