@@ -1702,6 +1702,9 @@ fn assemble_organelle(
     }
     // what no cover explains, as partial paths (not molecules: see `ovasm solve linearize`)
     let partial_paths = linear["partial_paths"].as_array().map_or(0, Vec::len);
+    let partial_lengths: Vec<u64> = linear["partial_paths"].as_array().into_iter().flatten()
+        .filter_map(|p| p["length"].as_u64()).collect();
+    let partial_bases: u64 = partial_lengths.iter().sum();
     if partial_paths > 0 {
         if let Some(f) = linear["partial_fasta"].as_str() {
             files.insert("partial_fasta".into(), f.to_string());
@@ -1755,6 +1758,9 @@ fn assemble_organelle(
         "circular": molecules.iter().map(|m| m["circular"].clone()).collect::<Vec<_>>(),
         // paths the reads join where no cover of molecules was found: not molecules
         "partial_paths": partial_paths,
+        "partial_bases": partial_bases,
+        "partial_lengths": partial_lengths,
+        "partial_scope": "Unresolved graph paths retained as sequence evidence; not complete molecules or certified organelle origin. Bases can overlap.",
         "component_filter": component_filter,
         "decisive": linear["decisive"],
         "unsolved_components": linear["unsolved_components"],
