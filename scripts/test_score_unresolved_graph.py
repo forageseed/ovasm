@@ -1,5 +1,9 @@
 import unittest
-from score_unresolved_graph import score
+import importlib.util
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('score_unresolved_graph',Path(__file__).with_name('score_unresolved_graph.py'))
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+score=module.score
 class ScoreTests(unittest.TestCase):
  def test_duplicate_secondary_and_reverse(self):
   def row(q,strand,a,b,match=1000,tags='tp:A:P\tcg:Z:1000M'):
