@@ -1114,7 +1114,11 @@ fn configurations(
             molecules.iter().any(|m| contains_joint_walk(&m.1, m.0.circular, path)).then_some(i)
         }).collect()
     }).collect();
-    let joint_scores: Vec<usize> = joint_matches.iter().map(|matches| matches.iter().map(|&i| joint_walks[i].1.len()).sum()).collect();
+    // Each sample contributes at most one vote even if several overlapping chains
+    // match the same candidate. Counts within a sample are not independent replicates.
+    let joint_scores: Vec<usize> = joint_matches.iter().map(|matches|
+        distinct_joint_samples(matches.iter().map(|&i| joint_walks[i].1))
+    ).collect();
     let rank_keys: Vec<_> = combined.iter().zip(&joint_scores).map(|(&score, &joint)| (score_bucket(score), joint)).collect();
     let mut tie_counts = BTreeMap::new();
     for key in &rank_keys { *tie_counts.entry(*key).or_insert(0usize) += 1; }
@@ -1238,6 +1242,10 @@ fn add_prior_joint_walks(sample: &str, walks: &[crate::evidence::Traversal], rep
         let key = walk_key(&steps, false);
         *support.entry(key).or_default().entry(sample.to_string()).or_default() += walk.reads;
     }
+}
+
+fn distinct_joint_samples<'a>(walks: impl Iterator<Item = &'a BTreeMap<String, u64>>) -> usize {
+    walks.flat_map(|samples| samples.keys()).collect::<BTreeSet<_>>().len()
 }
 
 fn contains_joint_walk(steps: &[(String, bool)], circular: bool, target: &[(String, bool)]) -> bool {
@@ -2033,6 +2041,13 @@ pub fn run(cfg: &Config) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn joint_tiebreak_counts_each_sample_only_once() {
+        let a = [("s1".to_string(), 20), ("s2".to_string(), 3)].into();
+        let b = [("s1".to_string(), 50), ("s3".to_string(), 4)].into();
+        assert_eq!(distinct_joint_samples([&a, &b].into_iter()), 3);
+    }
+
     #[test]
     fn score_bucket_does_not_break_a_tie_on_float_noise() {
         assert_eq!(score_bucket(-6.0), score_bucket(-6.0 + 1e-15));
