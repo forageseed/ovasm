@@ -195,6 +195,7 @@ impl Replay {
                     break;
                 }
                 let mut batch = Vec::with_capacity(count as usize);
+                let mut lengths = Vec::with_capacity(count as usize);
                 for _ in 0..count {
                     let id_len = next_number(&mut r)? as usize;
                     let len = next_number(&mut r)? as usize;
@@ -208,10 +209,14 @@ impl Replay {
                     r.read_exact(&mut id)?;
                     let mut seq = vec![0; if flags[0] == 1 { len.div_ceil(4) } else { len }];
                     r.read_exact(&mut seq)?;
-                    let packed = (flags[0] == 1).then(|| {
-                        let unpacked = unpack(&seq, len);
-                        std::mem::replace(&mut seq, unpacked)
-                    });
+                    // Keep packed bytes until the whole batch has been read. Decode on the
+                    // worker pool in input order; each record retains its packed form.
+                    let (seq, packed) = if flags[0] == 1 {
+                        (Vec::new(), Some(seq))
+                    } else {
+                        (seq, None)
+                    };
+                    lengths.push(len);
                     batch.push(Entry {
                         rec: Rec {
                             id,
@@ -221,6 +226,11 @@ impl Replay {
                         packed,
                     });
                 }
+                batch.par_iter_mut().zip(lengths.par_iter()).for_each(|(entry, &len)| {
+                    if let Some(packed) = &entry.packed {
+                        entry.rec.seq = unpack(packed, len);
+                    }
+                });
                 crate::recruit::PROF_READER_WORK_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 let ts = std::time::Instant::now();
                 if tx.send(batch).is_err() {
