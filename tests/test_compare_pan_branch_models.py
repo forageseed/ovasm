@@ -44,6 +44,22 @@ class ComparePanBranchModels(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inconsistent counts"):
             model.evaluate(data, 10)
 
+    def test_insufficient_training_is_visible_in_exclusions(self):
+        data = example()
+        for pairing in data["candidates"][0]["pairings"]:
+            pairing["read_counts"]["s4"] = 0
+        for pairing in data["candidates"][0]["pairings"]:
+            pairing["read_counts"]["s1"] = 0
+        # This group has only two covered runs, so no held-out event is eligible.
+        # Add a second group covered in three runs to keep the overall result nonempty.
+        data["candidates"][0]["pairings"].extend([
+            {"path": "d+ r+ e+", "read_counts": {"s1": 10, "s2": 10, "s3": 10, "s4": 0}},
+            {"path": "d+ r+ f+", "read_counts": {"s1": 10, "s2": 10, "s3": 10, "s4": 0}},
+        ])
+        result = model.evaluate(data, 10)
+        self.assertTrue(any(x["heldout"] == "s2" and x["group"] == ("a+", "r+") and x["reason"] == "insufficient_training_runs" and x["training_runs"] == 1 for x in result["exclusions"]))
+        self.assertTrue(any(x["heldout"] == "s1" and x["reason"] == "insufficient_heldout_depth" for x in result["exclusions"]))
+
     def test_pseudocount_is_checked_and_changes_predictions(self):
         with self.assertRaisesRegex(ValueError, "pseudocount"):
             model.evaluate(example(), 10, 0)

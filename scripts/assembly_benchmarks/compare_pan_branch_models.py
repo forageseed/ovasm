@@ -50,6 +50,7 @@ def evaluate(data, minimum_depth, pseudocount=0.5):
         groups[(a, middle)].add((a, middle, b))
         groups[(flip(b), flip(middle))].add((a, middle, b))
     events = []
+    exclusions = []
     for held in sorted(samples):
         for group, pathset in sorted(groups.items()):
             ps = sorted(pathset)
@@ -58,6 +59,7 @@ def evaluate(data, minimum_depth, pseudocount=0.5):
             held_counts = [paths[p][held] for p in ps]
             held_n = sum(held_counts)
             if held_n < minimum_depth:
+                exclusions.append({"heldout": held, "group": group, "heldout_depth": held_n, "reason": "insufficient_heldout_depth"})
                 continue
             training = []
             for sample in sorted(samples - {held}):
@@ -65,6 +67,7 @@ def evaluate(data, minimum_depth, pseudocount=0.5):
                 if sum(counts) >= minimum_depth:
                     training.append(counts)
             if len(training) < 2:
+                exclusions.append({"heldout": held, "group": group, "heldout_depth": held_n, "training_runs": len(training), "reason": "insufficient_training_runs"})
                 continue
             n = len(ps)
             observed = [x / held_n for x in held_counts]
@@ -97,7 +100,7 @@ def evaluate(data, minimum_depth, pseudocount=0.5):
             "event_weighted_summary": summarize(events),
             "sample_weighted_summary": {model: {metric: sum(v[model][metric] for v in per_sample.values()) / len(per_sample)
                                                  for metric in ("cross_entropy", "brier", "squared_fraction_error")} for model in MODELS},
-            "per_sample_summary": per_sample, "events": events}
+            "per_sample_summary": per_sample, "events": events, "exclusions": exclusions}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,7 +111,7 @@ def main():
     args = parser.parse_args()
     result = evaluate(json.loads(args.input.read_text()), args.minimum_depth, args.pseudocount)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps({k: v for k, v in result.items() if k not in ("events", "per_sample_summary")}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k not in ("events", "per_sample_summary", "exclusions")}, indent=2))
 
 if __name__ == "__main__":
     main()
