@@ -371,6 +371,9 @@ struct ReconstructArgs {
     /// These are direct target evidence, not a panel prior; CLR is not supported here.
     #[arg(long = "target-hifi")]
     target_hifi: Vec<String>,
+    /// Exploratory mean log(1 + count) target-HiFi ranking; not a posterior.
+    #[arg(long, requires = "target_hifi")]
+    target_hifi_strength: bool,
     /// Recruited HiFi reads as ORGANELLE=SAMPLE=PATH; repeat for prior samples.
     #[arg(long = "prior-reads")]
     prior_reads: Vec<String>,
@@ -455,6 +458,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
         reads: args.reads,
         target_reads,
         target_hifi,
+        target_hifi_strength: args.target_hifi_strength,
         prior_reads,
         references,
         sample: args.sample,

@@ -931,6 +931,7 @@ fn configurations(
     ref_names: &[String],
     prior_reads: &BTreeMap<String, Vec<PathBuf>>,
     target_hifi: &[PathBuf],
+    target_hifi_strength: bool,
 ) -> Result<(Value, Option<Representative>)> {
     let d = dir.join("de-novo");
     let mut rep = crate::linearize::run(
@@ -1104,7 +1105,9 @@ fn configurations(
         add_prior_traversals("target", &report.traversals, &repeats, &mut target_support);
         Some(json!({"inputs": target_hifi, "report": path, "reads_scanned": report.reads_scanned, "reads_with_support": report.reads_with_support, "organelle_origin_certified": false}))
     };
-    let target_link_scores: Vec<f64> = pairings.iter().map(|ps| read_backed_score(ps, &target_support, 1)).collect();
+    let target_presence_scores: Vec<f64> = pairings.iter().map(|ps| read_backed_score(ps, &target_support, 1)).collect();
+    let target_strength_scores: Vec<f64> = pairings.iter().map(|ps| target_log_strength(ps, &target_support)).collect();
+    let target_link_scores = if target_hifi_strength { &target_strength_scores } else { &target_presence_scores };
     // A bounded exploratory support score, not a likelihood; absence can reflect low coverage.
     // Path priors from these read samples were excluded above to avoid double counting.
     // Multiple conformations may coexist in one sample.
@@ -1198,7 +1201,7 @@ fn configurations(
             })
             .collect();
         listed.push(json!({"configuration": n, "reads_score_ln": score, "reference_prior_ln": prior.scores[c],
-            "target_rank_score": target_rank_score, "target_hifi_support_score": target_link_scores[c], "copy_number_deviation": copy_deviation, "combined_score": combined[c], "relative_weight": weights[c], "prior_read_support_score": support_scores[c],
+            "target_rank_score": target_rank_score, "target_hifi_support_score": target_presence_scores[c], "target_hifi_log_strength_score": target_strength_scores[c], "target_hifi_ranking_score": target_link_scores[c], "copy_number_deviation": copy_deviation, "combined_score": combined[c], "relative_weight": weights[c], "prior_read_support_score": support_scores[c],
             "joint_walk_sample_support": joint_scores[c], "equally_ranked_candidates": tie_counts[&rank_keys[c]], "joint_walks": joint_matches[c].iter().map(|&i| json!({"path":joint_walks[i].0.iter().map(|(n,o)| format!("{}{}",n,if *o {'+'} else {'-'})).collect::<Vec<_>>().join(" "), "read_counts":joint_walks[i].1})).collect::<Vec<_>>(),
             "reference_runs_with_all_pairings": runs, "pairings": detail, "molecules": lengths}));
     }
@@ -1218,7 +1221,7 @@ fn configurations(
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
         "cover_size_limited": component.cover_size_limited, "candidate_list_limited": candidate_list_limited, "skipped_covers": skipped,
         "reference_runs": prior.runs, "fasta": path, "list": listed,
-        "target_hifi_evidence": target_report, "ranking_basis": if target_hifi.is_empty() { "combined target and pan heuristic score, then panel linked-walk tiebreak" } else { "target short-read graph score, then same-individual HiFi pairing presence, then pan combined score and linked-walk tiebreak; heuristic, not a posterior" }, "prior_read_evidence": read_reports, "prior_read_origin_certified": false, "prior_nuclear_competition": "not performed by this reconstruction; recruited reads may include nuclear organelle insertions or other homologous sequences", "joint_evidence_truncated": joint_evidence_truncated, "joint_evidence_limit": joint_evidence_limit, "joint_tiebreak_basis": "At equal combined score to 1e-9, count samples with at least three reads supporting a single chain spanning two or more repeat nodes. This is an uncalibrated tiebreak, not independent evidence multiplied into relative weights.", "prior_scoring": "reference paths excluding read-prior sample labels plus read-backed presence mean", "reference_path_runs_excluded_for_read_prior": ref_names.iter().map(|n| n.split('#').next().unwrap_or("")).filter(|n| prior_reads.contains_key(*n)).collect::<BTreeSet<_>>(),
+        "target_hifi_evidence": target_report, "target_hifi_ranking_method": if target_hifi.is_empty() { "none" } else if target_hifi_strength { "mean_log1p_read_count" } else { "pairing_presence_at_least_3_reads" }, "ranking_basis": if target_hifi.is_empty() { "combined target and pan heuristic score, then panel linked-walk tiebreak" } else { "target short-read graph score, then selected same-individual HiFi score, then pan combined score and linked-walk tiebreak; heuristic, not a posterior" }, "prior_read_evidence": read_reports, "prior_read_origin_certified": false, "prior_nuclear_competition": "not performed by this reconstruction; recruited reads may include nuclear organelle insertions or other homologous sequences", "joint_evidence_truncated": joint_evidence_truncated, "joint_evidence_limit": joint_evidence_limit, "joint_tiebreak_basis": "At equal combined score to 1e-9, count samples with at least three reads supporting a single chain spanning two or more repeat nodes. This is an uncalibrated tiebreak, not independent evidence multiplied into relative weights.", "prior_scoring": "reference paths excluding read-prior sample labels plus read-backed presence mean", "reference_path_runs_excluded_for_read_prior": ref_names.iter().map(|n| n.split('#').next().unwrap_or("")).filter(|n| prior_reads.contains_key(*n)).collect::<BTreeSet<_>>(),
         "weight_interpretation": "Normalized heuristic weights within enumerated candidates, not posterior probabilities. They exclude same-individual HiFi ranking and the linked-walk tiebreak and can disagree with the final ordering. The target score includes copy-number penalties and can include synthetic topological bridge weights; it is not a calibrated data likelihood. The read-backed score is an uncalibrated mean fraction of samples with at least three spanning reads per pairing, added to the target read score with unit weight; samples and pairings may be correlated, absence may reflect low coverage, and the search may be incomplete.",
         "circular_representative": circular.as_ref().map(|r| r.configuration),
         "basis": "enumerated covers of the anchor graph; the reads do not decide between \
@@ -1280,6 +1283,14 @@ fn eligible_path_prior_indices(names: &[String], prior_reads: &BTreeMap<String, 
 fn candidate_rank_key(short_score: f64, target_link: f64, combined: f64, joint: usize, has_target: bool) -> (i128, i128, i128, usize) {
     if has_target { (score_bucket(short_score), score_bucket(target_link), score_bucket(combined), joint) }
     else { (score_bucket(combined), 0, 0, joint) }
+}
+
+// Correlated counts and unequal detection mean this exploratory score is not a
+// likelihood or molecule-frequency estimate. Count each candidate pairing once.
+fn target_log_strength(pairings: &[Pairing], support: &BTreeMap<Pairing, BTreeMap<String, u64>>) -> f64 {
+    let unique: BTreeSet<&Pairing> = pairings.iter().collect();
+    if unique.is_empty() { return 0.0; }
+    unique.iter().map(|p| (support.get(*p).and_then(|m| m.get("target")).copied().unwrap_or(0) as f64).ln_1p()).sum::<f64>() / unique.len() as f64
 }
 
 fn read_backed_score(pairings: &[Pairing], support: &BTreeMap<Pairing, BTreeMap<String, u64>>, samples: usize) -> f64 {
@@ -1478,6 +1489,7 @@ fn final_outputs(
     walk_names: &[String],
     prior_reads: &BTreeMap<String, Vec<PathBuf>>,
     target_hifi: &[PathBuf],
+    target_hifi_strength: bool,
 ) -> Result<Value> {
     let graph = dir.join("de-novo/organelle.gfa");
     let fasta = dir.join("de-novo/molecules.fasta");
@@ -1609,7 +1621,7 @@ fn final_outputs(
     };
     // the reads leave the configuration open: every one the graph allows
     let (configurations_found, chosen) = if should_evaluate_configurations(decisive, pieces.len()) {
-        configurations(dir, out, organelle, &gfa_out, walks, walk_names, prior_reads, target_hifi)?
+        configurations(dir, out, organelle, &gfa_out, walks, walk_names, prior_reads, target_hifi, target_hifi_strength)?
     } else {
         (Value::Null, None)
     };
@@ -1784,6 +1796,7 @@ pub struct Config {
     pub reads: Vec<PathBuf>,
     pub target_reads: BTreeMap<String, Vec<PathBuf>>,
     pub target_hifi: BTreeMap<String, Vec<PathBuf>>,
+    pub target_hifi_strength: bool,
     pub prior_reads: BTreeMap<String, BTreeMap<String, Vec<PathBuf>>>,
     pub references: BTreeMap<String, PathBuf>,
     pub sample: String,
@@ -1799,6 +1812,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
     }
+    if cfg.target_hifi_strength && cfg.target_hifi.is_empty() { bail!("target HiFi strength scoring needs target HiFi reads"); }
     let direct_hifi: BTreeSet<ReadFileIdentity> = cfg.target_hifi.values().flatten().map(|p| read_file_identity(p)).collect::<Result<_>>()?;
     let short_inputs: BTreeSet<ReadFileIdentity> = cfg.reads.iter().chain(cfg.target_reads.values().flatten()).map(|p| read_file_identity(p)).collect::<Result<_>>()?;
     if !direct_hifi.is_disjoint(&short_inputs) { bail!("target HiFi cannot reuse a short-read input file"); }
@@ -2029,7 +2043,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             let walks: Vec<(Vec<u8>, bool)> =
                 r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| (w.sequence.clone(), w.circular)).collect();
             let names: Vec<String> = r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| w.name.clone()).collect();
-            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names, cfg.prior_reads.get(o).unwrap_or(&BTreeMap::new()), cfg.target_hifi.get(o).map(Vec::as_slice).unwrap_or(&[]))?
+            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names, cfg.prior_reads.get(o).unwrap_or(&BTreeMap::new()), cfg.target_hifi.get(o).map(Vec::as_slice).unwrap_or(&[]), cfg.target_hifi_strength)?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
@@ -2094,6 +2108,17 @@ mod tests {
         let a = [("s1".to_string(), 20), ("s2".to_string(), 3)].into();
         let b = [("s1".to_string(), 50), ("s3".to_string(), 4)].into();
         assert_eq!(distinct_joint_samples([&a, &b].into_iter()), 3);
+    }
+
+    #[test]
+    fn target_strength_deduplicates_pairings_and_handles_missing_support() {
+        let a = (("a".into(), true), ("r".into(), true), ("b".into(), true));
+        let b = (("c".into(), true), ("r".into(), true), ("d".into(), true));
+        let mut support = BTreeMap::new();
+        support.insert(a.clone(), BTreeMap::from([("target".to_string(), 99)]));
+        let score = target_log_strength(&[a.clone(), a.clone(), b], &support);
+        assert!((score - 100f64.ln()/2.0).abs() < 1e-12);
+        assert_eq!(target_log_strength(&[], &support), 0.0);
     }
 
     #[test]
