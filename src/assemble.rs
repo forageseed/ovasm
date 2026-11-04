@@ -184,6 +184,9 @@ fn sample_dense(seq: &[u8], k: usize) -> Vec<Sample> {
 #[derive(Serialize)]
 pub struct AssembleReport {
     pub cleaning_audit_only: bool,
+    /// Experimental dense-read bubble protection; threshold relative to graph node depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_deep_bubble_fraction: Option<f64>,
     /// Original-read support for structural junctions hidden by the long-k backbone.
     /// Absent for the dense short-read graph, whose reads cannot span these contexts.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -996,6 +999,8 @@ pub struct CleanStats {
     pub rounds: usize,
     pub tips_removed: usize,
     pub bubbles_popped: usize,
+    /// Repeated cleaning-round proposals retained by the experimental depth guard.
+    pub experimental_protected_bubble_proposals: usize,
     pub isolated_removed: usize,
     /// Unitigs of components whose deepest unitig is below 30% of the genome's depth.
     pub shallow_component_removed: usize,
@@ -1119,6 +1124,7 @@ fn clean(
     audit: &mut Vec<CleanEvent>,
     keep_short_isolated: bool,
     numt_depth: Option<f64>,
+    deep_bubble_fraction: Option<f64>,
 ) -> usize {
     let n = unitigs.len();
     let len: Vec<usize> = unitigs
@@ -1250,9 +1256,15 @@ fn clean(
                     && !strongest_at[u]
                     && has_detour(u, &out, &len, len[u] + 2 * k)
                 {
-                    remove[u] = true;
-                    why[u] = "bubble";
-                    stats.bubbles_popped += 1;
+                    if deep_bubble_fraction.is_some_and(|f| dp[u] >= f * depth) {
+                        // A high-depth short allele can be real; retention does not certify
+                        // organelle origin and can also retain systematic errors or NUMTs.
+                        stats.experimental_protected_bubble_proposals += 1;
+                    } else {
+                        remove[u] = true;
+                        why[u] = "bubble";
+                        stats.bubbles_popped += 1;
+                    }
                 }
             }
         }
@@ -1584,7 +1596,14 @@ pub fn run_with_context(
     out_json: &Path,
     context: Option<&Path>,
 ) -> Result<AssembleReport> {
-    let mut r = run_backbone(inputs.clone(), p, out_gfa, out_json)?;
+    run_with_context_guard(inputs, p, out_gfa, out_json, context, None)
+}
+
+fn run_with_context_guard(
+    inputs: Vec<PathBuf>, p: AssembleParams, out_gfa: &Path, out_json: &Path,
+    context: Option<&Path>, deep_bubble_fraction: Option<f64>,
+) -> Result<AssembleReport> {
+    let mut r = run_backbone_layout_guard(inputs.clone(), p, out_gfa, out_json, Coordinates::Bases, deep_bubble_fraction)?;
     add_junctions(&mut r, &inputs, out_gfa, context)?;
     if p.cleaning_audit_only {
         bind_cleaning_audit(out_gfa, &out_gfa.with_extension("cleaning.json"))?;
@@ -1739,6 +1758,7 @@ pub struct EngineParams<'a> {
     pub nuclear_share: Option<f64>,
     pub auto_k_depth: f64,
     pub context: Option<&'a Path>,
+    pub experimental_deep_bubble_fraction: Option<f64>,
 }
 
 /// The report of one engine run, in the encoding's existing JSON schema.
@@ -1757,6 +1777,17 @@ pub fn run_engine(
     out_gfa: &Path,
     out_json: &Path,
 ) -> Result<EngineReport> {
+    if let Some(fraction) = p.experimental_deep_bubble_fraction {
+        if !matches!(p.coordinates, Coordinates::Bases) || p.s != 0 || p.k.is_none() || p.cleaning_audit_only {
+            bail!("experimental deep-bubble protection requires base coordinates, explicit --k, --s 0 and active cleaning");
+        }
+        if !(fraction > 0.0 && fraction <= 1.0) {
+            bail!("experimental deep-bubble fraction must be in (0, 1]");
+        }
+        let params = AssembleParams { cleaning_audit_only: false, k: p.k.unwrap(), s: p.s,
+            min_count: p.min_count, min_count_fraction: p.min_count_fraction, nuclear_share: p.nuclear_share };
+        return run_with_context_guard(inputs, params, out_gfa, out_json, p.context, Some(fraction)).map(EngineReport::Bases);
+    }
     match p.coordinates {
         Coordinates::HomopolymerRuns => {
             let k = p.k.unwrap_or(HPC_DEFAULT_K);
@@ -1834,11 +1865,14 @@ fn run_backbone(
 /// them, so nothing is filled, shifted or trimmed before observations are assigned. The
 /// default base-coordinate assembler retains its existing layout.
 pub(crate) fn run_backbone_layout(
-    inputs: Vec<PathBuf>,
-    p: AssembleParams,
-    out_gfa: &Path,
-    out_json: &Path,
-    coordinates: Coordinates,
+    inputs: Vec<PathBuf>, p: AssembleParams, out_gfa: &Path, out_json: &Path, coordinates: Coordinates,
+) -> Result<AssembleReport> {
+    run_backbone_layout_guard(inputs, p, out_gfa, out_json, coordinates, None)
+}
+
+fn run_backbone_layout_guard(
+    inputs: Vec<PathBuf>, p: AssembleParams, out_gfa: &Path, out_json: &Path,
+    coordinates: Coordinates, deep_bubble_fraction: Option<f64>,
 ) -> Result<AssembleReport> {
     let preserve_overlaps = coordinates == Coordinates::HomopolymerRuns;
     if let Some(f) = p.min_count_fraction {
@@ -1978,6 +2012,7 @@ pub(crate) fn run_backbone_layout(
                 &mut audit,
                 deferring,
                 p.nuclear_share.map(|s| NUMT_BRANCH_FOLD * s * node_depth),
+                deep_bubble_fraction,
             );
             cleaning.rounds += 1;
             if let Some(saved) = saved_alive {
@@ -2127,6 +2162,7 @@ pub(crate) fn run_backbone_layout(
         .unwrap_or(0);
     let report = AssembleReport {
         cleaning_audit_only: p.cleaning_audit_only,
+        experimental_deep_bubble_fraction: deep_bubble_fraction,
         junction_rescue: None,
         cleaning_audit: cleaning_audit.display().to_string(),
         k: p.k,
@@ -2490,6 +2526,50 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn experimental_guard_rejects_unsupported_modes_before_reading_inputs() {
+        let params = |k, s, fraction| EngineParams {
+            cleaning_audit_only: false, coordinates: Coordinates::Bases, k, s,
+            min_count: None, min_count_fraction: None, nuclear_share: None,
+            auto_k_depth: AUTO_K_NODE_DEPTH, context: None,
+            experimental_deep_bubble_fraction: Some(fraction),
+        };
+        let dir = tmpdir("deep-guard-invalid");
+        let out = dir.join("must-not-be-created");
+        for p in [params(Some(77), 0, 0.0), params(None, 0, 0.75), params(Some(77), 31, 0.75)] {
+            assert!(run_engine(Vec::new(), p, &out, &out).is_err());
+        }
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn experimental_guard_retains_deep_bubble_but_keeps_default_cleaning() {
+        let unitigs = vec![
+            Unitig { nodes: vec![((0, true), 0), ((4, true), 10)], circular: false, close: 0 },
+            Unitig { nodes: vec![((1, true), 0)], circular: false, close: 0 },
+            Unitig { nodes: vec![((2, true), 0)], circular: false, close: 0 },
+            Unitig { nodes: vec![((3, true), 0), ((5, true), 10)], circular: false, close: 0 },
+        ];
+        let links = vec![(((0,true),(1,true)),0), (((1,true),(3,true)),0),
+                         (((0,true),(2,true)),0), (((2,true),(3,true)),0)];
+        let count = vec![1000,800,1000,1000,1000,1000];
+        let kmers: Vec<&[u8]> = vec![b"AAA",b"CCC",b"GGG",b"TTT",b"AAC",b"TTA"];
+        let run = |threshold| {
+            let mut alive = vec![true; 6];
+            let mut stats = CleanStats::default();
+            let mut audit = Vec::new();
+            clean(&unitigs, &links, &count, 3, 1000.0, &kmers, &mut alive,
+                  &mut stats, &mut audit, false, None, threshold);
+            (alive[1], stats.bubbles_popped, stats.experimental_protected_bubble_proposals)
+        };
+        let baseline = run(None);
+        assert!(!baseline.0 && baseline.1 >= 1);
+        let protected = run(Some(0.75));
+        assert!(protected.0 && protected.2 >= 1);
+        let below = run(Some(0.9));
+        assert!(!below.0);
     }
 
     #[test]

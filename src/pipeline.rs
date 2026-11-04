@@ -453,6 +453,7 @@ struct GraphAttempts<'a> {
     filter: Option<&'a ComponentFilter>,
     /// `assemble graph --nuclear-share` (`nuclear_share`).
     nuclear_share: Option<f64>,
+    experimental_deep_bubble_fraction: Option<f64>,
 }
 
 fn molecules_of(linearization: &Value) -> Vec<&Value> {
@@ -518,6 +519,9 @@ impl Attempts for GraphAttempts<'_> {
         }
         if let Some(share) = self.nuclear_share {
             asm = asm.opt("--nuclear-share", format!("{share}"));
+        }
+        if let Some(fraction) = self.experimental_deep_bubble_fraction {
+            asm = asm.opt("--experimental-deep-bubble-fraction", fraction.to_string());
         }
         if let Some(k) = k {
             asm = asm.opt("--k", k.to_string());
@@ -1589,6 +1593,7 @@ fn assemble_organelle(
     dir: &Path,
     mut files: BTreeMap<String, String>,
     sr_min_graph_bases: Option<u64>,
+    experimental_deep_bubble_fraction: Option<f64>,
 ) -> Result<Value> {
     let t0 = Instant::now();
     fs::create_dir_all(dir)?;
@@ -1614,6 +1619,7 @@ fn assemble_organelle(
         read_type: cfg.read_type,
         filter: filter.as_ref(),
         nuclear_share: nuclear_share(&recruited.recruitment),
+        experimental_deep_bubble_fraction,
     };
     let ladder = match cfg.read_type {
         ReadType::Hifi => k_ladder(&mut attempts, true, start)?,
@@ -1958,6 +1964,13 @@ pub fn run(cfg: &RunConfig) -> Result<Value> {
 }
 
 pub(crate) fn run_with_sr_evidence_floor(cfg: &RunConfig, sr_min_graph_bases: Option<u64>) -> Result<Value> {
+    run_with_experimental_deep_bubble(cfg, sr_min_graph_bases, None)
+}
+
+pub(crate) fn run_with_experimental_deep_bubble(cfg: &RunConfig, sr_min_graph_bases: Option<u64>, experimental_deep_bubble_fraction: Option<f64>) -> Result<Value> {
+    if let Some(f) = experimental_deep_bubble_fraction {
+        if cfg.read_type != ReadType::Sr || !(f > 0.0 && f <= 1.0) { bail!("experimental deep bubble fraction requires short reads and a value in (0, 1]"); }
+    }
     let t0 = Instant::now();
     validate(cfg)?;
     fs::create_dir_all(&cfg.out)?;
@@ -2000,7 +2013,7 @@ pub(crate) fn run_with_sr_evidence_floor(cfg: &RunConfig, sr_min_graph_bases: Op
         let r = recruited
             .remove(organelle)
             .expect("one entry per organelle")?;
-        return assemble_organelle(cfg, organelle, &r, &cfg.out, files, sr_min_graph_bases);
+        return assemble_organelle(cfg, organelle, &r, &cfg.out, files, sr_min_graph_bases, experimental_deep_bubble_fraction);
     }
     let mut results = Map::new();
     let mut failed = Vec::new();
@@ -2009,7 +2022,7 @@ pub(crate) fn run_with_sr_evidence_floor(cfg: &RunConfig, sr_min_graph_bases: Op
             .remove(organelle)
             .expect("one entry per organelle")
             .and_then(|r| {
-                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone(), sr_min_graph_bases)
+                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone(), sr_min_graph_bases, experimental_deep_bubble_fraction)
             });
         match result {
             Ok(report) => {
@@ -2131,7 +2144,7 @@ mod tests {
         let dir=tmpdir("configuration-family-restore");
         let reads=Vec::new();
         let mut attempts=GraphAttempts {reads:&reads,read_context:None,dir:&dir,
-            read_type:ReadType::Hifi,filter:None,nuclear_share:None};
+            read_type:ReadType::Hifi,filter:None,nuclear_share:None,experimental_deep_bubble_fraction:None};
         // Restoring a retry must restore its family, including the absence of one.
         let family=dir.join("molecules.configurations.fasta");
         fs::write(&family,"best family").unwrap();
@@ -2845,7 +2858,7 @@ mod tests {
             discovered: true,
             recruitment: Value::Null,
         };
-        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new(), None)
+        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new(), None, None)
             .unwrap();
         let filter = &s["component_filter"];
         assert_eq!(filter["kept_components"], json!(1), "{filter}");
