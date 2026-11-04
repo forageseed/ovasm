@@ -367,6 +367,10 @@ struct ReconstructArgs {
     /// Explicit target-input mode preserves an earlier recruitment without rescanning WGS.
     #[arg(long = "target-reads", conflicts_with = "target_depth")]
     target_reads: Vec<String>,
+    /// Recruited HiFi reads from the target individual as ORGANELLE=PATH.
+    /// These are direct target evidence, not a panel prior; CLR is not supported here.
+    #[arg(long = "target-hifi")]
+    target_hifi: Vec<String>,
     /// Recruited HiFi reads as ORGANELLE=SAMPLE=PATH; repeat for prior samples.
     #[arg(long = "prior-reads")]
     prior_reads: Vec<String>,
@@ -424,6 +428,12 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
             .or_default()
             .push(PathBuf::from(p));
     }
+    let mut target_hifi = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    for spec in args.target_hifi {
+        let (o, p) = spec.split_once('=').context("target HiFi must be ORGANELLE=PATH")?;
+        if !["mitochondrion", "plastid"].contains(&o) || p.is_empty() { bail!("invalid target HiFi organelle or path"); }
+        target_hifi.entry(o.to_string()).or_default().push(PathBuf::from(p));
+    }
     let mut prior_reads = std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Vec<PathBuf>>>::new();
     for spec in args.prior_reads {
         let (organelle, rest) = spec.split_once('=').context("prior reads must be ORGANELLE=SAMPLE=PATH")?;
@@ -444,6 +454,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
     reconstruct::run(&reconstruct::Config {
         reads: args.reads,
         target_reads,
+        target_hifi,
         prior_reads,
         references,
         sample: args.sample,
