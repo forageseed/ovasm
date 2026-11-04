@@ -48,7 +48,8 @@ def compare(paf, organelle_ids, nuclear_ids, min_fraction=.9, min_identity=.95, 
         if o is None or n is None:
             state = "missing_qualifying_competitor"
             delta = None
-        elif abs((n["query_end"] - n["query_start"]) - (o["query_end"] - o["query_start"])) > 0.05 * row["length"]:
+        elif (abs((n["query_end"] - n["query_start"]) - (o["query_end"] - o["query_start"])) > 0.05 * row["length"]
+              or min(n["query_end"], o["query_end"]) - max(n["query_start"], o["query_start"]) < 0.9 * max(n["query_end"] - n["query_start"], o["query_end"] - o["query_start"])):
             state = "alignment_span_incomparable"
             delta = None
         else:
@@ -56,7 +57,7 @@ def compare(paf, organelle_ids, nuclear_ids, min_fraction=.9, min_identity=.95, 
             state = "nuclear_score_higher" if delta > margin else "organelle_score_higher" if delta < -margin else "score_ambiguous"
         rows.append({"read": name, "status": state, "nuclear_minus_organelle_score": delta, **row})
     return {"scope": "Comparison of scores against specified references only. Neither taxonomic origin nor molecule type is certified; a missing alignment is not evidence of absence and unrepresented loci are not assessed.",
-            "parameters": {"min_query_fraction":min_fraction,"min_identity":min_identity,"score_margin":margin,"max_query_span_difference_fraction":0.05},
+            "parameters": {"min_query_fraction":min_fraction,"min_identity":min_identity,"score_margin":margin,"max_query_span_difference_fraction":0.05,"min_query_span_overlap_fraction":0.9},
             "summary":dict(Counter(x["status"] for x in rows)),"reads":rows}
 
 def main():

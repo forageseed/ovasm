@@ -26,6 +26,10 @@ class CompetingAlignments(unittest.TestCase):
         self.path.write_text(paf("r1","mito",300)+paf("r1","nuclear",280,0,140))
         result=model.compare(self.path,["mito"],["nuclear"])
         self.assertEqual(result["reads"][0]["status"],"alignment_span_incomparable")
+    def test_disjoint_query_ends_are_not_directly_compared(self):
+        self.path.write_text(paf("r1","mito",270,0,135)+paf("r1","nuclear",270,15,150))
+        result=model.compare(self.path,["mito"],["nuclear"])
+        self.assertEqual(result["reads"][0]["status"],"alignment_span_incomparable")
     def test_ambiguous_target_sets_and_missing_scores_rejected(self):
         with self.assertRaisesRegex(ValueError,"disjoint"):
             model.compare(self.path,["same"],["same"])
