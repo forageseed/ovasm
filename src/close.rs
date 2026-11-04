@@ -115,6 +115,9 @@ pub fn close(molecule: &[u8], reads: &[PathBuf]) -> Result<Closure> {
             }
         })?;
     }
+    // Ambiguous duplicate/colliding IDs must not contribute to local extension either:
+    // otherwise they could amplify bases after other pairs establish an apparent join.
+    where_.retain(|_, placements| placements.len() <= 2);
     c.anchored_names = where_.len();
     let median = |mut v: Vec<i64>| -> Option<f64> {
         v.sort_unstable();
@@ -123,6 +126,10 @@ pub fn close(molecule: &[u8], reads: &[PathBuf]) -> Result<Closure> {
     let mut inserts = Vec::new();
     let mut spans = Vec::new();
     for v in where_.values() {
+        // A read name identifies at most one pair, not a set of independent fragments.
+        // More than two placements mean duplicate/colliding names: abstain instead of
+        // turning their Cartesian product into spurious support for a join.
+        if v.len() != 2 { continue; }
         for a in v.iter().filter(|a| a.1) {
             for b in v.iter().filter(|b| !b.1) {
                 if a.0 == b.0 && b.3 > a.2 && b.3 - a.2 < 2000 {
@@ -443,6 +450,28 @@ mod tests {
         assert_eq!(normalized.joining_pairs, ordinary.joining_pairs);
         assert_eq!(normalized.fill, Some(120));
         assert_eq!(normalized.sequence, genome[4880..].to_vec());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_read_names_do_not_multiply_closing_support() {
+        let genome = random(5000, 123);
+        let dir = std::env::temp_dir().join(format!("ovasm-close-duplicate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fq");
+        let m1 = &genome[4800..4900];
+        let m2 = revcomp(&genome[30..130]);
+        let mut fq = String::new();
+        for _ in 0..5 {
+            for (mate, seq) in [(1, m1), (2, m2.as_slice())] {
+                writeln!(fq, "@same/{mate}\n{}\n+\n{}", String::from_utf8_lossy(seq), "I".repeat(seq.len())).unwrap();
+            }
+        }
+        std::fs::write(&reads, fq).unwrap();
+        let result = close(&genome[..4880], &[reads]).unwrap();
+        assert_eq!(result.joining_pairs, 0, "duplicate IDs cannot establish independent pairs: {result:?}");
+        assert_eq!(result.anchored_names, 0, "ambiguous IDs must not supply extension reads");
+        assert_eq!(result.fill, None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
