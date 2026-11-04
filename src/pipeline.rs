@@ -381,7 +381,7 @@ fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> R
 }
 
 /// Files of one attempt, all in the organelle's output directory.
-const ATTEMPT_FILES: [&str; 9] = [
+const ATTEMPT_FILES: [&str; 10] = [
     "assembly.gfa",
     "assembly.backbone.gfa",
     "assembly.json",
@@ -390,6 +390,7 @@ const ATTEMPT_FILES: [&str; 9] = [
     "evidence.json",
     "linearization.json",
     "molecules.fasta",
+    "molecules.configurations.fasta",
     "molecules.partial.fasta",
 ];
 const BEST_ATTEMPT_DIR: &str = ".best_attempt";
@@ -493,6 +494,10 @@ impl Attempts for GraphAttempts<'_> {
         let (graph, fasta) = (d.join("assembly.gfa"), d.join("molecules.fasta"));
         let (filtered, components_json) =
             (d.join("assembly.filtered.gfa"), d.join("components.json"));
+        let configurations = d.join("molecules.configurations.fasta");
+        if configurations.exists() {
+            fs::remove_file(&configurations)?;
+        }
         // `linearize` writes the FASTA only when it has a molecule: one left by an earlier run
         // into this directory must not pass for this run's (nor a filter report of one)
         for stale in [&fasta, &filtered, &components_json] {
@@ -1734,6 +1739,9 @@ fn assemble_organelle(
             path_str(&dir.join("molecules.fasta")),
         );
     }
+    if let Some(f) = linear["configurations_fasta"].as_str() {
+        files.insert("configurations_fasta".into(), f.to_string());
+    }
     let report = json!({
         "backend": "ovasm",
         "organelle": organelle,
@@ -2116,6 +2124,24 @@ mod tests {
 
     fn ks(l: &Ladder) -> Vec<usize> {
         l.tried.iter().map(|o| o.k).collect()
+    }
+
+    #[test]
+    fn retry_restore_keeps_only_the_chosen_configuration_family() {
+        let dir=tmpdir("configuration-family-restore");
+        let reads=Vec::new();
+        let mut attempts=GraphAttempts {reads:&reads,read_context:None,dir:&dir,
+            read_type:ReadType::Hifi,filter:None,nuclear_share:None};
+        // Restoring a retry must restore its family, including the absence of one.
+        let family=dir.join("molecules.configurations.fasta");
+        fs::write(&family,"best family").unwrap();
+        attempts.stash().unwrap();assert!(!family.exists());
+        fs::write(&family,"later inferior family").unwrap();
+        attempts.restore().unwrap();assert_eq!(fs::read_to_string(&family).unwrap(),"best family");
+        fs::remove_file(&family).unwrap();
+        attempts.stash().unwrap();fs::write(&family,"stale family").unwrap();
+        attempts.restore().unwrap();assert!(!family.exists());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
