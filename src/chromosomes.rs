@@ -116,9 +116,12 @@ pub struct Excluded {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChromosomeReport {
-    /// The count when the evidence decides it, else none and `range` holds the bounds.
+    /// An estimate for the represented graph, not a certified physical chromosome count.
     pub count: Option<usize>,
+    /// Bounds for represented graph groups, not bounds on unobserved biological molecules.
     pub range: (usize, usize),
+    /// Disconnected components contain linear paths that may be assembly fragments.
+    pub fragmented_components: bool,
     /// Components of a source still to be found (rule 6), in `range`'s maximum only.
     pub source_pending: usize,
     pub reasons: Vec<String>,
@@ -288,6 +291,7 @@ pub fn call(
     let mut report = ChromosomeReport {
         count: None,
         range: (0, 0),
+        fragmented_components: false,
         source_pending: 0,
         reasons: Vec::new(),
         depth_source: if depths.is_some() { "library" } else { "kept_reads" },
@@ -477,8 +481,30 @@ pub fn call(
             repeats: calls,
         });
     }
-    report.range = (lo, hi);
-    report.count = (lo == hi).then_some(lo);
+    // A disconnected linear path may be a piece of a chromosome shared with another component.
+    // No edge is not evidence of biological separation: do not count these as established
+    // chromosomes merely because incomplete assembly split them. Preserve components and paths.
+    let fragmented = report.chromosomes.len() > 1
+        && report.chromosomes.iter().any(|c| c.conformations.iter().any(|m| !m.circular));
+    if fragmented {
+        report.fragmented_components = true;
+        report.reasons.push("Disconnected graph components include linear paths; they may be assembly fragments. The range describes represented graph groups, not biological chromosome-count bounds.".into());
+        for c in &mut report.chromosomes {
+            if c.conformations.iter().any(|m| !m.circular) {
+                let why = "unconnected linear assembly path; biological separation is unresolved";
+                c.reason = Some(match c.reason.take() {
+                    Some(previous) => format!("{previous}; {why}"),
+                    None => why.into(),
+                });
+                c.status = "fragment_unresolved";
+            }
+        }
+        report.range = (usize::from(lo > 0), hi);
+        report.count = None;
+    } else {
+        report.range = (lo, hi);
+        report.count = (lo == hi).then_some(lo);
+    }
     Ok(report)
 }
 
@@ -500,15 +526,30 @@ pub fn annotate_fasta(path: &Path, report: &ChromosomeReport) -> Result<()> {
     let mut out = String::with_capacity(text.len() + 64 * labels.len());
     let mut n = 0;
     for line in text.lines() {
-        out.push_str(line);
         if line.starts_with('>') {
+            // Replace our own old annotations when re-running this command, while preserving
+            // other header fields and conservative provenance from earlier stages.
+            let fragment = labels.get(&(n + 1)).is_some_and(|label| label.3 == "fragment_unresolved");
+            let clean = line.split_whitespace().filter(|field| {
+                !(fragment && *field == "reads_decide=false")
+                    && !["chromosome=", "conformation=", "share=", "chromosome_status=", "graph_component_group="]
+                        .iter().any(|prefix| field.starts_with(prefix))
+            }).collect::<Vec<_>>().join(" ");
+            out.push_str(&clean);
             n += 1;
             if let Some((c, k, share, status)) = labels.get(&n) {
-                out.push_str(&format!(" chromosome={c} conformation={k} share={share:.3}"));
-                if *status != "counted" {
-                    out.push_str(&format!(" chromosome_status={status}"));
+                if *status == "fragment_unresolved" {
+                    out.push_str(&format!(" graph_component_group={c} chromosome_status=fragment_unresolved"));
+                    out.push_str(" reads_decide=false");
+                } else {
+                    out.push_str(&format!(" chromosome={c} conformation={k} share={share:.3}"));
+                    if *status != "counted" {
+                        out.push_str(&format!(" chromosome_status={status}"));
+                    }
                 }
             }
+        } else {
+            out.push_str(line);
         }
         out.push('\n');
     }
@@ -523,18 +564,34 @@ pub fn annotate_gfa(path: &Path, report: &ChromosomeReport) -> Result<()> {
     let labels = labels(report);
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
-        out.push_str(line);
-        if line.starts_with("P\t") {
-            let name = line.split('\t').nth(1).unwrap_or_default();
+        let fields: Vec<&str> = line.split('\t').collect();
+        let mut new_label = None;
+        if fields.first() == Some(&"P") {
+            let name = fields.get(1).copied().unwrap_or_default();
             let mut parts = name.rsplitn(2, '#');
             let last = parts.next().unwrap_or_default();
             let solution = parts.next().and_then(|rest| rest.rsplit('#').next());
             let n = last.rsplit('.').next().and_then(|x| x.parse::<usize>().ok());
             if let (Some("1"), Some(n)) = (solution, n) {
-                if let Some((c, k, _, _)) = labels.get(&n) {
-                    out.push_str(&format!("\tCH:i:{c}\tCF:i:{k}"));
-                }
+                new_label = labels.get(&n);
             }
+        }
+        if let Some((c, k, _, status)) = new_label {
+            let clean: Vec<&str> = fields.iter().copied().enumerate().filter_map(|(i, f)| {
+                (i < 4 || (!["CH:", "CF:", "FG:"].iter().any(|prefix| f.starts_with(prefix))
+                    && !(*status == "fragment_unresolved" && f == "up:Z:fragment_unresolved"))).then_some(f)
+            }).collect();
+            out.push_str(&clean.join("\t"));
+            if *status == "fragment_unresolved" {
+                out.push_str(&format!("\tFG:i:{c}"));
+                if !clean.iter().skip(4).any(|f| f.starts_with("up:")) {
+                    out.push_str("\tup:Z:fragment_unresolved");
+                }
+            } else {
+                out.push_str(&format!("\tCH:i:{c}\tCF:i:{k}"));
+            }
+        } else {
+            out.push_str(line);
         }
         out.push('\n');
     }
@@ -657,6 +714,39 @@ mod tests {
         let r = call(&g, &ev, &lin, None, None).unwrap();
         assert_eq!(r.count, Some(1));
         assert_eq!(r.chromosomes[0].conformations.len(), 3);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn disconnected_linear_fragments_are_not_counted_as_chromosomes() {
+        let d = dir("fragmented");
+        let g = gfa(&d, &[("a", 1200, 100.0), ("b", 1000, 100.0), ("c", 900, 100.0)]);
+        let ev = json!({"links": [], "repeats": [], "repeat_segments": []});
+        let lin = json!({"components": [
+            {"best": {"molecules": [{"path": "a+", "circular": false, "length": 1200}]}},
+            {"best": {"molecules": [{"path": "b+", "circular": false, "length": 1000}]}},
+            {"best": {"molecules": [{"path": "c+", "circular": false, "length": 900}]}}]});
+        let r = call(&g, &ev, &lin, None, None).unwrap();
+        assert_eq!(r.count, None);
+        assert_eq!(r.range, (1, 3));
+        assert!(r.fragmented_components);
+        assert!(r.chromosomes.iter().all(|c| c.status == "fragment_unresolved"));
+        assert!(r.reasons.iter().any(|s| s.contains("not biological chromosome-count bounds")));
+        let fa = d.join("molecules.fa");
+        fs::write(&fa, ">one chromosome=7 conformation=2 share=0.500\nACGT\n>two\nACGT\n>three\nACGT\n").unwrap();
+        annotate_fasta(&fa, &r).unwrap();
+        annotate_fasta(&fa, &r).unwrap();
+        let text = fs::read_to_string(fa).unwrap();
+        assert!(text.contains("graph_component_group=1 chromosome_status=fragment_unresolved reads_decide=false"));
+        assert!(!text.contains(" chromosome="));
+        let paths = d.join("paths.gfa");
+        fs::write(&paths, "P\tsample#1#mt.1\ta+\t*\tCH:i:7\tCF:i:2\n").unwrap();
+        annotate_gfa(&paths, &r).unwrap();
+        annotate_gfa(&paths, &r).unwrap();
+        let text = fs::read_to_string(paths).unwrap();
+        assert!(text.contains("FG:i:1\tup:Z:fragment_unresolved"));
+        assert!(!text.contains("CH:i:"));
+        assert_eq!(text.matches("up:Z:fragment_unresolved").count(), 1);
         fs::remove_dir_all(&d).ok();
     }
 
