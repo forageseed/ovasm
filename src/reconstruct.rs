@@ -937,6 +937,7 @@ fn configurations(
         crate::linearize::LinearizeParams {
             min_reads: 2,
             max_steps: 5_000_000,
+            adaptive_steps: true,
             max_molecules: 0,
             max_alternatives: MAX_CONFIGURATIONS,
             optional_below: 0.5,

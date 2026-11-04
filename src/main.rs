@@ -1267,8 +1267,9 @@ struct LinearizeArgs {
     /// Ignore phased paths and links supported by fewer reads.
     #[arg(long, default_value_t = 2)]
     min_reads: u64,
-    #[arg(long, default_value_t = 5_000_000)]
-    max_steps: u64,
+    /// Hard search budget per cover size; omitted enables one bounded adaptive retry on small graphs.
+    #[arg(long)]
+    max_steps: Option<u64>,
     #[arg(long, default_value_t = 10)]
     max_alternatives: usize,
     /// Anchors shallower than this fraction of the median depth are optional (low-frequency
@@ -1289,7 +1290,8 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
         &args.evidence,
         linearize::LinearizeParams {
             min_reads: args.min_reads,
-            max_steps: args.max_steps,
+            max_steps: args.max_steps.unwrap_or(5_000_000),
+            adaptive_steps: args.max_steps.is_none(),
             max_alternatives: args.max_alternatives,
             optional_below: args.optional_below,
             max_molecules: args.max_molecules,

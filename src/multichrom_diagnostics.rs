@@ -44,7 +44,7 @@ fn shared_repeat_case(
         &dir.join("evidence.json"),
         LinearizeParams {
             min_reads: 2,
-            max_steps: 100_000,
+            max_steps: 100_000, adaptive_steps: false,
             max_molecules: 4,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -209,7 +209,7 @@ fn omitted_larger_cover_sizes_cannot_establish_confidence() {
         Path::new(&full.evidence),
         LinearizeParams {
             min_reads: 2,
-            max_steps: 100_000,
+            max_steps: 100_000, adaptive_steps: false,
             max_molecules: 1,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -241,7 +241,7 @@ fn a_truncated_search_with_a_valid_cover_is_not_decisive() {
         Path::new(&full.evidence),
         LinearizeParams {
             min_reads: 2,
-            max_steps: 8,
+            max_steps: 8, adaptive_steps: false,
             max_molecules: 4,
             max_alternatives: 10,
             optional_below: 0.5,
@@ -286,7 +286,7 @@ fn audit_existing_graphs_across_cover_sizes() {
             evidence_path,
             LinearizeParams {
                 min_reads: 2,
-                max_steps: 5_000_000,
+                max_steps: 5_000_000, adaptive_steps: false,
                 max_molecules: 4,
                 max_alternatives: 10,
                 optional_below: 0.5,
