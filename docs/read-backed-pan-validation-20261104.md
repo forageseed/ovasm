@@ -1,5 +1,7 @@
 # ZM4 read-backed pan validation (2026-11-04)
 
+> Sample-identity update, 2026-11-04: the user confirms that SRR13333747 WGS and the separately held-out ZM4 HiFi sample come from the same plant. Earlier identity uncertainty for that pair is superseded; it does not concern the eight other prior samples or nuclear reference haplotypes. See [the same-plant sequence comparison](zm4-wgs-hifi-same-plant-comparison-20261104.md).
+
 ## Scope and provenance
 
 Formal source: `/home/jiazc/data24t/work-live/PhytoOrga_AI_c/ovasm`. Source and binary hashes, test logs, commands, and immutable tested binaries are retained under `.agent-work/zm4-prior-ranking-20261104/`. The source snapshot also included separately maintained uncommitted changes outside the files in commits `a2de73b`, `16569df` and `b989a12`; the test counts belong to the entire recorded snapshot, not to those commits in isolation. Computations were performed on the server. This document does not claim Windows or browser validation.
