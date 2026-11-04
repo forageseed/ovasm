@@ -1778,13 +1778,17 @@ pub fn run_engine(
     out_json: &Path,
 ) -> Result<EngineReport> {
     if let Some(fraction) = p.experimental_deep_bubble_fraction {
-        if !matches!(p.coordinates, Coordinates::Bases) || p.s != 0 || p.k.is_none() || p.cleaning_audit_only {
-            bail!("experimental deep-bubble protection requires base coordinates, explicit --k, --s 0 and active cleaning");
+        if !matches!(p.coordinates, Coordinates::Bases) || p.s != 0 || p.cleaning_audit_only {
+            bail!("experimental deep-bubble protection requires base coordinates, --s 0 and active cleaning");
         }
         if !(fraction > 0.0 && fraction <= 1.0) {
             bail!("experimental deep-bubble fraction must be in (0, 1]");
         }
-        let params = AssembleParams { cleaning_audit_only: false, k: p.k.unwrap(), s: p.s,
+        let k = match p.k {
+            Some(k) => k,
+            None => { let (k, median) = dense_k(&inputs)?; eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}"); k }
+        };
+        let params = AssembleParams { cleaning_audit_only: false, k, s: p.s,
             min_count: p.min_count, min_count_fraction: p.min_count_fraction, nuclear_share: p.nuclear_share };
         return run_with_context_guard(inputs, params, out_gfa, out_json, p.context, Some(fraction)).map(EngineReport::Bases);
     }
@@ -2538,10 +2542,23 @@ mod tests {
         };
         let dir = tmpdir("deep-guard-invalid");
         let out = dir.join("must-not-be-created");
-        for p in [params(Some(77), 0, 0.0), params(None, 0, 0.75), params(Some(77), 31, 0.75)] {
+        for p in [params(Some(77), 0, 0.0), params(Some(77), 31, 0.75)] {
             assert!(run_engine(Vec::new(), p, &out, &out).is_err());
         }
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn experimental_guard_accepts_automatic_dense_k() {
+        let dir = tmpdir("deep-guard-auto-k");
+        let reads = dir.join("reads.fa");
+        fs::write(&reads, format!(">r1\n{}\n>r2\n{}\n", "ACGT".repeat(38), "ACGT".repeat(38))).unwrap();
+        let p = EngineParams { cleaning_audit_only: false, coordinates: Coordinates::Bases,
+            k: None, s: 0, min_count: None, min_count_fraction: None, nuclear_share: None,
+            auto_k_depth: AUTO_K_NODE_DEPTH, context: None, experimental_deep_bubble_fraction: Some(0.15) };
+        let result = run_engine(vec![reads], p, &dir.join("graph.gfa"), &dir.join("report.json")).unwrap();
+        match result { EngineReport::Bases(report) => { assert_eq!(report.k, 129); assert_eq!(report.experimental_deep_bubble_fraction, Some(0.15)); }, _ => panic!("expected dense graph") }
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
