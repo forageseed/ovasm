@@ -506,7 +506,7 @@ fn search_phased(
     for (i, b) in br.iter().enumerate() {
         out_of.entry(b.walk[0]).or_default().push(i);
     }
-    search_phased_indexed(n_seg, anchors, optional, br, m, max_steps, phases, &out_of)
+    search_phased_indexed(n_seg, anchors, optional, br, m, max_steps, phases, &out_of, false)
 }
 
 fn search_phased_indexed(
@@ -518,6 +518,7 @@ fn search_phased_indexed(
     max_steps: u64,
     phases: &crate::phase::Constraints,
     out_of: &FxHashMap<Oriented, Vec<usize>>,
+    topology_neutral: bool,
 ) -> (Vec<Vec<Found>>, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
@@ -528,6 +529,7 @@ fn search_phased_indexed(
         want: usize,
         m: usize,
         max_steps: u64,
+        topology_neutral: bool,
     }
     struct State {
         used: Vec<bool>,
@@ -586,7 +588,7 @@ fn search_phased_indexed(
         if !visits(c, start, &s.path, s.must) {
             return;
         }
-        let closing = c.out_of.get(&at).and_then(|v| {
+        let mut closings: Vec<usize> = c.out_of.get(&at).map(|v| {
             v.iter()
                 .copied()
                 .filter(|&i| *c.br[i].walk.last().unwrap() == start)
@@ -602,8 +604,11 @@ fn search_phased_indexed(
                     walk.pop();
                     c.phases.allows_walk(&walk, true)
                 })
-                .max_by_key(|&i| c.br[i].reads)
-        });
+                .collect()
+        }).unwrap_or_default();
+        if !c.topology_neutral {
+            closings = closings.into_iter().max_by_key(|&i| c.br[i].reads).into_iter().collect();
+        }
         // A path ends only where it cannot go on: no bridge from either end reaches a required
         // anchor still unused. Cutting it anywhere else just multiplies covers.
         let open_to = |o: Oriented| {
@@ -630,8 +635,18 @@ fn search_phased_indexed(
                 })
             })
         };
-        if closing.is_none() && (open_to(at) || open_to(flip(start))) {
+        let can_end_open = !open_to(at) && !open_to(flip(start));
+        if closings.is_empty() && !can_end_open {
             return;
+        }
+        let mut endings: Vec<Option<usize>> = closings.iter().copied().map(Some).collect();
+        if endings.is_empty() || (c.topology_neutral && can_end_open) { endings.push(None); }
+        // Every closing bridge competes, and an admissible open path also competes.
+        // The previous maximum-count closing preselection could erase whole-read linkage.
+        for closing in endings {
+        if c.topology_neutral {
+            s.steps += 1;
+            if s.steps > c.max_steps { s.truncated = true; return; }
         }
         let mut bridges = s.path.clone();
         bridges.extend(closing);
@@ -646,10 +661,10 @@ fn search_phased_indexed(
                 cover.push(mol);
                 s.found.push(cover);
             }
-            return;
+            continue;
         }
         if s.done.len() + 1 == c.m {
-            return;
+            continue;
         }
         // Start the next molecule; it must take the smallest required anchor still unused.
         let Some(&must) = c.anchors.iter().find(|&&a| !s.used[a] && !c.optional[a]) else {
@@ -677,6 +692,8 @@ fn search_phased_indexed(
         s.done.pop();
         s.path = saved_path;
         s.must = saved_must;
+        if s.truncated { return; }
+        }
     }
 
     let ctx = Ctx {
@@ -688,6 +705,7 @@ fn search_phased_indexed(
         want: anchors.iter().filter(|&&a| !optional[a]).count(),
         m,
         max_steps,
+        topology_neutral,
     };
     let mut st = State {
         used: vec![false; n_seg],
@@ -1106,6 +1124,8 @@ pub struct CoverReport {
     /// Repeat copies laid down more or fewer times than the repeats' depths say (see
     /// `copy_deviation`); each costs `COPY_PENALTY_LN` in the ranking.
     pub copy_deviation: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_support: Option<crate::read_model::ReadFit>,
 }
 
 impl CoverReport {
@@ -1159,6 +1179,11 @@ fn copy_deviation(expected: &[Option<usize>], br: &[Bridge], cover: &[Found]) ->
 /// representative, while retaining the larger covers as ambiguous alternatives. Fully
 /// read-supported covers compete by score across molecule counts.
 fn cover_order(a: &CoverReport, b: &CoverReport) -> Ordering {
+    if let (Some(x),Some(y))=(&a.read_support,&b.read_support) {
+        return x.order(y).then(a.copy_deviation.cmp(&b.copy_deviation))
+            // Representation-only tiebreak, never a biological evidence advantage.
+            .then(a.molecules.len().cmp(&b.molecules.len()));
+    }
     a.linear()
         .cmp(&b.linear())
         .then(
@@ -1180,6 +1205,13 @@ fn cover_order(a: &CoverReport, b: &CoverReport) -> Ordering {
 /// Anchors joined by bridges, and the molecules unringing finds for them.
 #[derive(Serialize)]
 pub struct ComponentReport {
+    pub ranking_model: &'static str,
+    /// Ties on measured record/link support, ignoring topology and copy-number preferences.
+    pub evidence_tied_candidates: usize,
+    pub read_model_budget_exhausted: bool,
+    pub read_path_cover: Option<crate::read_model::ReadPathCover>,
+    /// An explanatory family of candidate configurations, not certified physical isoforms.
+    pub witness_configurations: Vec<CoverReport>,
     pub anchors: Vec<String>,
     /// Length-weighted median depth of the anchors, when the evidence records depth.
     pub depth: Option<f64>,
@@ -1222,6 +1254,9 @@ pub struct ComponentReport {
 
 #[derive(Serialize)]
 pub struct LinearizeReport {
+    pub ranking_model: &'static str,
+    pub physical_topology_identified: bool,
+    pub configurations_fasta: Option<String>,
     pub graph: String,
     pub evidence: String,
     pub anchors: Vec<String>,
@@ -1365,6 +1400,7 @@ pub fn run_phased(
         .map(|n| repeat_names.contains(n.as_str()))
         .collect();
     let anchors: Vec<usize> = (0..g.names.len()).filter(|&s| !repeat[s]).collect();
+    let read_model=crate::read_model::ReadModel::load(&g,&report,&repeat,p.min_reads)?;
     if g.names.is_empty() {
         bail!("the assembly graph has no segments; the reads gave nothing to assemble");
     }
@@ -1497,6 +1533,7 @@ pub fn run_phased(
                 .filter(|&&i| br[i].topological)
                 .count(),
             copy_deviation: copy_deviation(&expected, &br, cover),
+            read_support: None,
         };
         Ok((walks, report))
     };
@@ -1512,7 +1549,13 @@ pub fn run_phased(
         search_out_of.entry(b.walk[0]).or_default().push(i);
     }
     for (comp, depth) in anchor_components.into_iter().zip(component_depth) {
+        let component_model=read_model.as_ref().map(|m|m.for_anchors(&comp,&repeat));
         let mut rep = ComponentReport {
+            ranking_model: if read_model.is_some() {crate::read_model::MODEL} else {"legacy_bridge_copy"},
+            evidence_tied_candidates: 0,
+            read_model_budget_exhausted: false,
+            read_path_cover: None,
+            witness_configurations: Vec::new(),
             anchors: comp.iter().map(|&a| g.names[a].clone()).collect(),
             depth,
             molecules: 0,
@@ -1553,7 +1596,7 @@ pub fn run_phased(
         // Explicit caller limits remain authoritative, and omitted larger
         // sizes still prohibit a decisive claim. No support threshold changes.
         let envelope = if p.max_molecules == 0 {
-            4.max(rep.min_molecules)
+            if read_model.is_some() && comp.len() <= 12 {comp.len()} else {4.max(rep.min_molecules)}
         } else {
             p.max_molecules
         };
@@ -1566,7 +1609,7 @@ pub fn run_phased(
         let mut m = rep.min_molecules;
         while m <= last {
             let (mut found, mut truncated) = search_phased_indexed(
-                g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of,
+                g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, read_model.is_some(),
             );
             // Automatic mode retries only compact graphs with a modest number of candidates.
             // Explicit --max-steps remains a hard limit. Release the first batch before retrying
@@ -1578,7 +1621,7 @@ pub fn run_phased(
                 drop(found);
                 (found, truncated) = search_phased_indexed(
                     g.names.len(), &comp, &optional, &br, m,
-                    p.max_steps.saturating_mul(2), &phases, &search_out_of,
+                    p.max_steps.saturating_mul(2), &phases, &search_out_of, read_model.is_some(),
                 );
             }
             rep.search_truncated |= truncated;
@@ -1611,6 +1654,18 @@ pub fn run_phased(
             partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
             rep.partial = Some(report);
         }
+        if let Some(model)=&component_model {
+            let mut budget=crate::read_model::WORK_BUDGET;
+            for (walks,cover,_) in &mut ranked {
+                let circular:Vec<_>=cover.molecules.iter().map(|m|m.circular).collect();
+                cover.read_support=model.score(walks,&circular,&mut budget);
+                if cover.read_support.is_none() {rep.read_model_budget_exhausted=true;break;}
+            }
+            if rep.read_model_budget_exhausted {
+                for (_,cover,_) in &mut ranked {cover.read_support=None;}
+                rep.ranking_model="legacy_after_read_budget_exhaustion";
+            }
+        }
         ranked.sort_by(|(wa, a, _), (wb, b, _)| cover_order(a, b).then_with(|| wa.cmp(wb)));
         rep.candidates = ranked.len();
         rep.margin_ln = ranked.first().and_then(|(_, best, _)| {
@@ -1632,13 +1687,34 @@ pub fn run_phased(
                 .first()
                 .is_some_and(|(_, c, _)| !c.incomplete_junction_evidence())
             && rep.margin_ln.map_or(true, |m| m >= DECISIVE_LN);
+        if let Some((_,best,_))=ranked.first() {
+            if let Some(fit)=&best.read_support {
+                rep.margin_ln=None; // A record-support objective is not a log likelihood.
+                rep.evidence_tied_candidates=ranked.iter().filter(|(_,c,_)|c.read_support.as_ref().is_some_and(|s|
+                    s.joint_records_explained==fit.joint_records_explained
+                    && s.thread_records_explained==fit.thread_records_explained
+                    && s.adjacency_record_occurrences_explained==fit.adjacency_record_occurrences_explained)).count();
+                rep.decisive=!rep.search_truncated && !rep.cover_size_limited
+                    && !best.incomplete_junction_evidence() && fit.complete()
+                    && rep.evidence_tied_candidates==1;
+            }
+        }
+        if rep.read_model_budget_exhausted {rep.decisive=false;}
+        if let Some(model)=&component_model {
+            if !ranked.is_empty() && !rep.read_model_budget_exhausted {
+                let fits:Vec<_>=ranked.iter().map(|(_,c,_)|c.read_support.as_ref().unwrap()).collect();
+                let path_cover=model.path_cover(&fits,1_000_000);
+                rep.witness_configurations=path_cover.candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
+                rep.read_path_cover=Some(path_cover);
+            }
+        }
         let mut it = ranked.into_iter();
         if let Some((mut walks, mut best, cover)) = it.next() {
             rep.molecules = best.molecules.len();
             // a linear molecule that leads back into itself: the circle and its tail
             let mut cut: Vec<Found> = Vec::new();
             for f in &cover {
-                match cut_tail_phased(&g, &br, f, &phases) {
+                match if read_model.is_none() {cut_tail_phased(&g, &br, f, &phases)} else {None} {
                     Some((circle, tail, left_out)) => {
                         rep.tails_cut.push(label(&br[left_out].walk));
                         cut.push(circle);
@@ -1699,6 +1775,11 @@ pub fn run_phased(
         };
         chosen.push((walk, lin.clone()));
         comps.push(ComponentReport {
+            ranking_model: "unbridged_sequence",
+            evidence_tied_candidates: 0,
+            read_model_budget_exhausted: false,
+            read_path_cover: None,
+            witness_configurations: Vec::new(),
             anchors: vec![g.names[a].clone()],
             depth: None,
             molecules: 1,
@@ -1716,6 +1797,7 @@ pub fn run_phased(
                 weak_bridges: 0,
                 topological_bridges: 0,
                 copy_deviation: 0,
+                read_support: None,
             }),
             partial: None,
             margin_ln: None,
@@ -1766,7 +1848,27 @@ pub fn run_phased(
         )?;
     }
     let main = comps.first().filter(|c| c.best.is_some());
+    let mut configuration_fasta=String::new();
+    let label_index:FxHashMap<_,_>=g.names.iter().enumerate().map(|(i,n)|(n.as_str(),i)).collect();
+    for (ci,component) in comps.iter().enumerate() {
+        for (fi,cover) in component.witness_configurations.iter().enumerate() {
+            let records=cover.molecules.iter().map(|m| {
+                let walk=m.path.split_whitespace().map(|s|parse_label(&label_index,s)).collect::<Result<Vec<_>>>()?;
+                Ok((walk,m.clone()))
+            }).collect::<Result<Vec<_>>>()?;
+            configuration_fasta.push_str(&fasta_records(&g,&records,&format!("configuration.{}.{}",ci+1,fi+1),true,
+                " representation=read_path_cover physical_topology_identified=false")?);
+        }
+    }
+    let stem=out_fasta.file_stem().unwrap_or_default().to_string_lossy();
+    let configuration_path=out_fasta.with_file_name(format!("{stem}.configurations.fasta"));
+    let has_configurations=!configuration_fasta.is_empty();
+    if !has_configurations {fs::remove_file(&configuration_path).ok();}
+    else {fs::write(&configuration_path,configuration_fasta)?;}
     let out = LinearizeReport {
+        ranking_model: if read_model.is_some() {crate::read_model::MODEL} else {"legacy_bridge_copy"},
+        physical_topology_identified: false,
+        configurations_fasta: has_configurations.then(||configuration_path.display().to_string()),
         graph: gfa.display().to_string(),
         evidence: evidence.display().to_string(),
         anchors: anchors.iter().map(|&s| g.names[s].clone()).collect(),
@@ -2176,6 +2278,7 @@ mod tests {
             weak_bridges: 0,
             topological_bridges: 0,
             copy_deviation: 0,
+            read_support: None,
         };
         let circles = cover(vec![mol(true, -1.0), mol(true, -1.0)]);
         let open = cover(vec![mol(true, -0.1), mol(false, -0.1)]);
@@ -3074,5 +3177,70 @@ mod tests {
         .to_string();
         std::fs::remove_dir_all(&dir).ok();
         assert!(err.contains("no segments"), "{err}");
+    }
+
+    fn model_evidence(gfa: &str, repeats: &[&str], links: &[(&str,&str,u64)], paths: &[(&str,u64)]) -> Value {
+        let file=std::env::temp_dir().join(format!("ovasm-model-fingerprint-{}-{:?}.gfa",std::process::id(),std::thread::current().id()));
+        std::fs::write(&file,gfa).unwrap();
+        let graph=parse_gfa(&file).unwrap();std::fs::remove_file(file).unwrap();
+        let phased:Vec<_>=paths.iter().filter(|(p,_)| {
+            let tokens:Vec<_>=p.split_whitespace().collect();
+            tokens.len()>2 && tokens[1..tokens.len()-1].iter().all(|t|repeats.contains(&&t[..t.len()-1]))
+        }).map(|(p,n)|json!({"path":p,"reads":n})).collect();
+        json!({"repeat_segments":repeats,"phased_paths":phased,
+            "links":links.iter().map(|(a,b,n)|json!({"from":a,"to":b,"reads":n})).collect::<Vec<_>>(),
+            "thread_evidence":{"schema":crate::thread_evidence::SCHEMA,
+                "graph_fingerprint":crate::unzip::graph_fingerprint(&graph),
+                "accepted_records":paths.iter().map(|(_,n)|n).sum::<u64>(),
+                "links":links.iter().map(|(a,b,n)|json!({"from":a,"to":b,"records":n})).collect::<Vec<_>>(),
+                "paths":paths.iter().map(|(p,n)|json!({"path":p,"reads":n})).collect::<Vec<_>>()}})
+    }
+
+    #[test]
+    fn native_model_uses_observed_closing_linkage() {
+        let g=gfa_text(&[("A",100),("B",100),("C",100)],&[("A+","B+"),("B+","C+"),("C+","A+")]);
+        let ev=model_evidence(&g,&[],&[("A+","B+",20),("B+","C+",20),("C+","A+",10)],&[("A+ B+ C+",10),("B+ C+ A+",10)]);
+        let r=run_on(&g,&ev,"ovasm-native-model-closed");
+        assert_eq!(r.ranking_model,crate::read_model::MODEL);
+        assert!(r.best.unwrap().circular); assert!(!r.cover_size_limited);
+        let c=&r.components[0];assert!(c.best.as_ref().unwrap().read_support.as_ref().unwrap().complete());
+        assert!(c.margin_ln.is_none());assert!(!r.physical_topology_identified);
+    }
+
+    #[test]
+    fn native_model_does_not_turn_weak_closure_into_certainty() {
+        let g=gfa_text(&[("A",100),("B",100),("C",100)],&[("A+","B+"),("B+","C+"),("C+","A+")]);
+        let ev=model_evidence(&g,&[],&[("A+","B+",10),("B+","C+",10),("C+","A+",1)],&[("A+ B+ C+",10)]);
+        let r=run_on(&g,&ev,"ovasm-native-model-weak-closed");
+        assert!(!r.best.unwrap().circular);
+        assert!(r.components[0].evidence_tied_candidates>=2);
+        assert!(!r.decisive);
+        assert!(r.components[0].alternatives.iter().any(|c|c.molecules.iter().any(|m|m.circular)));
+    }
+
+    #[test]
+    fn native_model_does_not_preselect_the_loudest_closing_bridge() {
+        let g=gfa_text(&[("A",100),("R",50),("S",50)],&[("A+","R+"),("R+","A+"),("A+","S+"),("S+","A+")]);
+        let mut ev=model_evidence(&g,&["R","S"],&[("A+","R+",5),("R+","A+",5),("A+","S+",10),("S+","A+",10)],&[("A+ R+ A+",5),("A+ S+ A+",10)]);
+        ev["phased_paths"]=json!([{"path":"A+ R+ A+","reads":100},{"path":"A+ S+ A+","reads":20}]);
+        let r=run_on(&g,&ev,"ovasm-native-model-all-closings");
+        assert!(r.best.as_ref().unwrap().path.contains('S'));
+        assert!(r.components[0].alternatives.iter().any(|c|c.molecules.iter().any(|m|m.path.contains('R'))));
+        assert!(!r.decisive,"coexisting read-supported alternatives remain unresolved");
+        assert_eq!(r.components[0].witness_configurations.len(),2);
+        let family=r.components[0].read_path_cover.as_ref().unwrap();
+        assert_eq!((family.supported_thread_records,family.represented_thread_records),(15,15));
+        assert!(family.minimum_family_size_proven);
+    }
+    #[test]
+    fn native_model_keeps_component_evidence_scopes_separate() {
+        let g=gfa_text(&[("A",100),("B",100),("C",100),("D",100),("E",100),("F",100)],
+            &[("A+","B+"),("B+","C+"),("C+","A+"),("D+","E+"),("E+","F+"),("F+","D+")]);
+        let ev=model_evidence(&g,&[],&[("A+","B+",20),("B+","C+",20),("C+","A+",10),
+            ("D+","E+",20),("E+","F+",20),("F+","D+",10)],
+            &[("A+ B+ C+",10),("B+ C+ A+",10),("D+ E+ F+",10),("E+ F+ D+",10)]);
+        let r=run_on(&g,&ev,"ovasm-native-model-components");
+        assert_eq!(r.components.len(),2);
+        for c in &r.components {assert_eq!(c.best.as_ref().unwrap().read_support.as_ref().unwrap().unexplained_thread_records,0);}
     }
 }

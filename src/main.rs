@@ -27,6 +27,7 @@ mod phase;
 mod pipeline;
 mod primary;
 mod read_context;
+mod read_model;
 mod reconstruct;
 mod recruit;
 mod replay;
