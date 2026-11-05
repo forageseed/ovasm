@@ -91,10 +91,14 @@ pub struct LongOptions {
     #[arg(long, value_enum, default_value_t = ReadSet::WholeGenome)]
     read_set: ReadSet,
     /// Seed FASTA as ORGANELLE=PATH (repeat for more files); a bare PATH seeds the --organelle.
-    /// Without --seeds the built-in land-plant seed library is used, written to <out>/seeds/.
+    /// Without --seeds the built-in seed library of --lineage is used, written to <out>/seeds/.
     /// Both organelles are seeded unless --single-seed, so that each claims its own reads.
     #[arg(long = "seeds")]
     seeds: Vec<String>,
+    /// Built-in seed library: landplants (mitochondrion and plastid), metazoa or fungi
+    /// (mitochondrion only).
+    #[arg(long, value_enum, default_value_t = crate::seeddb::Lineage::Landplants)]
+    lineage: crate::seeddb::Lineage,
     /// Recruit one organelle without seeding the other (not advised).
     #[arg(long)]
     single_seed: bool,
@@ -655,12 +659,19 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
     fs::create_dir_all(&o.out)?;
     let mut builtin = BTreeSet::new();
     if o.read_set == ReadSet::WholeGenome {
-        builtin = crate::seeddb::fill_missing(&mut seeds, &o.out.join("seeds"), single, o.single_seed)?;
+        builtin = crate::seeddb::fill_missing(
+            &mut seeds,
+            &o.out.join("seeds"),
+            single,
+            o.single_seed,
+            o.lineage,
+        )?;
         if !builtin.is_empty() {
             log(&format!(
-                "no --seeds for {}: using the built-in seed library {}",
+                "no --seeds for {}: using the built-in {} seed library {}",
                 builtin.iter().cloned().collect::<Vec<_>>().join(" and "),
-                crate::seeddb::VERSION
+                o.lineage.name(),
+                o.lineage.version()
             ));
         }
     }
@@ -1053,6 +1064,7 @@ fn assemble(
         read_set: ReadSet::Target,
         seeds: own_seeds,
         builtin_seeds: builtin.clone(),
+        seed_lineage: o.lineage,
         recruit: pipeline::RecruitBy::Seeds,
         recruit_depth: None,
         recruit_cache: None,

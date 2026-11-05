@@ -2045,6 +2045,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             read_set: pipeline::ReadSet::Target,
             seeds: BTreeMap::new(),
             builtin_seeds: BTreeSet::new(),
+            seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: pipeline::RecruitBy::Seeds,
             recruit_depth: None,
             recruit_cache: None,
