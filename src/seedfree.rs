@@ -297,7 +297,7 @@ fn passes(f: &Features, p: &DiscoverParams) -> bool {
 }
 
 /// Peaks of the log2(median depth) histogram; returns peak centres (log2 units).
-fn depth_peaks(medians: &[f64], min_reads: usize) -> Vec<f64> {
+pub(crate) fn depth_peaks(medians: &[f64], min_reads: usize) -> Vec<f64> {
     const BIN: f64 = 0.25;
     let mut hist: FxHashMap<i64, usize> = FxHashMap::default();
     for &m in medians {

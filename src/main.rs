@@ -24,6 +24,7 @@ mod pan_external;
 mod pan_backend;
 mod panel;
 mod phase;
+mod protein_seed;
 mod pipeline;
 mod primary;
 mod read_context;
@@ -107,6 +108,10 @@ enum FindCommand {
     /// Say which organelle each set of reads (e.g. a `find discover` cluster) comes from, by
     /// conserved mitochondrial and plastid proteins; no reference genome needed.
     Classify(PanelArgs),
+    /// Seeds from the sample's own reads: organelle-like reads (by depth) split into depth
+    /// clusters, a cluster called mitochondrion or plastid by its conserved proteins, its
+    /// gene-bearing reads cropped to their genes; for species far from every seed library.
+    ProteinSeeds(ProteinSeedArgs),
     /// Assemble each read cluster and label unitigs mitochondrion or plastid by gene content;
     /// write the labelled unitigs as the sample's own seeds.
     Label(LabelArgs),
@@ -561,6 +566,16 @@ struct RunArgs {
     /// --organelle mitochondrion).
     #[arg(long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
     lineage: seeddb::Lineage,
+    /// HiFi whole-genome reads: seed each organelle without --seeds from the sample's own reads
+    /// first (`ovasm find protein-seeds`, written to <out>/protein-seeds/): depth clusters called
+    /// by their conserved proteins (the --lineage protein panel and genetic code), under the same
+    /// depth-gate options. An organelle without a called cluster falls back to the --lineage
+    /// seed library. For species far from every library genome.
+    #[arg(long)]
+    protein_seeds: bool,
+    /// Protein panel for --protein-seeds; default: the built-in panel.
+    #[arg(long, requires = "protein_seeds")]
+    protein_seed_panel: Option<PathBuf>,
     /// How whole-genome reads are recruited: seeds; discover (no seeds: depth clusters called
     /// by their organelle proteins, HiFi only); both (seed reads plus the clusters called as
     /// the target, each read once). With discovery each assembly graph first loses the
@@ -659,6 +674,9 @@ struct RunArgs {
     threads: Option<u16>,
 }
 
+/// Recruitment passes from protein seeds (see `run`).
+const PROTEIN_SEED_PASSES: usize = 1;
+
 fn run(args: RunArgs) -> Result<()> {
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -712,10 +730,70 @@ fn run(args: RunArgs) -> Result<()> {
     }
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
+    if args.protein_seeds
+        && (args.read_type != pipeline::ReadType::Hifi
+            || args.read_set != pipeline::ReadSet::WholeGenome
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!(
+            "--protein-seeds seeds the recruitment of HiFi whole-genome reads: run hifi, not with --read-set target or --recruit discover"
+        );
+    }
     let mut builtin_seeds = std::collections::BTreeSet::new();
+    // Recruitment passes when every seeded organelle has protein seeds: one. Protein seeds are the
+    // sample's own organelle reads, so the first pass already finds the organelle (leave-out test on
+    // five mosses, 2026-11-05: mitochondrial recall 0.96-1.0 after one pass, the same after 60),
+    // and every further pass of gated extension only adds reads that are not (precision after one /
+    // two / 60 passes: Polytrichum commune 0.92 / 0.59 / 0.59, Bryoerythrophyllum caledonicum 0.98 /
+    // 0.81 / 0.34).
+    let mut protein_passes = None;
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
+        // the organelles seeded (the asked one and, unless --single-seed, its competitor)
+        let wanted: Vec<&str> = match single {
+            Some(o) if args.single_seed => vec![o],
+            _ => protein_seed::ORGANELLES.to_vec(),
+        };
+        if args.protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
+            let p = protein_seed_params(
+                3000,
+                2000,
+                (args.nuclear_depth, args.genome_size, args.extend_gate_fold),
+                5,
+                0.3,
+            )?;
+            let panel = load_panel(
+                args.protein_seed_panel.as_deref(),
+                args.lineage,
+                None,
+                p.panel.k,
+                &[],
+            )?;
+            let report =
+                protein_seed::run(&args.reads, &panel, &p, &args.out.join("protein-seeds"))?;
+            eprintln!("{}", report.summary());
+            let unseeded: Vec<&str> =
+                wanted.iter().copied().filter(|o| !seeds.contains_key(*o)).collect();
+            for &o in &unseeded {
+                if let Some(path) = report.seeds.get(o) {
+                    seeds.insert(o.to_string(), vec![path.clone()]);
+                }
+            }
+            if unseeded.iter().all(|o| report.seeds.contains_key(o)) {
+                protein_passes = Some(PROTEIN_SEED_PASSES);
+            } else {
+                eprintln!(
+                    "[ovasm] run: no protein seeds for {}: the --lineage seed library seeds it, with the usual recruitment passes",
+                    unseeded
+                        .iter()
+                        .filter(|o| !report.seeds.contains_key(*o))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                );
+            }
+        }
         let dir = args.out.join("seeds");
         builtin_seeds =
             seeddb::fill_missing(&mut seeds, &dir, single, args.single_seed, args.lineage)?;
@@ -756,7 +834,7 @@ fn run(args: RunArgs) -> Result<()> {
         assemble_k: None,
         recruit_max_depth: (args.recruit_max_depth > 0.0).then_some(args.recruit_max_depth),
         recruit_max_bases: (args.recruit_max_bases > 0).then_some(args.recruit_max_bases),
-        recruit_iterations: args.recruit_iterations,
+        recruit_iterations: args.recruit_iterations.or(protein_passes),
         read_context: args.read_context,
         single_seed: args.single_seed,
         mode: args.mode,
@@ -1659,6 +1737,137 @@ struct DiscoverArgs {
     dump_profiles: bool,
 }
 
+#[derive(clap::Args)]
+struct ProteinSeedArgs {
+    /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
+    #[arg(long = "reads", required = true)]
+    reads: Vec<PathBuf>,
+    /// Output directory: protein_seeds.{mitochondrion,plastid}.fasta (for each organelle with a
+    /// called cluster) and protein_seeds.json.
+    #[arg(long)]
+    out: PathBuf,
+    /// Which built-in protein panel and genetic code: landplants (mitochondrion and plastid
+    /// proteins, standard code), metazoa (mitochondrial proteins, invertebrate mitochondrial code
+    /// 5) or fungi (mitochondrial proteins, mold mitochondrial code 4).
+    #[arg(long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
+    lineage: seeddb::Lineage,
+    /// Protein panel FASTA (headers `class|gene|species`) instead of the lineage's built-in one.
+    #[arg(long)]
+    panel: Option<PathBuf>,
+    /// NCBI translation table for the reads (1, 2, 4 or 5) instead of the lineage's.
+    #[arg(long)]
+    genetic_code: Option<u8>,
+    /// Leave panel proteins of species starting with this name out (repeatable).
+    #[arg(long = "exclude-species")]
+    exclude: Vec<String>,
+    /// Reads scanned per depth cluster at most.
+    #[arg(long, default_value_t = 3000)]
+    sample: usize,
+    /// Bases kept on each side of a seed read's gene stretches.
+    #[arg(long, default_value_t = 2000)]
+    flank: usize,
+    /// The depth gate's nuclear peak instead of the judged one (`find recruit --nuclear-depth`).
+    #[arg(long, conflicts_with = "genome_size")]
+    nuclear_depth: Option<u32>,
+    /// The nuclear genome's collapsed size for the depth gate (`find recruit --genome-size`).
+    #[arg(long, value_parser = parse_genome_size)]
+    genome_size: Option<u64>,
+    /// The depth gate's organelle threshold, in multiples of the nuclear peak (default 3).
+    #[arg(long)]
+    gate_fold: Option<f64>,
+    /// Distinct genes a class needs for a cluster call (`find classify --min-genes`).
+    #[arg(long, default_value_t = 5)]
+    min_genes: usize,
+    /// Gene stretches per scanned read a class needs for a call (`find classify --min-density`).
+    #[arg(long, default_value_t = 0.3)]
+    min_density: f64,
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+fn protein_seed_params(
+    sample: usize,
+    flank: usize,
+    gate: (Option<u32>, Option<u64>, Option<f64>),
+    min_genes: usize,
+    min_density: f64,
+) -> Result<protein_seed::ProteinSeedParams> {
+    let (nuclear_depth, genome_size, depth_fold) = gate;
+    if sample == 0 {
+        bail!("--sample must be at least 1");
+    }
+    if depth_fold.is_some_and(|f| f.is_nan() || f <= 0.0) || nuclear_depth == Some(0) {
+        bail!("the depth gate's fold and nuclear depth must be positive");
+    }
+    Ok(protein_seed::ProteinSeedParams {
+        sample,
+        flank,
+        nuclear_depth,
+        genome_size,
+        depth_fold,
+        panel: panel::PanelParams {
+            min_genes,
+            min_density,
+            ..panel::PanelParams::default()
+        },
+        ..protein_seed::ProteinSeedParams::default()
+    })
+}
+
+/// The protein panel of `lineage` (or `file`), reads translated with the lineage's genetic code
+/// unless `code` is given.
+fn load_panel(
+    file: Option<&std::path::Path>,
+    lineage: seeddb::Lineage,
+    code: Option<u8>,
+    k: usize,
+    exclude: &[String],
+) -> Result<panel::Panel> {
+    let builtin = panel::Panel::for_lineage(lineage.name(), k, exclude)?;
+    let panel = match file {
+        Some(f) => {
+            let text =
+                std::fs::read_to_string(f).with_context(|| format!("cannot read {}", f.display()))?;
+            let default = match lineage {
+                seeddb::Lineage::Landplants => 1,
+                seeddb::Lineage::Metazoa => 5,
+                seeddb::Lineage::Fungi => 4,
+            };
+            panel::Panel::parse(&text, k, exclude)?.with_code(default)?
+        }
+        None => builtin,
+    };
+    match code {
+        Some(t) => panel.with_code(t),
+        None => Ok(panel),
+    }
+}
+
+fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()?;
+    }
+    let p = protein_seed_params(
+        args.sample,
+        args.flank,
+        (args.nuclear_depth, args.genome_size, args.gate_fold),
+        args.min_genes,
+        args.min_density,
+    )?;
+    let panel = load_panel(
+        args.panel.as_deref(),
+        args.lineage,
+        args.genetic_code,
+        p.panel.k,
+        &args.exclude,
+    )?;
+    let report = protein_seed::run(&args.reads, &panel, &p, &args.out)?;
+    eprintln!("{}", report.summary());
+    Ok(())
+}
+
 fn discover(args: DiscoverArgs) -> Result<()> {
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
@@ -2066,6 +2275,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Find(FindCommand::Recruit(args)) => recruit(args),
         Command::Find(FindCommand::Discover(args)) => discover(args),
         Command::Find(FindCommand::Classify(args)) => panel(args),
+        Command::Find(FindCommand::ProteinSeeds(args)) => protein_seeds(args),
         Command::Find(FindCommand::Label(args)) => label(args),
         Command::Assemble(AssembleCommand::Correct(args)) => correct(args),
         Command::Assemble(AssembleCommand::Graph(args)) => assemble(args),

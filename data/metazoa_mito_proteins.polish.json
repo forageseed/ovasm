@@ -1,0 +1,220 @@
+{
+ "kind": "metazoa",
+ "pool_genomes": 15750,
+ "candidates": 6000,
+ "tests": 1500,
+ "excluded_genera": 93,
+ "min_shared_6mers": 5,
+ "min_gain": 1,
+ "genes": {
+  "atp6": {
+   "select_tests": 747,
+   "validate_tests": 747,
+   "redundancy": {
+    "8": {
+     "proteins": 171,
+     "found": 735,
+     "proteins_all_tests": 218
+    }
+   },
+   "previous_found": 736,
+   "previous_proteins": 469,
+   "findable": 743
+  },
+  "atp8": {
+   "select_tests": 703,
+   "validate_tests": 703,
+   "redundancy": {
+    "8": {
+     "proteins": 732,
+     "found": 568,
+     "proteins_all_tests": 1025
+    }
+   },
+   "previous_found": 358,
+   "previous_proteins": 397,
+   "findable": 631
+  },
+  "atp9": {
+   "select_tests": 3,
+   "validate_tests": 2,
+   "redundancy": {
+    "8": {
+     "proteins": 8,
+     "found": 2,
+     "proteins_all_tests": 8
+    }
+   },
+   "previous_found": 2,
+   "previous_proteins": 45,
+   "findable": 2
+  },
+  "cob": {
+   "select_tests": 750,
+   "validate_tests": 749,
+   "redundancy": {
+    "8": {
+     "proteins": 21,
+     "found": 748,
+     "proteins_all_tests": 21
+    }
+   },
+   "previous_found": 748,
+   "previous_proteins": 478,
+   "findable": 748
+  },
+  "cox1": {
+   "select_tests": 750,
+   "validate_tests": 750,
+   "redundancy": {
+    "8": {
+     "proteins": 8,
+     "found": 750,
+     "proteins_all_tests": 8
+    }
+   },
+   "previous_found": 750,
+   "previous_proteins": 478,
+   "findable": 750
+  },
+  "cox2": {
+   "select_tests": 750,
+   "validate_tests": 750,
+   "redundancy": {
+    "8": {
+     "proteins": 55,
+     "found": 747,
+     "proteins_all_tests": 69
+    }
+   },
+   "previous_found": 747,
+   "previous_proteins": 477,
+   "findable": 749
+  },
+  "cox3": {
+   "select_tests": 746,
+   "validate_tests": 745,
+   "redundancy": {
+    "8": {
+     "proteins": 46,
+     "found": 744,
+     "proteins_all_tests": 54
+    }
+   },
+   "previous_found": 745,
+   "previous_proteins": 475,
+   "findable": 745
+  },
+  "nad1": {
+   "select_tests": 750,
+   "validate_tests": 749,
+   "redundancy": {
+    "8": {
+     "proteins": 20,
+     "found": 748,
+     "proteins_all_tests": 22
+    }
+   },
+   "previous_found": 748,
+   "previous_proteins": 478,
+   "findable": 748
+  },
+  "nad2": {
+   "select_tests": 749,
+   "validate_tests": 748,
+   "redundancy": {
+    "8": {
+     "proteins": 240,
+     "found": 735,
+     "proteins_all_tests": 329
+    }
+   },
+   "previous_found": 713,
+   "previous_proteins": 474,
+   "findable": 744
+  },
+  "nad3": {
+   "select_tests": 749,
+   "validate_tests": 748,
+   "redundancy": {
+    "8": {
+     "proteins": 161,
+     "found": 741,
+     "proteins_all_tests": 205
+    }
+   },
+   "previous_found": 743,
+   "previous_proteins": 477,
+   "findable": 745
+  },
+  "nad4": {
+   "select_tests": 749,
+   "validate_tests": 749,
+   "redundancy": {
+    "8": {
+     "proteins": 49,
+     "found": 747,
+     "proteins_all_tests": 60
+    }
+   },
+   "previous_found": 748,
+   "previous_proteins": 475,
+   "findable": 749
+  },
+  "nad4l": {
+   "select_tests": 749,
+   "validate_tests": 748,
+   "redundancy": {
+    "8": {
+     "proteins": 403,
+     "found": 698,
+     "proteins_all_tests": 579
+    }
+   },
+   "previous_found": 645,
+   "previous_proteins": 474,
+   "findable": 728
+  },
+  "nad5": {
+   "select_tests": 750,
+   "validate_tests": 750,
+   "redundancy": {
+    "8": {
+     "proteins": 19,
+     "found": 749,
+     "proteins_all_tests": 23
+    }
+   },
+   "previous_found": 749,
+   "previous_proteins": 477,
+   "findable": 750
+  },
+  "nad6": {
+   "select_tests": 748,
+   "validate_tests": 748,
+   "redundancy": {
+    "8": {
+     "proteins": 398,
+     "found": 702,
+     "proteins_all_tests": 583
+    }
+   },
+   "previous_found": 637,
+   "previous_proteins": 476,
+   "findable": 737
+  }
+ },
+ "redundancy": {
+  "8": {
+   "held_out_found": 9414,
+   "proteins": 3204,
+   "held_out_rate": 0.9719
+  }
+ },
+ "chosen_redundancy": 8,
+ "validate_tests": 9686,
+ "previous_found": 9069,
+ "previous_rate": 0.9363,
+ "findable": 9569,
+ "previous_proteins": 6150
+}

@@ -29,9 +29,40 @@ use crate::recruit::{peak_rss_mb, read_batches};
 
 /// The panel shipped in the binary.
 const PANEL: &str = include_str!("../data/organelle_proteins.faa");
+/// Mitochondrial core proteins of metazoa and fungi (RefSeq mitochondrion release, one genome per
+/// taxonomic group; `.agent-work/seed-evidence/build_lineage_panels.py`), for protein seeds.
+const METAZOA_PANEL: &str = include_str!("../data/metazoa_mito_proteins.faa");
+const FUNGI_PANEL: &str = include_str!("../data/fungi_mito_proteins.faa");
 
 /// Standard genetic code, codon index = 16 * b1 + 4 * b2 + b3 with A, C, G, T = 0..3.
 const CODE: &[u8; 64] = b"KNKNTTTTRSRSIIMIQHQHPPPPRRRRLLLLEDEDAAAAGGGGVVVV*Y*YSSSS*CWCLFLF";
+
+/// An NCBI translation table as a codon table in `CODE`'s order: 1 (standard; land-plant
+/// organelles), 4 (mold mitochondrial: TGA is Trp; most fungi), 5 (invertebrate mitochondrial: TGA
+/// Trp, ATA Met, AGA/AGG Ser) or 2 (vertebrate mitochondrial: TGA Trp, ATA Met, AGA/AGG stop).
+/// Mitochondrial genes of animals and fungi read TGA as Trp, so the standard table cuts them into
+/// pieces shorter than `min_orf`.
+pub fn genetic_code(table: u8) -> Result<[u8; 64]> {
+    let mut c = *CODE;
+    let at = |s: &[u8; 3]| {
+        let b = |x: u8| b"ACGT".iter().position(|&y| y == x).unwrap();
+        16 * b(s[0]) + 4 * b(s[1]) + b(s[2])
+    };
+    match table {
+        1 => {}
+        2 | 4 | 5 => {
+            c[at(b"TGA")] = b'W';
+            if table != 4 {
+                c[at(b"ATA")] = b'M';
+                let aga = if table == 5 { b'S' } else { b'*' };
+                c[at(b"AGA")] = aga;
+                c[at(b"AGG")] = aga;
+            }
+        }
+        other => bail!("genetic code {other} is not supported (1, 2, 4 or 5)"),
+    }
+    Ok(c)
+}
 const STOP: u8 = 20;
 const RESIDUES: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
 
@@ -84,6 +115,8 @@ pub struct Panel {
     index: FxHashMap<u64, Vec<u16>>,
     k: usize,
     proteins: usize,
+    /// Codon table reads are translated with (`genetic_code`).
+    code: [u8; 64],
 }
 
 #[inline]
@@ -108,9 +141,16 @@ fn base_code(b: u8) -> Option<usize> {
 /// Residue code of the codon at the start of `s` (`STOP` for a stop codon, `None` when a base
 /// is not A, C, G or T).
 #[inline]
+#[cfg(test)]
 fn translate_codon(s: &[u8]) -> Option<u8> {
+    translate_with(CODE, s)
+}
+
+/// `translate_codon` with the codon table `code`.
+#[inline]
+fn translate_with(code: &[u8; 64], s: &[u8]) -> Option<u8> {
     let i = 16 * base_code(s[0])? + 4 * base_code(s[1])? + base_code(s[2])?;
-    let aa = CODE[i];
+    let aa = code[i];
     if aa == b'*' {
         Some(STOP)
     } else {
@@ -191,11 +231,31 @@ impl Panel {
             index,
             k,
             proteins,
+            code: *CODE,
         })
     }
 
     pub fn embedded(k: usize, exclude: &[String]) -> Result<Self> {
         Self::parse(PANEL, k, exclude)
+    }
+
+    /// The built-in panel of a seed lineage with its genetic code: "landplants" (mitochondrion
+    /// and plastid, standard code), "metazoa" (mitochondrion, code 5) or "fungi" (mitochondrion,
+    /// code 4).
+    pub fn for_lineage(lineage: &str, k: usize, exclude: &[String]) -> Result<Self> {
+        let (text, table) = match lineage {
+            "landplants" => (PANEL, 1),
+            "metazoa" => (METAZOA_PANEL, 5),
+            "fungi" => (FUNGI_PANEL, 4),
+            other => bail!("no built-in protein panel for lineage {other:?}"),
+        };
+        Self::parse(text, k, exclude)?.with_code(table)
+    }
+
+    /// The same panel, reads translated with NCBI table `table` (`genetic_code`).
+    pub fn with_code(mut self, table: u8) -> Result<Self> {
+        self.code = genetic_code(table)?;
+        Ok(self)
     }
 
     /// Proteins and distinct genes in the panel.
@@ -237,9 +297,8 @@ impl Tally {
     }
 }
 
-/// Look up one stop-free stretch; assign it to its best gene.
-fn assign(aa: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32], tally: &mut Tally) {
-    tally.orfs += 1;
+/// Look up one stop-free stretch: its best gene, if it shares at least `min_hits` k-mers with it.
+fn best_gene(aa: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32]) -> Option<u16> {
     let mask = (1u64 << (5 * panel.k)) - 1;
     let mut code = 0u64;
     let mut touched: Vec<u16> = Vec::new();
@@ -266,10 +325,54 @@ fn assign(aa: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32], tally: &m
         }
         hits[g as usize] = 0;
     }
-    if let Some((g, h)) = best {
-        if h >= p.min_hits {
-            tally.gene_segments[g as usize] += 1;
-            tally.assigned += 1;
+    best.filter(|&(_, h)| h >= p.min_hits).map(|(g, _)| g)
+}
+
+/// Every stop-free stretch of at least `min_orf` residues in the six frames of `seq`, with the
+/// span it covers on `seq`'s forward strand: `f(residues, start, end)`.
+fn for_each_stretch(
+    seq: &[u8],
+    code: &[u8; 64],
+    min_orf: usize,
+    mut f: impl FnMut(&[u8], usize, usize),
+) {
+    let n = seq.len();
+    for strand in 0..2 {
+        let s: Cow<[u8]> = if strand == 0 {
+            Cow::Borrowed(seq)
+        } else {
+            Cow::Owned(revcomp(seq))
+        };
+        let mut emit = |aa: &[u8], start: usize, end: usize| {
+            if strand == 0 {
+                f(aa, start, end)
+            } else {
+                f(aa, n - end, n - start)
+            }
+        };
+        for frame in 0..3 {
+            let mut aa: Vec<u8> = Vec::with_capacity(s.len() / 3 + 1);
+            let (mut i, mut start) = (frame, frame);
+            while i + 3 <= s.len() {
+                match translate_with(code, &s[i..i + 3]) {
+                    Some(a) if a < STOP => {
+                        if aa.is_empty() {
+                            start = i;
+                        }
+                        aa.push(a)
+                    }
+                    _ => {
+                        if aa.len() >= min_orf {
+                            emit(&aa, start, i);
+                        }
+                        aa.clear();
+                    }
+                }
+                i += 3;
+            }
+            if aa.len() >= min_orf {
+                emit(&aa, start, i);
+            }
         }
     }
 }
@@ -277,32 +380,66 @@ fn assign(aa: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32], tally: &m
 fn scan_read(seq: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32], tally: &mut Tally) {
     tally.reads += 1;
     tally.bases += seq.len() as u64;
-    for strand in 0..2 {
-        let s: Cow<[u8]> = if strand == 0 {
-            Cow::Borrowed(seq)
-        } else {
-            Cow::Owned(revcomp(seq))
-        };
-        for frame in 0..3 {
-            let mut aa: Vec<u8> = Vec::with_capacity(s.len() / 3 + 1);
-            let mut i = frame;
-            while i + 3 <= s.len() {
-                match translate_codon(&s[i..i + 3]) {
-                    Some(a) if a < STOP => aa.push(a),
-                    _ => {
-                        if aa.len() >= p.min_orf {
-                            assign(&aa, panel, p, hits, tally);
-                        }
-                        aa.clear();
-                    }
-                }
-                i += 3;
-            }
-            if aa.len() >= p.min_orf {
-                assign(&aa, panel, p, hits, tally);
-            }
+    for_each_stretch(seq, &panel.code, p.min_orf, |aa, _, _| {
+        tally.orfs += 1;
+        if let Some(g) = best_gene(aa, panel, p, hits) {
+            tally.gene_segments[g as usize] += 1;
+            tally.assigned += 1;
+        }
+    });
+}
+
+/// The stretches of `seq` assigned to a panel gene: (gene, start, end) on the forward strand,
+/// for cropping a read to its genes (`protein_seed`).
+pub(crate) fn gene_stretches(
+    seq: &[u8],
+    panel: &Panel,
+    p: &PanelParams,
+    hits: &mut [u32],
+) -> Vec<(u16, usize, usize)> {
+    let mut out = Vec::new();
+    for_each_stretch(seq, &panel.code, p.min_orf, |aa, start, end| {
+        if let Some(g) = best_gene(aa, panel, p, hits) {
+            out.push((g, start, end));
+        }
+    });
+    out
+}
+
+impl Panel {
+    /// Distinct panel genes (the length of a per-gene count vector).
+    pub(crate) fn gene_count(&self) -> usize {
+        self.genes.len()
+    }
+
+    /// A gene's organelle: "mitochondrion" or "plastid".
+    pub(crate) fn gene_organelle(&self, g: u16) -> &'static str {
+        match self.genes[g as usize].class {
+            Class::Mito => "mitochondrion",
+            Class::Plastid => "plastid",
         }
     }
+}
+
+/// The call of a set of `reads` reads holding `gene_segments` stretches per panel gene, as
+/// `panel_set` makes it: (mitochondrion, plastid, their densities, call).
+pub(crate) fn call_segments(
+    panel: &Panel,
+    gene_segments: Vec<u64>,
+    reads: u64,
+    p: &PanelParams,
+) -> (ClassReport, ClassReport, f64, f64, &'static str) {
+    let tally = Tally {
+        gene_segments,
+        reads,
+        ..Tally::new(0)
+    };
+    let mitochondrion = class_report(panel, &tally, Class::Mito, p);
+    let plastid = class_report(panel, &tally, Class::Plastid, p);
+    let density = |c: &ClassReport| c.segments as f64 / reads.max(1) as f64;
+    let (md, pd) = (density(&mitochondrion), density(&plastid));
+    let call = call_from((mitochondrion.genes, md), (plastid.genes, pd), p);
+    (mitochondrion, plastid, md, pd, call)
 }
 
 #[derive(Serialize)]
@@ -605,6 +742,86 @@ mod tests {
         );
         assert_eq!(t.assigned, 0);
         assert!(hits.iter().all(|&h| h == 0), "scratch counts are reset");
+    }
+
+    #[test]
+    fn gene_stretches_are_spans_on_the_forward_strand() {
+        let panel = Panel::parse(&panel_text(), 6, &[]).unwrap();
+        let p = PanelParams::default();
+        let mut hits = vec![0u32; panel.genes.len()];
+        let cox1 = panel
+            .genes
+            .iter()
+            .position(|g| g.name == "cox1")
+            .unwrap() as u16;
+        // frame 0 of the flank stops at TAG (bases 18-20): the stretch starts at 21 and runs to
+        // the gene's stop codon (27 + 600)
+        let mut read = b"GCGCGCATATATGGCCATTAGGCGAAT".to_vec();
+        read.extend(back_translate(&protein(200, 1)));
+        read.extend(b"TTGACCATGGCATTAGC");
+        assert_eq!(
+            gene_stretches(&read, &panel, &p, &mut hits),
+            vec![(cox1, 21, 627)]
+        );
+        assert_eq!(
+            gene_stretches(&revcomp(&read), &panel, &p, &mut hits),
+            vec![(cox1, read.len() - 627, read.len() - 21)]
+        );
+    }
+
+    #[test]
+    fn mitochondrial_codes_read_tga_as_tryptophan() {
+        let c = |t: u8, codon: &[u8; 3]| translate_with(&genetic_code(t).unwrap(), codon);
+        assert_eq!(c(1, b"TGA"), Some(STOP));
+        for t in [2, 4, 5] {
+            assert_eq!(c(t, b"TGA"), residue_code(b'W'), "table {t}");
+        }
+        assert_eq!(c(4, b"ATA"), residue_code(b'I'));
+        assert_eq!(c(5, b"ATA"), residue_code(b'M'));
+        assert_eq!(c(5, b"AGG"), residue_code(b'S'));
+        assert_eq!(c(2, b"AGA"), Some(STOP));
+        assert_eq!(c(1, b"AGA"), residue_code(b'R'));
+        assert!(genetic_code(3).is_err());
+    }
+
+    #[test]
+    fn an_animal_gene_is_one_stretch_only_in_its_own_code() {
+        let code5 = genetic_code(5).unwrap();
+        // DNA that code 5 translates to the protein (its first codon per residue: TGA for Trp)
+        let prot = protein(200, 1);
+        let mut dna = Vec::new();
+        for &a in &prot {
+            let i = code5.iter().position(|&c| c == a).unwrap();
+            dna.extend([b"ACGT"[i / 16], b"ACGT"[(i / 4) % 4], b"ACGT"[i % 4]]);
+        }
+        dna.extend(b"TAA");
+        assert!(dna.windows(3).step_by(3).any(|w| w == b"TGA"));
+        let p = PanelParams::default();
+        let standard = Panel::parse(&panel_text(), 6, &[]).unwrap();
+        let animal = Panel::parse(&panel_text(), 6, &[])
+            .unwrap()
+            .with_code(5)
+            .unwrap();
+        let mut hits = vec![0u32; standard.genes.len()];
+        let found = gene_stretches(&dna, &animal, &p, &mut hits);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].1, found[0].2), (0, 600));
+        assert!(gene_stretches(&dna, &standard, &p, &mut hits)
+            .iter()
+            .all(|&(_, a, b)| b - a < 600));
+    }
+
+    #[test]
+    fn the_lineage_panels_parse_with_their_codes() {
+        let metazoa = Panel::for_lineage("metazoa", 6, &[]).unwrap();
+        let fungi = Panel::for_lineage("fungi", 6, &[]).unwrap();
+        for (panel, table) in [(&metazoa, 5), (&fungi, 4)] {
+            assert!(panel.proteins > 500);
+            assert!(panel.genes.iter().all(|g| g.class == Class::Mito));
+            assert!(panel.genes.iter().any(|g| g.name == "cox1"));
+            assert_eq!(panel.code, genetic_code(table).unwrap());
+        }
+        assert!(Panel::for_lineage("protists", 6, &[]).is_err());
     }
 
     #[test]
