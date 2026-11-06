@@ -1454,6 +1454,60 @@ const LOW_DEPTH_NODES: f64 = 8.0;
 /// 9.8-14.9 kb with 2.
 const VERY_LOW_DEPTH_NODES: f64 = 6.0;
 
+/// (open ends, unitigs, longer total, larger k): smaller is better.
+type LadderScore = (usize, usize, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>);
+
+/// Unitigs a deep graph may have for its open ends to send the ladder further down. Organelle
+/// graphs of a few unitigs with an open end are a broken circle; large graphs keep the k their
+/// depth chose (their open ends are mostly removed branches, and a smaller k merges repeats).
+const OPEN_END_MAX_UNITIGS: usize = 4;
+/// Node threshold of the second ladder for a small graph still open (`run_auto_k_cleaning`): a
+/// stretch present in a fraction of the copies (an optional intron, say) stays under a tenth of the
+/// node depth at every k. Rhizosphaera kalkhoffii: open at every k at the automatic 11-20, one
+/// circular 44,388 bp unitig at k 201 with 3.
+const OPEN_END_MIN_COUNT: u32 = 3;
+
+/// The k to assemble at, from the k tried (`scored`): where the node depth did not choose one (no
+/// k reached the target) or the chosen graph is small and open, the k with the fewest open ends,
+/// then the fewest unitigs, the longest, the largest. Rhizosphaera kalkhoffii mitochondrion (PMAT2
+/// benchmark, 604 reads at about 106x): k 1001 lost a 10.5 kb stretch under its node threshold and
+/// gave one open 33.8 kb unitig, k 201 one circular 44,388 bp unitig (PMAT2: 44,388 bp).
+/// Platycnemis pennipes (about 18x, no k at the target): the smallest k, 101, gave three unitigs and
+/// a 14.9 kb representative, k 1001 a closed two-unitig graph of 17.2 kb (PMAT2: 17,361 bp).
+fn ladder_choice(scored: &[(LadderScore, usize)], last: &AssembleReport, target: f64) -> Option<usize> {
+    let small_and_open = last.unitigs <= OPEN_END_MAX_UNITIGS
+        && scored.iter().find(|x| x.1 == last.k).is_some_and(|x| x.0 .0 > 0);
+    if last.node_depth >= target && !small_and_open {
+        return None;
+    }
+    scored.iter().min_by_key(|x| x.0).map(|x| x.1)
+}
+
+/// Unitig ends of a GFA without a link.
+fn open_ends(gfa: &Path) -> usize {
+    let Ok(text) = fs::read_to_string(gfa) else {
+        return 0;
+    };
+    let mut ends: FxHashSet<(String, bool)> = FxHashSet::default();
+    let mut used: FxHashSet<(String, bool)> = FxHashSet::default();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.first() {
+            Some(&"S") if f.len() > 1 => {
+                ends.insert((f[1].to_string(), false));
+                ends.insert((f[1].to_string(), true));
+            }
+            // L a o1 b o2: a's right end when o1 is +, b's left end when o2 is +
+            Some(&"L") if f.len() > 4 => {
+                used.insert((f[1].to_string(), f[2] == "+"));
+                used.insert((f[3].to_string(), f[4] != "+"));
+            }
+            _ => {}
+        }
+    }
+    ends.difference(&used).count()
+}
+
 /// Assemble at the largest k of `K_LADDER` whose node depth reaches `AUTO_K_NODE_DEPTH`, or at
 /// the smallest if none does.
 ///
@@ -1533,7 +1587,9 @@ fn run_auto_k_cleaning(
 ) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
-        let mut best_low: Option<((usize, std::cmp::Reverse<usize>), usize)> = None;
+        // every k tried, by (open ends, unitigs, longer, larger k): the choice when the node depth
+        // does not make it (see `ladder_choice`)
+        let mut scored: Vec<(LadderScore, usize)> = Vec::new();
         for (i, &k) in K_LADDER.iter().enumerate() {
             let r = run_backbone(
                 reads.to_vec(),
@@ -1549,31 +1605,84 @@ fn run_auto_k_cleaning(
                 out_json,
             )?;
             tried.push((k, r.node_depth));
-            // under LOW_DEPTH_NODES every k stays far from the target and the node depth no longer
-            // chooses among them: the fewest unitigs does (the larger k on a tie)
-            if r.node_depth < LOW_DEPTH_NODES && r.unitigs > 0 {
-                let key = (r.unitigs, std::cmp::Reverse(k));
-                if best_low.map_or(true, |b: ((usize, std::cmp::Reverse<usize>), usize)| key < b.0) {
-                    best_low = Some((key, k));
-                }
+            let open = open_ends(out_gfa);
+            if r.unitigs > 0 {
+                scored.push((
+                    (
+                        open,
+                        r.unitigs,
+                        std::cmp::Reverse(r.total_length),
+                        std::cmp::Reverse(k),
+                    ),
+                    k,
+                ));
             }
-            let done = r.node_depth >= target || i + 1 == K_LADDER.len();
+            let deep = r.node_depth >= target;
+            // a deep graph that is closed is done; a small deep graph with open ends goes on down
+            // the ladder (a stretch under the threshold at this k breaks the circle)
+            let done = (deep && (open == 0 || r.unitigs > OPEN_END_MAX_UNITIGS))
+                || i + 1 == K_LADDER.len();
             last = Some(r);
             if done {
                 break;
             }
         }
         let last = last.expect("the ladder is not empty");
-        match best_low {
-            Some((_, k)) if last.node_depth < LOW_DEPTH_NODES && k != last.k => {
-                eprintln!("[ovasm] low depth: k {k} gives the fewest unitigs; assembling at it");
+        let mut choice = ladder_choice(&scored, &last, target).map(|k| (k, min_count));
+        let mut ran_low = false;
+        // a small graph still open at the automatic threshold: a stretch of the organelle sits
+        // under it at every k (OPEN_END_MIN_COUNT); the ladder again at that threshold, kept only
+        // where it closes more ends
+        let best = choice
+            .and_then(|(k, _)| scored.iter().find(|x| x.1 == k))
+            .or_else(|| scored.iter().find(|x| x.1 == last.k));
+        if let Some(&(b, _)) = best {
+            if b.0 > 0 && b.1 <= OPEN_END_MAX_UNITIGS && min_count.is_none() {
+                let mut low = b;
+                for &k in K_LADDER.iter() {
+                    let r = run_backbone(
+                        reads.to_vec(),
+                        AssembleParams {
+                            cleaning_audit_only,
+                            k,
+                            s,
+                            min_count: Some(OPEN_END_MIN_COUNT),
+                            min_count_fraction,
+                            nuclear_share,
+                        },
+                        out_gfa,
+                        out_json,
+                    )?;
+                    tried.push((k, r.node_depth));
+                    let open = open_ends(out_gfa);
+                    let score = (
+                        open,
+                        r.unitigs,
+                        std::cmp::Reverse(r.total_length),
+                        std::cmp::Reverse(k),
+                    );
+                    if r.unitigs > 0 && score.0 < low.0 && score < low {
+                        low = score;
+                        choice = Some((k, Some(OPEN_END_MIN_COUNT)));
+                    }
+                }
+                ran_low = true;
+            }
+        }
+        // the second ladder overwrote the graph files: the choice is assembled again in any case
+        match choice.or(ran_low.then_some((last.k, min_count))) {
+            Some((k, mc)) if ran_low || k != last.k || mc != min_count => {
+                eprintln!(
+                    "[ovasm] k {k}{} gives the fewest open ends and unitigs of the k tried; assembling at it",
+                    mc.map_or(String::new(), |m| format!(" (node threshold {m})"))
+                );
                 let r = run_backbone(
                     reads.to_vec(),
                     AssembleParams {
                         cleaning_audit_only,
                         k,
                         s,
-                        min_count,
+                        min_count: mc,
                         min_count_fraction,
                         nuclear_share,
                     },
