@@ -1444,6 +1444,9 @@ pub const K_LADDER: [usize; 8] = [1001, 701, 501, 351, 251, 201, 151, 101];
 /// Node depth a k must reach to be taken by `run_auto_k`.
 pub const AUTO_K_NODE_DEPTH: f64 = 22.0;
 
+/// Node depth under which the automatic node threshold may be 2 instead of 3 (`build`).
+const LOW_DEPTH_NODES: f64 = 8.0;
+
 /// Assemble at the largest k of `K_LADDER` whose node depth reaches `AUTO_K_NODE_DEPTH`, or at
 /// the smallest if none does.
 ///
@@ -1568,8 +1571,21 @@ fn run_auto_k_cleaning(
             &corrected,
             &out_gfa.with_extension("correct.json"),
         )?;
-        r = ladder(std::slice::from_ref(&corrected), &mut tried)?;
-        r.corrected_reads = Some(corrected.display().to_string());
+        let before = r.bases;
+        let rc = ladder(std::slice::from_ref(&corrected), &mut tried)?;
+        if 2 * rc.bases < before {
+            // Correction needs depth for its solid k-mers: at about 5x it trimmed away what the
+            // reads held (Canis lupus mitochondrion from 10 Mb of HiFi reads, the PMAT2 benchmark's
+            // lowest-depth test: 11 reads, 75 kb -> 5 reads, 1.4 kb, no unitig). The uncorrected
+            // reads' graph is the better one then.
+            eprintln!(
+                "[ovasm] correction kept under half of the bases (too shallow to correct); assembling the reads as they are"
+            );
+            r = ladder(&inputs, &mut tried)?;
+        } else {
+            r = rc;
+            r.corrected_reads = Some(corrected.display().to_string());
+        }
     }
     add_junctions(&mut r, &inputs, out_gfa, context)?;
     r.k_tried = tried;
@@ -1974,9 +1990,13 @@ fn run_backbone_layout_guard(
             .copied()
             .unwrap_or(0) as f64
     };
+    // The automatic threshold is at least 3, or 2 under LOW_DEPTH_NODES: at about 5x a count of 3
+    // drops every stretch where coverage dips to two reads (Canis lupus mitochondrion from 10 Mb of
+    // HiFi reads, the PMAT2 benchmark's lowest-depth test: 2 unitigs, 14.2 of 16.7 kb).
+    let floor = if node_depth < LOW_DEPTH_NODES { 2 } else { 3 };
     let min_count = p.min_count.unwrap_or_else(|| match p.min_count_fraction {
-        Some(f) => ((node_depth * f + 1e-9) as u32).max(3),
-        None => ((node_depth / 10.0) as u32).max(3),
+        Some(f) => ((node_depth * f + 1e-9) as u32).max(floor),
+        None => ((node_depth / 10.0) as u32).max(floor),
     });
 
     // Keep nodes and edges seen at least min_count times, plus whatever gap rescue adds.
