@@ -87,6 +87,8 @@ pub struct ClusterCall {
     pub depth: f64,
     /// Organelle-like reads nearest this peak.
     pub reads: u64,
+    /// The sequence those reads stand for: their bases over the depth (`MIN_CLUSTER_SPAN`).
+    pub span_bp: u64,
     pub scanned: u64,
     pub mitochondrion: ClassReport,
     pub plastid: ClassReport,
@@ -119,11 +121,46 @@ pub struct ProteinSeedReport {
     pub seed_reads: FxHashMap<&'static str, usize>,
     pub seed_bases: FxHashMap<&'static str, u64>,
     pub seeds: FxHashMap<&'static str, PathBuf>,
+    /// The scan of every read for the organelles no depth cluster seeded (`whole_read_seeds`).
+    pub whole_read_scan: Option<WholeReadScan>,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
 }
 
+/// Seeds found without the depth gate: every read scanned, a read a seed when it holds at least
+/// `min_read_stretches` stretches of at least `WHOLE_READ_MIN_GENES` distinct genes of the class.
+#[derive(Serialize)]
+pub struct WholeReadScan {
+    /// The organelles it looked for (those without depth-cluster seeds).
+    pub organelles: Vec<&'static str>,
+    pub reads: u64,
+    pub bases: u64,
+    /// Seed reads per organelle (whole reads, not cropped).
+    pub seed_reads: FxHashMap<&'static str, usize>,
+    pub seconds: f64,
+}
+
+/// Distinct genes of its class a read needs in the whole-read scan. Without the depth gate a
+/// nuclear copy of organelle DNA (NUMT, NUPT) is not set apart by depth, and most are a few kb of
+/// one or two genes; an animal mitochondrial HiFi read of 10 kb holds five or more.
+pub const WHOLE_READ_MIN_GENES: usize = 3;
+/// Shared k-mers each counted stretch needs with its gene in the whole-read scan. A chance stretch
+/// of a nuclear read reaches 5-8 (transposon ORFs, low-complexity peptides), a mitochondrial gene
+/// 13-140 on its best stretch (references of the PMAT2 benchmark scanned with the metazoa panel);
+/// with 2 genes at 5 hits, 1,514 of 74,216 Gibbula magus reads passed, of 19 mitochondrial ones.
+pub const WHOLE_READ_MIN_HITS: u32 = 12;
+/// Seed reads kept per organelle in the whole-read scan (in input order).
+pub const WHOLE_READ_MAX_SEEDS: usize = 3000;
+
 impl ProteinSeedReport {
+    /// Whether some seeds came from the whole-read scan: the organelle is not deeper than the
+    /// nucleus in these reads, so recruitment should not gate on depth either.
+    pub fn shallow(&self) -> bool {
+        self.whole_read_scan
+            .as_ref()
+            .is_some_and(|w| w.seed_reads.values().any(|&n| n > 0))
+    }
+
     /// One line for the terminal.
     pub fn summary(&self) -> String {
         let calls: Vec<String> = self
@@ -131,11 +168,21 @@ impl ProteinSeedReport {
             .iter()
             .map(|c| format!("{:.0}x {} ({} reads, seeds {})", c.depth, c.call, c.reads, c.seeded.join("+")))
             .collect();
+        let whole = match &self.whole_read_scan {
+            Some(w) => format!(
+                "; whole-read scan for {} ({} reads): {} seed reads",
+                w.organelles.join(" and "),
+                w.reads,
+                w.seed_reads.values().sum::<usize>()
+            ),
+            None => String::new(),
+        };
         format!(
-            "[ovasm] protein seeds: {} organelle-like reads in {} clusters [{}]; seeds: mitochondrion {}, plastid {} reads ({:.0} s)",
+            "[ovasm] protein seeds: {} organelle-like reads in {} clusters [{}]{}; seeds: mitochondrion {}, plastid {} reads ({:.0} s)",
             self.organelle_like_reads,
             self.clusters.len(),
             calls.join(", "),
+            whole,
             self.seed_reads.get("mitochondrion").copied().unwrap_or(0),
             self.seed_reads.get("plastid").copied().unwrap_or(0),
             self.elapsed_seconds
@@ -216,10 +263,20 @@ fn crop(
     (lo < hi).then(|| (lo.saturating_sub(flank), (hi + flank).min(len)))
 }
 
+/// Fewest bases a depth cluster must stand for (its reads' bases over its depth) to seed: a deep
+/// nuclear repeat with organelle-derived genes stands for a few hundred bases at most (Orcinus
+/// orca, the PMAT2 benchmark's 1 Gb: a 101,070x cluster of 356 reads, 3.6 Mb, about 36 bp, with
+/// atp8/nad3/nad4 hits, where the whole read set held 19 mitochondrial reads); the smallest
+/// mitochondrial genomes are about 6 kb.
+pub const MIN_CLUSTER_SPAN: f64 = 4000.0;
+
+/// Protein seeds for the organelles in `want` (the others are not looked for in the whole-read
+/// scan; depth clusters may still seed them).
 pub fn run(
     inputs: &[PathBuf],
     panel: &Panel,
     p: &ProteinSeedParams,
+    want: &[&'static str],
     out_dir: &Path,
 ) -> Result<ProteinSeedReport> {
     let t0 = Instant::now();
@@ -239,17 +296,18 @@ pub fn run(
     }
     // pass 3: organelle-like reads and their median depths
     let (rx, reader) = read_batches(inputs);
-    let mut liked: Vec<(u64, f64)> = Vec::new();
+    let mut liked: Vec<(u64, f64, u64)> = Vec::new();
     let mut reads = 0u64;
     for batch in rx {
         let first = reads;
         reads += batch.len() as u64;
-        let found: Vec<(u64, f64)> = batch
+        let found: Vec<(u64, f64, u64)> = batch
             .par_iter()
             .enumerate()
             .filter_map(|(i, r)| {
                 let d = gate.profile(&r.seq)?;
-                d.organelle_like.then_some((first + i as u64, d.median))
+                d.organelle_like
+                    .then_some((first + i as u64, d.median, r.seq.len() as u64))
             })
             .collect();
         liked.extend(found);
@@ -263,12 +321,14 @@ pub fn run(
     } else {
         liked
             .iter()
-            .map(|&(o, m)| (o, nearest(&peaks, m)))
+            .map(|&(o, m, _)| (o, nearest(&peaks, m)))
             .collect()
     };
     let mut cluster_reads = vec![0u64; peaks.len()];
-    for &(_, c) in &candidates {
+    let mut cluster_bases = vec![0u64; peaks.len()];
+    for (&(_, c), &(_, _, len)) in candidates.iter().zip(&liked) {
         cluster_reads[c] += 1;
+        cluster_bases[c] += len;
     }
     let picked = sample_reads(&candidates, peaks.len(), p.sample);
     drop(candidates);
@@ -350,10 +410,11 @@ pub fn run(
         // a class that counts here (enough genes, enough stretches per read) seeds from its reads,
         // also where both count (a cluster holding parts of both genomes at one depth)
         let counts = |r: &ClassReport, d: f64| r.genes >= p.panel.min_genes && d >= p.panel.min_density;
+        let span = cluster_bases[c] as f64 / 2f64.powf(peak);
         let seeded: Vec<&'static str> = [(&mitochondrion, md), (&plastid, pd)]
             .iter()
             .zip(ORGANELLES)
-            .filter(|((r, d), _)| counts(*r, *d))
+            .filter(|((r, d), _)| counts(*r, *d) && span >= MIN_CLUSTER_SPAN)
             .map(|(_, o)| o)
             .collect();
         let mut given = 0;
@@ -390,6 +451,7 @@ pub fn run(
         clusters.push(ClusterCall {
             depth: 2f64.powf(peak),
             reads: cluster_reads[c],
+            span_bp: span.round() as u64,
             scanned: n,
             mitochondrion,
             plastid,
@@ -405,6 +467,25 @@ pub fn run(
     for (_, mut w) in fasta {
         w.flush()?;
     }
+    // organelles no cluster seeded: every read, without the depth gate
+    let missing: Vec<&'static str> = want
+        .iter()
+        .copied()
+        .filter(|o| !seeds.contains_key(o))
+        .collect();
+    let whole_read_scan = if missing.is_empty() {
+        None
+    } else {
+        let w = whole_read_seeds(inputs, panel, p, &missing, out_dir)?;
+        for (&o, &n) in &w.0.seed_reads {
+            if n > 0 {
+                seeds.insert(o, out_dir.join(format!("protein_seeds.{o}.fasta")));
+                seed_reads.insert(o, n);
+                seed_bases.insert(o, w.1.get(o).copied().unwrap_or(0));
+            }
+        }
+        Some(w.0)
+    };
     let (panel_proteins, panel_genes) = panel.sizes();
     let report = ProteinSeedReport {
         tool: "ovasm find protein-seeds",
@@ -419,6 +500,7 @@ pub fn run(
         seed_reads,
         seed_bases,
         seeds,
+        whole_read_scan,
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
     };
@@ -427,6 +509,95 @@ pub fn run(
         serde_json::to_string_pretty(&report)?,
     )?;
     Ok(report)
+}
+
+/// Whole reads as seeds for `organelles`, from a scan of every read: a read is a seed when its
+/// stretches make it of the organelle's class (`read_class`) and cover at least
+/// `WHOLE_READ_MIN_GENES` distinct genes. For reads where the organelle is not deeper than the
+/// nucleus (the PMAT2 benchmark's read amounts: Orcinus orca 19 mitochondrial reads in 1 Gb, about
+/// 6x; Sterechinus neumayeri 9 in 2.5 Gb), which the depth gate cannot set apart.
+fn whole_read_seeds(
+    inputs: &[PathBuf],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    organelles: &[&'static str],
+    out_dir: &Path,
+) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
+    let t0 = Instant::now();
+    let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
+        FxHashMap::default();
+    let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
+        Default::default();
+    let (mut reads, mut bases) = (0u64, 0u64);
+    let (rx, reader) = read_batches(inputs);
+    for batch in rx {
+        reads += batch.len() as u64;
+        bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
+        let strict = PanelParams {
+            min_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
+            ..p.panel.clone()
+        };
+        let hits: Vec<(usize, &'static str)> = batch
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || vec![0u32; panel.gene_count()],
+                |hits, (i, r)| {
+                    let st = panel::gene_stretches(&r.seq, panel, &strict, hits);
+                    let genes: Vec<u16> = st.iter().map(|x| x.0).collect();
+                    let class = read_class(&genes, panel, p.min_read_stretches)?;
+                    if !organelles.contains(&class) {
+                        return None;
+                    }
+                    let mut distinct: Vec<u16> = genes
+                        .iter()
+                        .copied()
+                        .filter(|&g| panel.gene_organelle(g) == class)
+                        .collect();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    (distinct.len() >= WHOLE_READ_MIN_GENES).then_some((i, class))
+                },
+            )
+            .flatten()
+            .collect();
+        for (i, class) in hits {
+            let c = n.entry(class).or_insert(0);
+            if *c >= WHOLE_READ_MAX_SEEDS {
+                continue;
+            }
+            if !writers.contains_key(class) {
+                let path = out_dir.join(format!("protein_seeds.{class}.fasta"));
+                writers.insert(class, std::io::BufWriter::new(std::fs::File::create(&path)?));
+            }
+            let w = writers.get_mut(class).expect("just inserted");
+            let r = &batch[i];
+            w.write_all(b">")?;
+            w.write_all(r.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&r.id))?;
+            w.write_all(b" whole_read_scan\n")?;
+            w.write_all(&r.seq)?;
+            w.write_all(b"\n")?;
+            *c += 1;
+            *b.entry(class).or_insert(0) += r.seq.len() as u64;
+        }
+    }
+    reader.join().expect("reader thread panicked")?;
+    for (_, mut w) in writers {
+        w.flush()?;
+    }
+    for &o in organelles {
+        n.entry(o).or_insert(0);
+    }
+    Ok((
+        WholeReadScan {
+            organelles: organelles.to_vec(),
+            reads,
+            bases,
+            seed_reads: n,
+            seconds: t0.elapsed().as_secs_f64(),
+        },
+        b,
+    ))
 }
 
 #[cfg(test)]

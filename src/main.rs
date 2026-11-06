@@ -747,12 +747,13 @@ fn run(args: RunArgs) -> Result<()> {
     // two / 60 passes: Polytrichum commune 0.92 / 0.59 / 0.59, Bryoerythrophyllum caledonicum 0.98 /
     // 0.81 / 0.34).
     let mut protein_passes = None;
+    let mut shallow = false;
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
         // the organelles seeded (the asked one and, unless --single-seed, its competitor)
         // and only those the lineage has (no plastid in metazoa or fungi)
-        let wanted: Vec<&str> = match single {
+        let wanted: Vec<&'static str> = match single {
             Some(o) if args.single_seed => vec![o],
             _ => protein_seed::ORGANELLES
                 .iter()
@@ -776,9 +777,22 @@ fn run(args: RunArgs) -> Result<()> {
                 p.panel.k,
                 &[],
             )?;
-            let report =
-                protein_seed::run(&args.reads, &panel, &p, &args.out.join("protein-seeds"))?;
+            let report = protein_seed::run(
+                &args.reads,
+                &panel,
+                &p,
+                &wanted,
+                &args.out.join("protein-seeds"),
+            )?;
             eprintln!("{}", report.summary());
+            if report.shallow() {
+                // the organelle is about as deep as the nucleus in these reads: a depth gate on
+                // recruitment would refuse its reads as it refused them in the seed search
+                eprintln!(
+                    "[ovasm] run: protein seeds from the whole-read scan: recruiting without the depth gate"
+                );
+                shallow = true;
+            }
             let unseeded: Vec<&str> =
                 wanted.iter().copied().filter(|o| !seeds.contains_key(*o)).collect();
             for &o in &unseeded {
@@ -833,7 +847,7 @@ fn run(args: RunArgs) -> Result<()> {
         // HiFi recruitment in `run` is gated (`find recruit --extend-gate --bootstrap`) unless
         // --no-extend-gate: the 0.2.1 ungated mode ran into the nucleus on species far from the
         // seed library (see docs/release-0.3.0.md).
-        gated_recruit: !args.no_extend_gate,
+        gated_recruit: !args.no_extend_gate && !shallow,
         recruit_gate_fold: args.extend_gate_fold,
         recruit_nuclear_depth: args.nuclear_depth,
         recruit_genome_size: args.genome_size,
@@ -1877,7 +1891,12 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         p.panel.k,
         &args.exclude,
     )?;
-    let report = protein_seed::run(&args.reads, &panel, &p, &args.out)?;
+    let want: Vec<&'static str> = protein_seed::ORGANELLES
+        .iter()
+        .copied()
+        .filter(|o| args.lineage.fasta(o).is_some())
+        .collect();
+    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out)?;
     eprintln!("{}", report.summary());
     Ok(())
 }

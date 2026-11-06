@@ -1446,6 +1446,13 @@ pub const AUTO_K_NODE_DEPTH: f64 = 22.0;
 
 /// Node depth under which the automatic node threshold may be 2 instead of 3 (`build`).
 const LOW_DEPTH_NODES: f64 = 8.0;
+/// Node depth under which it may be 1. At 4-5x a node seen by two reads is missing wherever two
+/// of the two or three reads there carry an error in its k-mer; HiFi errors are rare enough that
+/// the k-mers seen once are mostly true, and cleaning removes the error tips. Canis lupus
+/// mitochondrion from the 11 reads (75 kb) the PMAT2 benchmark's 10 Mb yield: at k 201-701 one
+/// circular 16.7 kb unitig with a threshold of 1 (PMAT2: 16,720 bp), two to four pieces of
+/// 9.8-14.9 kb with 2.
+const VERY_LOW_DEPTH_NODES: f64 = 6.0;
 
 /// Assemble at the largest k of `K_LADDER` whose node depth reaches `AUTO_K_NODE_DEPTH`, or at
 /// the smallest if none does.
@@ -1526,6 +1533,7 @@ fn run_auto_k_cleaning(
 ) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
+        let mut best_low: Option<((usize, std::cmp::Reverse<usize>), usize)> = None;
         for (i, &k) in K_LADDER.iter().enumerate() {
             let r = run_backbone(
                 reads.to_vec(),
@@ -1541,13 +1549,42 @@ fn run_auto_k_cleaning(
                 out_json,
             )?;
             tried.push((k, r.node_depth));
+            // under LOW_DEPTH_NODES every k stays far from the target and the node depth no longer
+            // chooses among them: the fewest unitigs does (the larger k on a tie)
+            if r.node_depth < LOW_DEPTH_NODES && r.unitigs > 0 {
+                let key = (r.unitigs, std::cmp::Reverse(k));
+                if best_low.map_or(true, |b: ((usize, std::cmp::Reverse<usize>), usize)| key < b.0) {
+                    best_low = Some((key, k));
+                }
+            }
             let done = r.node_depth >= target || i + 1 == K_LADDER.len();
             last = Some(r);
             if done {
                 break;
             }
         }
-        Ok(last.expect("the ladder is not empty"))
+        let last = last.expect("the ladder is not empty");
+        match best_low {
+            Some((_, k)) if last.node_depth < LOW_DEPTH_NODES && k != last.k => {
+                eprintln!("[ovasm] low depth: k {k} gives the fewest unitigs; assembling at it");
+                let r = run_backbone(
+                    reads.to_vec(),
+                    AssembleParams {
+                        cleaning_audit_only,
+                        k,
+                        s,
+                        min_count,
+                        min_count_fraction,
+                        nuclear_share,
+                    },
+                    out_gfa,
+                    out_json,
+                )?;
+                tried.push((k, r.node_depth));
+                Ok(r)
+            }
+            _ => Ok(last),
+        }
     };
     let mut tried = Vec::new();
     let mut r = ladder(&inputs, &mut tried)?;
@@ -1993,7 +2030,13 @@ fn run_backbone_layout_guard(
     // The automatic threshold is at least 3, or 2 under LOW_DEPTH_NODES: at about 5x a count of 3
     // drops every stretch where coverage dips to two reads (Canis lupus mitochondrion from 10 Mb of
     // HiFi reads, the PMAT2 benchmark's lowest-depth test: 2 unitigs, 14.2 of 16.7 kb).
-    let floor = if node_depth < LOW_DEPTH_NODES { 2 } else { 3 };
+    let floor = if node_depth < VERY_LOW_DEPTH_NODES {
+        1
+    } else if node_depth < LOW_DEPTH_NODES {
+        2
+    } else {
+        3
+    };
     let min_count = p.min_count.unwrap_or_else(|| match p.min_count_fraction {
         Some(f) => ((node_depth * f + 1e-9) as u32).max(floor),
         None => ((node_depth / 10.0) as u32).max(floor),
@@ -2893,7 +2936,8 @@ mod tests {
         assert_eq!(rep.k, 1001);
         assert_eq!(rep.k_tried.len(), 1);
         // shallow: a read every 600 bp (5x) -> no k reaches the target; every k is tried,
-        // largest first, and the smallest is kept
+        // largest first, and the one with the fewest unitigs is assembled again and kept
+        // (LOW_DEPTH_NODES)
         let dir = tmpdir("autok-shallow");
         let rep = run_auto_k(
             vec![fastq(&dir, &tile(&g, 3000, 600))],
@@ -2905,10 +2949,14 @@ mod tests {
             &dir.join("a.json"),
         )
         .unwrap();
-        // raw reads first, every k, then the same ladder on the self-corrected reads
+        // raw reads first, every k (and the chosen one again), then the same on the self-corrected
+        // reads; error-free tiles give the fewest unitigs at the largest k
         let ks: Vec<usize> = rep.k_tried.iter().map(|x| x.0).collect();
-        assert_eq!(ks, [K_LADDER.to_vec(), K_LADDER.to_vec()].concat());
-        assert_eq!(rep.k, *K_LADDER.last().unwrap());
+        let n = K_LADDER.len();
+        assert_eq!(ks[..n], K_LADDER);
+        assert_eq!(ks[n + 1..2 * n + 1], K_LADDER);
+        assert_eq!(rep.k, *ks.last().unwrap());
+        assert_eq!(rep.k, 1001);
         let corrected = rep
             .corrected_reads
             .clone()
@@ -2917,10 +2965,7 @@ mod tests {
         // the report on disk carries both ladders too
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(dir.join("a.json")).unwrap()).unwrap();
-        assert_eq!(
-            json["k_tried"].as_array().unwrap().len(),
-            2 * K_LADDER.len()
-        );
+        assert_eq!(json["k_tried"].as_array().unwrap().len(), ks.len());
         assert_eq!(json["corrected_reads"].as_str(), Some(corrected.as_str()));
     }
 
