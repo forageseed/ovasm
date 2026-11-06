@@ -674,8 +674,23 @@ struct RunArgs {
     threads: Option<u16>,
 }
 
-/// Recruitment passes from protein seeds (see `run`).
+/// Recruitment passes from protein seeds (see `run`), land plants.
 const PROTEIN_SEED_PASSES: usize = 1;
+/// The same for animals and fungi: seeds are genes +- 2 kb, and in a small mitochondrion whose
+/// genes sit apart (long control regions, fungal introns and intergenic stretches) the first pass
+/// misses part of the molecule. PMAT2 benchmark, one pass: Rhizopus microsporus 186 reads standing
+/// for 29 kb of 43 kb, Ganoderma resinaceum 60 of 87 kb, Bibio marci 13 of 16 kb, each assembled
+/// into one linear piece; the nucleotide-seeded run of Rhizopus reached the whole 43 kb at pass 2
+/// and stopped there (bait complete). Passes stop earlier once no read is added.
+const PROTEIN_SEED_PASSES_SMALL_MITO: usize = 3;
+
+/// Recruitment passes from protein seeds for `lineage`.
+fn protein_seed_passes(lineage: seeddb::Lineage) -> usize {
+    match lineage {
+        seeddb::Lineage::Landplants => PROTEIN_SEED_PASSES,
+        seeddb::Lineage::Metazoa | seeddb::Lineage::Fungi => PROTEIN_SEED_PASSES_SMALL_MITO,
+    }
+}
 
 fn run(args: RunArgs) -> Result<()> {
     if let Some(n) = args.threads {
@@ -740,12 +755,12 @@ fn run(args: RunArgs) -> Result<()> {
         );
     }
     let mut builtin_seeds = std::collections::BTreeSet::new();
-    // Recruitment passes when every seeded organelle has protein seeds: one. Protein seeds are the
+    // Recruitment passes when every seeded organelle has protein seeds, land plants: one. Protein seeds are the
     // sample's own organelle reads, so the first pass already finds the organelle (leave-out test on
     // five mosses, 2026-11-05: mitochondrial recall 0.96-1.0 after one pass, the same after 60),
     // and every further pass of gated extension only adds reads that are not (precision after one /
     // two / 60 passes: Polytrichum commune 0.92 / 0.59 / 0.59, Bryoerythrophyllum caledonicum 0.98 /
-    // 0.81 / 0.34).
+    // 0.81 / 0.34). Animals and fungi: up to three (`protein_seed_passes`).
     let mut protein_passes = None;
     let mut shallow = false;
     if args.read_set == pipeline::ReadSet::WholeGenome
@@ -801,7 +816,7 @@ fn run(args: RunArgs) -> Result<()> {
                 }
             }
             if unseeded.iter().all(|o| report.seeds.contains_key(o)) {
-                protein_passes = Some(PROTEIN_SEED_PASSES);
+                protein_passes = Some(protein_seed_passes(args.lineage));
             } else {
                 eprintln!(
                     "[ovasm] run: no protein seeds for {}: the --lineage seed library seeds it, with the usual recruitment passes",
@@ -2344,6 +2359,13 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protein_seed_passes_one_for_plants_more_for_small_mitochondria() {
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Landplants), 1);
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Metazoa), 3);
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Fungi), 3);
+    }
+
     use super::{parse_bases, parse_genome_size};
     #[test]
     fn explicit_support_floor_conflicts_with_automatic_shallow_policy() {
