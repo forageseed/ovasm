@@ -41,6 +41,17 @@ use crate::replicate::{self, Reproduced};
 /// millions of bases.
 pub const MIN_RECRUITED_BASES: u64 = 100_000;
 
+/// `MIN_RECRUITED_BASES` for a seed lineage: animal and fungal mitochondria are 14-160 kb (most
+/// animals 15-20 kb), so 30 kb is two animal mitogenomes. In the PMAT2 benchmark's lowest-depth
+/// test (Canis lupus, 10 Mb of HiFi reads) recruitment found 11 mitochondrial reads, 75 kb: four
+/// times the 16.7 kb genome, which the 100 kb floor refused to assemble.
+pub fn min_recruited_bases(lineage: crate::seeddb::Lineage) -> u64 {
+    match lineage {
+        crate::seeddb::Lineage::Landplants => MIN_RECRUITED_BASES,
+        crate::seeddb::Lineage::Metazoa | crate::seeddb::Lineage::Fungi => 30_000,
+    }
+}
+
 /// What the result is and is not, written into every summary.
 const SCOPE: &str =
     "native assembly and read evidence; no independent assembler certification or polishing";
@@ -799,13 +810,13 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
 }
 
 /// Stop before assembly when recruitment left too little to assemble anything.
-fn require_enough(organelle: &str, reads: u64, bases: u64, source: &str) -> Result<()> {
-    if bases >= MIN_RECRUITED_BASES {
+fn require_enough(organelle: &str, reads: u64, bases: u64, source: &str, min: u64) -> Result<()> {
+    if bases >= min {
         return Ok(());
     }
     bail!(
         "ovasm recruited {reads} reads ({bases} bp) for the {organelle} from {source}: too \
-         little to assemble anything (fewer than {MIN_RECRUITED_BASES} bp). The seeds are \
+         little to assemble anything (fewer than {min} bp). The seeds are \
          probably too distant from this species; supply a closer reference seed (--seeds), use \
          seed-free discovery (--recruit discover), or give the target reads themselves \
          (--read-set target)."
@@ -1189,7 +1200,13 @@ fn recruit_all(
                 }
                 (None, None) => unreachable!("recruitment uses seeds, discovery or both"),
             };
-            require_enough(organelle, n_reads, n_bases, &source)?;
+            require_enough(
+                organelle,
+                n_reads,
+                n_bases,
+                &source,
+                min_recruited_bases(cfg.seed_lineage),
+            )?;
             Ok(Recruited {
                 reads: vec![reads],
                 kept: Some((n_reads, n_bases)),
@@ -2412,8 +2429,14 @@ mod tests {
 
     #[test]
     fn too_few_recruited_bases_stop_the_run_and_say_why() {
-        assert!(require_enough("plastid", 900, MIN_RECRUITED_BASES, "seed.fa").is_ok());
-        let e = require_enough("mitochondrion", 4, 4000, "seed.fa")
+        let min = MIN_RECRUITED_BASES;
+        assert!(require_enough("plastid", 900, MIN_RECRUITED_BASES, "seed.fa", min).is_ok());
+        assert!(require_enough("mitochondrion", 11, 74_797, "seed.fa", 30_000).is_ok());
+        assert_eq!(
+            min_recruited_bases(crate::seeddb::Lineage::Metazoa),
+            30_000
+        );
+        let e = require_enough("mitochondrion", 4, 4000, "seed.fa", min)
             .unwrap_err()
             .to_string();
         assert!(e.contains("recruited 4 reads (4000 bp) for the mitochondrion from seed.fa"));

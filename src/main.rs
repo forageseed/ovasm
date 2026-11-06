@@ -751,9 +751,14 @@ fn run(args: RunArgs) -> Result<()> {
         && args.recruit != pipeline::RecruitBy::Discover
     {
         // the organelles seeded (the asked one and, unless --single-seed, its competitor)
+        // and only those the lineage has (no plastid in metazoa or fungi)
         let wanted: Vec<&str> = match single {
             Some(o) if args.single_seed => vec![o],
-            _ => protein_seed::ORGANELLES.to_vec(),
+            _ => protein_seed::ORGANELLES
+                .iter()
+                .copied()
+                .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
+                .collect(),
         };
         if args.protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
             let p = protein_seed_params(

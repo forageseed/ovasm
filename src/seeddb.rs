@@ -66,7 +66,7 @@ impl Lineage {
         }
     }
 
-    fn fasta(self, organelle: &str) -> Option<(&'static str, &'static [u8])> {
+    pub(crate) fn fasta(self, organelle: &str) -> Option<(&'static str, &'static [u8])> {
         match (self, organelle) {
             (Lineage::Landplants, "mitochondrion") => {
                 Some(("landplants.mitochondrion.fasta", MITOCHONDRION))
