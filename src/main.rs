@@ -879,6 +879,7 @@ fn run(args: RunArgs) -> Result<()> {
         salt: args.salt,
         sample: args.sample,
         component_panel: args.component_panel,
+        prune_gene_free: protein_passes.is_some_and(|n| n > 1),
     })?;
     eprintln!(
         "[ovasm] run: summary -> {}; peak RSS {}",
@@ -1246,9 +1247,17 @@ struct ComponentsArgs {
     /// Components lacking both classes of genes still use the depth window.
     #[arg(long)]
     reject_other_only: bool,
+    /// When the reference component is closed, exclude components whose genes are all on it (what
+    /// `run` does for animal and fungal protein seeds).
+    #[arg(long)]
+    reject_beside_closed_reference: bool,
     /// Protein panel FASTA (headers `class|gene|species`); default: the built-in panel.
     #[arg(long)]
     panel: Option<PathBuf>,
+    /// The built-in panel of this seed lineage (with its genetic code) instead of the land-plant
+    /// one; ignored with --panel.
+    #[arg(long, value_enum)]
+    lineage: Option<seeddb::Lineage>,
     /// Amino-acid k-mer length.
     #[arg(long, default_value_t = 6)]
     k: usize,
@@ -1270,7 +1279,10 @@ fn components(args: ComponentsArgs) -> Result<()> {
             args.k,
             &args.exclude,
         )?,
-        None => panel::Panel::embedded(args.k, &args.exclude)?,
+        None => match args.lineage {
+            Some(l) => panel::Panel::for_lineage(l.name(), args.k, &args.exclude)?,
+            None => panel::Panel::embedded(args.k, &args.exclude)?,
+        },
     };
     let report = components::run(
         &args.gfa,
@@ -1284,6 +1296,7 @@ fn components(args: ComponentsArgs) -> Result<()> {
             gene_depth_factor: args.gene_depth_factor,
             min_other_genes: args.min_other_genes,
             reject_other_only: args.reject_other_only,
+            reject_beside_closed_reference: args.reject_beside_closed_reference,
             k: args.k,
             min_orf: args.min_orf,
             min_hits: args.min_hits,

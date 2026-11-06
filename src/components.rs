@@ -46,6 +46,19 @@ pub struct ComponentParams {
     /// use the depth rule. Enabled only by the multichrom primary-sequence profile.
     #[serde(skip_serializing_if = "is_false")]
     pub reject_other_only: bool,
+    /// When the reference component is closed (every segment end linked), a component is
+    /// excluded whose target genes are all on the reference already, none included: animal and
+    /// fungal mitochondria after more than one protein-seed recruitment pass (`run`,
+    /// `protein_seed_passes`). The later passes go into the nucleus through organelle-derived
+    /// inserts and their repeats, which assemble beside the closed chromosome at its depth or
+    /// above it (PMAT2 benchmark, ps-c08cf22, 47 graphs: Aporia crataegi a 98 kb component at
+    /// 25x with nad2 and nad4l beside the 15.1 kb circle at 34x, Nemoura dubitans a 51 kb one at
+    /// 100-167x without genes beside the 15.7 kb circle at 70x; none of the removed sequence on
+    /// the published genome). A component with a gene the reference lacks stays (the circles of
+    /// a multi-chromosome mitochondrion carry different genes); so does all when the reference
+    /// is open, as a gene-free piece may then be the rest of the chromosome.
+    #[serde(skip_serializing_if = "is_false")]
+    pub reject_beside_closed_reference: bool,
     /// A component without genes is kept when its depth is within this factor of the
     /// reference's, either way. Components without genes that are in no published genome sat
     /// at 0.09-0.45 of the reference depth (0.45: a 14.5 kb circle beside the Climacium
@@ -76,6 +89,7 @@ impl Default for ComponentParams {
             out_assigned_gfa: None,
             out_unassigned_gfa: None,
             reject_other_only: false,
+            reject_beside_closed_reference: false,
             depth_factor: 2.0,
             gene_depth_factor: 2.5,
             min_other_genes: 5,
@@ -146,13 +160,17 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// What the rule looks at in one component.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Stat {
     pub length: usize,
     pub depth: Option<f64>,
     /// Distinct panel genes of the target organelle and of the other one.
     pub target_genes: usize,
     pub other_genes: usize,
+    /// Every end of every segment has a link (a circle, or a graph without a loose end).
+    pub closed: bool,
+    /// The target genes (names) behind `target_genes`.
+    pub target_names: Vec<String>,
 }
 
 /// The reference component and, for every component, whether it stays and why.
@@ -191,6 +209,15 @@ pub fn decide(stats: &[Stat], p: &ComponentParams) -> (Option<usize>, Vec<(bool,
             };
             if p.reject_other_only && s.target_genes == 0 && s.other_genes > 0 {
                 (false, "other_organelle_only")
+            } else if p.reject_beside_closed_reference
+                && stats[r].closed
+                && s.target_names.iter().all(|g| stats[r].target_names.contains(g))
+            {
+                (false, if s.target_genes == 0 {
+                    "no_genes_beside_closed_reference"
+                } else {
+                    "genes_on_closed_reference"
+                })
             } else if s.other_genes >= p.min_other_genes && s.other_genes >= 2 * s.target_genes {
                 (false, "other_organelle")
             } else if s.target_genes > 0 {
@@ -228,7 +255,8 @@ pub struct ComponentReport {
     pub kept: bool,
     /// "reference", "target_genes", "depth_like_reference", "no_reference", "no_depth" (kept);
     /// "other_organelle", "target_genes_but_depth_far_below_reference", "depth_below_reference",
-    /// "depth_above_reference" (removed).
+    /// "depth_above_reference", "no_genes_beside_closed_reference", "genes_on_closed_reference"
+    /// (removed).
     pub reason: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read_origin_evidence: Vec<SegmentOrigin>,
@@ -367,9 +395,18 @@ pub fn run(
         min_gene_segments: 1,
         ..PanelParams::default()
     };
+    // segment ends with a link: (segment, right end?); `L a + b +` joins a's right end to b's left
+    let mut linked_ends: FxHashSet<(usize, bool)> = FxHashSet::default();
+    for &((a, fa), (b, fb)) in &g.links {
+        linked_ends.insert((a, fa));
+        linked_ends.insert((b, !fb));
+    }
     let mut stats = Vec::new();
     let mut genes = Vec::new();
     for part in &parts {
+        let closed = part
+            .iter()
+            .all(|&s| linked_ends.contains(&(s, true)) && linked_ends.contains(&(s, false)));
         let length: usize = part.iter().map(|&s| g.seqs[s].len()).sum();
         let depth = part
             .iter()
@@ -388,6 +425,8 @@ pub fn run(
             depth,
             target_genes: target.genes,
             other_genes: other.genes,
+            closed,
+            target_names: target.gene_segments.iter().map(|g| g.0.clone()).collect(),
         });
         genes.push((target.gene_segments, other.gene_segments));
     }
@@ -695,7 +734,40 @@ mod tests {
             depth: Some(depth),
             target_genes,
             other_genes,
+            closed: false,
+            target_names: (0..target_genes).map(|i| format!("g{i}")).collect(),
         }
+    }
+
+    #[test]
+    fn gene_free_components_go_beside_a_closed_reference_only() {
+        let mut stats = vec![
+            stat(15_000, 34.0, 12, 0),
+            stat(84_000, 30.0, 0, 0),
+            stat(10_000, 150.0, 0, 0),
+            stat(3_000, 30.0, 1, 0),
+        ];
+        let p = ComponentParams {
+            reject_beside_closed_reference: true,
+            ..ComponentParams::default()
+        };
+        // an open reference: the old rule (the deep one goes on depth)
+        let (_, open) = decide(&stats, &p);
+        assert_eq!(open.iter().map(|x| x.0).collect::<Vec<_>>(), vec![true, true, false, true]);
+        stats[0].closed = true;
+        let (r, closed) = decide(&stats, &p);
+        assert_eq!(r, Some(0));
+        assert_eq!(closed.iter().map(|x| x.0).collect::<Vec<_>>(), vec![true, false, false, false]);
+        assert_eq!(closed[1].1, "no_genes_beside_closed_reference");
+        // the one gene of the small component is on the reference (g0): an insert; a gene the
+        // reference lacks keeps it
+        assert_eq!(closed[3].1, "genes_on_closed_reference");
+        stats[3].target_names = vec!["other".into()];
+        let (_, own) = decide(&stats, &p);
+        assert_eq!(own[3], (true, "target_genes"));
+        // off by default
+        let (_, off) = decide(&stats, &ComponentParams::default());
+        assert!(off[1].0);
     }
 
     fn reasons(stats: &[Stat]) -> (Option<usize>, Vec<&'static str>) {

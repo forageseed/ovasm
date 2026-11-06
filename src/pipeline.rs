@@ -158,6 +158,11 @@ pub struct RunConfig {
     pub sample: String,
     /// Protein panel FASTA of the component filter (None: the built-in panel).
     pub component_panel: Option<PathBuf>,
+    /// Seeded mitochondrial graphs go through the component filter with the `seed_lineage`
+    /// panel, gene-free components removed beside a closed reference
+    /// (`ComponentParams::reject_beside_closed_reference`): set by `run` for animal and fungal
+    /// protein seeds, whose recruitment takes more than one pass.
+    pub prune_gene_free: bool,
 }
 
 fn log(message: &str) {
@@ -413,6 +418,7 @@ const BEST_ATTEMPT_DIR: &str = ".best_attempt";
 struct ComponentFilter {
     organelle: String,
     panel: Panel,
+    params: ComponentParams,
 }
 
 impl ComponentFilter {
@@ -429,6 +435,22 @@ impl ComponentFilter {
         Ok(Self {
             organelle: organelle.to_string(),
             panel,
+            params: ComponentParams::default(),
+        })
+    }
+
+    /// The filter of a seeded small mitochondrion (`RunConfig::prune_gene_free`): the lineage's
+    /// built-in panel and its gene threshold.
+    fn gene_free(organelle: &str, lineage: &str) -> Result<Self> {
+        let k = ComponentParams::default().k;
+        Ok(Self {
+            organelle: organelle.to_string(),
+            panel: Panel::for_lineage(lineage, k, &[])?,
+            params: ComponentParams {
+                reject_beside_closed_reference: true,
+                min_hits: Panel::lineage_min_hits(lineage),
+                ..ComponentParams::default()
+            },
         })
     }
 
@@ -439,7 +461,7 @@ impl ComponentFilter {
             graph,
             &self.organelle,
             &self.panel,
-            &ComponentParams::default(),
+            &self.params,
             kept,
             json,
         )?;
@@ -1625,6 +1647,8 @@ fn assemble_organelle(
             organelle,
             cfg.component_panel.as_deref(),
         )?)
+    } else if cfg.prune_gene_free && organelle == "mitochondrion" {
+        Some(ComponentFilter::gene_free(organelle, cfg.seed_lineage.name())?)
     } else {
         None
     };
@@ -2538,6 +2562,7 @@ mod tests {
             salt: 0,
             sample: "desktop".into(),
             component_panel: None,
+            prune_gene_free: false,
         }
     }
 

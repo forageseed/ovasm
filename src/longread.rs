@@ -1086,6 +1086,7 @@ fn assemble(
         salt: o.salt,
         sample: o.sample.clone(),
         component_panel: None,
+        prune_gene_free: false,
     })?;
     let mut short_evidence = Value::Null;
     if let Some(sr) = r.short["reads"].as_str() {
