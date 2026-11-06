@@ -183,6 +183,8 @@ for r in REDUNDANCY:
 # the shipped redundancy: the smallest that finds as many held-out tests as the previous panel, else the best
 ok = [r for r in REDUNDANCY if by_r[r]["held_out_found"] >= prev_found]
 chosen = min(ok) if ok else max(REDUNDANCY, key=lambda r: by_r[r]["held_out_found"])
+if os.environ.get("PICK") == "max":  # accuracy first: the most held-out tests found, the smaller panel on a tie
+    chosen = max(REDUNDANCY, key=lambda r: (by_r[r]["held_out_found"], -r))
 if os.environ.get("CHOSEN"):
     chosen = int(os.environ["CHOSEN"])  # a choice made from an earlier run of the curve
 summary.update(redundancy=by_r, chosen_redundancy=chosen, validate_tests=tot_val, previous_found=prev_found,

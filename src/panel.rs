@@ -29,8 +29,11 @@ use crate::recruit::{peak_rss_mb, read_batches};
 
 /// The panel shipped in the binary.
 const PANEL: &str = include_str!("../data/organelle_proteins.faa");
-/// Mitochondrial core proteins of metazoa and fungi (RefSeq mitochondrion release, one genome per
-/// taxonomic group; `.agent-work/seed-evidence/build_lineage_panels.py`), for protein seeds.
+/// Mitochondrial core proteins of metazoa (551) and fungi (696), for protein seeds: from the RefSeq
+/// mitochondrion release, chosen gene by gene as the fewest proteins that find held-out genera
+/// (leave-genus-out greedy cover, scripts/polish_panel.py; no genus of the PMAT2 benchmark, see
+/// data/lineage_panels.excluded_genera.txt). Larger covers find barely more and hit random
+/// sequence far more often (see `Panel::lineage_min_hits`).
 const METAZOA_PANEL: &str = include_str!("../data/metazoa_mito_proteins.faa");
 const FUNGI_PANEL: &str = include_str!("../data/fungi_mito_proteins.faa");
 
@@ -250,6 +253,21 @@ impl Panel {
             other => bail!("no built-in protein panel for lineage {other:?}"),
         };
         Self::parse(text, k, exclude)?.with_code(table)
+    }
+
+    /// `PanelParams::min_hits` for a lineage's built-in panel: the lowest threshold at which
+    /// random DNA (six frames, 10 Mb, GC 0.30 and 0.45) gets at most 0.2 gene stretches per Mb (the
+    /// land-plant panel: 0.4 at 5 hits), which keeps the most held-out genes
+    /// (scripts/panel_tradeoff.py, 2026-11-05). Animal and fungal mitochondrial
+    /// proteins are rich in the hydrophobic residues AT-rich random sequence translates to, so a
+    /// larger panel needs a higher threshold and ends up finding fewer genes: metazoa 551 proteins
+    /// at 5 hits found 98.96% of held-out genes, 13,868 proteins at 15 hits 98.08%; fungi 696 at 6
+    /// hits 99.34%, 8,650 at 10 hits 99.10%.
+    pub fn lineage_min_hits(lineage: &str) -> u32 {
+        match lineage {
+            "fungi" => 6,
+            _ => 5,
+        }
     }
 
     /// The same panel, reads translated with NCBI table `table` (`genetic_code`).

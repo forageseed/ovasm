@@ -11,6 +11,26 @@
    "select_tests": 747,
    "validate_tests": 747,
    "redundancy": {
+    "1": {
+     "proteins": 30,
+     "found": 724,
+     "proteins_all_tests": 39
+    },
+    "2": {
+     "proteins": 57,
+     "found": 731,
+     "proteins_all_tests": 75
+    },
+    "3": {
+     "proteins": 82,
+     "found": 733,
+     "proteins_all_tests": 103
+    },
+    "5": {
+     "proteins": 123,
+     "found": 735,
+     "proteins_all_tests": 157
+    },
     "8": {
      "proteins": 171,
      "found": 735,
@@ -25,6 +45,26 @@
    "select_tests": 703,
    "validate_tests": 703,
    "redundancy": {
+    "1": {
+     "proteins": 125,
+     "found": 509,
+     "proteins_all_tests": 197
+    },
+    "2": {
+     "proteins": 231,
+     "found": 539,
+     "proteins_all_tests": 354
+    },
+    "3": {
+     "proteins": 326,
+     "found": 551,
+     "proteins_all_tests": 491
+    },
+    "5": {
+     "proteins": 507,
+     "found": 562,
+     "proteins_all_tests": 740
+    },
     "8": {
      "proteins": 732,
      "found": 568,
@@ -39,6 +79,26 @@
    "select_tests": 3,
    "validate_tests": 2,
    "redundancy": {
+    "1": {
+     "proteins": 1,
+     "found": 2,
+     "proteins_all_tests": 1
+    },
+    "2": {
+     "proteins": 2,
+     "found": 2,
+     "proteins_all_tests": 2
+    },
+    "3": {
+     "proteins": 3,
+     "found": 2,
+     "proteins_all_tests": 3
+    },
+    "5": {
+     "proteins": 5,
+     "found": 2,
+     "proteins_all_tests": 5
+    },
     "8": {
      "proteins": 8,
      "found": 2,
@@ -53,6 +113,26 @@
    "select_tests": 750,
    "validate_tests": 749,
    "redundancy": {
+    "1": {
+     "proteins": 3,
+     "found": 748,
+     "proteins_all_tests": 3
+    },
+    "2": {
+     "proteins": 6,
+     "found": 748,
+     "proteins_all_tests": 6
+    },
+    "3": {
+     "proteins": 8,
+     "found": 748,
+     "proteins_all_tests": 8
+    },
+    "5": {
+     "proteins": 13,
+     "found": 748,
+     "proteins_all_tests": 13
+    },
     "8": {
      "proteins": 21,
      "found": 748,
@@ -67,6 +147,26 @@
    "select_tests": 750,
    "validate_tests": 750,
    "redundancy": {
+    "1": {
+     "proteins": 1,
+     "found": 748,
+     "proteins_all_tests": 1
+    },
+    "2": {
+     "proteins": 2,
+     "found": 749,
+     "proteins_all_tests": 2
+    },
+    "3": {
+     "proteins": 3,
+     "found": 750,
+     "proteins_all_tests": 3
+    },
+    "5": {
+     "proteins": 5,
+     "found": 750,
+     "proteins_all_tests": 5
+    },
     "8": {
      "proteins": 8,
      "found": 750,
@@ -81,6 +181,26 @@
    "select_tests": 750,
    "validate_tests": 750,
    "redundancy": {
+    "1": {
+     "proteins": 6,
+     "found": 744,
+     "proteins_all_tests": 8
+    },
+    "2": {
+     "proteins": 13,
+     "found": 747,
+     "proteins_all_tests": 16
+    },
+    "3": {
+     "proteins": 20,
+     "found": 747,
+     "proteins_all_tests": 24
+    },
+    "5": {
+     "proteins": 35,
+     "found": 747,
+     "proteins_all_tests": 42
+    },
     "8": {
      "proteins": 55,
      "found": 747,
@@ -95,6 +215,26 @@
    "select_tests": 746,
    "validate_tests": 745,
    "redundancy": {
+    "1": {
+     "proteins": 5,
+     "found": 741,
+     "proteins_all_tests": 7
+    },
+    "2": {
+     "proteins": 10,
+     "found": 742,
+     "proteins_all_tests": 13
+    },
+    "3": {
+     "proteins": 15,
+     "found": 743,
+     "proteins_all_tests": 19
+    },
+    "5": {
+     "proteins": 27,
+     "found": 744,
+     "proteins_all_tests": 32
+    },
     "8": {
      "proteins": 46,
      "found": 744,
@@ -109,6 +249,26 @@
    "select_tests": 750,
    "validate_tests": 749,
    "redundancy": {
+    "1": {
+     "proteins": 2,
+     "found": 745,
+     "proteins_all_tests": 3
+    },
+    "2": {
+     "proteins": 5,
+     "found": 747,
+     "proteins_all_tests": 6
+    },
+    "3": {
+     "proteins": 7,
+     "found": 747,
+     "proteins_all_tests": 8
+    },
+    "5": {
+     "proteins": 12,
+     "found": 747,
+     "proteins_all_tests": 14
+    },
     "8": {
      "proteins": 20,
      "found": 748,
@@ -123,6 +283,26 @@
    "select_tests": 749,
    "validate_tests": 748,
    "redundancy": {
+    "1": {
+     "proteins": 35,
+     "found": 709,
+     "proteins_all_tests": 52
+    },
+    "2": {
+     "proteins": 66,
+     "found": 721,
+     "proteins_all_tests": 94
+    },
+    "3": {
+     "proteins": 97,
+     "found": 726,
+     "proteins_all_tests": 136
+    },
+    "5": {
+     "proteins": 157,
+     "found": 732,
+     "proteins_all_tests": 219
+    },
     "8": {
      "proteins": 240,
      "found": 735,
@@ -137,6 +317,26 @@
    "select_tests": 749,
    "validate_tests": 748,
    "redundancy": {
+    "1": {
+     "proteins": 26,
+     "found": 727,
+     "proteins_all_tests": 32
+    },
+    "2": {
+     "proteins": 44,
+     "found": 732,
+     "proteins_all_tests": 59
+    },
+    "3": {
+     "proteins": 62,
+     "found": 738,
+     "proteins_all_tests": 84
+    },
+    "5": {
+     "proteins": 99,
+     "found": 739,
+     "proteins_all_tests": 132
+    },
     "8": {
      "proteins": 161,
      "found": 741,
@@ -151,6 +351,26 @@
    "select_tests": 749,
    "validate_tests": 749,
    "redundancy": {
+    "1": {
+     "proteins": 6,
+     "found": 746,
+     "proteins_all_tests": 7
+    },
+    "2": {
+     "proteins": 13,
+     "found": 746,
+     "proteins_all_tests": 15
+    },
+    "3": {
+     "proteins": 20,
+     "found": 747,
+     "proteins_all_tests": 24
+    },
+    "5": {
+     "proteins": 34,
+     "found": 747,
+     "proteins_all_tests": 40
+    },
     "8": {
      "proteins": 49,
      "found": 747,
@@ -165,6 +385,26 @@
    "select_tests": 749,
    "validate_tests": 748,
    "redundancy": {
+    "1": {
+     "proteins": 61,
+     "found": 666,
+     "proteins_all_tests": 95
+    },
+    "2": {
+     "proteins": 115,
+     "found": 681,
+     "proteins_all_tests": 177
+    },
+    "3": {
+     "proteins": 168,
+     "found": 690,
+     "proteins_all_tests": 256
+    },
+    "5": {
+     "proteins": 272,
+     "found": 692,
+     "proteins_all_tests": 401
+    },
     "8": {
      "proteins": 403,
      "found": 698,
@@ -179,6 +419,26 @@
    "select_tests": 750,
    "validate_tests": 750,
    "redundancy": {
+    "1": {
+     "proteins": 2,
+     "found": 748,
+     "proteins_all_tests": 4
+    },
+    "2": {
+     "proteins": 4,
+     "found": 748,
+     "proteins_all_tests": 7
+    },
+    "3": {
+     "proteins": 7,
+     "found": 749,
+     "proteins_all_tests": 9
+    },
+    "5": {
+     "proteins": 12,
+     "found": 749,
+     "proteins_all_tests": 14
+    },
     "8": {
      "proteins": 19,
      "found": 749,
@@ -193,6 +453,26 @@
    "select_tests": 748,
    "validate_tests": 748,
    "redundancy": {
+    "1": {
+     "proteins": 63,
+     "found": 666,
+     "proteins_all_tests": 102
+    },
+    "2": {
+     "proteins": 114,
+     "found": 685,
+     "proteins_all_tests": 185
+    },
+    "3": {
+     "proteins": 169,
+     "found": 690,
+     "proteins_all_tests": 261
+    },
+    "5": {
+     "proteins": 270,
+     "found": 695,
+     "proteins_all_tests": 404
+    },
     "8": {
      "proteins": 398,
      "found": 702,
@@ -205,13 +485,33 @@
   }
  },
  "redundancy": {
+  "1": {
+   "held_out_found": 9223,
+   "proteins": 551,
+   "held_out_rate": 0.9522
+  },
+  "2": {
+   "held_out_found": 9318,
+   "proteins": 1011,
+   "held_out_rate": 0.962
+  },
+  "3": {
+   "held_out_found": 9361,
+   "proteins": 1429,
+   "held_out_rate": 0.9664
+  },
+  "5": {
+   "held_out_found": 9389,
+   "proteins": 2218,
+   "held_out_rate": 0.9693
+  },
   "8": {
    "held_out_found": 9414,
    "proteins": 3204,
    "held_out_rate": 0.9719
   }
  },
- "chosen_redundancy": 8,
+ "chosen_redundancy": 1,
  "validate_tests": 9686,
  "previous_found": 9069,
  "previous_rate": 0.9363,

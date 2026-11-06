@@ -762,6 +762,7 @@ fn run(args: RunArgs) -> Result<()> {
                 (args.nuclear_depth, args.genome_size, args.extend_gate_fold),
                 5,
                 0.3,
+                panel::Panel::lineage_min_hits(args.lineage.name()),
             )?;
             let panel = load_panel(
                 args.protein_seed_panel.as_deref(),
@@ -1781,6 +1782,10 @@ struct ProteinSeedArgs {
     /// Gene stretches per scanned read a class needs for a call (`find classify --min-density`).
     #[arg(long, default_value_t = 0.3)]
     min_density: f64,
+    /// Shared amino-acid k-mers a stretch needs with its best gene, instead of the lineage's
+    /// (5; fungi 6: the lowest at which random DNA gets no gene).
+    #[arg(long)]
+    min_hits: Option<u32>,
     #[arg(long)]
     threads: Option<usize>,
 }
@@ -1791,6 +1796,7 @@ fn protein_seed_params(
     gate: (Option<u32>, Option<u64>, Option<f64>),
     min_genes: usize,
     min_density: f64,
+    min_hits: u32,
 ) -> Result<protein_seed::ProteinSeedParams> {
     let (nuclear_depth, genome_size, depth_fold) = gate;
     if sample == 0 {
@@ -1808,6 +1814,7 @@ fn protein_seed_params(
         panel: panel::PanelParams {
             min_genes,
             min_density,
+            min_hits,
             ..panel::PanelParams::default()
         },
         ..protein_seed::ProteinSeedParams::default()
@@ -1855,6 +1862,8 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         (args.nuclear_depth, args.genome_size, args.gate_fold),
         args.min_genes,
         args.min_density,
+        args.min_hits
+            .unwrap_or_else(|| panel::Panel::lineage_min_hits(args.lineage.name())),
     )?;
     let panel = load_panel(
         args.panel.as_deref(),
