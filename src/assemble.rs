@@ -2171,18 +2171,7 @@ fn run_backbone_layout_guard(
     // Depth and threshold from the node-count distribution.
     let mut counts: Vec<u32> = nodes.values().map(|v| v.0).filter(|&c| c >= 3).collect();
     counts.sort_unstable();
-    let mut node_depth = {
-        let total: u64 = counts.iter().map(|&c| c as u64).sum();
-        let mut acc = 0u64;
-        counts
-            .iter()
-            .find(|&&c| {
-                acc += c as u64;
-                acc * 2 >= total
-            })
-            .copied()
-            .unwrap_or(0) as f64
-    };
+    let mut node_depth = sequence_depth(&counts);
     if let Some(path) = p.depth_reference.filter(|_| matches!(coordinates, Coordinates::Bases)) {
         let text = fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
@@ -2460,8 +2449,94 @@ fn run_backbone_layout_guard(
     Ok(report)
 }
 
+/// Width of a bin of `sequence_depth`'s histogram: 5% of the count.
+const DEPTH_BIN: f64 = 1.05;
+
+/// The depth most of the sequence stands at, from the sorted counts of its solid nodes: the
+/// most populous bin (`DEPTH_BIN` wide on a log scale) past the valley after the error tail, as
+/// the median count of its nodes. Each node is one k-mer of sequence, so the bins weigh sequence
+/// length. The count-weighted median it replaces weighs nodes by their count, and follows
+/// high-copy sequence once that holds half the k-mer mass: the rice mitochondrion of SAMEA115396709
+/// from 100 bp reads, whose plastid-derived stretches (a few percent of its length at about 15
+/// times its depth) held more than half, gave depth ~1,182 where the rest of it stood near 44,
+/// min count 118, and 15 kb of a ~490 kb molecule. Falls back to the count-weighted median when
+/// the histogram has no valley.
+fn sequence_depth(counts: &[u32]) -> f64 {
+    if counts.is_empty() {
+        return 0.0;
+    }
+    let bin = |c: u32| (f64::from(c).ln() / DEPTH_BIN.ln()) as usize;
+    let mut hist = vec![0u64; bin(*counts.last().unwrap()) + 2];
+    for &c in counts {
+        hist[bin(c)] += 1;
+    }
+    // bins hold more counts as they widen: per count, so an error tail falling as 1/c^2 and a
+    // Poisson peak are compared on one scale
+    let width = |i: usize| (DEPTH_BIN.powi(i as i32 + 1) - DEPTH_BIN.powi(i as i32)).max(1.0);
+    let density: Vec<f64> = hist.iter().enumerate().map(|(i, &h)| h as f64 / width(i)).collect();
+    let first = bin(counts[0]);
+    let valley = (first + 1..density.len() - 1)
+        .find(|&i| density[i] <= density[i - 1] && density[i] < density[i + 1]);
+    let peak = valley.and_then(|v| {
+        (v..hist.len()).max_by(|&x, &y| hist[x].cmp(&hist[y]).then(y.cmp(&x)))
+    });
+    match peak {
+        Some(i) if hist[i] > 0 => {
+            let at: Vec<u32> = counts.iter().copied().filter(|&c| bin(c) == i).collect();
+            f64::from(at[at.len() / 2])
+        }
+        _ => {
+            let total: u64 = counts.iter().map(|&c| c as u64).sum();
+            let mut acc = 0u64;
+            counts
+                .iter()
+                .find(|&&c| {
+                    acc += c as u64;
+                    acc * 2 >= total
+                })
+                .copied()
+                .unwrap_or(0) as f64
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sequence_depth_is_where_most_of_the_sequence_stands() {
+        fn poisson_like(n: usize, mean: f64, seed: u64) -> Vec<u32> {
+            // a binomial-ish spread around mean, deterministic
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let u = ((x >> 11) as f64) / ((1u64 << 53) as f64);
+                    (mean * (0.8 + 0.4 * u)).round().max(3.0) as u32
+                })
+                .collect()
+        }
+        // 490 kb at ~44, 30 kb at ~1,180 (more than half the mass), an error tail at 3-5
+        let mut counts = poisson_like(490_000, 44.0, 1);
+        counts.extend(poisson_like(30_000, 1180.0, 2));
+        counts.extend(std::iter::repeat(3).take(40_000));
+        counts.extend(std::iter::repeat(4).take(15_000));
+        counts.extend(std::iter::repeat(5).take(6_000));
+        counts.sort_unstable();
+        let d = sequence_depth(&counts);
+        assert!((38.0..=50.0).contains(&d), "{d}");
+        // the count-weighted median follows the high-copy stretch
+        let total: u64 = counts.iter().map(|&c| c as u64).sum();
+        let mut acc = 0;
+        let median = *counts.iter().find(|&&c| { acc += c as u64; acc * 2 >= total }).unwrap();
+        assert!(median > 900, "{median}");
+        // one genome, no error tail: its own depth
+        let mut one = poisson_like(100_000, 300.0, 3);
+        one.sort_unstable();
+        let d = sequence_depth(&one);
+        assert!((260.0..=340.0).contains(&d), "{d}");
+        assert_eq!(sequence_depth(&[]), 0.0);
+    }
+
     use super::*;
 
     fn seq(n: usize, seed: u64) -> Vec<u8> {
