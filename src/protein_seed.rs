@@ -143,14 +143,24 @@ pub struct WholeReadScan {
     /// (Acanthosoma haemorrhoidale: mitochondrion at 312x over a 4x nucleus, clusters called none).
     /// Only the first is shallow.
     pub seed_reads_above_gate: FxHashMap<&'static str, usize>,
+    /// The depth gate's nuclear peak stands for less sequence than a nuclear genome
+    /// (`seedfree::MIN_NUCLEAR_GENOME`): the nucleus does not show in the sketch, and the gate's
+    /// threshold, a multiple of that peak, sets nothing apart.
+    pub gate_without_nucleus: bool,
     pub seconds: f64,
 }
 
 impl WholeReadScan {
-    /// Some organelle has seeds and at most half of them pass the depth gate.
+    /// Some organelle has seeds, and at most half of them pass the depth gate or the gate has no
+    /// nucleus to judge them against. Gliophorus irrigatus (organelle ~10x; nuclear peak 2x
+    /// standing for 0.8 Mb): 13 of 21 cropped seeds passed a 6x threshold, recruitment was
+    /// gated over the usual passes and took in nuclear repeats above it (59 molecules, 927 kb,
+    /// none of the 46.5 kb mitochondrion); judged shallow, 27 kb of it at 99.7% identity.
     fn shallow(&self) -> bool {
         self.seed_reads.iter().any(|(o, &n)| {
-            n > 0 && 2 * self.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n
+            n > 0
+                && (self.gate_without_nucleus
+                    || 2 * self.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n)
         })
     }
 }
@@ -633,6 +643,7 @@ fn whole_read_seeds(
             bases,
             seed_reads: n,
             seed_reads_above_gate: above,
+            gate_without_nucleus: gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME,
             seconds: t0.elapsed().as_secs_f64(),
         },
         b,
@@ -717,6 +728,7 @@ mod tests {
             bases: 10_000_000,
             seed_reads: seeds.iter().map(|&(o, n, _)| (o, n)).collect(),
             seed_reads_above_gate: seeds.iter().map(|&(o, _, a)| (o, a)).collect(),
+            gate_without_nucleus: false,
             seconds: 0.0,
         }
     }
@@ -733,6 +745,15 @@ mod tests {
         assert!(!scan(&[("mitochondrion", 0, 0)]).shallow());
         // any shallow organelle makes the scan shallow
         assert!(scan(&[("mitochondrion", 20, 20), ("plastid", 4, 1)]).shallow());
+        // a gate without a nucleus judges nothing: Gliophorus irrigatus, 13 of 21 above it
+        let mut s = scan(&[("mitochondrion", 21, 13)]);
+        assert!(!s.shallow());
+        s.gate_without_nucleus = true;
+        assert!(s.shallow());
+        // still nothing to judge without seeds
+        let mut s = scan(&[("mitochondrion", 0, 0)]);
+        s.gate_without_nucleus = true;
+        assert!(!s.shallow());
     }
 
     fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
