@@ -2068,6 +2068,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
             prune_gene_free: false,
+            depth_reference: Default::default(),
         }, retry_floor, cfg.experimental_deep_bubble_fraction.get(o).copied());
         let denovo_path = dir.join("de-novo/organelle.gfa");
         let integration = export_individual(

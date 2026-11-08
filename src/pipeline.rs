@@ -163,6 +163,8 @@ pub struct RunConfig {
     /// (`ComponentParams::reject_beside_closed_reference`): set by `run` for animal and fungal
     /// protein seeds, whose recruitment takes more than one pass.
     pub prune_gene_free: bool,
+    /// Per organelle, sequence known to be its own (`assemble graph --depth-reference`).
+    pub depth_reference: BTreeMap<String, PathBuf>,
 }
 
 fn log(message: &str) {
@@ -524,6 +526,8 @@ struct GraphAttempts<'a> {
     filter: Option<&'a ComponentFilter>,
     /// `assemble graph --nuclear-share` (`nuclear_share`).
     nuclear_share: Option<f64>,
+    /// `assemble graph --depth-reference` (`RunConfig::depth_reference`).
+    depth_reference: Option<&'a Path>,
     experimental_deep_bubble_fraction: Option<f64>,
 }
 
@@ -591,6 +595,9 @@ impl Attempts for GraphAttempts<'_> {
         if let Some(share) = self.nuclear_share {
             asm = asm.opt("--nuclear-share", format!("{share}"));
         }
+        if let Some(path) = self.depth_reference {
+            asm = asm.opt("--depth-reference", path);
+        }
         if let Some(fraction) = self.experimental_deep_bubble_fraction {
             asm = asm.opt("--experimental-deep-bubble-fraction", fraction.to_string());
         }
@@ -615,6 +622,21 @@ impl Attempts for GraphAttempts<'_> {
             ),
         };
         let open_ends = crate::assemble::open_ends(&graph);
+        if total_length == 0 {
+            // nothing over the node threshold at this k: no molecule, and the ladder goes on
+            // (`solve linearize` refuses an empty graph)
+            let k = assembly["k"].as_u64().context("assembly.json has no k")? as usize;
+            log(&format!("k={k} gave an empty graph"));
+            return Ok(Outcome {
+                k,
+                molecules: 0,
+                molecule_bases: 0,
+                pieces: 0,
+                total_length: 0,
+                unitigs: 0,
+                open_ends: 0,
+            });
+        }
         log("evaluating read support and repeat pairings");
         evidence_argv(&graph, self.reads, &d.join("evidence.json"), self.read_type).run()?;
         log("generating representative sequences and retaining configuration uncertainty");
@@ -1706,6 +1728,7 @@ fn assemble_organelle(
         read_type: cfg.read_type,
         filter: filter.as_ref(),
         nuclear_share: nuclear_share(&recruited.recruitment),
+        depth_reference: cfg.depth_reference.get(organelle).map(PathBuf::as_path),
         experimental_deep_bubble_fraction,
     };
     let ladder = match cfg.read_type {
@@ -1720,6 +1743,9 @@ fn assemble_organelle(
                 "molecules": o.molecules, "molecule_bases": o.molecule_bases,
                 "passes_floor": o.total_length >= floor})).collect::<Vec<_>>(),
         }))?;
+    }
+    if ladder.result().total_length == 0 {
+        bail!("no k gave the {organelle} reads an assembly graph (every node under the threshold)");
     }
     let assembly = read_json(&dir.join("assembly.json"))?;
     let evidence = read_json(&dir.join("evidence.json"))?;
@@ -2238,7 +2264,7 @@ mod tests {
         let dir=tmpdir("configuration-family-restore");
         let reads=Vec::new();
         let mut attempts=GraphAttempts {reads:&reads,read_context:None,dir:&dir,
-            read_type:ReadType::Hifi,filter:None,nuclear_share:None,experimental_deep_bubble_fraction:None};
+            read_type:ReadType::Hifi,filter:None,nuclear_share:None,depth_reference:None,experimental_deep_bubble_fraction:None};
         // Restoring a retry must restore its family, including the absence of one.
         let family=dir.join("molecules.configurations.fasta");
         fs::write(&family,"best family").unwrap();
@@ -2639,6 +2665,7 @@ mod tests {
             sample: "desktop".into(),
             component_panel: None,
             prune_gene_free: false,
+            depth_reference: Default::default(),
         }
     }
 

@@ -563,7 +563,7 @@ mod tests {
             s,
             min_count,
             min_count_fraction: None,
-            nuclear_share: None,
+            nuclear_share: None, depth_reference: None,
         }
     }
     fn random_runs(n: usize) -> Vec<u8> {
@@ -685,7 +685,7 @@ mod tests {
             s: 11,
             min_count: Some(1),
             min_count_fraction: None,
-            nuclear_share: None,
+            nuclear_share: None, depth_reference: None,
         };
         // A read-end-censored graph coordinate must fail instead of inventing a length.
         assert!(restore(&graph, &[input.clone()], &p).is_err());

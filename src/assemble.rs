@@ -50,7 +50,23 @@ pub struct AssembleParams {
     /// gate and core depth), when known: a dead-end branch no deeper than `NUMT_BRANCH_FOLD`
     /// times that share of the node depth is a NUMT's nuclear flank and is removed (`clean`).
     pub nuclear_share: Option<f64>,
+    /// Sequences known to be the organelle's (FASTA), when given: the node depth is the median
+    /// count of the graph's nodes at their sampled k-mers instead of the count-weighted median of
+    /// every node (threshold and cleaning follow it). `ovasm run --protein-seeds` gives the seeds
+    /// of the protein-seed cluster with the most genes. The count-weighted median is where half of
+    /// all k-mer occurrences lie, the depth of the read mass, so a deep repeat among the reads
+    /// makes it the repeat's: Eilema depressum (PMAT2 benchmark, ps-3e55167), 3,861 for a repeat
+    /// beside the mitochondrion at about 140x read depth, whose threshold of 386 left no unitig;
+    /// Platycheirus albimanus, 375 for a 14 kb element at about 300x holding 4 gene fragments,
+    /// threshold 37 against the 13-gene mitochondrion at about 35x, and only the element assembled.
+    /// Bases coordinates only (homopolymer-run coordinates sample other k-mers).
+    pub depth_reference: Option<&'static Path>,
 }
+
+/// Fewest nodes of the reference sequences the graph must hold for their median to be the node
+/// depth: fewer say nothing about the depth (seeds of another species' genes, say), and the
+/// count-weighted median stays.
+pub const DEPTH_REFERENCE_MIN_NODES: usize = 50;
 
 #[inline]
 fn mix64(mut z: u64) -> u64 {
@@ -1570,6 +1586,7 @@ pub fn run_auto_k_with_context(
         context,
         false,
         None,
+        None,
     )
 }
 
@@ -1584,6 +1601,7 @@ fn run_auto_k_cleaning(
     context: Option<&Path>,
     cleaning_audit_only: bool,
     nuclear_share: Option<f64>,
+    depth_reference: Option<&'static Path>,
 ) -> Result<AssembleReport> {
     let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
         let mut last = None;
@@ -1599,7 +1617,7 @@ fn run_auto_k_cleaning(
                     s,
                     min_count,
                     min_count_fraction,
-                    nuclear_share,
+                    nuclear_share, depth_reference: depth_reference,
                 },
                 out_gfa,
                 out_json,
@@ -1648,7 +1666,7 @@ fn run_auto_k_cleaning(
                             s,
                             min_count: Some(OPEN_END_MIN_COUNT),
                             min_count_fraction,
-                            nuclear_share,
+                            nuclear_share, depth_reference: depth_reference,
                         },
                         out_gfa,
                         out_json,
@@ -1684,7 +1702,7 @@ fn run_auto_k_cleaning(
                         s,
                         min_count: mc,
                         min_count_fraction,
-                        nuclear_share,
+                        nuclear_share, depth_reference: depth_reference,
                     },
                     out_gfa,
                     out_json,
@@ -1918,6 +1936,8 @@ pub struct EngineParams<'a> {
     pub min_count: Option<u32>,
     pub min_count_fraction: Option<f64>,
     pub nuclear_share: Option<f64>,
+    /// `AssembleParams::depth_reference`.
+    pub depth_reference: Option<&'static Path>,
     pub auto_k_depth: f64,
     pub context: Option<&'a Path>,
     pub experimental_deep_bubble_fraction: Option<f64>,
@@ -1951,7 +1971,7 @@ pub fn run_engine(
             None => { let (k, median) = dense_k(&inputs)?; eprintln!("[ovasm] dense mode: median read length {median} bp, k {k}"); k }
         };
         let params = AssembleParams { cleaning_audit_only: false, k, s: p.s,
-            min_count: p.min_count, min_count_fraction: p.min_count_fraction, nuclear_share: p.nuclear_share };
+            min_count: p.min_count, min_count_fraction: p.min_count_fraction, nuclear_share: p.nuclear_share , depth_reference: p.depth_reference,};
         return run_with_context_guard(inputs, params, out_gfa, out_json, p.context, Some(fraction)).map(EngineReport::Bases);
     }
     match p.coordinates {
@@ -1965,7 +1985,7 @@ pub fn run_engine(
                     s: p.s,
                     min_count: p.min_count,
                     min_count_fraction: p.min_count_fraction,
-                    nuclear_share: p.nuclear_share,
+                    nuclear_share: p.nuclear_share, depth_reference: p.depth_reference,
                 },
                 out_gfa,
                 out_json,
@@ -1985,6 +2005,7 @@ pub fn run_engine(
                 p.context,
                 p.cleaning_audit_only,
                 p.nuclear_share,
+                p.depth_reference,
             )
             .map(EngineReport::Bases),
             k => {
@@ -2004,7 +2025,7 @@ pub fn run_engine(
                         s: p.s,
                         min_count: p.min_count,
                         min_count_fraction: p.min_count_fraction,
-                        nuclear_share: p.nuclear_share,
+                        nuclear_share: p.nuclear_share, depth_reference: p.depth_reference,
                     },
                     out_gfa,
                     out_json,
@@ -2124,7 +2145,7 @@ fn run_backbone_layout_guard(
     // Depth and threshold from the node-count distribution.
     let mut counts: Vec<u32> = nodes.values().map(|v| v.0).filter(|&c| c >= 3).collect();
     counts.sort_unstable();
-    let node_depth = {
+    let mut node_depth = {
         let total: u64 = counts.iter().map(|&c| c as u64).sum();
         let mut acc = 0u64;
         counts
@@ -2136,6 +2157,37 @@ fn run_backbone_layout_guard(
             .copied()
             .unwrap_or(0) as f64
     };
+    if let Some(path) = p.depth_reference.filter(|_| matches!(coordinates, Coordinates::Bases)) {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let mut seen: FxHashSet<u64> = FxHashSet::default();
+        let mut at: Vec<u32> = Vec::new();
+        for rec in text.split('>').skip(1) {
+            let seq: Vec<u8> = rec
+                .lines()
+                .skip(1)
+                .flat_map(|l| l.trim().bytes())
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
+            for (h, _, _) in sample_read(&seq, &p) {
+                if seen.insert(h) {
+                    if let Some(v) = nodes.get(&h) {
+                        at.push(v.0);
+                    }
+                }
+            }
+        }
+        if at.len() >= DEPTH_REFERENCE_MIN_NODES {
+            at.sort_unstable();
+            let own = at[at.len() / 2] as f64;
+            eprintln!(
+                "[ovasm] node depth {own:.0} at the {} nodes of {} (count-weighted median of all nodes {node_depth:.0})",
+                at.len(),
+                path.display()
+            );
+            node_depth = own;
+        }
+    }
     // The automatic threshold is at least 3, or 2 under LOW_DEPTH_NODES: at about 5x a count of 3
     // drops every stretch where coverage dips to two reads (Canis lupus mitochondrion from 10 Mb of
     // HiFi reads, the PMAT2 benchmark's lowest-depth test: 2 unitigs, 14.2 of 16.7 kb).
@@ -2484,7 +2536,7 @@ mod tests {
             s: 15,
             min_count: Some(3),
             min_count_fraction: None,
-            nuclear_share: None,
+            nuclear_share: None, depth_reference: None,
         }
     }
 
@@ -2599,7 +2651,7 @@ mod tests {
                 s: 15,
                 min_count: None,
                 min_count_fraction: None,
-                nuclear_share: None,
+                nuclear_share: None, depth_reference: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -2679,7 +2731,7 @@ mod tests {
             s: 15,
             min_count: None,
             min_count_fraction: None,
-            nuclear_share: None,
+            nuclear_share: None, depth_reference: None,
         };
         let report = run_backbone(
             vec![input],
@@ -2708,7 +2760,7 @@ mod tests {
     fn experimental_guard_rejects_unsupported_modes_before_reading_inputs() {
         let params = |k, s, fraction| EngineParams {
             cleaning_audit_only: false, coordinates: Coordinates::Bases, k, s,
-            min_count: None, min_count_fraction: None, nuclear_share: None,
+            min_count: None, min_count_fraction: None, nuclear_share: None, depth_reference: None,
             auto_k_depth: AUTO_K_NODE_DEPTH, context: None,
             experimental_deep_bubble_fraction: Some(fraction),
         };
@@ -2726,7 +2778,7 @@ mod tests {
         let reads = dir.join("reads.fa");
         fs::write(&reads, format!(">r1\n{}\n>r2\n{}\n", "ACGT".repeat(38), "ACGT".repeat(38))).unwrap();
         let p = EngineParams { cleaning_audit_only: false, coordinates: Coordinates::Bases,
-            k: None, s: 0, min_count: None, min_count_fraction: None, nuclear_share: None,
+            k: None, s: 0, min_count: None, min_count_fraction: None, nuclear_share: None, depth_reference: None,
             auto_k_depth: AUTO_K_NODE_DEPTH, context: None, experimental_deep_bubble_fraction: Some(0.15) };
         let result = run_engine(vec![reads], p, &dir.join("graph.gfa"), &dir.join("report.json")).unwrap();
         match result { EngineReport::Bases(report) => { assert_eq!(report.k, 129); assert_eq!(report.experimental_deep_bubble_fraction, Some(0.15)); }, _ => panic!("expected dense graph") }
@@ -3006,7 +3058,7 @@ mod tests {
                 s: 15,
                 min_count: Some(3),
                 min_count_fraction: None,
-                nuclear_share: None,
+                nuclear_share: None, depth_reference: None,
             },
             &dir.join("a.gfa"),
             &dir.join("a.json"),
@@ -3092,7 +3144,7 @@ mod tests {
                     s: 15,
                     min_count: None,
                     min_count_fraction: fraction,
-                    nuclear_share: None,
+                    nuclear_share: None, depth_reference: None,
                 },
                 &dir.join(format!("{name}.gfa")),
                 &dir.join(format!("{name}.json")),
@@ -3122,7 +3174,7 @@ mod tests {
                 s: 15,
                 min_count: Some(4),
                 min_count_fraction: Some(0.5),
-                nuclear_share: None,
+                nuclear_share: None, depth_reference: None,
             },
             &dir.join("explicit.gfa"),
             &dir.join("explicit.json"),

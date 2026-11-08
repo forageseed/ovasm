@@ -763,6 +763,9 @@ fn run(args: RunArgs) -> Result<()> {
     // 0.81 / 0.34). Animals and fungi: up to three (`protein_seed_passes`).
     let mut protein_passes = None;
     let mut shallow = false;
+    // per organelle: the seeds of its protein-seed cluster with the most genes, whose node depth
+    // is the organelle's in assembly (`assemble graph --depth-reference`)
+    let mut depth_reference: std::collections::BTreeMap<String, PathBuf> = Default::default();
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
@@ -800,6 +803,38 @@ fn run(args: RunArgs) -> Result<()> {
                 &args.out.join("protein-seeds"),
             )?;
             eprintln!("{}", report.summary());
+            for &o in &wanted {
+                // the complete organelle holds its whole gene set; a repeat or an insert array
+                // that a cluster of its own stands for, a part of it
+                let best = report
+                    .clusters
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.seeded.contains(&o))
+                    .map(|(i, c)| {
+                        let genes = if o == "mitochondrion" { c.mitochondrion.genes } else { c.plastid.genes };
+                        (genes, c.depth, i + 1)
+                    })
+                    .max_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                if let (Some((genes, depth, c)), Some(seeds)) = (best, report.seeds.get(o)) {
+                    let tag = format!(" cluster={c} ");
+                    let text = std::fs::read_to_string(seeds)?;
+                    let mine: String = text
+                        .split('>')
+                        .skip(1)
+                        .filter(|r| r.lines().next().is_some_and(|h| h.contains(&tag)))
+                        .map(|r| format!(">{r}"))
+                        .collect();
+                    if !mine.is_empty() {
+                        let path = args.out.join("protein-seeds").join(format!("protein_seeds.{o}.depth.fasta"));
+                        std::fs::write(&path, mine)?;
+                        eprintln!(
+                            "[ovasm] run: {o}: node depth from the seeds of cluster {c} ({genes} genes, {depth:.0}x)"
+                        );
+                        depth_reference.insert(o.to_string(), path);
+                    }
+                }
+            }
             if report.shallow() {
                 // the organelle is about as deep as the nucleus in these reads: a depth gate on
                 // recruitment would refuse its reads as it refused them in the seed search
@@ -887,6 +922,7 @@ fn run(args: RunArgs) -> Result<()> {
         sample: args.sample,
         component_panel: args.component_panel,
         prune_gene_free: protein_passes.is_some_and(|n| n > 1),
+        depth_reference,
     })?;
     eprintln!(
         "[ovasm] run: summary -> {}; peak RSS {}",
@@ -1025,6 +1061,11 @@ struct AssembleArgs {
     /// the node depth is a NUMT's nuclear flank and is removed. Not given: no such removal.
     #[arg(long)]
     nuclear_share: Option<f64>,
+    /// FASTA of sequence known to be the organelle's (`ovasm run --protein-seeds` passes the seeds
+    /// of the protein-seed cluster with the most genes): the node depth is the median count of
+    /// the graph's nodes at its k-mers, so a deeper repeat among the reads does not set it.
+    #[arg(long)]
+    depth_reference: Option<PathBuf>,
     /// Complete original-read nuclear context; shared local matches do not establish source.
     #[arg(long)]
     read_context: Option<PathBuf>,
@@ -1069,7 +1110,7 @@ fn assemble(args: AssembleArgs) -> Result<()> {
             s: args.s,
             min_count: args.min_count,
             min_count_fraction: args.min_count_fraction,
-            nuclear_share: args.nuclear_share,
+            nuclear_share: args.nuclear_share, depth_reference: args.depth_reference.map(|p| &*Box::leak(p.into_boxed_path())),
             auto_k_depth: args.auto_k_depth.unwrap_or(assemble::AUTO_K_NODE_DEPTH),
             context: args.read_context.as_deref(),
         },
