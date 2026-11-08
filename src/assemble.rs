@@ -199,7 +199,7 @@ fn sample_dense(seq: &[u8], k: usize) -> Vec<Sample> {
     out
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct AssembleReport {
     pub cleaning_audit_only: bool,
     /// Experimental dense-read bubble protection; threshold relative to graph node depth.
@@ -1492,14 +1492,38 @@ const OPEN_END_MIN_COUNT: u32 = 3;
 /// gave one open 33.8 kb unitig, k 201 one circular 44,388 bp unitig (PMAT2: 44,388 bp).
 /// Platycnemis pennipes (about 18x, no k at the target): the smallest k, 101, gave three unitigs and
 /// a 14.9 kb representative, k 1001 a closed two-unitig graph of 17.2 kb (PMAT2: 17,361 bp).
+///
+/// Where the node depth did choose, a larger k tried on the way down still wins when its graph is
+/// small and closed (at most `OPEN_END_MAX_UNITIGS` unitigs, no open end), if it scores better than the chosen
+/// graph and holds `CLOSED_SAME_SEQUENCE` of the longest graph tried: the
+/// node-depth target stands in for a graph that does not fall apart, and a closed graph shows that
+/// directly, while a smaller k than needed merges short repeats. Apamea monoglypha (PMAT2 benchmark,
+/// 36 reads): one closed graph of 3 unitigs at k 251, 201 and 151, node depth 18-21 by the seeds,
+/// below the target 22 that k 101 reached with 6 unitigs and two linear pieces (the count-weighted
+/// median, 22 at k 151, had stopped there: one circle, 100% of the reference).
 fn ladder_choice(scored: &[(LadderScore, usize)], last: &AssembleReport, target: f64) -> Option<usize> {
-    let small_and_open = last.unitigs <= OPEN_END_MAX_UNITIGS
-        && scored.iter().find(|x| x.1 == last.k).is_some_and(|x| x.0 .0 > 0);
+    let last_score = scored.iter().find(|x| x.1 == last.k).map(|x| x.0);
+    let small_and_open = last.unitigs <= OPEN_END_MAX_UNITIGS && last_score.is_some_and(|x| x.0 > 0);
     if last.node_depth >= target && !small_and_open {
-        return None;
+        let longest = scored.iter().map(|x| x.0 .2 .0).max().unwrap_or(0) as f64;
+        return scored
+            .iter()
+            .filter(|x| {
+                x.0 .0 == 0
+                    && x.0 .1 <= OPEN_END_MAX_UNITIGS
+                    && x.0 .2 .0 as f64 >= CLOSED_SAME_SEQUENCE * longest
+            })
+            .min_by_key(|x| x.0)
+            .filter(|x| last_score.is_some_and(|l| x.0 < l))
+            .map(|x| x.1);
     }
     scored.iter().min_by_key(|x| x.0).map(|x| x.1)
 }
+
+/// Share of the longest graph tried that a closed small graph must hold to be the same sequence
+/// (`ladder_choice`): the k tried differ by a few k-mer overlaps per unitig (Apamea monoglypha:
+/// 15,667-15,767 bp at k 251-101); a closed loop of one repeat holds a small part.
+const CLOSED_SAME_SEQUENCE: f64 = 0.9;
 
 /// Unitig ends of a GFA without a link.
 pub fn open_ends(gfa: &Path) -> usize {
@@ -3195,4 +3219,21 @@ mod tests {
         }
         fs::remove_dir_all(&dir).ok();
     }
+    #[test]
+    fn a_closed_small_graph_on_the_way_down_beats_a_larger_deep_one() {
+        let sc = |open, unitigs, len, k| ((open, unitigs, std::cmp::Reverse(len), std::cmp::Reverse(k)), k);
+        let last = AssembleReport { k: 101, unitigs: 6, node_depth: 22.0, ..Default::default() };
+        // Apamea monoglypha: open at k 1001-351, closed 3 unitigs at 251-151, 6 at 101 (deep)
+        let scored = vec![sc(2, 5, 12_000, 1001), sc(0, 3, 15_754, 251), sc(0, 3, 15_767, 201),
+            sc(0, 3, 15_667, 151), sc(0, 6, 15_701, 101)];
+        assert_eq!(ladder_choice(&scored, &last, 22.0), Some(201));
+        // a closed loop of one repeat is not the same sequence
+        let scored = vec![sc(0, 1, 900, 1001), sc(0, 6, 15_701, 101)];
+        assert_eq!(ladder_choice(&scored, &last, 22.0), None);
+        // the deep graph is itself best: kept
+        let last = AssembleReport { k: 151, unitigs: 3, node_depth: 22.0, ..Default::default() };
+        let scored = vec![sc(1, 4, 15_000, 201), sc(0, 3, 15_667, 151)];
+        assert_eq!(ladder_choice(&scored, &last, 22.0), None);
+    }
+
 }

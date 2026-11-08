@@ -137,6 +137,12 @@ pub struct WholeReadScan {
     pub bases: u64,
     /// Seed reads per organelle (whole reads, not cropped).
     pub seed_reads: FxHashMap<&'static str, usize>,
+    /// Of those, the reads the depth gate calls organelle-like (sketch depth above its threshold).
+    /// The scan runs when no depth cluster was seeded, which happens for two reasons: the organelle
+    /// is no deeper than the nucleus, or it is deep but its clusters' sampled reads called no class
+    /// (Acanthosoma haemorrhoidale: mitochondrion at 312x over a 4x nucleus, clusters called none).
+    /// Only the first is shallow.
+    pub seed_reads_above_gate: FxHashMap<&'static str, usize>,
     pub seconds: f64,
 }
 
@@ -153,12 +159,15 @@ pub const WHOLE_READ_MIN_HITS: u32 = 12;
 pub const WHOLE_READ_MAX_SEEDS: usize = 3000;
 
 impl ProteinSeedReport {
-    /// Whether some seeds came from the whole-read scan: the organelle is not deeper than the
-    /// nucleus in these reads, so recruitment should not gate on depth either.
+    /// Whether an organelle is no deeper than the nucleus in these reads, so recruitment should not
+    /// gate on depth either: its seeds came from the whole-read scan and at most half of them pass
+    /// the depth gate (the gate's own test, applied to the organelle's own reads).
     pub fn shallow(&self) -> bool {
-        self.whole_read_scan
-            .as_ref()
-            .is_some_and(|w| w.seed_reads.values().any(|&n| n > 0))
+        self.whole_read_scan.as_ref().is_some_and(|w| {
+            w.seed_reads.iter().any(|(o, &n)| {
+                n > 0 && 2 * w.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n
+            })
+        })
     }
 
     /// One line for the terminal.
@@ -170,10 +179,12 @@ impl ProteinSeedReport {
             .collect();
         let whole = match &self.whole_read_scan {
             Some(w) => format!(
-                "; whole-read scan for {} ({} reads): {} seed reads",
+                "; whole-read scan for {} ({} reads): {} seed reads, {} above the depth gate{}",
                 w.organelles.join(" and "),
                 w.reads,
-                w.seed_reads.values().sum::<usize>()
+                w.seed_reads.values().sum::<usize>(),
+                w.seed_reads_above_gate.values().sum::<usize>(),
+                if self.shallow() { " (shallow)" } else { "" }
             ),
             None => String::new(),
         };
@@ -476,7 +487,7 @@ pub fn run(
     let whole_read_scan = if missing.is_empty() {
         None
     } else {
-        let w = whole_read_seeds(inputs, panel, p, &missing, out_dir)?;
+        let w = whole_read_seeds(inputs, panel, p, &missing, out_dir, &gate)?;
         for (&o, &n) in &w.0.seed_reads {
             if n > 0 {
                 seeds.insert(o, out_dir.join(format!("protein_seeds.{o}.fasta")));
@@ -522,7 +533,9 @@ fn whole_read_seeds(
     p: &ProteinSeedParams,
     organelles: &[&'static str],
     out_dir: &Path,
+    gate: &DepthGate,
 ) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
+    let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
     let t0 = Instant::now();
     let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
         FxHashMap::default();
@@ -579,6 +592,9 @@ fn whole_read_seeds(
             w.write_all(b"\n")?;
             *c += 1;
             *b.entry(class).or_insert(0) += r.seq.len() as u64;
+            if gate.profile(&r.seq).is_some_and(|d| d.organelle_like) {
+                *above.entry(class).or_insert(0) += 1;
+            }
         }
     }
     reader.join().expect("reader thread panicked")?;
@@ -594,6 +610,7 @@ fn whole_read_seeds(
             reads,
             bases,
             seed_reads: n,
+            seed_reads_above_gate: above,
             seconds: t0.elapsed().as_secs_f64(),
         },
         b,

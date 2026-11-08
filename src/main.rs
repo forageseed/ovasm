@@ -914,9 +914,10 @@ fn run(args: RunArgs) -> Result<()> {
                 }
             }
             if unseeded.iter().all(|o| report.seeds.contains_key(o)) {
-                // without the depth gate (seeds from the whole-read scan) every further pass extends
-                // into the nucleus: PMAT2 benchmark, Orcinus orca, 237 reads after one pass, 7,237
-                // (660 kb) after three, killed at 30.6 GB
+                // without the depth gate (an organelle no deeper than the nucleus) every further pass
+                // extends into the nucleus: PMAT2 benchmark, Orcinus orca, 237 reads after one pass,
+                // 7,237 (660 kb) after three, killed at 30.6 GB. Whole-read seeds that pass the gate
+                // (Acanthosoma haemorrhoidale) are not shallow and get the gate and the usual passes.
                 protein_passes = Some(if shallow {
                     PROTEIN_SEED_PASSES
                 } else {
