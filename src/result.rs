@@ -5,7 +5,8 @@
 //! everything else.
 //!
 //! Status of an organelle: `complete` (molecules, all circular, or one linear molecule whose
-//! chromosome call is decisive), `partial` (molecules, some open), `no_molecule` (a graph and no
+//! chromosome call is decisive, from an accepted k), `partial` (molecules, some open, or no k
+//! explained half of the graph), `no_molecule` (a graph and no
 //! molecule) or `failed` (the run stopped; `error` says why). The run's status is the worst of its
 //! organelles'.
 
@@ -42,9 +43,10 @@ fn organelle(out: &Path, dir: &Path, name: &str, summary: Option<&Value>, error:
     let mols = molecules(dir);
     let all_circular = !mols.is_empty() && mols.iter().all(|m| m["circular"] == true);
     let decisive = summary.and_then(|s| s["decisive"].as_bool()).unwrap_or(false);
+    let accepted = summary.map_or(true, |s| s["k_accepted"] != false);
     let status = if error.is_some() {
         "failed"
-    } else if all_circular || (mols.len() == 1 && decisive) {
+    } else if accepted && (all_circular || (mols.len() == 1 && decisive)) {
         "complete"
     } else if !mols.is_empty() {
         "partial"

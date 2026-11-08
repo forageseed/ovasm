@@ -43,7 +43,8 @@ pub struct AssembleParams {
     pub s: usize,
     /// Minimum reads for a node or an edge; `None` picks it from the node-count distribution.
     pub min_count: Option<u32>,
-    /// Fraction of the typical node depth used when `min_count` is `None` (default 0.1, floor 3).
+    /// Fraction of the typical node depth used when `min_count` is `None` (default 0.1; floor 3, or 2 under
+    /// `LOW_DEPTH_NODES` and 1 under `VERY_LOW_DEPTH_NODES`).
     /// Ignored when `min_count` is given. Must be in (0, 1].
     pub min_count_fraction: Option<f64>,
     /// Nuclear depth over the organelle's own depth in the whole library (recruitment's depth
@@ -2194,7 +2195,8 @@ fn run_backbone_layout_guard(
             node_depth = own;
         }
     }
-    // The automatic threshold is at least 3, or 2 under LOW_DEPTH_NODES: at about 5x a count of 3
+    // The automatic threshold is at least 3, 2 under LOW_DEPTH_NODES and 1 under
+    // VERY_LOW_DEPTH_NODES: at about 5x a count of 3
     // drops every stretch where coverage dips to two reads (Canis lupus mitochondrion from 10 Mb of
     // HiFi reads, the PMAT2 benchmark's lowest-depth test: 2 unitigs, 14.2 of 16.7 kb).
     let floor = if node_depth < VERY_LOW_DEPTH_NODES {

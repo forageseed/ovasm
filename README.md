@@ -35,24 +35,35 @@ No internet on the machine? See [offline installation](docs/installation.md).
 HiFi reads:
 
 ```sh
-ovasm run hifi --reads sample.hifi.fastq.gz --organelle both --threads 8 --out result
+ovasm run hifi -i sample.hifi.fastq.gz -G all -t 8 -o result     # land plant, both organelles
+ovasm run hifi -i sample.hifi.fastq.gz -x animal -t 8 -o result  # animal mitochondrion (-G mt is the default)
+ovasm run hifi -i sample.hifi.fastq.gz -x fungi -t 8 -o result   # fungal mitochondrion
 ```
+
+Short options follow PMAT2 where they overlap: `-G mt|pt|all`, `-x 0|1|2` (plant, animal, fungi),
+`-g` nuclear genome size, `-T` as well as `-t` for threads. `ovasm run hifi -h` lists the everyday
+options, `--help` all of them. For animals and fungi the seeds come from the sample's own reads
+(mitochondrial protein genes found in the reads); `--no-protein-seeds` uses the built-in seed
+library only.
 
 Illumina paired reads:
 
 ```sh
-ovasm run short --reads sample_R1.fq.gz --reads sample_R2.fq.gz --organelle both --threads 8 --out result
+ovasm run short -i sample_R1.fq.gz sample_R2.fq.gz -G all -t 8 -o result
 ```
 
 ONT reads, alone or with Illumina reads of the same sample ([details](docs/long-reads.md)). PacBio
 CLR reads go through `run ont` too, but so far it has only been checked on ONT data.
 
 ```sh
-ovasm run ont --reads sample.ont.fastq.gz --organelle both --threads 8 --out result
-ovasm run hybrid --long sample.ont.fastq.gz --short sample_R1.fq.gz --short sample_R2.fq.gz --organelle both --threads 8 --out result
+ovasm run ont -i sample.ont.fastq.gz -G all -t 8 -o result
+ovasm run hybrid --long sample.ont.fastq.gz --short sample_R1.fq.gz --short sample_R2.fq.gz -G all -t 8 -o result
 ```
 
-Each organelle gets its own folder in `result/` with:
+`result/result.json` says how the run went, in a fixed shape for scripts and agents (schema
+`ovasm.result.v1`): `status` (`complete`, `partial`, `no_molecule` or `failed`), per organelle the
+molecules (name, length, circular) and file paths, the warnings, the run time and the peak memory.
+`--json` also prints it. With `-G all` each organelle gets its own folder in `result/` with:
 
 - `molecules.fasta`: the assembled sequences;
 - `organelle.gfa`: the assembly graph, including alternative connections that reads support;
@@ -77,6 +88,7 @@ circle in the graph is not proof of a single circular molecule.
 | `solve` | `linearize`, `primary`, `chromosomes` | turn the graph into sequences |
 | `pan` | `merge`, `reconstruct`, `identify`, `sharing` | work across many samples |
 
+How each step works and where every threshold comes from: [method](docs/method.md).
 More: [rebuilding an individual from a species graph](docs/reference-reconstruction.md) ·
 [all documentation](docs/).
 
