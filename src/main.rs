@@ -816,7 +816,14 @@ fn run(args: RunArgs) -> Result<()> {
                 }
             }
             if unseeded.iter().all(|o| report.seeds.contains_key(o)) {
-                protein_passes = Some(protein_seed_passes(args.lineage));
+                // without the depth gate (seeds from the whole-read scan) every further pass extends
+                // into the nucleus: PMAT2 benchmark, Orcinus orca, 237 reads after one pass, 7,237
+                // (660 kb) after three, killed at 30.6 GB
+                protein_passes = Some(if shallow {
+                    PROTEIN_SEED_PASSES
+                } else {
+                    protein_seed_passes(args.lineage)
+                });
             } else {
                 eprintln!(
                     "[ovasm] run: no protein seeds for {}: the --lineage seed library seeds it, with the usual recruitment passes",
