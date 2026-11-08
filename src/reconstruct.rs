@@ -1844,6 +1844,11 @@ pub struct Config {
     pub frontier: Option<frontier::Params>,
 }
 
+
+/// Read depth the recruited reads are downsampled to before assembly, as `run`'s
+/// `--recruit-max-depth` default.
+const RECRUIT_MAX_READ_DEPTH: f64 = 250.0;
+
 pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
@@ -1997,11 +2002,18 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 out_dir: cfg.out.join("recruit"),
                 bootstrap: false,
                 extend_gate: false,
-                max_read_depth: None,
+                // Short reads are recruited as `run short` recruits them: the k-mer gate keeps
+                // extension at the organelle's depth and the read depth caps what goes on to
+                // assembly. Ungated, the rice mitochondria of a five-sample leave-one-out took in
+                // the nucleus around their NUMTs until the growth guard stopped them, and their
+                // own assembly, at ~1,550x on the plastid-derived stretches and ~100x elsewhere,
+                // explained 0-9% of its graph in four of five folds; `run short` on the same reads
+                // reached 76-94% of the held-out molecules in three of those four.
+                max_read_depth: Some(RECRUIT_MAX_READ_DEPTH),
                 max_bases: None,
                 // read pairs close the circles (`close`)
                 mates_together: true,
-                kmer_gate: false,
+                kmer_gate: true,
                 bait_growth_guard: true,
                 gate_fold: None,
                 nuclear_depth: None,
