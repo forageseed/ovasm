@@ -600,7 +600,11 @@ fn whole_read_seeds(
             w.write_all(b"\n")?;
             *c += 1;
             *b.entry(class).or_insert(0) += (hi - lo) as u64;
-            if gate.profile(&r.seq).is_some_and(|d| d.organelle_like) {
+            // judged on the seed itself: a read that is partly nuclear is not organelle-like
+            // along its whole length however deep its organelle part (Gliophorus irrigatus: 6 of
+            // 21 whole reads above the gate, the organelle 10x over a 2x nucleus; called shallow,
+            // recruited ungated in one pass, 7 reads from the cropped seeds)
+            if gate.profile(&r.seq[lo..hi]).is_some_and(|d| d.organelle_like) {
                 *above.entry(class).or_insert(0) += 1;
             }
         }
