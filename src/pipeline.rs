@@ -69,9 +69,12 @@ pub const REPLICATE_MIN_DEPTH: f64 = 30.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum OrganelleChoice {
+    #[value(alias = "mt", alias = "mito")]
     Mitochondrion,
+    #[value(alias = "pt", alias = "cp", alias = "chloroplast")]
     Plastid,
     /// Both organelles from one recruitment pass, each in its own directory under --out.
+    #[value(alias = "all")]
     Both,
 }
 

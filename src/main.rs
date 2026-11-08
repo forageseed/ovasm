@@ -31,6 +31,7 @@ mod read_context;
 mod read_model;
 mod reconstruct;
 mod recruit;
+mod result;
 mod replay;
 mod replicate;
 mod retained;
@@ -47,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ovasm", version, about = "OrganelleVerse organelle assembler")]
+#[command(name = "ovasm", version, about = "OrganelleVerse organelle assembler", after_help = RUN_EXAMPLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -75,23 +76,44 @@ enum Command {
     Pan(PanCommand),
 }
 
+/// Examples shown with `ovasm --help` and `ovasm run hifi --help`.
+const RUN_EXAMPLES: &str = "\
+Examples:
+  ovasm run hifi -i reads.fq.gz -o out -x animal -t 16             animal mitochondrion (-G mt is the default)
+  ovasm run hifi -i reads.fq.gz -o out -x 2 -t 16                  fungal mitochondrion (-x 0/1/2 as PMAT2)
+  ovasm run hifi -i a.fq.gz b.fq.gz -o out -G all -g 1.2g -t 16    land plant, both organelles
+  ovasm run hifi -i reads.fq.gz -o out -G pt -S pt=my_seed.fa      own seed sequence
+  ovasm run short -i r1.fq.gz r2.fq.gz -o out -G pt -t 16           Illumina reads
+Output: <out>/result.json (status, molecules, files, time, memory; --json prints it),
+<out>/molecules.fasta, <out>/organelle.gfa, <out>/summary.json (everything).
+`ovasm run hifi -h`: the everyday options; `--help`: all of them.";
+
 #[derive(Subcommand)]
 enum RunCommand {
-    /// Illumina short reads: find, assemble on a dense graph (every k-mer a node, k from the
+    /// Illumina short reads.
+    ///
+    /// Find, assemble on a dense graph (every k-mer a node, k from the
     /// read length, no retry), check, solve.
     Short(RunArgs),
-    /// PacBio HiFi: find, assemble on a sparse graph at the automatic k, retried at the next
+    /// PacBio HiFi reads (the main mode).
+    ///
+    /// Find, assemble on a sparse graph at the automatic k, retried at the next
     /// smaller k of 1001, 701, 501, 351, 251, 201, 151, 101 until the molecules add up to at
     /// least half of the graph's length (when no k does, the attempt that comes closest is kept
     /// and summary.json says k_accepted: false), check, solve; --mode standard adds downsampled
     /// replicates.
+    #[command(after_help = RUN_EXAMPLES)]
     Hifi(RunArgs),
-    /// Noisy long reads (ONT, PacBio CLR): one recruitment pass with the seeds (k 21, never
+    /// Noisy long reads (ONT, PacBio CLR).
+    ///
+    /// One recruitment pass with the seeds (k 21, never
     /// extended from raw reads), self-correction, further rounds baited by the corrected reads
     /// (--recruit-rounds), then the HiFi stages on the corrected reads (`run hifi --read-set
     /// target`: sparse graph, k ladder, check, solve, assess).
     Ont(longread::OntArgs),
-    /// Long reads with short reads of the same sample (--long ONT/CLR, --short Illumina): the
+    /// Long reads with short reads of the same sample.
+    ///
+    /// --long ONT/CLR, --short Illumina): the
     /// long reads are recruited and self-corrected as in `run ont`, seed the short reads'
     /// recruitment, are corrected again with those short reads (hybrid correction, then self
     /// rounds), go through the HiFi stages, and the graph is checked against both: evidence.json
@@ -537,69 +559,88 @@ fn identify(args: IdentifyArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct RunArgs {
+    /// Reads: FASTQ/FASTA, optionally .gz; several files after one -i, or -i repeated.
+    ///
     /// Read files (FASTQ/FASTA, optionally .gz); repeat for several.
-    #[arg(long = "reads", required = true)]
+    #[arg(short = 'i', long = "reads", required = true, num_args = 1..)]
     reads: Vec<PathBuf>,
+    /// Organelle: mt (default), pt or all (both), as PMAT2 -G.
+    ///
     /// Organelle to assemble; `both` recruits once and assembles each into <out>/<organelle>/.
-    #[arg(long, value_enum)]
+    #[arg(short = 'G', long, value_enum, default_value = "mitochondrion")]
     organelle: pipeline::OrganelleChoice,
+    /// Output directory; result.json there says how the run went.
+    ///
     /// Output directory: assembly.gfa/json, evidence.json, linearization.json, molecules.fasta
     /// (when there is a molecule), organelle.gfa/json (OV-GFA v1), summary.json; recruit/ and
     /// discover/ for whole-genome reads; replicates/ in standard mode.
-    #[arg(long)]
+    #[arg(short = 'o', long)]
     out: PathBuf,
     /// Set by the subcommand: `run hifi` or `run short`.
     #[arg(skip = pipeline::ReadType::Hifi)]
     read_type: pipeline::ReadType,
     /// whole-genome: recruit the organelle's reads first (stops when fewer than 100 kb are
     /// found). target: the reads are the organelle's already and are assembled as given.
-    #[arg(long, value_enum, default_value_t = pipeline::ReadSet::WholeGenome)]
+    #[arg(long, value_enum, default_value_t = pipeline::ReadSet::WholeGenome, hide_short_help = true)]
     read_set: pipeline::ReadSet,
+    /// Seed FASTA as mt=PATH or pt=PATH (a bare PATH seeds -G); default: built-in seeds of -x.
+    ///
     /// Seed FASTA as ORGANELLE=PATH (mitochondrion=mt.fa, plastid=pt.fa; repeat for more
     /// files); a bare PATH seeds the --organelle. Optional: an organelle without --seeds uses
     /// the built-in seed library of --lineage (seeddb/, compiled in), written to <out>/seeds/.
     /// Both organelles are always seeded unless --single-seed, so that each claims its own reads.
-    #[arg(long = "seeds")]
+    #[arg(short = 'S', long = "seeds")]
     seeds: Vec<String>,
+    /// Lineage: plant (default), animal or fungi; 0/1/2 as PMAT2 -x. Sets seeds, protein panel, genetic code.
+    ///
     /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
     /// plastid; includes Arabidopsis thaliana), metazoa or fungi (mitochondrion only: use
     /// --organelle mitochondrion).
-    #[arg(long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
+    #[arg(short = 'x', short_alias = 'l', long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
     lineage: seeddb::Lineage,
+    /// Protein seeds from the sample's own reads (default for animal and fungi).
+    ///
     /// HiFi whole-genome reads: seed each organelle without --seeds from the sample's own reads
     /// first (`ovasm find protein-seeds`, written to <out>/protein-seeds/): depth clusters called
     /// by their conserved proteins (the --lineage protein panel and genetic code), under the same
     /// depth-gate options. An organelle without a called cluster falls back to the --lineage
     /// seed library. For species far from every library genome.
-    #[arg(long)]
+    #[arg(short = 'P', long)]
     protein_seeds: bool,
-    /// Protein panel for --protein-seeds; default: the built-in panel.
-    #[arg(long, requires = "protein_seeds")]
+    /// No protein seeds where they are the default (animals and fungi): seed from the --lineage
+    /// seed library only.
+    #[arg(long, conflicts_with = "protein_seeds", hide_short_help = true)]
+    no_protein_seeds: bool,
+    /// Protein panel for the protein seeds; default: the built-in panel of --lineage.
+    #[arg(long, hide_short_help = true)]
     protein_seed_panel: Option<PathBuf>,
+    /// Print result.json (the run's outcome for scripts and agents) on standard output too.
+    #[arg(long, hide_short_help = true)]
+    json: bool,
     /// How whole-genome reads are recruited: seeds; discover (no seeds: depth clusters called
     /// by their organelle proteins, HiFi only); both (seed reads plus the clusters called as
     /// the target, each read once). With discovery each assembly graph first loses the
     /// components that are not the target organelle (`ovasm assemble filter`; assembly.filtered.gfa,
     /// components.json), and the later stages work on the kept ones.
-    #[arg(long, value_enum, default_value_t = pipeline::RecruitBy::Seeds)]
+    #[arg(long, value_enum, default_value_t = pipeline::RecruitBy::Seeds, hide_short_help = true)]
     recruit: pipeline::RecruitBy,
     /// Downsample seed-recruited reads to about this depth (recruited bases / seed length).
     /// Right for a single close reference (the desktop runner uses 150 for a custom seed);
     /// leave unset for a multi-species seed database, whose summed length is no genome size.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     recruit_depth: Option<f64>,
     /// New scratch directory for lossless recruitment input replay (disk space required).
     /// Without it, HiFi recruitment caches the reads in <out>/recruit/input-cache when that
     /// disk has room (a quarter of a byte per base and the read names), so that passes after the
     /// first, and the depth sketch, read the cache instead of decompressing the input again.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     recruit_cache: Option<PathBuf>,
     /// Never cache the reads for recruitment (see --recruit-cache).
-    #[arg(long, conflicts_with = "recruit_cache")]
+    #[arg(long, conflicts_with = "recruit_cache", hide_short_help = true)]
     no_recruit_cache: bool,
     /// HiFi: downsample each organelle's recruited reads to about this read depth before
     /// assembly (their median depth in the depth sketch); 0 keeps every read.
-    #[arg(long, default_value_t = 250.0)]
+    #[arg(long, default_value_t = 250.0, hide_short_help = true)]
     recruit_max_depth: f64,
     /// Keep at most about this many recruited bases per organelle, which bounds the memory of
     /// assembly whatever recruitment found; 0 for no cap. Short reads too: a plastid at a
@@ -607,70 +648,77 @@ struct RunArgs {
     /// sequence among the reads, not their bases: 4.3 Gb of Medicago polymorpha plastid reads
     /// took 2.5 GB, 8.5 Gb of mostly nuclear Carex echinata "plastid" reads 309 GB. A billion
     /// bases still holds the largest mitochondrial genome (11 Mb) at 90x.
-    #[arg(long, default_value_t = 1_000_000_000)]
+    #[arg(long, default_value_t = 1_000_000_000, hide_short_help = true)]
     recruit_max_bases: u64,
     /// HiFi: the depth gate's organelle threshold for seed recruitment, in multiples of the
     /// nuclear peak depth (`find recruit --gate-fold`; default 3). Extension already lowers it
     /// for an organelle shallower than that but deeper than the nucleus.
-    #[arg(long, conflicts_with = "no_extend_gate")]
+    #[arg(long, conflicts_with = "no_extend_gate", hide_short_help = true)]
     extend_gate_fold: Option<f64>,
     /// HiFi: the depth gate's nuclear peak, given instead of judged from the reads' median
     /// depths (`find recruit --nuclear-depth`), which stand two copies deep in a repeat-rich or
     /// polyploid genome.
-    #[arg(long, conflicts_with_all = ["no_extend_gate", "genome_size"])]
+    #[arg(long, conflicts_with_all = ["no_extend_gate", "genome_size"], hide_short_help = true)]
     nuclear_depth: Option<u32>,
+    /// Nuclear genome size (k/m/g, e.g. 1.26g), as PMAT2 -g; estimated from the reads if not given.
+    ///
     /// HiFi: the nuclear genome's collapsed size for the depth gate (`find recruit
     /// --genome-size`): all subgenomes of an allopolyploid (1C), one set of an autopolyploid;
     /// bases, or with k, m or g (1.26g).
-    #[arg(long, value_parser = parse_genome_size, conflicts_with = "no_extend_gate")]
+    #[arg(short = 'g', long, value_parser = parse_genome_size, conflicts_with = "no_extend_gate")]
     genome_size: Option<u64>,
     /// HiFi: recruit without the depth gate (`find recruit` without --extend-gate --bootstrap),
     /// as up to 0.2.1. On a species far from the seed library extension can then run into the
     /// nucleus (Carex echinata: 8.5 Gb of "plastid" reads); --recruit-max-bases still bounds what
     /// goes on to assembly.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     no_extend_gate: bool,
     /// Seed recruitment: most scanning passes (`ovasm find recruit --iterations`). Default: 60 for
     /// HiFi reads, whose gated recruitment grows a large mitochondrion by a few tens of kilobases
     /// a pass (see pipeline::GATED_RECRUIT_PASSES); `find recruit`'s own default otherwise. A target
     /// stops as soon as it stops growing, so the limit only costs time where one is incomplete.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     recruit_iterations: Option<usize>,
     /// Checked complete original-read nuclear alignments (ovasm.whole-read-context.v1).
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     read_context: Option<PathBuf>,
     /// Recruit one organelle without a seed for the other (not advised: mitochondrial seeds
     /// alone can extend into the plastid genome).
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     single_seed: bool,
+    /// Mode: fast (default), or standard: also downsampled replicates per junction.
+    ///
     /// fast: assemble once. standard: also assemble downsampled replicates of the recruited
     /// reads and report, per junction of the full-depth graph, the share of replicates that
     /// reproduce it (summary.json, replicates/junctions.tsv, rs:f/rn:i on organelle.gfa
     /// links). Replicates take half of the reads (at most 100x) and need 30x each, so a full
     /// depth of 60x; below that, and for short reads, the run falls back to fast and says so.
-    #[arg(long, value_enum, default_value_t = pipeline::Mode::Fast)]
+    #[arg(long, value_enum, default_value_t = pipeline::Mode::Fast, hide_short_help = true)]
     mode: pipeline::Mode,
     /// Replicates drawn before the stopping rule applies (1-5). Further ones are drawn until
     /// the junction set was the same in three replicates in a row, or --max-replicates.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 3, hide_short_help = true)]
     replicates: usize,
-    #[arg(long, default_value_t = replicate::MAX_REPLICATES)]
+    #[arg(long, default_value_t = replicate::MAX_REPLICATES, hide_short_help = true)]
     max_replicates: usize,
     /// Depth of each replicate instead of half the full depth (at most half of it).
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     replicate_depth: Option<f64>,
     /// Salt of every random draw: recruitment downsampling uses it, replicate i uses salt + i.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide_short_help = true)]
     salt: u64,
+    /// Sample name in the output graph (segment names, PanSN paths).
+    ///
     /// Sample name in the unified graph (segment names, PanSN paths).
-    #[arg(long, default_value = "sample")]
+    #[arg(short = 'p', long, default_value = "sample")]
     sample: String,
     /// Protein panel FASTA (headers `class|gene|species`) of the component filter that
     /// graphs of discovered reads (--recruit discover|both) go through; default: the
     /// built-in panel. See `ovasm assemble filter`.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     component_panel: Option<PathBuf>,
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    /// Threads (default: all cores); -T as PMAT2.
+    #[arg(short = 't', short_alias = 'T', long, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: Option<u16>,
 }
 
@@ -693,6 +741,7 @@ fn protein_seed_passes(lineage: seeddb::Lineage) -> usize {
 }
 
 fn run(args: RunArgs) -> Result<()> {
+    let run_started = std::time::Instant::now();
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n as usize)
@@ -741,10 +790,24 @@ fn run(args: RunArgs) -> Result<()> {
                 bail!("--seeds must be ORGANELLE=PATH with --organelle both, got {spec:?}")
             }
         };
+        // the short names of `-g` work here too (mt=PATH, pt=PATH)
+        let name = match name {
+            "mt" | "mito" => "mitochondrion",
+            "pt" | "cp" | "chloroplast" => "plastid",
+            other => other,
+        };
         seeds.entry(name.to_string()).or_default().push(path.into());
     }
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
+    // protein seeds: asked for, or the default for animals and fungi (HiFi whole-genome reads
+    // recruited with seeds), whose seed libraries are far from most species
+    let protein_seeds = args.protein_seeds
+        || (!args.no_protein_seeds
+            && args.lineage != seeddb::Lineage::Landplants
+            && args.read_type == pipeline::ReadType::Hifi
+            && args.read_set == pipeline::ReadSet::WholeGenome
+            && args.recruit != pipeline::RecruitBy::Discover);
     if args.protein_seeds
         && (args.read_type != pipeline::ReadType::Hifi
             || args.read_set != pipeline::ReadSet::WholeGenome
@@ -779,7 +842,7 @@ fn run(args: RunArgs) -> Result<()> {
                 .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
                 .collect(),
         };
-        if args.protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
+        if protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
             let p = protein_seed_params(
                 3000,
                 2000,
@@ -888,6 +951,8 @@ fn run(args: RunArgs) -> Result<()> {
             );
         }
     }
+    let out = args.out.clone();
+    let json_out = args.json;
     let report = pipeline::run(&pipeline::RunConfig {
         reads: args.reads,
         organelle: args.organelle,
@@ -923,10 +988,16 @@ fn run(args: RunArgs) -> Result<()> {
         component_panel: args.component_panel,
         prune_gene_free: protein_passes.is_some_and(|n| n > 1),
         depth_reference,
-    })?;
+    });
+    let result = result::write(&out, &report, run_started.elapsed().as_secs_f64())?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    let report = report?;
     eprintln!(
-        "[ovasm] run: summary -> {}; peak RSS {}",
-        args.out.join("summary.json").display(),
+        "[ovasm] run: {} -> {}; peak RSS {}",
+        result["status"].as_str().unwrap_or(""),
+        out.join("result.json").display(),
         report["peak_rss_mb"]
             .as_f64()
             .map_or("n/a".into(), |m| format!("{m:.0} MB"))

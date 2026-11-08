@@ -30,10 +30,13 @@ const FUNGI_MANIFEST: &[u8] = include_bytes!("../seeddb/fungi.manifest.json");
 pub enum Lineage {
     /// Land plants: 16 mitochondria and 44 plastids.
     #[default]
+    #[value(alias = "plant", alias = "plants", alias = "0")]
     Landplants,
     /// Animals: 32 RefSeq mitochondria, sponge to human.
+    #[value(alias = "animal", alias = "animals", alias = "1")]
     Metazoa,
     /// Fungi: 19 RefSeq mitochondria, Blastocladiomycota to Basidiomycota.
+    #[value(alias = "fungus", alias = "2")]
     Fungi,
 }
 
