@@ -1460,7 +1460,7 @@ type LadderScore = (usize, usize, std::cmp::Reverse<usize>, std::cmp::Reverse<us
 /// Unitigs a deep graph may have for its open ends to send the ladder further down. Organelle
 /// graphs of a few unitigs with an open end are a broken circle; large graphs keep the k their
 /// depth chose (their open ends are mostly removed branches, and a smaller k merges repeats).
-const OPEN_END_MAX_UNITIGS: usize = 4;
+pub const OPEN_END_MAX_UNITIGS: usize = 4;
 /// Node threshold of the second ladder for a small graph still open (`run_auto_k_cleaning`): a
 /// stretch present in a fraction of the copies (an optional intron, say) stays under a tenth of the
 /// node depth at every k. Rhizosphaera kalkhoffii: open at every k at the automatic 11-20, one
@@ -1484,7 +1484,7 @@ fn ladder_choice(scored: &[(LadderScore, usize)], last: &AssembleReport, target:
 }
 
 /// Unitig ends of a GFA without a link.
-fn open_ends(gfa: &Path) -> usize {
+pub fn open_ends(gfa: &Path) -> usize {
     let Ok(text) = fs::read_to_string(gfa) else {
         return 0;
     };

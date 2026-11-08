@@ -247,6 +247,10 @@ pub struct Outcome {
     /// filter, of the components it kept (the molecules are the target organelle's, and the
     /// nuclear repeats beside it are not what they should explain).
     pub total_length: u64,
+    /// Unitigs of the graph and their ends without a link (`assemble::open_ends`; of the
+    /// components kept by the filter).
+    pub unitigs: usize,
+    pub open_ends: usize,
 }
 
 impl Outcome {
@@ -306,6 +310,16 @@ impl Ladder {
 /// the largest share of its graph is the result (the earliest of equals), and `accepted` is
 /// false. `retry` is false for dense (short-read) assembly, whose k comes from the read length.
 /// `start` is the first attempt's k (`start_k`); None leaves it to the assembler.
+///
+/// An accepted graph from `start` that is small and open (at most
+/// `assemble::OPEN_END_MAX_UNITIGS` unitigs, an end without a link) is assembled once more at
+/// the automatic k, which goes down the ladder for small open graphs and picks the k with the
+/// fewest open ends; that attempt is the result when it is accepted and has fewer open ends.
+/// `start_k` exists for large plant graphs whose automatic k falls too low (Medicago polymorpha);
+/// on the small animal and fungal mitochondria of the PMAT2 benchmark it fixed k 1001 and left
+/// broken circles where the automatic k closes them (Rhizosphaera kalkhoffii 0.76 of the reference
+/// at k 1001 against one circle of 44,388 bp at k 201; Bibio marci and Limnoperna fortunei one
+/// open unitig each).
 pub fn k_ladder(a: &mut impl Attempts, retry: bool, start: Option<usize>) -> Result<Ladder> {
     let mut tried: Vec<Outcome> = Vec::new();
     let (mut best, mut stashed) = (0usize, false);
@@ -330,10 +344,32 @@ pub fn k_ladder(a: &mut impl Attempts, retry: bool, start: Option<usize>) -> Res
     }
     let last = tried.len() - 1;
     let accepted = tried[last].accepted();
-    let chosen = if accepted { last } else { best };
+    let mut chosen = if accepted { last } else { best };
     if stashed {
         if chosen == last {
             a.drop_stash()?;
+        } else {
+            a.restore()?;
+        }
+    }
+    let c = &tried[chosen];
+    if retry
+        && start.is_some()
+        && accepted
+        && c.open_ends > 0
+        && c.unitigs <= crate::assemble::OPEN_END_MAX_UNITIGS
+    {
+        log(&format!(
+            "k={} left a small graph with {} open end(s): trying the automatic k",
+            c.k, c.open_ends
+        ));
+        a.stash()?;
+        let o = a.attempt(None)?;
+        let better = o.accepted() && o.open_ends < tried[chosen].open_ends;
+        tried.push(o);
+        if better {
+            a.drop_stash()?;
+            chosen = tried.len() - 1;
         } else {
             a.restore()?;
         }
@@ -567,13 +603,18 @@ impl Attempts for GraphAttempts<'_> {
         asm.run()?;
         let assembly = read_json(&d.join("assembly.json"))?;
         // reads found by depth: the stages go on with the target's components only
-        let (graph, total_length) = match self.filter {
+        let (graph, total_length, unitigs) = match self.filter {
             Some(f) => {
                 let kept = f.keep_target(&graph, &filtered, &components_json)?;
-                (filtered, kept.kept_length as u64)
+                (filtered, kept.kept_length as u64, kept.kept_segments)
             }
-            None => (graph, assembly["total_length"].as_u64().unwrap_or(0)),
+            None => (
+                graph,
+                assembly["total_length"].as_u64().unwrap_or(0),
+                assembly["unitigs"].as_u64().unwrap_or(0) as usize,
+            ),
         };
+        let open_ends = crate::assemble::open_ends(&graph);
         log("evaluating read support and repeat pairings");
         evidence_argv(&graph, self.reads, &d.join("evidence.json"), self.read_type).run()?;
         log("generating representative sequences and retaining configuration uncertainty");
@@ -595,6 +636,8 @@ impl Attempts for GraphAttempts<'_> {
                 .filter(|m| m["length"].as_u64().unwrap_or(0) >= MIN_PIECE)
                 .count(),
             total_length,
+            unitigs,
+            open_ends,
         };
         if !o.accepted() {
             log(&format!(
@@ -2134,6 +2177,8 @@ mod tests {
         outcomes: Vec<(usize, usize, u64)>,
         asked: Vec<Option<usize>>,
         events: Vec<&'static str>,
+        /// (k, open ends); 0 for a k not listed
+        open: Vec<(usize, usize)>,
     }
 
     const GRAPH: u64 = 1000;
@@ -2145,6 +2190,7 @@ mod tests {
                 outcomes: outcomes.to_vec(),
                 asked: Vec::new(),
                 events: Vec::new(),
+                open: Vec::new(),
             }
         }
     }
@@ -2165,6 +2211,8 @@ mod tests {
                 molecule_bases,
                 pieces: molecules,
                 total_length: GRAPH,
+                unitigs: 1,
+                open_ends: self.open.iter().find(|o| o.0 == used).map_or(0, |o| o.1),
             })
         }
         fn stash(&mut self) -> Result<()> {
@@ -2211,6 +2259,8 @@ mod tests {
             molecule_bases,
             pieces: molecules,
             total_length,
+            unitigs: 1,
+            open_ends: 0,
         };
         assert!(o(1, 500, 1000).accepted(), "exactly half is enough");
         assert!(!o(1, 499, 1000).accepted());
@@ -2223,6 +2273,32 @@ mod tests {
         assert!(!o(1, 500, 0).accepted(), "an empty graph explains nothing");
         assert_eq!(o(0, 700, 1000).explained(), 0.0);
         assert_eq!(o(2, 250, 1000).explained(), 0.25);
+    }
+
+    #[test]
+    fn a_small_open_graph_from_the_start_k_tries_the_automatic_k() {
+        // k 1001 accepted but open (Rhizosphaera kalkhoffii); the automatic k (201) closes it
+        let mut a = Scripted::new(201, &[(1001, 1, 900), (201, 1, 1000)]);
+        a.open = vec![(1001, 2)];
+        let l = k_ladder(&mut a, true, Some(1001)).unwrap();
+        assert_eq!(a.asked, [Some(1001), None]);
+        assert_eq!(l.result().k, 201);
+        assert_eq!(a.events, ["attempt", "stash", "attempt", "drop"]);
+        // the automatic k no better: the start's files come back
+        let mut b = Scripted::new(1001, &[(1001, 1, 900)]);
+        b.open = vec![(1001, 2)];
+        let l = k_ladder(&mut b, true, Some(1001)).unwrap();
+        assert_eq!(l.result().k, 1001);
+        assert_eq!(l.chosen, 0);
+        assert_eq!(b.events, ["attempt", "stash", "attempt", "restore"]);
+        // closed, or no start k: nothing more
+        let mut c = Scripted::new(1001, &[(1001, 1, 900)]);
+        k_ladder(&mut c, true, Some(1001)).unwrap();
+        assert_eq!(c.asked, [Some(1001)]);
+        let mut d = Scripted::new(1001, &[(1001, 1, 900)]);
+        d.open = vec![(1001, 2)];
+        k_ladder(&mut d, true, None).unwrap();
+        assert_eq!(d.asked, [None]);
     }
 
     #[test]
@@ -2400,7 +2476,7 @@ mod tests {
             fn restore(&mut self) -> Result<()> { Ok(()) }
             fn drop_stash(&mut self) -> Result<()> { Ok(()) }
         }
-        let o = |k, graph, molecules, bases| Outcome { k, total_length: graph, molecules, molecule_bases: bases, pieces: molecules };
+        let o = |k, graph, molecules, bases| Outcome { k, total_length: graph, molecules, molecule_bases: bases, pieces: molecules, unitigs: 1, open_ends: 0 };
         let candidates = vec![o(127, 8931, 1, 5006), o(99, 220562, 3, 224833), o(77, 224785, 2, 230798), o(55, 226854, 1, 232196)];
         let mut a = Sized { outcomes: candidates.clone(), calls: vec![] };
         let r = sr_ladder_with_evidence_floor(&mut a, Some(122477)).unwrap();
