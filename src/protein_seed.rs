@@ -135,7 +135,7 @@ pub struct WholeReadScan {
     pub organelles: Vec<&'static str>,
     pub reads: u64,
     pub bases: u64,
-    /// Seed reads per organelle (whole reads, not cropped).
+    /// Seed reads per organelle (cropped to their genes and flanks, as cluster seeds).
     pub seed_reads: FxHashMap<&'static str, usize>,
     /// Of those, the reads the depth gate calls organelle-like (sketch depth above its threshold).
     /// The scan runs when no depth cluster was seeded, which happens for two reasons: the organelle
@@ -550,7 +550,7 @@ fn whole_read_seeds(
             min_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
             ..p.panel.clone()
         };
-        let hits: Vec<(usize, &'static str)> = batch
+        let hits: Vec<(usize, &'static str, usize, usize)> = batch
             .par_iter()
             .enumerate()
             .map_init(
@@ -569,12 +569,20 @@ fn whole_read_seeds(
                         .collect();
                     distinct.sort_unstable();
                     distinct.dedup();
-                    (distinct.len() >= WHOLE_READ_MIN_GENES).then_some((i, class))
+                    if distinct.len() < WHOLE_READ_MIN_GENES {
+                        return None;
+                    }
+                    // the read's own genes and flanks, as a cluster seed (`crop`): the rest of a
+                    // read can be nuclear (Gliophorus irrigatus: 18 of 21 seed reads 26-80%
+                    // mitochondrial, the rest a GC-rich nuclear repeat that recruited 125 nuclear
+                    // reads next to 23 mitochondrial ones)
+                    let (a, b) = crop(r.seq.len(), &st, class, panel, p.flank)?;
+                    Some((i, class, a, b))
                 },
             )
             .flatten()
             .collect();
-        for (i, class) in hits {
+        for (i, class, lo, hi) in hits {
             let c = n.entry(class).or_insert(0);
             if *c >= WHOLE_READ_MAX_SEEDS {
                 continue;
@@ -587,11 +595,11 @@ fn whole_read_seeds(
             let r = &batch[i];
             w.write_all(b">")?;
             w.write_all(r.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&r.id))?;
-            w.write_all(b" whole_read_scan\n")?;
-            w.write_all(&r.seq)?;
+            writeln!(w, " whole_read_scan span={lo}-{hi}")?;
+            w.write_all(&r.seq[lo..hi])?;
             w.write_all(b"\n")?;
             *c += 1;
-            *b.entry(class).or_insert(0) += r.seq.len() as u64;
+            *b.entry(class).or_insert(0) += (hi - lo) as u64;
             if gate.profile(&r.seq).is_some_and(|d| d.organelle_like) {
                 *above.entry(class).or_insert(0) += 1;
             }
