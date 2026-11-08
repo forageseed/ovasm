@@ -51,7 +51,8 @@ pub struct AssembleParams {
     /// times that share of the node depth is a NUMT's nuclear flank and is removed (`clean`).
     pub nuclear_share: Option<f64>,
     /// Sequences known to be the organelle's (FASTA), when given: the node depth is the median
-    /// count of the graph's nodes at their sampled k-mers instead of the count-weighted median of
+    /// count of the graph's solid nodes (count >= 3, as for the count-weighted median) at their
+    /// sampled k-mers instead of the count-weighted median of
     /// every node (threshold and cleaning follow it). `ovasm run --protein-seeds` gives the seeds
     /// of the protein-seed cluster with the most genes. The count-weighted median is where half of
     /// all k-mer occurrences lie, the depth of the read mass, so a deep repeat among the reads
@@ -2170,8 +2171,13 @@ fn run_backbone_layout_guard(
                 .map(|b| b.to_ascii_uppercase())
                 .collect();
             for (h, _, _) in sample_read(&seq, &p) {
+                // solid nodes only, as the count-weighted median takes them (count >= 3): the
+                // seeds are reads, and at k 1001 most of a HiFi read's k-mers hold one of its
+                // errors (0.999^1001 = 0.37 error-free), each a node of count 1 (Trichoderma
+                // longibrachiatum: the median of all its seed nodes was 1, threshold 1, 127
+                // unitigs; Acleris sparsana killed at 30.6 GB)
                 if seen.insert(h) {
-                    if let Some(v) = nodes.get(&h) {
+                    if let Some(v) = nodes.get(&h).filter(|v| v.0 >= 3) {
                         at.push(v.0);
                     }
                 }
