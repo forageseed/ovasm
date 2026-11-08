@@ -1091,8 +1091,8 @@ pub struct RecruitConfig {
     /// than any such genome has (`size_cap`).
     pub extend_gate: bool,
     /// Downsample each target's output to about this read depth: the median sketch depth of
-    /// its reads, so the recruited bases over it are the genome size they stand for. Long reads
-    /// only (the depth sketch judges whole long reads).
+    /// its reads for long reads (the depth sketch judges whole long reads), the k-mer gate's
+    /// depth of the target as a read depth for short reads (`kmer_read_depth`).
     pub max_read_depth: Option<f64>,
     /// Downsample each target's output to about this many bases at most.
     pub max_bases: Option<u64>,
@@ -1199,6 +1199,19 @@ fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, rea
     }
     per_read.sort_unstable();
     Some(f64::from(per_read[per_read.len() / 2]))
+}
+
+/// The read depth of a target whose k-mers of length `k` stand at `kmer_depth` in the k-mer gate's
+/// table, from its recruited `reads` and `bases`: a read of length L holds L - k + 1 of them, so
+/// the read depth is the k-mer depth times L / (L - k + 1). None for reads no longer than k.
+///
+/// Short reads had no depth cap but `max_bases`: the Nipponbare plastid went to assembly at about
+/// 9,000x (k-mer depth 7,870 at k 21 in 150 bp reads, a billion bases kept), where an error
+/// recurring in one read in a few thousand is seen by several reads, passes as solid, and branches
+/// the graph (20 representative molecules for one circle).
+fn kmer_read_depth(kmer_depth: f64, reads: u64, bases: u64, k: usize) -> Option<f64> {
+    let len = bases as f64 / reads.max(1) as f64;
+    (len > k as f64).then(|| kmer_depth * len / (len - k as f64 + 1.0))
 }
 
 /// A bootstrap read must not be this much shallower than the target's own reads (when the
@@ -2389,7 +2402,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         if let Some(d) = cfg.target_depth.filter(|&d| depth > d) {
             cap(d / depth, "target_depth");
         }
-        if let (Some(max), Some(d)) = (cfg.max_read_depth, final_depths.read[t]) {
+        let read_depth = final_depths.read[t].or_else(|| {
+            kmer_target_depth[t].and_then(|d| kmer_read_depth(d, counts.reads, counts.bases, bait.k))
+        });
+        if let (Some(max), Some(d)) = (cfg.max_read_depth, read_depth) {
             if d > max {
                 cap(max / d, "max_read_depth");
             }
@@ -4215,6 +4231,19 @@ mod tests {
             plain.iterations.len()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_kmer_depth_is_a_read_depth_by_the_words_a_read_holds() {
+        // Nipponbare plastid: k-mer depth 7,870 at k 21 in 150 bp reads
+        let d = kmer_read_depth(7870.0, 1_000_000, 150_000_000, 21).unwrap();
+        assert!((d - 7870.0 * 150.0 / 130.0).abs() < 1e-6, "{d}");
+        // long reads: nearly the same
+        let d = kmer_read_depth(100.0, 10, 150_000, 21).unwrap();
+        assert!((d - 100.0).abs() < 0.2, "{d}");
+        // reads no longer than k hold no k-mer
+        assert_eq!(kmer_read_depth(100.0, 10, 200, 21), None);
+        assert_eq!(kmer_read_depth(100.0, 0, 0, 21), None);
     }
 
     #[test]

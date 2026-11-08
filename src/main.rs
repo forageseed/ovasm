@@ -638,8 +638,9 @@ struct RunArgs {
     /// Never cache the reads for recruitment (see --recruit-cache).
     #[arg(long, conflicts_with = "recruit_cache", hide_short_help = true)]
     no_recruit_cache: bool,
-    /// HiFi: downsample each organelle's recruited reads to about this read depth before
-    /// assembly (their median depth in the depth sketch); 0 keeps every read.
+    /// Downsample each organelle's recruited reads to about this read depth before assembly
+    /// (HiFi: their median depth in the depth sketch; short reads: the organelle's k-mer depth
+    /// as a read depth); 0 keeps every read.
     #[arg(long, default_value_t = 250.0, hide_short_help = true)]
     recruit_max_depth: f64,
     /// Keep at most about this many recruited bases per organelle, which bounds the memory of
@@ -2348,8 +2349,11 @@ fn recruit(args: RecruitArgs) -> Result<()> {
              --extend-gate, --bootstrap or --max-read-depth"
         );
     }
-    if args.max_read_depth.is_some() && !matches!(args.preset, Preset::Hifi) {
-        bail!("--max-read-depth needs the hifi preset: its depth sketch judges whole long reads");
+    if args.max_read_depth.is_some() && !matches!(args.preset, Preset::Hifi) && !args.kmer_gate {
+        bail!(
+            "--max-read-depth needs the hifi preset (its depth sketch judges whole long reads) or \
+             --kmer-gate (the target's k-mer depth)"
+        );
     }
     if args.max_read_depth.is_some_and(|d| d.is_nan() || d <= 0.0) || args.max_bases == Some(0)
     {

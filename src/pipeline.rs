@@ -1125,6 +1125,9 @@ fn recruit_all(
         // together for the read-pair closure.
         if cfg.read_type == ReadType::Sr {
             argv = argv.arg("--kmer-gate").arg("--mates-together");
+            if let Some(d) = cfg.recruit_max_depth {
+                argv = argv.opt("--max-read-depth", d.to_string());
+            }
             if let Some(b) = cfg.recruit_max_bases {
                 argv = argv.opt("--max-bases", b.to_string());
             }
