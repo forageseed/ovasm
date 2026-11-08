@@ -1250,6 +1250,20 @@ const BOOTSTRAP_MAX_OTHER_COVER: f64 = 0.5;
 const LEFTOVER_DEPTH: (f64, f64) = (0.5, 2.0);
 /// Fewest such leftovers for that bootstrap.
 const LEFTOVER_MIN_READS: usize = 5;
+
+/// Whether leftovers admitted at no less than `LEFTOVER_DEPTH.0` times the target's read depth
+/// `own` would add more solid k-mers (`solid`, seen in two of them at least) than the genome their
+/// `bases` stand for at that depth: reads at depth d cover at most bases / d of sequence, and up to
+/// a read length (`longest`) more for each stretch they cover rather than a whole circle (its two
+/// ends stand out by half a read each); leftovers grow from a gap of the bait on both its sides,
+/// two stretches. More new sequence than that is not one genome at that
+/// depth but many sparsely sampled ones, the high-copy repeats of the nucleus. Pseudognaphalium luteoalbum (mitochondrion ~242 kb at
+/// ~1,786x): 5,620 leftovers, 44 Mb, stand for at most 50 kb at 893x and added 2,586,749 k-mers;
+/// recruitment went from 71,227 to 774,926 reads over 7 hours. A second circle passes: the
+/// Buxus sempervirens 89 kb circle at 1,434x beside 1,366x stands for about 187 kb.
+fn leftovers_outgrow_their_depth(solid: usize, bases: usize, longest: usize, own: f64) -> bool {
+    own > 0.0 && solid as f64 > bases as f64 / (LEFTOVER_DEPTH.0 * own) + 2.0 * longest as f64
+}
 /// The only target the leftover bootstrap applies to. A plastid is one circle; what is left at its
 /// depth beside it is nuclear repeat sequence (rDNA, satellites at thousands of copies), and
 /// bootstrapping from it ran the Pseudognaphalium luteoalbum plastid away to the 1 Mb size cap
@@ -2151,6 +2165,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // (`LEFTOVER_DEPTH`) bootstrap it from `LEFTOVER_MIN_READS` of them, with at most
                 // three rounds when the HiFi automatic policy permits and recruitment grows.
                 let mut established_leftovers = false;
+                let mut leftover_own = None;
                 let (picked, keys) = if picked.len() as u64 > res.recruited[t].reads && boot_used[t].is_empty() {
                     (picked, keys)
                 } else {
@@ -2161,6 +2176,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     };
                     leftovers_judged[t] = true;
                     established_leftovers = true;
+                    leftover_own = Some(own);
                     // Established mitochondrial leftovers use the same nuclear-safe depth
                     // test as extension. The global 3x-nuclear threshold otherwise rejects
                     // a shallow second circle before its 0.5-2x target-depth test below.
@@ -2232,6 +2248,27 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     added[t] += bait.add_kmers(t, &kmers);
                     warnings.push(format!("{}: third leftover retry included candidates without nuclear-origin certification; same-depth nuclear repeats may be included", bait.targets[t].name));
                 } else {
+                    if let Some(own) = leftover_own {
+                        let solid = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), 2).len();
+                        let longest = picked.iter().map(Vec::len).max().unwrap_or(0);
+                        if leftovers_outgrow_their_depth(solid, picked_bases, longest, own) {
+                            saturated[t] = true;
+                            stopped[t] = Some("bootstrap_limit");
+                            let w = format!(
+                                "{}: leftover bootstrap round {} held: its {} reads ({} bp) stand for at most {:.0} bp at {:.0}x and would add {} new k-mers; they are not one genome at the target's depth",
+                                bait.targets[t].name,
+                                leftover_rounds[t] + 1,
+                                picked.len(),
+                                picked_bases,
+                                picked_bases as f64 / (LEFTOVER_DEPTH.0 * own) + 2.0 * longest as f64,
+                                LEFTOVER_DEPTH.0 * own,
+                                solid
+                            );
+                            eprintln!("[ovasm] warning: {w}");
+                            warnings.push(w);
+                            continue;
+                        }
+                    }
                     for seq in &picked {
                         added[t] += bait.add_sequence_counted(t, seq);
                     }
@@ -4253,6 +4290,26 @@ mod tests {
             plain.iterations.len()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leftovers_may_add_no_more_than_the_genome_they_stand_for() {
+        // Pseudognaphalium luteoalbum: 5,620 leftovers, 44 Mb, at a ~1,786x mitochondrion
+        assert!(leftovers_outgrow_their_depth(2_586_749, 44_000_000, 25_000, 1786.0));
+        // and its first round: 137 reads, 1.08 Mb, at 1,146x, 418,332 k-mers
+        assert!(leftovers_outgrow_their_depth(418_332, 1_080_000, 25_000, 1146.0));
+        // Buxus sempervirens: an 89 kb circle at 1,434x, 8 kb reads, beside 1,366x
+        let bases = 89_000 * 1434;
+        assert!(!leftovers_outgrow_their_depth(89_000, bases, 8_000, 1366.0));
+        // even at the lowest admitted depth, half the target's
+        assert!(!leftovers_outgrow_their_depth(89_000, 89_000 * 683, 0, 1366.0));
+        assert!(leftovers_outgrow_their_depth(89_000, 89_000 * 600, 0, 1366.0));
+        // a stretch of 11 reads of 3 kb, one every 250 bp (12x), covers 5.5 kb, beyond
+        // the 3.3 kb its bases stand for at 10x by its ends
+        assert!(!leftovers_outgrow_their_depth(5_500, 33_000, 3_000, 20.0));
+        // 15 reads of 3 kb at 100x on both sides of a bait gap: 3,929 new k-mers
+        assert!(!leftovers_outgrow_their_depth(3_929, 45_000, 3_000, 100.0));
+        assert!(!leftovers_outgrow_their_depth(1, 1, 0, 0.0));
     }
 
     #[test]
