@@ -361,7 +361,7 @@ pub fn extend(
                     run = if previous == pos.checked_sub(1) { run + 1 } else { 1 };
                     previous = Some(pos);
                 } else { run = 0; previous = None; }
-                run >= MIN_TIP.saturating_sub(K - 1)
+                run >= MIN_TIP.saturating_sub(counts.k - 1)
             })
         });
         if !anchored { ext.skipped = Some("sparse_reference_support"); return ext; }
