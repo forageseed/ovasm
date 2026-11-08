@@ -142,7 +142,7 @@ impl KmerCounts {
         Ok(table)
     }
 
-    fn add_seq(&self, seq: &[u8]) {
+    pub(crate) fn add_seq(&self, seq: &[u8]) {
         for (_, key) in CanonicalKmers::new(seq, self.k) {
             self.add(key);
         }

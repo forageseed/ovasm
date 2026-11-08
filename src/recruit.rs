@@ -1176,6 +1176,26 @@ fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, s
     m >= KMER_GATE_FLOOR * depth && m <= KMER_GATE_CEILING * depth
 }
 
+/// Keep the k-mers new to a target's bait that stand at its depth in the k-mer gate's table
+/// (`KMER_GATE_FLOOR` to `KMER_GATE_CEILING` times `depth`), each judged by its own count.
+///
+/// `kmer_extends` admits a read by the median count of the k-mers it would add, and
+/// `new_from_reads` then keeps every k-mer seen `extend_min_count` times among the admitted
+/// reads. At a deep target that count is no filter: a base error recurs in one read in a few
+/// hundred and passes it at ~190x (rice mitochondria in a pan reconstruction gained 594,022
+/// k-mers in their second pass against 112,585 in the first, more than the whole molecule,
+/// and the growth guard stopped them). An error k-mer stands near zero in the whole read set's
+/// table, a nuclear k-mer at the nuclear depth: both below the floor. No-op without a table or
+/// a depth.
+fn keep_at_target_depth(table: Option<&crate::frontier::KmerCounts>, depth: Option<f64>, kmers: &mut Vec<u64>) {
+    if let (Some(table), Some(d)) = (table, depth) {
+        kmers.retain(|&km| {
+            let c = f64::from(table.get(km));
+            c >= KMER_GATE_FLOOR * d && c <= KMER_GATE_CEILING * d
+        });
+    }
+}
+
 /// A target's k-mer depth: the median, over its sampled reads, of the median count of each
 /// read's k-mers that are in the target's bait.
 fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, reads: &[&[u8]]) -> Option<f64> {
@@ -1986,6 +2006,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         new.sort_unstable();
                         new.dedup();
                     }
+                    keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], &mut new);
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                     if runaway_bait_gain(previous, added[t] + new.len()) {
                         saturated[t] = true;
@@ -2055,6 +2076,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                             new.sort_unstable();
                             new.dedup();
                         }
+                        keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], &mut new);
                         let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                         if runaway_bait_gain(previous, added[t].saturating_add(new.len())) {
                             saturated[t] = true;
@@ -4231,6 +4253,48 @@ mod tests {
             plain.iterations.len()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_bait_kmers_are_kept_at_the_targets_depth_each_by_its_own_count() {
+        let seq = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    b"ACGT"[(x >> 33) as usize % 4]
+                })
+                .collect()
+        };
+        let table = crate::frontier::KmerCounts::new(20);
+        let (organelle, nuclear) = (seq(1, 200), seq(2, 200));
+        let mut error = organelle.clone();
+        error[100] = if error[100] == b'A' { b'C' } else { b'A' };
+        for _ in 0..100 {
+            table.add_seq(&organelle);
+        }
+        for _ in 0..10 {
+            table.add_seq(&nuclear);
+        }
+        for _ in 0..3 {
+            table.add_seq(&error);
+        }
+        let k = crate::frontier::K;
+        let kmers = |s: &[u8]| -> Vec<u64> { CanonicalKmers::new(s, k).map(|(_, km)| km).collect() };
+        let mut new: Vec<u64> = [kmers(&organelle), kmers(&nuclear), kmers(&error)].concat();
+        new.sort_unstable();
+        new.dedup();
+        let mut kept = new.clone();
+        keep_at_target_depth(Some(&table), Some(100.0), &mut kept);
+        let mut want = kmers(&organelle);
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(kept, want);
+        // without a table or a depth nothing is dropped
+        let mut all = new.clone();
+        keep_at_target_depth(None, Some(100.0), &mut all);
+        keep_at_target_depth(Some(&table), None, &mut all);
+        assert_eq!(all, new);
     }
 
     #[test]
