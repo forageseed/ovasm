@@ -146,6 +146,24 @@ pub struct WholeReadScan {
     pub seconds: f64,
 }
 
+impl WholeReadScan {
+    /// Some organelle has seeds and at most half of them pass the depth gate.
+    fn shallow(&self) -> bool {
+        self.seed_reads.iter().any(|(o, &n)| {
+            n > 0 && 2 * self.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n
+        })
+    }
+}
+
+/// Whether a whole-read seed, the span `lo..hi` of `seq` (`crop`), is organelle-like by the depth
+/// gate: judged on the seed itself, since a read that is partly nuclear is not organelle-like
+/// along its whole length however deep its organelle part (Gliophorus irrigatus: 6 of 21 whole
+/// reads above the gate, the organelle 10x over a 2x nucleus; called shallow, recruited ungated
+/// in one pass, 7 reads from the cropped seeds).
+fn seed_above_gate(gate: &DepthGate, seq: &[u8], lo: usize, hi: usize) -> bool {
+    gate.profile(&seq[lo..hi]).is_some_and(|d| d.organelle_like)
+}
+
 /// Distinct genes of its class a read needs in the whole-read scan. Without the depth gate a
 /// nuclear copy of organelle DNA (NUMT, NUPT) is not set apart by depth, and most are a few kb of
 /// one or two genes; an animal mitochondrial HiFi read of 10 kb holds five or more.
@@ -163,11 +181,7 @@ impl ProteinSeedReport {
     /// gate on depth either: its seeds came from the whole-read scan and at most half of them pass
     /// the depth gate (the gate's own test, applied to the organelle's own reads).
     pub fn shallow(&self) -> bool {
-        self.whole_read_scan.as_ref().is_some_and(|w| {
-            w.seed_reads.iter().any(|(o, &n)| {
-                n > 0 && 2 * w.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n
-            })
-        })
+        self.whole_read_scan.as_ref().is_some_and(WholeReadScan::shallow)
     }
 
     /// One line for the terminal.
@@ -600,11 +614,7 @@ fn whole_read_seeds(
             w.write_all(b"\n")?;
             *c += 1;
             *b.entry(class).or_insert(0) += (hi - lo) as u64;
-            // judged on the seed itself: a read that is partly nuclear is not organelle-like
-            // along its whole length however deep its organelle part (Gliophorus irrigatus: 6 of
-            // 21 whole reads above the gate, the organelle 10x over a 2x nucleus; called shallow,
-            // recruited ungated in one pass, 7 reads from the cropped seeds)
-            if gate.profile(&r.seq[lo..hi]).is_some_and(|d| d.organelle_like) {
+            if seed_above_gate(gate, &r.seq, lo, hi) {
                 *above.entry(class).or_insert(0) += 1;
             }
         }
@@ -698,5 +708,74 @@ mod tests {
             Some((0, 1000))
         );
         assert_eq!(crop(1000, &[(pltd, 1, 2)], "mitochondrion", &panel, 10), None);
+    }
+
+    fn scan(seeds: &[(&'static str, usize, usize)]) -> WholeReadScan {
+        WholeReadScan {
+            organelles: seeds.iter().map(|x| x.0).collect(),
+            reads: 1000,
+            bases: 10_000_000,
+            seed_reads: seeds.iter().map(|&(o, n, _)| (o, n)).collect(),
+            seed_reads_above_gate: seeds.iter().map(|&(o, _, a)| (o, a)).collect(),
+            seconds: 0.0,
+        }
+    }
+
+    #[test]
+    fn shallow_is_at_most_half_the_seeds_above_the_gate() {
+        // Orcinus orca: the mitochondrion no deeper than the nucleus, no seed above the gate
+        assert!(scan(&[("mitochondrion", 19, 0)]).shallow());
+        // exactly half: shallow
+        assert!(scan(&[("mitochondrion", 20, 10)]).shallow());
+        // Acanthosoma haemorrhoidale: deep, its seeds above the gate, only its clusters called none
+        assert!(!scan(&[("mitochondrion", 20, 11)]).shallow());
+        // no seeds: nothing to judge
+        assert!(!scan(&[("mitochondrion", 0, 0)]).shallow());
+        // any shallow organelle makes the scan shallow
+        assert!(scan(&[("mitochondrion", 20, 20), ("plastid", 4, 1)]).shallow());
+    }
+
+    fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x % 4) as usize]
+            })
+            .collect()
+    }
+
+    /// Reads of 3 kb every `step` bases along `genome`, as FASTA.
+    fn tiled(genome: &[u8], step: usize, tag: &str) -> String {
+        (0..genome.len() - 3000)
+            .step_by(step)
+            .enumerate()
+            .map(|(i, st)| {
+                format!(">{tag}{i}\n{}\n", std::str::from_utf8(&genome[st..st + 3000]).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_partly_nuclear_seed_read_is_judged_on_its_seed() {
+        // nucleus at 30x, organelle at 300x; a read of 3 kb of each, its seed the organelle half
+        let nuclear = pseudo_random(200_000, 33);
+        let organelle = pseudo_random(20_000, 7);
+        let dir = std::env::temp_dir().join(format!("ovasm-seed-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        std::fs::write(&fa, tiled(&nuclear, 100, "n") + &tiled(&organelle, 10, "m")).unwrap();
+        let gate = DepthGate::long_reads(&[fa]).unwrap();
+        let read: Vec<u8> = [&organelle[8000..11_000], &nuclear[50_000..53_000]].concat();
+        assert!(
+            !gate.profile(&read).is_some_and(|d| d.organelle_like),
+            "the whole read is half nuclear"
+        );
+        assert!(seed_above_gate(&gate, &read, 0, 3000), "its seed is organelle-deep");
+        assert!(!seed_above_gate(&gate, &read, 3000, 6000), "a nuclear span is not");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
