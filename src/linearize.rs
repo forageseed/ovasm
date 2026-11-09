@@ -1235,6 +1235,11 @@ pub struct ComponentReport {
     /// Larger cover sizes, up to one molecule per anchor, were excluded by the configured
     /// molecule-count limit. Even a complete expansion search cannot rule those covers out.
     pub cover_size_limited: bool,
+    /// The selected cover is the read-joined paths (`partial_paths`), taken because the search
+    /// ran out of budget before finding any cover of the sizes it tried. Those paths visit every
+    /// required anchor once through read-backed bridges, so they are a cover of their own size;
+    /// a smaller one may exist unseen, and the component is not decisive.
+    pub read_join_cover: bool,
     pub best: Option<CoverReport>,
     /// For a component without a cover: the paths its read bridges make (see `partial_paths`),
     /// so that its sequence is reported. Not a solution: `best` stays empty, `molecules` 0, and
@@ -1569,6 +1574,7 @@ pub fn run_phased(
             adaptive_retry: false,
             searched_max_molecules: 0,
             cover_size_limited: false,
+            read_join_cover: false,
             best: None,
             partial: None,
             margin_ln: None,
@@ -1653,8 +1659,20 @@ pub fn run_phased(
         if ranked.is_empty() {
             let paths = partial_paths_phased(g.names.len(), &comp, &optional, &br, &frac, &phases);
             let (walks, report) = cover_report(&paths)?;
-            partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
-            rep.partial = Some(report);
+            // A search that ran out of budget has not shown that no cover exists, and the
+            // read-joined paths are one: every required anchor once, joined only by bridges
+            // reads took. With no molecule limit set, they are the cover found. Otherwise a
+            // better-linked graph would come out with less than a more broken one, whose pieces
+            // are covers of single anchors (rice SAMEA115396709's mitochondrion, 34 anchors
+            // holding 252 of its 316 kb: truncated at four molecules, all of it partial, 54 kb
+            // of molecules against 287 kb from a graph in more pieces).
+            if rep.search_truncated && p.max_molecules == 0 {
+                rep.read_join_cover = true;
+                ranked.push((walks, report, paths));
+            } else {
+                partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
+                rep.partial = Some(report);
+            }
         }
         if let Some(model)=&component_model {
             let mut budget=crate::read_model::WORK_BUDGET;
@@ -1795,6 +1813,7 @@ pub fn run_phased(
             adaptive_retry: false,
             searched_max_molecules: 1,
             cover_size_limited: false,
+            read_join_cover: false,
             best: Some(CoverReport {
                 score: 0.0,
                 molecules: vec![lin],
@@ -3117,6 +3136,11 @@ mod tests {
         assert!(report.search_truncated);
         assert!(report.components.iter().all(|c| c.searched_max_molecules == 1));
         assert!(report.components.iter().all(|c| !c.decisive));
+        // no cover was found, but the read-joined paths are one: A B C, closed by C to A
+        let c = &report.components[0];
+        assert!(c.read_join_cover && c.partial.is_none());
+        assert_eq!((report.molecules, report.unsolved_components), (1, 0));
+        assert!(report.best.as_ref().unwrap().circular);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
