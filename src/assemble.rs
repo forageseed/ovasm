@@ -2449,36 +2449,56 @@ fn run_backbone_layout_guard(
     Ok(report)
 }
 
-/// Width of a bin of `sequence_depth`'s histogram: 5% of the count.
+/// Width of a bin of `sequence_depth`'s histogram above `DEPTH_INTEGER_BINS`: 5% of the count.
 const DEPTH_BIN: f64 = 1.05;
+/// Below this count every count is a bin of its own: 5%-wide bins there are narrower than one
+/// count, most of them empty, and an empty bin reads as a valley (rice SAMEA115396709: the error
+/// tail's count 4 taken for the peak, depth 4, min count 1).
+const DEPTH_INTEGER_BINS: u32 = 20;
 
 /// The depth most of the sequence stands at, from the sorted counts of its solid nodes: the
-/// most populous bin (`DEPTH_BIN` wide on a log scale) past the valley after the error tail, as
-/// the median count of its nodes. Each node is one k-mer of sequence, so the bins weigh sequence
-/// length. The count-weighted median it replaces weighs nodes by their count, and follows
-/// high-copy sequence once that holds half the k-mer mass: the rice mitochondrion of SAMEA115396709
-/// from 100 bp reads, whose plastid-derived stretches (a few percent of its length at about 15
-/// times its depth) held more than half, gave depth ~1,182 where the rest of it stood near 44,
-/// min count 118, and 15 kb of a ~490 kb molecule. Falls back to the count-weighted median when
-/// the histogram has no valley.
-fn sequence_depth(counts: &[u32]) -> f64 {
+/// densest bin, per count, past the valley after the error tail, as the median count
+/// of its nodes. Each node is one k-mer of sequence, so the bins weigh sequence length. The
+/// count-weighted median it replaces weighs nodes by their count, and follows high-copy sequence
+/// once that holds half the k-mer mass: the rice mitochondrion of SAMEA115396709 from 100 bp
+/// reads, whose plastid-derived stretches (a few percent of its length at about 15 times its
+/// depth) held more than half, gave depth ~1,182 where the rest of it stood near 44, min count
+/// 118, and 15 kb of a ~490 kb molecule. Falls back to the count-weighted median when the
+/// histogram has no valley.
+pub(crate) fn sequence_depth(counts: &[u32]) -> f64 {
     if counts.is_empty() {
         return 0.0;
     }
-    let bin = |c: u32| (f64::from(c).ln() / DEPTH_BIN.ln()) as usize;
+    let n0 = DEPTH_INTEGER_BINS;
+    let bin = |c: u32| {
+        if c < n0 {
+            c as usize
+        } else {
+            n0 as usize + (f64::from(c) / f64::from(n0)).ln().div_euclid(DEPTH_BIN.ln()) as usize
+        }
+    };
+    let lower = |i: usize| {
+        if i < n0 as usize {
+            i as f64
+        } else {
+            f64::from(n0) * DEPTH_BIN.powi((i - n0 as usize) as i32)
+        }
+    };
     let mut hist = vec![0u64; bin(*counts.last().unwrap()) + 2];
     for &c in counts {
         hist[bin(c)] += 1;
     }
-    // bins hold more counts as they widen: per count, so an error tail falling as 1/c^2 and a
-    // Poisson peak are compared on one scale
-    let width = |i: usize| (DEPTH_BIN.powi(i as i32 + 1) - DEPTH_BIN.powi(i as i32)).max(1.0);
-    let density: Vec<f64> = hist.iter().enumerate().map(|(i, &h)| h as f64 / width(i)).collect();
+    // per count, so integer and 5% bins are on one scale and the peak is the mode of the counts
+    let density: Vec<f64> = hist
+        .iter()
+        .enumerate()
+        .map(|(i, &h)| h as f64 / (lower(i + 1) - lower(i)).max(1.0))
+        .collect();
     let first = bin(counts[0]);
     let valley = (first + 1..density.len() - 1)
         .find(|&i| density[i] <= density[i - 1] && density[i] < density[i + 1]);
     let peak = valley.and_then(|v| {
-        (v..hist.len()).max_by(|&x, &y| hist[x].cmp(&hist[y]).then(y.cmp(&x)))
+        (v..hist.len()).max_by(|&x, &y| density[x].total_cmp(&density[y]).then(y.cmp(&x)))
     });
     match peak {
         Some(i) if hist[i] > 0 => {
@@ -2523,6 +2543,15 @@ mod tests {
         counts.extend(std::iter::repeat(5).take(6_000));
         counts.sort_unstable();
         let d = sequence_depth(&counts);
+        assert!((38.0..=50.0).contains(&d), "{d}");
+        // a contiguous error tail from 3 up, far more nodes than the molecule at its low counts
+        // (rice SAMEA115396709 from 100 bp reads: 760,237 distinct, ~490 kb of molecule)
+        let mut tailed = poisson_like(490_000, 44.0, 4);
+        for c in 3u32..=25 {
+            tailed.extend(std::iter::repeat(c).take((2_000_000 / (c * c)) as usize));
+        }
+        tailed.sort_unstable();
+        let d = sequence_depth(&tailed);
         assert!((38.0..=50.0).contains(&d), "{d}");
         // the count-weighted median follows the high-copy stretch
         let total: u64 = counts.iter().map(|&c| c as u64).sum();

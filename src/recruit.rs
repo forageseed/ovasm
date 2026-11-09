@@ -1196,29 +1196,31 @@ fn keep_at_target_depth(table: Option<&crate::frontier::KmerCounts>, depth: Opti
     }
 }
 
-/// A target's k-mer depth: the median, over its sampled reads, of the median count of each
-/// read's k-mers that are in the target's bait.
+/// A target's k-mer depth: where most of its sequence stands (`assemble::sequence_depth`), over the
+/// distinct bait k-mers its sampled reads hold, each by its count in the table. It was the median
+/// over reads of each read's median, which weighs sequence by its reads: a pan reference holds the
+/// mitochondrion's plastid-derived stretches, the plastid's reads outnumber the mitochondrion's, and
+/// rice SAMEA115396710's mitochondrion stood at 1,707 (its plastid at 1,946, the reconstruction's
+/// own frontier walk at 220): its gate band let 1.9 M plastid reads in among 4.9 M.
 fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, reads: &[&[u8]]) -> Option<f64> {
     let bit = 1u8 << t;
-    let mut per_read: Vec<u32> = reads
+    let mut seen: Vec<u64> = reads
         .par_iter()
-        .filter_map(|s| {
-            let mut v: Vec<u32> = CanonicalKmers::new(s, bait.k)
+        .flat_map_iter(|s| {
+            CanonicalKmers::new(s, bait.k)
                 .filter(|&(_, km)| bait.get(km) & bit != 0)
-                .map(|(_, km)| table.get(km))
-                .collect();
-            if v.is_empty() {
-                return None;
-            }
-            v.sort_unstable();
-            Some(v[v.len() / 2])
+                .map(|(_, km)| km)
+                .collect::<Vec<_>>()
         })
         .collect();
-    if per_read.is_empty() {
+    seen.sort_unstable();
+    seen.dedup();
+    let mut counts: Vec<u32> = seen.iter().map(|&km| table.get(km)).filter(|&c| c >= 3).collect();
+    if counts.is_empty() {
         return None;
     }
-    per_read.sort_unstable();
-    Some(f64::from(per_read[per_read.len() / 2]))
+    counts.sort_unstable();
+    Some(crate::assemble::sequence_depth(&counts)).filter(|&d| d > 0.0)
 }
 
 /// The read depth of a target whose k-mers of length `k` stand at `kmer_depth` in the k-mer gate's
