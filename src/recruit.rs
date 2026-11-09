@@ -376,8 +376,9 @@ impl<const N: usize> Sample<N> {
     }
 }
 
-/// Sketch depth of the sampled reads (`target_depth`) and how many had one.
-fn sample_depth(gate: &DepthGate, sample: &Sample) -> (Option<f64>, usize) {
+/// Sketch depth of the sampled reads (`target_depth`) and how many had one; `bases` are those of
+/// all the reads the sample was drawn from.
+fn sample_depth(gate: &DepthGate, sample: &Sample, bases: u64) -> (Option<f64>, usize) {
     let mut reads: Vec<(f64, usize)> = sample
         .reads()
         .into_par_iter()
@@ -387,7 +388,9 @@ fn sample_depth(gate: &DepthGate, sample: &Sample) -> (Option<f64>, usize) {
         return (None, 0);
     }
     let n = reads.len();
-    (Some(target_depth(&mut reads, gate.organelle_min_depth)), n)
+    let sampled: usize = reads.iter().map(|r| r.1).sum();
+    let scale = (bases as f64 / sampled.max(1) as f64).max(1.0);
+    (Some(target_depth(&mut reads, gate.organelle_min_depth, scale)), n)
 }
 
 /// Reads this many times deeper than a target's own are a high-copy repeat, not the target: its
@@ -471,8 +474,10 @@ fn extension_fraction(reads: u64, bases: u64, genome: f64, extend_depth: f64) ->
 /// from them again under the same rules, until no more qualify.
 const FRONTIER_STEPS: usize = 10;
 
-/// A target's depth from its reads' (sketch depth, length): their median, unless that is more
-/// than `HIGH_COPY_FOLD` times the depth most of the target's sequence has, which is then taken.
+/// A target's depth from its reads' (sketch depth, length), a uniform sample of reads holding
+/// `1 / scale` of their bases: their median, unless that is more than `HIGH_COPY_FOLD` times the
+/// depth most of the target's sequence has and the reads that deep are a repeat, which is then
+/// taken.
 /// A read stands for its length over its depth, so the reads of a high-copy repeat stand for
 /// almost none: the first pass of the Lophophora williamsii plastid recruited 2,899 reads, most of
 /// them a repeat at ~700,000x beside the plastid's own at ~440x; their median gave a 24 bp
@@ -481,7 +486,16 @@ const FRONTIER_STEPS: usize = 10;
 /// `organelle_min`), not of all: shallow reads stand for much sequence each. A mitochondrion with
 /// plastid-deep reads among its own keeps its median (Medicago polymorpha: 3,212x, its sequence at
 /// 1,045x), as does a plastid with its inverted repeat.
-fn target_depth(reads: &mut [(f64, usize)], organelle_min: f64) -> f64 {
+/// Reads that deep are a repeat when they stand for less sequence than one of them: N reads at
+/// depth d hold the sequence N x length / d, and a genome is longer than its reads. The span-
+/// weighted median weighs a read by the sequence it stands for, so a few shallow reads of other
+/// sequence outweigh the target's own when it is far deeper: the first pass of the Linaria
+/// vulgaris plastid recruited 50,679 reads from a 44-plastid seed library, 47,818 of them along the
+/// plastid at thousands x and ~2,800 others at ~169x, which stood for more sequence; its depth was
+/// taken as 169x, its reads stood for 3.9 Mb and the size cap stopped it after one pass, missing
+/// the part of its large single-copy region the seeds did not reach (Oatk's plastid covered 0.87).
+/// Those deep reads stood for over 100 kb, the plastid, not a repeat.
+fn target_depth(reads: &mut [(f64, usize)], organelle_min: f64, scale: f64) -> f64 {
     reads.sort_by(|a, b| a.0.total_cmp(&b.0));
     let median = reads[reads.len() / 2].0;
     let deep: Vec<(f64, f64)> = reads
@@ -494,12 +508,29 @@ fn target_depth(reads: &mut [(f64, usize)], organelle_min: f64) -> f64 {
     for &(d, span) in &deep {
         acc += span;
         if 2.0 * acc >= total {
-            return if median > HIGH_COPY_FOLD * d { d } else { median };
+            return if median > HIGH_COPY_FOLD * d && is_repeat(reads, HIGH_COPY_FOLD * d, scale) {
+                d
+            } else {
+                median
+            };
         }
     }
     median
 }
 
+
+/// Whether the sampled reads deeper than `deep` (sorted by depth), scaled by `scale` to all the
+/// reads, stand for less sequence than their median length: a repeat, not a genome.
+fn is_repeat(reads: &[(f64, usize)], deep: f64, scale: f64) -> bool {
+    let high: Vec<&(f64, usize)> = reads.iter().filter(|r| r.0 > deep).collect();
+    if high.is_empty() {
+        return false;
+    }
+    let span: f64 = scale * high.iter().map(|r| r.1 as f64 / r.0).sum::<f64>();
+    let mut lens: Vec<usize> = high.iter().map(|r| r.1).collect();
+    lens.sort_unstable();
+    span < lens[lens.len() / 2] as f64
+}
 
 /// Which of a target's recruited reads a pass writes to its pass file.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1658,8 +1689,8 @@ fn pass_depths(gate: Option<&DepthGate>, res: &ScanResult) -> PassDepths {
     };
     if let Some(g) = gate {
         for t in 0..n {
-            (d.read[t], d.measured[t]) = sample_depth(g, &res.all_sample[t]);
-            d.fresh[t] = sample_depth(g, &res.fresh_sample[t]).0;
+            (d.read[t], d.measured[t]) = sample_depth(g, &res.all_sample[t], res.recruited[t].bases);
+            d.fresh[t] = sample_depth(g, &res.fresh_sample[t], res.fresh[t].bases).0;
             d.implied_size[t] = d.read[t]
                 .filter(|&x| x > 0.0)
                 .map(|x| (res.recruited[t].bases as f64 / x) as u64);
@@ -4490,7 +4521,7 @@ mod tests {
             .collect();
         reads.extend((0..900).map(|i| (400.0 + (i % 80) as f64, 10_000)));
         reads.extend((0..100).map(|_| (22.0, 10_000)));
-        let d = target_depth(&mut reads, 66.0);
+        let d = target_depth(&mut reads, 66.0, 1.0);
         assert!((400.0..480.0).contains(&d), "{d}");
         // a mitochondrion with plastid-deep reads among its own keeps its median, as Medicago
         // polymorpha's did (3,212x, its sequence at 1,045x)
@@ -4502,12 +4533,26 @@ mod tests {
         sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let median = sorted[sorted.len() / 2].0;
         assert!(median > 4.0 * 1100.0, "{median}");
-        assert_eq!(target_depth(&mut mito, 165.0), median);
+        assert_eq!(target_depth(&mut mito, 165.0, 1.0), median);
         // no organelle-deep read: the median
         assert_eq!(
-            target_depth(&mut [(20.0, 5000), (22.0, 5000), (25.0, 5000)], 66.0),
+            target_depth(&mut [(20.0, 5000), (22.0, 5000), (25.0, 5000)], 66.0, 1.0),
             22.0
         );
+        // a plastid far deeper than the few shallow reads of other sequence among its own keeps
+        // its median: the Linaria vulgaris plastid's first pass (a 2,000-read sample of 666 Mb),
+        // 95% of its reads along the plastid at thousands x, the rest at ~169x
+        let mut plastid: Vec<(f64, usize)> = (0..1900)
+            .map(|i| (3_000.0 + 10.0 * i as f64, 13_000))
+            .collect();
+        plastid.extend((0..100).map(|i| (160.0 + (i % 20) as f64, 13_000)));
+        let mut sorted = plastid.clone();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let median = sorted[sorted.len() / 2].0;
+        let scale = 666e6 / (2000.0 * 13_000.0);
+        assert_eq!(target_depth(&mut plastid, 90.0, scale), median);
+        // the same reads standing for less than a read: a repeat, its depth left out
+        assert!(target_depth(&mut plastid, 90.0, 1e-3) < 200.0);
     }
 
 
