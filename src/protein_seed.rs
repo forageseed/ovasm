@@ -26,7 +26,9 @@
 //! 6. Seeds: the counting classes' reads, cropped to the span of their class's stretches plus
 //!    `flank` bases on each side.
 //!
-//! The same reads reversed (not complemented) are scanned and called as a control. An organelle
+//! The same reads reversed (not complemented) are scanned as a control of chance hits: a gene
+//! counts with its stretches in excess of the control's (`excess_over_control`), and a class that
+//! counts in the control seeds nothing there (`class_seeds`). An organelle
 //! without a called cluster gets no protein seeds; `run` then seeds it from the library.
 
 use std::io::Write;
@@ -90,6 +92,8 @@ pub struct ClusterCall {
     /// The sequence those reads stand for: their bases over the depth (`MIN_CLUSTER_SPAN`).
     pub span_bp: u64,
     pub scanned: u64,
+    /// Each class's genes by their stretches in excess of the reversed control's
+    /// (`excess_over_control`); the densities and the call are of these.
     pub mitochondrion: ClassReport,
     pub plastid: ClassReport,
     pub mitochondrion_density: f64,
@@ -102,6 +106,8 @@ pub struct ClusterCall {
     /// low-complexity sequence fakes genes.
     pub reversed_control_call: &'static str,
     pub reversed_control_genes: (usize, usize),
+    /// The reversed control's stretches per gene (both classes, most first).
+    pub reversed_control_segments: Vec<(String, u64)>,
     /// Seed reads this cluster gave.
     pub seed_reads: usize,
 }
@@ -305,6 +311,47 @@ fn crop(
 /// mitochondrial genomes are about 6 kb.
 pub const MIN_CLUSTER_SPAN: f64 = 4000.0;
 
+/// Each gene's stretches in excess of the reversed control's: the forward count less the control's
+/// where the forward count is at least twice the control's, else none. The reversed reads (not
+/// complemented) keep the cluster's composition and low-complexity runs but not real codon order,
+/// so their stretches per gene are what chance alone assigns that gene in this cluster; a gene is
+/// present only where the reads hold it beyond that level. Chance hits gather on the short,
+/// divergent, hydrophobic animal genes the metazoa panel holds most proteins of (atp8 197, nad6
+/// 102, nad4l 95, nad2 52, nad3 32 of 551), whose larger k-mer space low-complexity peptides hit
+/// more often. Acipenser ruthenus (PMAT2 benchmark, first 1.9 Gb), the 332x cluster with
+/// forward/control nad6 52/97, nad4l 17/4, nad2 6/0, atp8 3/3, nad4 3/12: 5 genes forwards, 2 in
+/// excess (none of its recruited reads mitochondrial); Coccinella septempunctata 256x: 13 genes,
+/// all in excess (12 at 165-402 against at most 2, atp8 15/3); Bugula neritina 91x: 12 genes, 11
+/// in excess (nad6 54/39 is not).
+fn excess_over_control(forward: &[u64], control: &[u64]) -> Vec<u64> {
+    forward
+        .iter()
+        .zip(control)
+        .map(|(&f, &c)| if f >= 2 * c { f - c } else { 0 })
+        .collect()
+}
+
+/// Whether a class seeds from a depth cluster: its (genes, stretches per read) count
+/// (`PanelParams::min_genes`, `min_density`), the cluster stands for at least `MIN_CLUSTER_SPAN`,
+/// and the same reads reversed (not complemented) do not count for the class too. Reversal keeps a
+/// read's composition and its low-complexity runs but destroys the order of real codons, so a
+/// protein-coding organelle gives genes only forwards; a class that counts both ways is chance
+/// hits of hydrophobic, low-complexity peptides on repeats, which match the short, divergent
+/// animal genes the panel holds most of (atp8, nad6, nad4l). PMAT2 benchmark, 8bb78d1: the three
+/// seeded clusters whose control counted were Acipenser ruthenus 140x and 70x (7 and 6 genes, mostly
+/// nad6/nad4l/atp8; controls 5 and 9 genes; 646 recruited reads, none mitochondrial, the
+/// mitochondrion about 5x) and Canis lupus 49x (its mitochondrion the 332x cluster); the controls
+/// of all 76 other seeded clusters (69 samples) counted no class.
+fn class_seeds(
+    forward: (&ClassReport, f64),
+    reversed: (&ClassReport, f64),
+    span: f64,
+    p: &PanelParams,
+) -> bool {
+    let counts = |(r, d): (&ClassReport, f64)| r.genes >= p.min_genes && d >= p.min_density;
+    counts(forward) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
+}
+
 /// Protein seeds for the organelles in `want` (the others are not looked for in the whole-read
 /// scan; depth clusters may still seed them).
 pub fn run(
@@ -440,16 +487,16 @@ pub fn run(
             }
         }
         let (mitochondrion, plastid, md, pd, call) =
-            panel::call_segments(panel, segs, n, &p.panel);
-        let (cm, cp, _, _, ccall) = panel::call_segments(panel, ctrl, n, &p.panel);
-        // a class that counts here (enough genes, enough stretches per read) seeds from its reads,
-        // also where both count (a cluster holding parts of both genomes at one depth)
-        let counts = |r: &ClassReport, d: f64| r.genes >= p.panel.min_genes && d >= p.panel.min_density;
+            panel::call_segments(panel, excess_over_control(&segs, &ctrl), n, &p.panel);
+        let (cm, cp, cmd, cpd, ccall) = panel::call_segments(panel, ctrl, n, &p.panel);
+        // a class that counts here (enough genes, enough stretches per read) and not in the
+        // reversed control seeds from its reads, also where both count (a cluster holding parts of
+        // both genomes at one depth)
         let span = cluster_bases[c] as f64 / 2f64.powf(peak);
-        let seeded: Vec<&'static str> = [(&mitochondrion, md), (&plastid, pd)]
+        let seeded: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd)), ((&plastid, pd), (&cp, cpd))]
             .iter()
             .zip(ORGANELLES)
-            .filter(|((r, d), _)| counts(*r, *d) && span >= MIN_CLUSTER_SPAN)
+            .filter(|((fwd, rev), _)| class_seeds(*fwd, *rev, span, &p.panel))
             .map(|(_, o)| o)
             .collect();
         let mut given = 0;
@@ -496,6 +543,7 @@ pub fn run(
             seeded,
             reversed_control_call: ccall,
             reversed_control_genes: (cm.genes, cp.genes),
+            reversed_control_segments: cm.gene_segments.iter().chain(&cp.gene_segments).cloned().collect(),
             seed_reads: given,
         });
     }
@@ -719,6 +767,42 @@ mod tests {
             Some((0, 1000))
         );
         assert_eq!(crop(1000, &[(pltd, 1, 2)], "mitochondrion", &panel, 10), None);
+    }
+
+    fn class(genes: usize, segments: u64) -> ClassReport {
+        ClassReport {
+            genes,
+            segments,
+            gene_segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_gene_counts_only_beyond_its_reversed_control() {
+        // Acipenser ruthenus 332x: nad6, nad4l, nad2, atp8, nad4 forward against reversed
+        let fwd = [52, 17, 6, 3, 3];
+        let rev = [97, 4, 0, 3, 12];
+        assert_eq!(excess_over_control(&fwd, &rev), vec![0, 13, 6, 0, 0]);
+        // a mitochondrial gene with a chance background still counts its excess
+        assert_eq!(excess_over_control(&[83, 54, 2], &[40, 39, 0]), vec![43, 0, 2]);
+        // exactly twice the control: the excess equals the background
+        assert_eq!(excess_over_control(&[10], &[5]), vec![5]);
+    }
+
+    #[test]
+    fn a_class_that_counts_reversed_too_seeds_nothing() {
+        let p = PanelParams::default();
+        let none = class(0, 0);
+        // a mitochondrial cluster: many genes forwards, a few chance ones reversed (Canis lupus 332x)
+        assert!(class_seeds((&class(12, 4226), 4.17), (&class(3, 12), 0.01), 18_910.0, &p));
+        // Acipenser ruthenus 70x: 7 genes at 0.47 forwards, 9 reversed at the same density
+        assert!(!class_seeds((&class(7, 136), 0.47), (&class(9, 140), 0.49), 52_337.0, &p));
+        // reversed genes without the density do not count, and do not stop it
+        assert!(class_seeds((&class(7, 136), 0.47), (&class(9, 20), 0.07), 52_337.0, &p));
+        // the forward class must count, and the cluster stand for enough sequence
+        assert!(!class_seeds((&class(4, 400), 2.0), (&none, 0.0), 52_337.0, &p));
+        assert!(!class_seeds((&class(12, 400), 0.2), (&none, 0.0), 52_337.0, &p));
+        assert!(!class_seeds((&class(5, 762), 2.14), (&none, 0.0), 23.0, &p));
     }
 
     fn scan(seeds: &[(&'static str, usize, usize)]) -> WholeReadScan {
