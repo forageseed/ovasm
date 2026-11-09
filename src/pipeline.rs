@@ -409,9 +409,15 @@ pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
 fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> Result<Ladder> {
     let floor = floor.unwrap_or(0);
     let qualifies = |o: &Outcome| o.accepted() && o.total_length >= floor;
+    // Fewer pieces is the better genome only among attempts whose molecules hold as much of it:
+    // an attempt that explains none of its graph has no piece at all. Rice SAMEA115396709's
+    // mitochondrion in a pan reconstruction: k 77 gave 9 molecules of 54,837 bp, k 55 one of
+    // 1,717 bp (no piece), neither accepted, and k 55 was kept for its fewer pieces, though both
+    // graphs held 99% of the mitochondrion.
+    let held = |o: &Outcome| if o.accepted() { floor } else { o.molecule_bases.min(floor) };
     let better = |o: &Outcome, b: &Outcome| {
-        (qualifies(o), o.accepted(), o.total_length.min(floor), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
-            > (qualifies(b), b.accepted(), b.total_length.min(floor), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
+        (qualifies(o), o.accepted(), o.total_length.min(floor), held(o), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
+            > (qualifies(b), b.accepted(), b.total_length.min(floor), held(b), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
     };
     let mut tried: Vec<Outcome> = Vec::new();
     let mut best = 0usize;
@@ -2525,6 +2531,12 @@ mod tests {
         assert_eq!(b.calls, [127, 99, 77, 55]); assert!(!r.accepted);
         let mut c = Sized { outcomes: candidates, calls: vec![] };
         let r = sr_ladder(&mut c).unwrap(); assert_eq!(c.calls, [127]); assert!(r.accepted);
+        // neither accepted: the one whose molecules hold more, not the one with fewer pieces
+        let rice = vec![o(127, 8_000, 0, 0), o(99, 400_000, 4, 20_000), o(77, 495_635, 9, 54_837), Outcome { pieces: 0, ..o(55, 729_616, 1, 1_717) }];
+        let mut d = Sized { outcomes: rice, calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut d, Some(179_464)).unwrap();
+        assert!(!r.accepted);
+        assert_eq!(r.result().k, 77);
     }
 
     #[test]
