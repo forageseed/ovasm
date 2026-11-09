@@ -69,6 +69,51 @@ pub fn genetic_code(table: u8) -> Result<[u8; 64]> {
 const STOP: u8 = 20;
 const RESIDUES: &[u8; 20] = b"ACDEFGHIKLMNPQRSTVWY";
 
+/// BLOSUM62 in `RESIDUES` order, for the score of a gene stretch against its panel proteins.
+#[rustfmt::skip]
+const BLOSUM62: [[i8; 20]; 20] = [
+    [ 4,  0, -2, -1, -2,  0, -2, -1, -1, -1, -1, -2, -1, -1, -1,  1,  0,  0, -3, -2], // A
+    [ 0,  9, -3, -4, -2, -3, -3, -1, -3, -1, -1, -3, -3, -3, -3, -1, -1, -1, -2, -2], // C
+    [-2, -3,  6,  2, -3, -1, -1, -3, -1, -4, -3,  1, -1,  0, -2,  0, -1, -3, -4, -3], // D
+    [-1, -4,  2,  5, -3, -2,  0, -3,  1, -3, -2,  0, -1,  2,  0,  0, -1, -2, -3, -2], // E
+    [-2, -2, -3, -3,  6, -3, -1,  0, -3,  0,  0, -3, -4, -3, -3, -2, -2, -1,  1,  3], // F
+    [ 0, -3, -1, -2, -3,  6, -2, -4, -2, -4, -3,  0, -2, -2, -2,  0, -2, -3, -2, -3], // G
+    [-2, -3, -1,  0, -1, -2,  8, -3, -1, -3, -2,  1, -2,  0,  0, -1, -2, -3, -2,  2], // H
+    [-1, -1, -3, -3,  0, -4, -3,  4, -3,  2,  1, -3, -3, -3, -3, -2, -1,  3, -3, -1], // I
+    [-1, -3, -1,  1, -3, -2, -1, -3,  5, -2, -1,  0, -1,  1,  2,  0, -1, -2, -3, -2], // K
+    [-1, -1, -4, -3,  0, -4, -3,  2, -2,  4,  2, -3, -3, -2, -2, -2, -1,  1, -2, -1], // L
+    [-1, -1, -3, -2,  0, -3, -2,  1, -1,  2,  5, -2, -2,  0, -1, -1, -1,  1, -1, -1], // M
+    [-2, -3,  1,  0, -3,  0,  1, -3,  0, -3, -2,  6, -2,  0,  0,  1,  0, -3, -4, -2], // N
+    [-1, -3, -1, -1, -4, -2, -2, -3, -1, -3, -2, -2,  7, -1, -2, -1, -1, -2, -4, -3], // P
+    [-1, -3,  0,  2, -3, -2,  0, -3,  1, -2,  0,  0, -1,  5,  1,  0, -1, -2, -2, -1], // Q
+    [-1, -3, -2,  0, -3, -2,  0, -3,  2, -2, -1,  0, -2,  1,  5, -1, -1, -3, -3, -2], // R
+    [ 1, -1,  0,  0, -2,  0, -1, -2,  0, -2, -1,  1, -1,  0, -1,  4,  1, -2, -3, -2], // S
+    [ 0, -1, -1, -1, -2, -2, -2, -1, -1, -1, -1,  0, -1, -1, -1,  1,  5,  0, -2, -2], // T
+    [ 0, -1, -3, -2, -1, -3, -3,  3, -2,  1,  1, -3, -2, -2, -3, -2,  0,  4, -3, -1], // V
+    [-3, -2, -4, -3,  1, -2, -2, -3, -3, -2, -1, -4, -4, -2, -3, -3, -2, -3, 11,  2], // W
+    [-2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7], // Y
+];
+
+/// Karlin-Altschul parameters of ungapped BLOSUM62 alignments (BLAST's lambda and K for the
+/// matrix with standard residue frequencies): bits = (LAMBDA * score - ln K) / ln 2.
+const UNGAPPED_LAMBDA: f64 = 0.3176;
+const UNGAPPED_K: f64 = 0.134;
+/// X-drop of the ungapped extension, in raw BLOSUM62 score (about 7 bits, as BLAST's).
+const XDROP: i32 = 16;
+/// Chance alignments a gene stretch may expect at the score it reached against the whole panel
+/// (`Panel::max_evalue`), animal and fungal panels. Shared amino-acid 6-mers alone do not say a
+/// stretch is homologous: the hydrophobic, low-complexity peptides that AT-rich nuclear and
+/// bacterial sequence translates to share many 6-mers with the short membrane proteins (atp8,
+/// nad4l, nad6, nad3) by chance. PMAT2 benchmark, read sets without the mitochondrion: none of the
+/// 31 whole-read seeds of Calliactis parasitica and 3 of the 46 of Myriapora truncata had any
+/// homology to the panel (DIAMOND blastx, e 1e-5); they became a 28 kb and a 9.7 kb
+/// "mitochondrion". The best ungapped BLOSUM62 alignment of a real gene (mitochondria of two
+/// sponges, a sea anemone and two bryozoans, codes 4 and 5) scores 61-592 bits for every gene but
+/// atp8, the same sequences reversed (not complemented) at most 35 bits; at 1e-6 a stretch of 300
+/// residues needs about 45 bits, after what its composition alone scores is taken off
+/// (`significant_bits`).
+pub const LINEAGE_MAX_EVALUE: f64 = 1e-6;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PanelParams {
     /// Amino-acid k-mer length (at most 12).
@@ -120,6 +165,17 @@ pub struct Panel {
     proteins: usize,
     /// Codon table reads are translated with (`genetic_code`).
     code: [u8; 64],
+    /// Each protein's gene and residue codes, and amino-acid k-mer -> (protein, position): the
+    /// seeds of a stretch's alignment to its gene (`stretch_bits`).
+    protein_gene: Vec<u16>,
+    protein_seqs: Vec<Vec<u8>>,
+    occurrences: FxHashMap<u64, Vec<(u32, u32)>>,
+    /// Residues in the panel: the database size of a stretch's E-value.
+    residues: u64,
+    /// A stretch keeps its gene only when its best ungapped alignment to that gene's proteins has
+    /// an E-value against the whole panel of at most this (`LINEAGE_MAX_EVALUE`); None: shared
+    /// k-mers alone decide, as for the land-plant panel.
+    max_evalue: Option<f64>,
 }
 
 #[inline]
@@ -172,6 +228,9 @@ impl Panel {
         let mut gene_ids: FxHashMap<(u8, String), u16> = FxHashMap::default();
         let mut index: FxHashMap<u64, Vec<u16>> = FxHashMap::default();
         let mut proteins = 0;
+        let mut protein_gene: Vec<u16> = Vec::new();
+        let mut protein_seqs: Vec<Vec<u8>> = Vec::new();
+        let mut occurrences: FxHashMap<u64, Vec<(u32, u32)>> = FxHashMap::default();
         let mut add = |header: &str, seq: &[u8]| -> Result<()> {
             let mut f = header.split('|');
             let (class, gene, species) = match (f.next(), f.next(), f.next()) {
@@ -200,6 +259,7 @@ impl Panel {
             let codes: Vec<u8> = seq.iter().filter_map(|&b| residue_code(b)).collect();
             let mask = (1u64 << (5 * k)) - 1;
             let mut code = 0u64;
+            let pid = protein_seqs.len() as u32;
             for (i, &a) in codes.iter().enumerate() {
                 code = ((code << 5) | a as u64) & mask;
                 if i + 1 >= k {
@@ -207,8 +267,14 @@ impl Panel {
                     if !v.contains(&id) {
                         v.push(id);
                     }
+                    occurrences
+                        .entry(code)
+                        .or_default()
+                        .push((pid, (i + 1 - k) as u32));
                 }
             }
+            protein_gene.push(id);
+            protein_seqs.push(codes);
             Ok(())
         };
         let (mut header, mut seq): (Option<String>, Vec<u8>) = (None, Vec::new());
@@ -229,12 +295,18 @@ impl Panel {
         if genes.is_empty() {
             bail!("the protein panel is empty");
         }
+        let residues = protein_seqs.iter().map(|s| s.len() as u64).sum();
         Ok(Self {
             genes,
             index,
             k,
             proteins,
             code: *CODE,
+            protein_gene,
+            protein_seqs,
+            occurrences,
+            residues,
+            max_evalue: None,
         })
     }
 
@@ -252,7 +324,30 @@ impl Panel {
             "fungi" => (FUNGI_PANEL, 4),
             other => bail!("no built-in protein panel for lineage {other:?}"),
         };
-        Self::parse(text, k, exclude)?.with_code(table)
+        Ok(Self::parse(text, k, exclude)?
+            .with_code(table)?
+            .with_max_evalue(Self::lineage_max_evalue(lineage)))
+    }
+
+    /// `Panel::max_evalue` of a lineage's panel: `LINEAGE_MAX_EVALUE` for the animal and fungal
+    /// panels; None (shared k-mers decide) for the land-plant one, whose `min_hits` was set on
+    /// random sequence and checked on five mosses (2026-11-05).
+    pub fn lineage_max_evalue(lineage: &str) -> Option<f64> {
+        match lineage {
+            "metazoa" | "fungi" => Some(LINEAGE_MAX_EVALUE),
+            _ => None,
+        }
+    }
+
+    /// The same panel, a stretch keeping its gene only at an alignment E-value of at most `e`.
+    pub fn with_max_evalue(mut self, e: Option<f64>) -> Self {
+        self.max_evalue = e;
+        self
+    }
+
+    /// `Panel::max_evalue` (for reports).
+    pub fn max_evalue(&self) -> Option<f64> {
+        self.max_evalue
     }
 
     /// `PanelParams::min_hits` for a lineage's built-in panel: the lowest threshold at which
@@ -343,7 +438,105 @@ fn best_gene(aa: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32]) -> Opt
         }
         hits[g as usize] = 0;
     }
-    best.filter(|&(_, h)| h >= p.min_hits).map(|(g, _)| g)
+    let (g, h) = best?;
+    if h < p.min_hits {
+        return None;
+    }
+    match panel.max_evalue {
+        None => Some(g),
+        Some(e) => (significant_bits(aa, g, panel) >= bits_needed(aa.len(), panel.residues, e))
+            .then_some(g),
+    }
+}
+
+/// Bits a stretch of `m` residues needs against a panel of `n` residues for an E-value of at most
+/// `e`: E = m n 2^-bits.
+fn bits_needed(m: usize, n: u64, e: f64) -> f64 {
+    ((m as f64) * (n as f64) / e).log2()
+}
+
+/// The stretch's best alignment to gene `g` in bits, less what its amino-acid composition alone
+/// scores: the same alignment against the gene's proteins reversed (residues and composition
+/// kept, homology gone; for an ungapped alignment the same as the stretch reversed against the
+/// proteins) scores about log2(m n) bits between unbiased sequences, and whatever it scores beyond
+/// that is the composition's (hydrophobic, low-complexity peptides score as high against the
+/// reversed membrane proteins as against the real ones: 53-77 bits both ways on the PMAT2
+/// benchmark's false whole-read seeds; real genes 73-592 bits forward, at most 38 reversed).
+fn significant_bits(aa: &[u8], g: u16, panel: &Panel) -> f64 {
+    let forward = stretch_bits(aa, g, panel);
+    let reversed: Vec<u8> = aa.iter().rev().copied().collect();
+    let chance = ((aa.len() as f64) * (panel.residues as f64)).log2();
+    forward - (stretch_bits(&reversed, g, panel) - chance).max(0.0)
+}
+
+/// Score of the best ungapped alignment of `aa` to a protein of gene `g`, in bits: every distinct
+/// diagonal of a shared k-mer (stretch position minus protein position) is extended both ways
+/// from that k-mer under BLOSUM62 with an X-drop (`XDROP`), as in BLAST's ungapped extension.
+fn stretch_bits(aa: &[u8], g: u16, panel: &Panel) -> f64 {
+    let k = panel.k;
+    if aa.len() < k {
+        return 0.0;
+    }
+    let mask = (1u64 << (5 * k)) - 1;
+    let mut code = 0u64;
+    let mut done: Vec<(u32, i64)> = Vec::new();
+    let mut best = 0i32;
+    for (i, &a) in aa.iter().enumerate() {
+        code = ((code << 5) | a as u64) & mask;
+        if i + 1 < k {
+            continue;
+        }
+        let Some(occ) = panel.occurrences.get(&code) else {
+            continue;
+        };
+        let qi = i + 1 - k;
+        for &(pid, pj) in occ {
+            if panel.protein_gene[pid as usize] != g {
+                continue;
+            }
+            let d = qi as i64 - pj as i64;
+            if done.contains(&(pid, d)) {
+                continue;
+            }
+            done.push((pid, d));
+            let s = ungapped_score(aa, &panel.protein_seqs[pid as usize], qi, pj as usize);
+            best = best.max(s);
+        }
+    }
+    if best <= 0 {
+        return 0.0;
+    }
+    (UNGAPPED_LAMBDA * best as f64 - UNGAPPED_K.ln()) / std::f64::consts::LN_2
+}
+
+/// Best ungapped BLOSUM62 score of `q` against `s` through residue `qi` of `q` aligned to residue
+/// `sj` of `s`: extended right from there and left from just before it, each side stopping once it
+/// falls `XDROP` below its best.
+fn ungapped_score(q: &[u8], s: &[u8], qi: usize, sj: usize) -> i32 {
+    let score = |a: u8, b: u8| BLOSUM62[a as usize][b as usize] as i32;
+    let (mut run, mut right) = (0i32, 0i32);
+    let (mut i, mut j) = (qi, sj);
+    while i < q.len() && j < s.len() {
+        run += score(q[i], s[j]);
+        right = right.max(run);
+        if right - run > XDROP {
+            break;
+        }
+        i += 1;
+        j += 1;
+    }
+    let (mut run, mut left) = (0i32, 0i32);
+    let (mut i, mut j) = (qi, sj);
+    while i > 0 && j > 0 {
+        i -= 1;
+        j -= 1;
+        run += score(q[i], s[j]);
+        left = left.max(run);
+        if left - run > XDROP {
+            break;
+        }
+    }
+    right + left
 }
 
 /// Every stop-free stretch of at least `min_orf` residues in the six frames of `seq`, with the
@@ -494,6 +687,8 @@ pub struct PanelReport {
     pub params: PanelParams,
     pub panel_proteins: usize,
     pub panel_genes: usize,
+    /// The alignment E-value a gene stretch needs (`Panel::max_evalue`); null: k-mers alone.
+    pub panel_max_evalue: Option<f64>,
     pub excluded_species: Vec<String>,
     pub sets: Vec<SetReport>,
     pub elapsed_seconds: f64,
@@ -592,21 +787,25 @@ pub fn panel_set(path: &Path, panel: &Panel, p: &PanelParams) -> Result<SetRepor
     })
 }
 
+/// `ovasm find classify`: each set called with `panel` when given (a lineage's panel), else with
+/// `panel_file` or the embedded panel.
 pub fn run(
     sets: &[PathBuf],
     panel_file: Option<&Path>,
+    panel: Option<Panel>,
     p: &PanelParams,
     exclude: &[String],
     out_json: &Path,
 ) -> Result<PanelReport> {
     let t0 = Instant::now();
-    let panel = match panel_file {
-        Some(f) => Panel::parse(
+    let panel = match (panel, panel_file) {
+        (Some(panel), _) => panel,
+        (None, Some(f)) => Panel::parse(
             &fs::read_to_string(f).with_context(|| format!("cannot read {}", f.display()))?,
             p.k,
             exclude,
         )?,
-        None => Panel::embedded(p.k, exclude)?,
+        (None, None) => Panel::embedded(p.k, exclude)?,
     };
     let mut reports = Vec::new();
     for s in sets {
@@ -618,6 +817,7 @@ pub fn run(
         params: p.clone(),
         panel_proteins: panel.proteins,
         panel_genes: panel.genes.len(),
+        panel_max_evalue: panel.max_evalue,
         excluded_species: exclude.to_vec(),
         sets: reports,
         elapsed_seconds: t0.elapsed().as_secs_f64(),
@@ -827,6 +1027,88 @@ mod tests {
         assert!(gene_stretches(&dna, &standard, &p, &mut hits)
             .iter()
             .all(|&(_, a, b)| b - a < 600));
+    }
+
+    /// A panel of one mitochondrial gene whose protein is a random protein with a hydrophobic,
+    /// low-complexity stretch (a transmembrane-like run) in its middle.
+    fn membrane_panel() -> (String, Vec<u8>) {
+        let tm: &[u8] = b"LILLFLLIVLFLILLFILLVLFLILLFLIVLLFILLFLIL";
+        let mut prot = protein(120, 41);
+        prot.extend_from_slice(tm);
+        prot.extend(protein(120, 42));
+        let text = format!(">mito|nad6|Sp_one\n{}\n", String::from_utf8_lossy(&prot));
+        (text, prot)
+    }
+
+    fn codes(prot: &[u8]) -> Vec<u8> {
+        prot.iter().map(|&b| residue_code(b).unwrap()).collect()
+    }
+
+    #[test]
+    fn ungapped_extension_stops_at_the_x_drop() {
+        let a = codes(b"WWWWWAAAAAPPPPPPPPPPPPPPPPWWWWWWWWWW");
+        let b = codes(b"WWWWWAAAAAGGGGGGGGGGGGGGGGWWWWWWWWWW");
+        // W-W scores 11, A-A 4, P-G -2: the run from the start reaches 5 * 11 + 5 * 4 = 75 and
+        // falls more than XDROP below it inside the P/G block, so the Ws after it are not reached
+        assert_eq!(ungapped_score(&a, &b, 0, 0), 75);
+        // seeded inside the last W block: it extends right to the end and left into the P/G block
+        // only until the X-drop
+        assert_eq!(ungapped_score(&a, &b, 26, 26), 10 * 11);
+        assert!((bits_needed(300, 100_000, 1e-6) - (3e7f64 / 1e-6).log2()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_diverged_homolog_keeps_its_gene_and_a_composition_match_does_not() {
+        let (text, prot) = membrane_panel();
+        let p = PanelParams::default();
+        let kmers_only = Panel::parse(&text, 6, &[]).unwrap();
+        let checked = Panel::parse(&text, 6, &[])
+            .unwrap()
+            .with_max_evalue(Some(LINEAGE_MAX_EVALUE));
+        let mut hits = vec![0u32; 1];
+        // the same gene in a distant species: every third residue changed, the conserved parts
+        // still sharing 6-mers here and there
+        let mut homolog = prot.clone();
+        for (i, r) in homolog.iter_mut().enumerate() {
+            if i % 3 == 1 && !(120..160).contains(&i) {
+                *r = if *r == b'K' { b'R' } else { b'K' };
+            }
+            if i % 37 == 0 {
+                *r = b'W';
+            }
+        }
+        let aa = codes(&homolog);
+        assert_eq!(best_gene(&aa, &kmers_only, &p, &mut hits), Some(0));
+        assert_eq!(best_gene(&aa, &checked, &p, &mut hits), Some(0));
+        assert!(significant_bits(&aa, 0, &checked) > 100.0);
+        // an unrelated protein with a transmembrane-like run of its own, of the same residues: it
+        // shares six 6-mers with the gene by composition alone, and scores about as much against
+        // the gene reversed as forward
+        let mut chance = protein(150, 77);
+        chance.extend_from_slice(b"IILFLLLIIFFILILLFIFILLFLLFLILLFFILLFFIIILILIVIIL");
+        chance.extend(protein(100, 78));
+        let aa = codes(&chance);
+        assert_eq!(best_gene(&aa, &kmers_only, &p, &mut hits), Some(0));
+        assert_eq!(
+            best_gene(&aa, &checked, &p, &mut hits),
+            None,
+            "forward {:.1} bits, significant {:.1}, needed {:.1}",
+            stretch_bits(&aa, 0, &checked),
+            significant_bits(&aa, 0, &checked),
+            bits_needed(aa.len(), checked.residues, LINEAGE_MAX_EVALUE)
+        );
+        assert!(hits.iter().all(|&h| h == 0), "scratch counts are reset");
+    }
+
+    #[test]
+    fn the_animal_and_fungal_panels_check_alignments_the_plant_panel_does_not() {
+        for l in ["metazoa", "fungi"] {
+            let panel = Panel::for_lineage(l, 6, &[]).unwrap();
+            assert_eq!(panel.max_evalue(), Some(LINEAGE_MAX_EVALUE), "{l}");
+            assert!(panel.residues > 50_000);
+        }
+        assert_eq!(Panel::lineage_max_evalue("landplants"), None);
+        assert_eq!(Panel::embedded(6, &[]).unwrap().max_evalue(), None);
     }
 
     #[test]

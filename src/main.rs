@@ -1302,6 +1302,11 @@ struct PanelArgs {
     /// panel built into the binary.
     #[arg(long)]
     panel: Option<PathBuf>,
+    /// The built-in panel of this seed lineage instead of the land-plant one, with its genetic
+    /// code and, for metazoa and fungi, the alignment E-value a gene stretch needs (with --panel:
+    /// that panel, read with the lineage's code and E-value).
+    #[arg(long, value_enum)]
+    lineage: Option<seeddb::Lineage>,
     /// Amino-acid k-mer length.
     #[arg(long, default_value_t = 6)]
     k: usize,
@@ -1435,9 +1440,14 @@ fn panel(args: PanelArgs) -> Result<()> {
             .num_threads(n)
             .build_global()?;
     }
+    let lineage_panel = match args.lineage {
+        Some(l) => Some(load_panel(args.panel.as_deref(), l, None, args.k, &args.exclude)?),
+        None => None,
+    };
     let report = panel::run(
         &args.reads,
         args.panel.as_deref(),
+        lineage_panel,
         &panel::PanelParams {
             k: args.k,
             min_orf: args.min_orf,
@@ -2008,7 +2018,9 @@ fn load_panel(
                 seeddb::Lineage::Metazoa => 5,
                 seeddb::Lineage::Fungi => 4,
             };
-            panel::Panel::parse(&text, k, exclude)?.with_code(default)?
+            panel::Panel::parse(&text, k, exclude)?
+                .with_code(default)?
+                .with_max_evalue(panel::Panel::lineage_max_evalue(lineage.name()))
         }
         None => builtin,
     };

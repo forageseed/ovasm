@@ -113,6 +113,9 @@ pub struct ProteinSeedReport {
     pub params: ProteinSeedParams,
     pub panel_proteins: usize,
     pub panel_genes: usize,
+    /// The alignment E-value a gene stretch needs (`panel::Panel::max_evalue`); null: shared
+    /// k-mers alone decide.
+    pub panel_max_evalue: Option<f64>,
     pub gate: GateReport,
     pub reads: u64,
     pub organelle_like_reads: u64,
@@ -528,6 +531,7 @@ pub fn run(
         params: p.clone(),
         panel_proteins,
         panel_genes,
+        panel_max_evalue: panel.max_evalue(),
         gate: gate.report.clone(),
         reads,
         organelle_like_reads: liked.len() as u64,
