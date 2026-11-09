@@ -107,11 +107,13 @@ const XDROP: i32 = 16;
 /// nad4l, nad6, nad3) by chance. PMAT2 benchmark, read sets without the mitochondrion: none of the
 /// 31 whole-read seeds of Calliactis parasitica and 3 of the 46 of Myriapora truncata had any
 /// homology to the panel (DIAMOND blastx, e 1e-5); they became a 28 kb and a 9.7 kb
-/// "mitochondrion". The best ungapped BLOSUM62 alignment of a real gene (mitochondria of two
-/// sponges, a sea anemone and two bryozoans, codes 4 and 5) scores 61-592 bits for every gene but
-/// atp8, the same sequences reversed (not complemented) at most 35 bits; at 1e-6 a stretch of 300
-/// residues needs about 45 bits, after what its composition alone scores is taken off
-/// (`significant_bits`).
+/// "mitochondrion". At 1e-6 a stretch of 300 residues needs about 45 bits after what its
+/// composition alone scores is taken off (`significant_bits`): of those seeds' 403 assigned
+/// stretches the 12 of the 3 real homologs keep their gene (up to 220 bits), 348 fall short
+/// forward and 43 more reach it forward (up to 120 bits) but score as much reversed; of the 84
+/// assigned stretches of seven reference mitochondria (two sponges, a sea anemone, two bryozoans,
+/// a moth, a sawfly; codes 4 and 5) 83 keep their gene (60-885 bits forward, at most 35 reversed),
+/// the one lost a sawfly nad6 at 20 bits.
 pub const LINEAGE_MAX_EVALUE: f64 = 1e-6;
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,7 +168,8 @@ pub struct Panel {
     /// Codon table reads are translated with (`genetic_code`).
     code: [u8; 64],
     /// Each protein's gene and residue codes, and amino-acid k-mer -> (protein, position): the
-    /// seeds of a stretch's alignment to its gene (`stretch_bits`).
+    /// seeds of a stretch's alignment to its gene (`stretch_bits`; built by `with_max_evalue`,
+    /// k-mers alone do not need it).
     protein_gene: Vec<u16>,
     protein_seqs: Vec<Vec<u8>>,
     occurrences: FxHashMap<u64, Vec<(u32, u32)>>,
@@ -230,7 +233,6 @@ impl Panel {
         let mut proteins = 0;
         let mut protein_gene: Vec<u16> = Vec::new();
         let mut protein_seqs: Vec<Vec<u8>> = Vec::new();
-        let mut occurrences: FxHashMap<u64, Vec<(u32, u32)>> = FxHashMap::default();
         let mut add = |header: &str, seq: &[u8]| -> Result<()> {
             let mut f = header.split('|');
             let (class, gene, species) = match (f.next(), f.next(), f.next()) {
@@ -259,7 +261,6 @@ impl Panel {
             let codes: Vec<u8> = seq.iter().filter_map(|&b| residue_code(b)).collect();
             let mask = (1u64 << (5 * k)) - 1;
             let mut code = 0u64;
-            let pid = protein_seqs.len() as u32;
             for (i, &a) in codes.iter().enumerate() {
                 code = ((code << 5) | a as u64) & mask;
                 if i + 1 >= k {
@@ -267,10 +268,6 @@ impl Panel {
                     if !v.contains(&id) {
                         v.push(id);
                     }
-                    occurrences
-                        .entry(code)
-                        .or_default()
-                        .push((pid, (i + 1 - k) as u32));
                 }
             }
             protein_gene.push(id);
@@ -304,7 +301,7 @@ impl Panel {
             code: *CODE,
             protein_gene,
             protein_seqs,
-            occurrences,
+            occurrences: FxHashMap::default(),
             residues,
             max_evalue: None,
         })
@@ -342,6 +339,21 @@ impl Panel {
     /// The same panel, a stretch keeping its gene only at an alignment E-value of at most `e`.
     pub fn with_max_evalue(mut self, e: Option<f64>) -> Self {
         self.max_evalue = e;
+        if e.is_some() && self.occurrences.is_empty() {
+            let mask = (1u64 << (5 * self.k)) - 1;
+            for (pid, codes) in self.protein_seqs.iter().enumerate() {
+                let mut code = 0u64;
+                for (i, &a) in codes.iter().enumerate() {
+                    code = ((code << 5) | a as u64) & mask;
+                    if i + 1 >= self.k {
+                        self.occurrences
+                            .entry(code)
+                            .or_default()
+                            .push((pid as u32, (i + 1 - self.k) as u32));
+                    }
+                }
+            }
+        }
         self
     }
 
@@ -456,12 +468,11 @@ fn bits_needed(m: usize, n: u64, e: f64) -> f64 {
 }
 
 /// The stretch's best alignment to gene `g` in bits, less what its amino-acid composition alone
-/// scores: the same alignment against the gene's proteins reversed (residues and composition
-/// kept, homology gone; for an ungapped alignment the same as the stretch reversed against the
-/// proteins) scores about log2(m n) bits between unbiased sequences, and whatever it scores beyond
-/// that is the composition's (hydrophobic, low-complexity peptides score as high against the
-/// reversed membrane proteins as against the real ones: 53-77 bits both ways on the PMAT2
-/// benchmark's false whole-read seeds; real genes 73-592 bits forward, at most 38 reversed).
+/// scores: the stretch reversed (residues and composition kept, homology gone) scores about
+/// log2(m n) bits against unrelated sequence, and whatever it scores beyond that is the
+/// composition's. Hydrophobic, low-complexity peptides score as high reversed as forward (43
+/// stretches of the PMAT2 benchmark's false whole-read seeds reached the bits needed forward, up
+/// to 120, and as much reversed); real genes at most 35 bits reversed (`LINEAGE_MAX_EVALUE`).
 fn significant_bits(aa: &[u8], g: u16, panel: &Panel) -> f64 {
     let forward = stretch_bits(aa, g, panel);
     let reversed: Vec<u8> = aa.iter().rev().copied().collect();
@@ -470,8 +481,9 @@ fn significant_bits(aa: &[u8], g: u16, panel: &Panel) -> f64 {
 }
 
 /// Score of the best ungapped alignment of `aa` to a protein of gene `g`, in bits: every distinct
-/// diagonal of a shared k-mer (stretch position minus protein position) is extended both ways
-/// from that k-mer under BLOSUM62 with an X-drop (`XDROP`), as in BLAST's ungapped extension.
+/// diagonal of an amino-acid k-mer `aa` shares with a protein of `g` (the panel's k, the words
+/// that picked the gene; stretch position minus protein position) is extended both ways from that
+/// k-mer under BLOSUM62 with an X-drop (`XDROP`), as in BLAST's ungapped extension from word hits.
 fn stretch_bits(aa: &[u8], g: u16, panel: &Panel) -> f64 {
     let k = panel.k;
     if aa.len() < k {

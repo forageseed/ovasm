@@ -119,14 +119,15 @@ Quantity: which panel gene, if any, a stop-free peptide stretch of a read belong
 - Significance (metazoa and fungi only; `Panel::max_evalue`, `panel::significant_bits`). Shared 6-mers pick the gene but
   do not by themselves show homology: hydrophobic, low-complexity peptides from AT-rich nuclear or bacterial DNA share many
   6-mers with the short membrane proteins (atp8, nad4l, nad6, nad3). A stretch of $m$ residues keeps $g^*$ only if its best
-  ungapped BLOSUM62 alignment to a protein of $g^*$ (Murphy-10 reduced 5-mer seeds on every diagonal, X-drop 16;
+  ungapped BLOSUM62 alignment to a protein of $g^*$ (extended from every diagonal of a shared 6-mer, X-drop 16;
   $\lambda = 0.3176$, $K = 0.134$), less what its composition alone scores, reaches E $\le 10^{-6}$ against the panel's $n$
   residues: $S_\mathrm{fwd} - \max(0, S_\mathrm{rev} - \log_2 mn) \ge \log_2(mn / 10^{-6})$ bits, where $S_\mathrm{rev}$ is the
-  same alignment of the stretch reversed (composition kept, homology gone). Empirical check: real genes of two sponges, a sea
-  anemone and two bryozoans score 61-592 bits forward and at most 38 reversed, every gene the 6-mers found is kept; the
-  whole-read seeds of two PMAT2 read sets without the mitochondrion (Calliactis parasitica, Myriapora truncata) scored about
-  as high reversed as forward and are dropped (DIAMOND blastx found homology in none of 31 and 3 of 46). The land-plant panel
-  has no such check (`max_evalue` None).
+  same score of the stretch reversed (composition kept, homology gone). Empirical check: of 84 assigned stretches of seven
+  reference mitochondria (two sponges, a sea anemone, two bryozoans, a moth, a sawfly) 83 are kept (60-885 bits forward, at
+  most 35 reversed; the one lost, a sawfly nad6, scores 20 bits). Of 403 assigned stretches of the whole-read seeds of two
+  PMAT2 read sets without the mitochondrion (Calliactis parasitica, Myriapora truncata; DIAMOND blastx found homology in none
+  of 31 and 3 of 46 seed reads) only the 12 of the real homologs are kept: 348 fall short forward, 43 reach the threshold
+  forward (up to 120 bits) but score as much reversed. The land-plant panel has no such check (`max_evalue` None).
 - Metazoa and fungi panels are small covers chosen by leave-genus-out greedy selection (`scripts/polish_panel.py`; no genus of
   the PMAT2 benchmark): 551 metazoan and 696 fungal proteins. Larger panels need higher `min_hits` and find slightly fewer
   held-out genes (metazoa 551 proteins at 5 hits 98.96%, 13,868 at 15 hits 98.08%; fungi 696 at 6 hits 99.34%, 8,650 at 10 hits
