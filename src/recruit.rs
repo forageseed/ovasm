@@ -55,6 +55,77 @@ pub struct ClassifyParams {
 /// A read across two tandem copies of an organelle segment is still about two thirds distinct.
 pub const HIFI_MIN_DISTINCT: f64 = 0.5;
 
+/// What tells an organelle's own tandem array from a satellite: copies across the genome. A
+/// k-mer of an array is as deep in the library as the array has copies times the depth of its
+/// molecule, and occurs in a read as often as the read holds copies. Over a read across the
+/// whole array the two counts cancel to the molecule's depth (over part of it, the share of the
+/// array the read holds divides it), so a read of an organelle's array is about as deep, per copy
+/// it holds, as its target (`DepthGate::copy_depth`, the median over the read's sampled k-mer
+/// positions, over the target's core depth: its copy ratio). A satellite has more copies than a
+/// read holds, its reads a higher ratio.
+///
+/// One read does not tell: a satellite whose copies are alike within a read and differ between
+/// reads (a higher-order repeat) has reads at 1-20 times its target (Coccinella septempunctata,
+/// PMAT2 benchmark: 685 satellite reads the mitochondrion's bait covered, at 2.2-3.9 times its
+/// 298x between the quartiles). The target's tandem reads together do: an organelle's are reads
+/// of its arrays, most across or along much of one, their median ratio about 1 (Sarcophaga
+/// caerulescens: 0.87 over 86 reads); a satellite's are reads of its many copies (Coccinella's
+/// 2.98, then 13.5 over 5,798 reads once its bait covered more of it). So a target takes its
+/// tandem reads only while their median ratio is at most `TANDEM_MEDIAN_FOLD` (the median read
+/// holding half an array's copies) and, at its core depth, they stand for no more sequence than
+/// its genome (`TANDEM_GENOME_SHARE`); and then only reads of ratio at most `HIGH_COPY_FOLD`, the
+/// ceiling extension puts on a read's depth. It is decided after each pass from the tandem reads
+/// that pass judged, for the next pass and the final outputs.
+/// Sarcophaga caerulescens: its control region holds a 2.9 kb array of a 455 bp unit beside
+/// 3.3 kb of a 230 bp one; 86 of the 615 reads over it were tandem, the reads into the array's
+/// exit went unrecruited and the 21.2 kb mitochondrion stayed a linear 18.3 kb. The sketch exists
+/// from the second pass on: the first rejects tandem reads, the second judges them, the third
+/// recruits them.
+pub struct TandemCheck<'a> {
+    pub gate: &'a DepthGate,
+    /// Each target's core depth; `None`: its tandem reads are not judged.
+    pub core: Vec<Option<f64>>,
+    /// Targets that take their tandem reads.
+    pub admitted: Vec<bool>,
+}
+
+/// Highest median copy ratio of a target's tandem reads for it to take them (see `TandemCheck`).
+pub const TANDEM_MEDIAN_FOLD: f64 = 2.0;
+/// Most of its genome a target's tandem reads may stand for (see `TandemCheck`).
+pub const TANDEM_GENOME_SHARE: f64 = 1.0;
+
+impl TandemCheck<'_> {
+    /// The read's copy ratio for target `t`; infinite when the sketch cannot judge it.
+    fn ratio(&self, seq: &[u8], t: usize) -> Option<f64> {
+        let core = self.core.get(t).copied().flatten()?;
+        Some(match self.gate.copy_depth(seq) {
+            Some(d) if core > 0.0 => d / core,
+            _ => f64::INFINITY,
+        })
+    }
+
+    fn admits(&self, t: usize) -> bool {
+        self.admitted.get(t).copied().unwrap_or(false)
+    }
+}
+
+/// Whether a target takes its tandem reads (see `TandemCheck`): their copy ratios' median is at
+/// most `TANDEM_MEDIAN_FOLD` and their `bases` at its `core` depth stand for no more than
+/// `TANDEM_GENOME_SHARE` of its `genome`.
+fn tandem_admitted(ratios: &mut [f32], bases: u64, core: Option<f64>, genome: Option<u64>) -> bool {
+    if ratios.is_empty() {
+        return false;
+    }
+    ratios.sort_by(f32::total_cmp);
+    let median = ratios[ratios.len() / 2] as f64;
+    match (core, genome) {
+        (Some(d), Some(g)) if d > 0.0 => {
+            median <= TANDEM_MEDIAN_FOLD && bases as f64 / d <= TANDEM_GENOME_SHARE * g as f64
+        }
+        _ => false,
+    }
+}
+
 /// Share of a read's k-mers that are distinct, over an eighth of them chosen by hash (a repeated
 /// k-mer is chosen every time); 1 for a read too short to judge.
 pub fn distinct_share(seq: &[u8], k: usize) -> f64 {
@@ -81,6 +152,13 @@ pub enum Call {
     Organelle(u8),
     NumtCandidate(usize),
     Other,
+    /// Covered, but a tandem array (`ClassifyParams::min_distinct`) the depth sketch did not
+    /// clear or its target does not admit (`TandemCheck`): not recruited, and judged again in
+    /// every pass with a check.
+    Tandem,
+    /// A tandem array that cleared and its target admits: recruited as `Organelle`, and judged
+    /// again in every pass with a check.
+    TandemArray(u8),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,8 +166,10 @@ pub struct ReadScore {
     pub cover_frac: f64,
     pub hit_frac: f64,
     pub longest_block: usize,
-    /// Covered, but a tandem array (`ClassifyParams::min_distinct`): called `Other`.
+    /// Covered, but a tandem array (`ClassifyParams::min_distinct`): called `Tandem`.
     pub tandem: bool,
+    /// A tandem array the check judged (`TandemCheck`): its target and copy ratio.
+    pub judged: Option<(usize, f32)>,
     /// The best target's gap-bridged coverage in bases, the most of any target (`still_other`).
     pub cover: usize,
 }
@@ -193,6 +273,16 @@ fn still_other(call: Call, bound: u16, added: usize, len: usize, p: &ClassifyPar
 
 /// Score a read against every target and decide what it is.
 pub fn classify(seq: &[u8], bait: &BaitSet, p: &ClassifyParams) -> (Call, ReadScore) {
+    classify_with(seq, bait, p, None)
+}
+
+/// `classify`, a tandem read recruited when `tandem` clears it.
+pub fn classify_with(
+    seq: &[u8],
+    bait: &BaitSet,
+    p: &ClassifyParams,
+    tandem: Option<&TandemCheck>,
+) -> (Call, ReadScore) {
     let n = bait.targets.len();
     let TargetHits {
         hits,
@@ -216,12 +306,20 @@ pub fn classify(seq: &[u8], bait: &BaitSet, p: &ClassifyParams) -> (Call, ReadSc
         hit_frac: hits[best] as f64 / total as f64,
         longest_block: longest[best],
         tandem: false,
+        judged: None,
         cover: block_cover[best],
     };
     let call = if score.cover_frac >= p.min_cover && score.hit_frac >= p.min_hit_frac {
         if p.min_distinct > 0.0 && distinct_share(seq, bait.k) < p.min_distinct {
-            score.tandem = true;
-            Call::Other
+            let ratio = tandem.and_then(|c| c.ratio(seq, best).map(|r| (c, r)));
+            score.judged = ratio.map(|(_, r)| (best, r as f32));
+            match ratio {
+                Some((c, r)) if c.admits(best) && r <= HIGH_COPY_FOLD => Call::TandemArray(tied),
+                _ => {
+                    score.tandem = true;
+                    Call::Tandem
+                }
+            }
         } else {
             Call::Organelle(tied)
         }
@@ -286,6 +384,11 @@ pub struct IterationStats {
     /// recruited; among the reads this pass classified (a replayed pass reclassifies only those
     /// the bait's changes touch).
     pub tandem_reads: u64,
+    /// Tandem reads of each target the check judged (`TandemCheck`), their median copy ratio,
+    /// and whether the target takes them after this pass (in the next and the final outputs).
+    pub tandem_judged: Vec<TargetCounts>,
+    pub tandem_median_ratio: Vec<Option<f64>>,
+    pub tandem_admitted: Vec<bool>,
     /// Sketch depth of each target's reads of this pass (`target_depth` of a sample of
     /// `DEPTH_SAMPLE`), when the depth sketch exists.
     pub read_depth: Vec<Option<f64>>,
@@ -315,6 +418,10 @@ struct ScanResult {
     reclassified: u64,
     /// Reads classified in this pass that the bait covered but are tandem arrays.
     tandem: u64,
+    /// Tandem reads of each target the check judged in this pass (`TandemCheck`), and their
+    /// copy ratios.
+    tandem_judged: Vec<TargetCounts>,
+    tandem_ratios: Vec<Vec<f32>>,
 }
 
 /// Reads per depth estimate. A median of 2,000 read depths is within a few percent, and the
@@ -682,6 +789,7 @@ fn scan(
     final_outputs: bool,
     gate_sketch: Option<&mut crate::seedfree::GateSketch>,
     gpu: Option<&mut crate::gpu::Gpu>,
+    tandem: Option<&TandemCheck>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
@@ -742,6 +850,8 @@ fn scan(
         multi_target: 0,
         reclassified: 0,
         tandem: 0,
+        tandem_judged: vec![TargetCounts::default(); n_targets],
+        tandem_ratios: vec![Vec::new(); n_targets],
     };
     let (mut t_wait, mut t_par, mut t_serial, mut t_check, mut n_batches) = (0f64, 0f64, 0f64, 0f64, 0u64);
     let scan_start = Instant::now();
@@ -808,7 +918,7 @@ fn scan(
         let storing = !replaying && replay.is_some();
         let (encoded, calls) = rayon::join(
             || storing.then(|| crate::replay::Replay::encode(&batch)),
-            || -> Vec<(Call, bool, bool, u16)> {
+            || -> Vec<(Call, bool, bool, u16, Option<(usize, f32)>)> {
                 batch
                     .par_iter()
                     .enumerate()
@@ -816,19 +926,28 @@ fn scan(
                         let seq = &rec.rec.seq;
                         let classified = || {
                             let tcl = profile_reads.then(Instant::now);
-                            let (call, score) = classify(seq, bait, p);
+                            let (call, score) = classify_with(seq, bait, p, tandem);
                             if let Some(tcl) = tcl {
                                 PROF_CLASSIFY_NS.fetch_add(tcl.elapsed().as_nanos() as u64, Relaxed);
                             }
                             let bound = u16::try_from(score.cover).unwrap_or(u16::MAX);
-                            (call, true, score.tandem, bound)
+                            (call, true, score.tandem, bound, score.judged)
                         };
                         let Some((calls, bounds)) = previous else {
                             return classified();
                         };
                         let (call, bound) = (calls[i], bounds[i]);
                         if final_outputs {
-                            return (call, false, false, bound);
+                            // the final outputs take tandem reads as last decided
+                            let call = match (call, tandem) {
+                                (Call::TandemArray(mask), Some(c))
+                                    if !(0..8).any(|t| mask & (1 << t) != 0 && c.admits(t)) =>
+                                {
+                                    Call::Tandem
+                                }
+                                _ => call,
+                            };
+                            return (call, false, false, bound, None);
                         }
                         let delta = delta.expect("replay has change set");
                         let td = profile_reads.then(Instant::now);
@@ -840,7 +959,9 @@ fn scan(
                         };
                         // unchanged: as it was; changed: kept with a new bound only when it
                         // cannot leave `Other` (the bound's full look, for such reads alone)
-                        let kept = if !changed {
+                        // a tandem read is judged again whenever there is a check
+                        let judged = matches!(call, Call::Tandem | Call::TandemArray(_)) && tandem.is_some();
+                        let kept = if !changed && !judged {
                             Some(bound)
                         } else if call == Call::Other && bound != u16::MAX {
                             added_cover(seq, delta, p.block_gap)
@@ -852,7 +973,7 @@ fn scan(
                             PROF_DELTA_NS.fetch_add(td.elapsed().as_nanos() as u64, Relaxed);
                         }
                         match kept {
-                            Some(bound) => (call, false, false, bound),
+                            Some(bound) => (call, false, false, bound, None),
                             None => classified(),
                         }
                     })
@@ -864,9 +985,14 @@ fn scan(
         }
         t_par += tpar.elapsed().as_secs_f64();
         let tser = Instant::now();
-        for (i, ((call, changed, tandem, bound), entry)) in calls.into_iter().zip(batch).enumerate() {
+        for (i, ((call, changed, tandem, bound, judged), entry)) in calls.into_iter().zip(batch).enumerate() {
             out.reclassified += u64::from(changed);
             out.tandem += u64::from(tandem);
+            if let Some((t, r)) = judged {
+                out.tandem_judged[t].reads += 1;
+                out.tandem_judged[t].bases += entry.rec.seq.len() as u64;
+                out.tandem_ratios[t].push(r);
+            }
             if let Some(cache) = replay.as_mut() {
                 if replaying {
                     cache.calls[offset + i] = call;
@@ -876,13 +1002,13 @@ fn scan(
                     cache.cover_bounds.push(bound);
                 }
             }
-            if call == Call::Other {
+            if matches!(call, Call::Other | Call::Tandem) {
                 continue;
             }
             let rec = entry.rec;
             let len = rec.seq.len() as u64;
             match call {
-                Call::Organelle(mask) => {
+                Call::Organelle(mask) | Call::TandemArray(mask) => {
                     if mask.count_ones() > 1 {
                         out.multi_target += 1;
                     }
@@ -924,7 +1050,7 @@ fn scan(
                         out.frontier[t].offer(name_key(&rec.id), &rec.seq);
                     }
                 }
-                Call::Other => {}
+                Call::Other | Call::Tandem => {}
             }
         }
         t_serial += tser.elapsed().as_secs_f64();
@@ -1832,6 +1958,11 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         && (cfg.iterations.max(1) > 1 || cfg.max_read_depth.is_some()))
     .then(crate::seedfree::GateSketch::default);
     let mut core_depth: Vec<Option<f64>> = vec![None; n_targets];
+    // the last core depth each target had, for `TandemCheck`: a bootstrap forgets core_depth
+    // until the reads it then recruits are measured, but a satellite is as deep as before
+    let mut tandem_core: Vec<Option<f64>> = vec![None; n_targets];
+    // targets whose cleared tandem reads the next pass recruits (`TandemCheck`)
+    let mut tandem_admit: Vec<bool> = vec![false; n_targets];
     let mut warnings: Vec<String> = Vec::new();
     let mut boot_used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
     // Targets whose leftover candidates have been judged (the bootstrap in the pass loop).
@@ -1886,7 +2017,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 }
             })
             .collect();
-        let res = scan(
+        let tandem = gate.as_ref().filter(|_| cfg.params.min_distinct > 0.0).map(|g| TandemCheck {
+            gate: g,
+            core: tandem_core.clone(),
+            admitted: tandem_admit.clone(),
+        });
+        let mut res = scan(
             &cfg.inputs,
             &bait,
             &cfg.params,
@@ -1902,6 +2038,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             // only the first pass: without a cache every pass reads the inputs
             if it == 0 { gate_sketch.as_mut() } else { None },
             gpu.as_mut(),
+            tandem.as_ref(),
         )?;
         if crate::recruit::profiling() {
             eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
@@ -1981,6 +2118,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         for t in 0..n_targets {
             if core_depth[t].is_none() && depths.measured[t] >= CORE_MIN_READS {
                 core_depth[t] = depths.read[t];
+            }
+            if core_depth[t].is_some() {
+                tandem_core[t] = core_depth[t];
             }
         }
         if cfg.extend_gate && !last {
@@ -2408,6 +2548,38 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 core_depth[t] = None;
             }
         }
+        // Tandem reads that cleared are admitted, or no longer, for the next pass; a change needs
+        // that pass, even where the target had settled.
+        let mut tandem_changed = false;
+        let mut tandem_median: Vec<Option<f64>> = vec![None; n_targets];
+        for t in 0..n_targets {
+            let mut ratios = std::mem::take(&mut res.tandem_ratios[t]);
+            let admit = tandem_admitted(
+                &mut ratios,
+                res.tandem_judged[t].bases,
+                tandem_core[t],
+                depths.implied_size[t],
+            );
+            tandem_median[t] = (!ratios.is_empty()).then(|| ratios[ratios.len() / 2] as f64);
+            if admit != tandem_admit[t] {
+                tandem_admit[t] = admit;
+                tandem_changed = true;
+                if stopped[t] == Some("saturated") {
+                    saturated[t] = false;
+                    stopped[t] = None;
+                }
+                eprintln!(
+                    "[ovasm] {}: {} {} tandem reads ({} bp, median copy ratio {:.2}) at {:.0}x against a {} bp genome",
+                    bait.targets[t].name,
+                    if admit { "taking" } else { "no longer taking" },
+                    res.tandem_judged[t].reads,
+                    res.tandem_judged[t].bases,
+                    tandem_median[t].unwrap_or(f64::NAN),
+                    tandem_core[t].unwrap_or(0.0),
+                    depths.implied_size[t].unwrap_or(0)
+                );
+            }
+        }
         // Emit bounded per-pass progress so a long WGS run exposes both growing bait and
         // the reason a target stopped before the final JSON report exists.
         let progress = bait.targets.iter().enumerate().map(|(t, target)| {
@@ -2426,6 +2598,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             numt_candidates: res.numt.clone(),
             multi_target_reads: res.multi_target,
             tandem_reads: res.tandem,
+            tandem_judged: res.tandem_judged.clone(),
+            tandem_median_ratio: tandem_median,
+            tandem_admitted: tandem_admit.clone(),
             bait_kmers_added: added.clone(),
             extended_from_reads: extended_from,
             saturated: saturated.clone(),
@@ -2441,8 +2616,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             implied_size: depths.implied_size,
         });
         result = Some(res);
-        // Nothing new to bait with: this pass already used the final bait set.
-        if !last && added.iter().all(|&a| a == 0) {
+        // Nothing new to bait with: this pass already used the final bait set (unless it changed
+        // which tandem reads a target takes).
+        if !last && added.iter().all(|&a| a == 0) && !tandem_changed {
             break;
         }
     }
@@ -2489,6 +2665,11 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 path.display()
             );
         }
+        let final_tandem = gate.as_ref().filter(|_| cfg.params.min_distinct > 0.0).map(|g| TandemCheck {
+            gate: g,
+            core: tandem_core.clone(),
+            admitted: tandem_admit.clone(),
+        });
         let final_res = scan(
             &cfg.inputs,
             &bait,
@@ -2504,6 +2685,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             true,
             None,
             None,
+            final_tandem.as_ref(),
         )?;
         anyhow::ensure!(
             final_res.reads == res.reads && final_res.bases == res.bases,
@@ -4312,7 +4494,7 @@ mod tests {
         assert_eq!(classify(&array, &bait, &p).0, Call::Organelle(1));
         p.min_distinct = HIFI_MIN_DISTINCT;
         let (call, score) = classify(&array, &bait, &p);
-        assert_eq!(call, Call::Other);
+        assert_eq!(call, Call::Tandem);
         assert!(score.tandem);
     }
 
@@ -4530,6 +4712,96 @@ mod tests {
                 format!(">{tag}{i}\n{read}\n")
             })
             .collect()
+    }
+
+    #[test]
+    fn an_organelle_array_is_recruited_and_a_satellite_is_not() {
+        // A 19.2 kb mitochondrion at 100x in 3 kb reads: 16 kb, then 7 copies of a 455 bp unit,
+        // as Sarcophaga caerulescens's control region; beside a 300 kb nucleus and a 1.37 Mb
+        // satellite of another 455 bp unit (3,000 copies) at 10x; seeded with the first 8 kb of
+        // the mitochondrion. A read inside either array is under a fifth distinct. The
+        // mitochondrion's array has 7 copies and its reads hold up to 6.6 of them, so they are as
+        // deep, per copy they hold, as the molecule; the satellite's, 4,500x per copy at 100x.
+        // The mitochondrion recruits the reads it recruits with no tandem rule at all. Seeded
+        // with the satellite's unit too, it covers the satellite's reads, which are then most of
+        // its tandem reads: it takes none of them, its own array's included, as before the rule.
+        let unique = pseudo_random(16_000, 81);
+        let unit = pseudo_random(455, 82);
+        let array: Vec<u8> = unit.iter().cycle().take(455 * 7).copied().collect();
+        let mito = [&unique[..], &array[..]].concat();
+        let sat_unit = pseudo_random(455, 83);
+        let satellite: Vec<u8> = sat_unit.iter().cycle().take(455 * 3000).copied().collect();
+        let nuclear = [pseudo_random(300_000, 84), satellite].concat();
+        let dir = std::env::temp_dir().join(format!("ovasm-sat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fa = dir.join("reads.fa");
+        let text = tiled(&mito, 30, 3000, true, "m") + &tiled(&nuclear, 300, 3000, false, "n");
+        std::fs::write(&fa, text).unwrap();
+        assert!(distinct_share(&array[..3000], 21) < 0.2);
+        assert!(distinct_share(&nuclear[400_000..403_000], 21) < 0.2);
+        let recruit = |name: &str, min_distinct: f64, cache: bool, sat: bool| {
+            let mut bait = BaitSet::new(21);
+            let t = bait.target("mitochondrion").unwrap();
+            bait.add_sequence(t, &mito[..8000]);
+            if sat {
+                bait.add_sequence(t, &[&sat_unit[..], &sat_unit[..]].concat());
+            }
+            let mut config = test_config(&fa, dir.join(name), 8, true);
+            config.params.min_distinct = min_distinct;
+            if cache {
+                config.replay_dir = Some(dir.join(format!("{name}-cache")));
+            }
+            let r = run(bait, config).unwrap();
+            let out = &r.outputs[0].output;
+            (count_reads(out, b'm'), count_reads(out, b'n'), r)
+        };
+        let (mito_all, _, _) = recruit("none", 0.0, false, false);
+        let (_, sat_all, _) = recruit("none-sat", 0.0, false, true);
+        assert!(sat_all > 4000, "no tandem rule: the satellite comes in ({sat_all})");
+        for (name, cache) in [("plain", false), ("cached", true)] {
+            let (m, n, r) = recruit(name, HIFI_MIN_DISTINCT, cache, false);
+            // a pass before it took them left them out
+            assert!(r.iterations.iter().any(|i| i.tandem_reads > 0), "{name}");
+            assert_eq!((m, n), (mito_all, 0), "{name}");
+            assert!(r.iterations.iter().any(|i| i.tandem_admitted[0]), "{name}");
+            let (m, n, r) = recruit(&format!("{name}-sat"), HIFI_MIN_DISTINCT, cache, true);
+            assert_eq!(n, 0, "{name}: the satellite");
+            assert!(m < mito_all, "{name}: its array's reads stay out with the satellite's");
+            assert!(r.iterations.iter().all(|i| !i.tandem_admitted[0]), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tandem_reads_are_taken_while_most_are_at_the_targets_depth() {
+        // Sarcophaga caerulescens: 86 reads, median copy ratio 0.87, 514,685 bp at 134x (3.8 kb)
+        // beside a 20.7 kb genome
+        let mut own: Vec<f32> = (0..86).map(|i| 0.7 + 0.01 * i as f32).collect();
+        assert!(tandem_admitted(&mut own, 514_685, Some(134.0), Some(20_673)));
+        // Coccinella septempunctata's satellite: median 2.98, 8.4 Mb at 298x (28 kb) beside what
+        // its reads made a 50.6 kb genome
+        let mut sat: Vec<f32> = (0..685).map(|i| 2.2 + 0.0025 * i as f32).collect();
+        assert!(!tandem_admitted(&mut sat, 8_377_977, Some(298.0), Some(50_632)));
+        // at the target's depth, but a gigabase at 623x (1.6 Mb) against 0.27 Mb
+        assert!(!tandem_admitted(&mut own.clone(), 1_000_000_000, Some(623.0), Some(271_000)));
+        // nothing judged, or no depth to judge by
+        assert!(!tandem_admitted(&mut [], 0, Some(134.0), Some(20_673)));
+        assert!(!tandem_admitted(&mut own.clone(), 514_685, None, Some(20_673)));
+        assert!(!tandem_admitted(&mut own, 514_685, Some(134.0), None));
+    }
+
+    #[test]
+    fn a_tandem_read_without_a_core_depth_is_not_cleared() {
+        // no sketch, or a sketch but no core depth for the target: rejected as before
+        let unit = pseudo_random(455, 85);
+        let array: Vec<u8> = unit.iter().cycle().take(4000).copied().collect();
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &[&unit[..], &unit[..]].concat());
+        let mut p = params();
+        p.min_distinct = HIFI_MIN_DISTINCT;
+        assert_eq!(classify_with(&array, &bait, &p, None).0, Call::Tandem);
     }
 
     #[test]

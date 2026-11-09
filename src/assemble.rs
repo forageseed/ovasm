@@ -1050,6 +1050,14 @@ pub struct TandemCircle {
 /// to be a near copy of that way (see `clean`): one difference per 100 bp still leaves ~85%.
 const VARIANT_W: usize = 15;
 const VARIANT_SHARE: f64 = 0.8;
+/// An arm at least this share of the node depth is the molecule's own sequence, not a near copy
+/// (see `clean`): a NUMT's reads are the nucleus's, a minor allele is under half the molecule's.
+/// Beside a tandem array the deeper way is the array, as deep as it has copies: Sarcophaga
+/// caerulescens (PMAT2 benchmark) has a 455 bp unit 6.5 times in its control region, at 195
+/// against a node depth of 61; the 1001-mer leading from the array into the rest of the
+/// mitochondrion, at 43, spells about a copy of the unit and was removed as a near copy, and
+/// the 21.2 kb mitochondrion stayed a linear 18.9 kb.
+const VARIANT_OWN_DEPTH: f64 = 0.5;
 
 /// A dead-end branch no deeper than this many times the nuclear share of the node depth is the
 /// nuclear flank of a NUMT (see `clean`).
@@ -1292,7 +1300,8 @@ fn clean(
     // identical and, at ~0.1x the mitochondrial depth, sits at the min_count threshold) or a
     // minor allele. Its length is where the copy's differences happen to fall, far beyond an
     // error's 4k; a real alternative, such as a recombining repeat's other exit, leads into
-    // different flanking sequence. It goes whatever its length, and is counted.
+    // different flanking sequence. It goes whatever its length, and is counted. An arm as deep
+    // as the molecule's own sequence is no near copy, whatever the deeper way (`VARIANT_OWN_DEPTH`).
     let mut ov: FxHashMap<(OEnd, OEnd), usize> = FxHashMap::default();
     for &(((a, af), (b, bf)), o) in links {
         ov.insert(((a, af), (b, bf)), o);
@@ -1317,6 +1326,7 @@ fn clean(
                 || strongest_at[u]
                 || unitigs[u].circular
                 || dp[u] >= 0.5 * dp[best.0]
+                || dp[u] >= VARIANT_OWN_DEPTH * depth
             {
                 continue;
             }
@@ -3158,6 +3168,54 @@ mod tests {
         // stops once it has what was asked for
         assert_eq!(unitig_prefix(&t, &kmers, 5, true, 4), b"ACGTT");
         assert!(b"ATTGCAACGT".starts_with(&unitig_prefix(&t, &kmers, 5, false, 6)));
+    }
+
+    #[test]
+    fn the_way_out_of_a_tandem_array_stays_at_the_molecules_depth() {
+        // A 16.6 kb circle, 12 kb of it unique and then 10 copies of a 455 bp unit, in 3 kb reads
+        // every 50 bp (60x), at k 1001: the array is a loop as deep as the reads holding its
+        // copies, more than twice the 1001-mers leading out of it, which spell about a copy of
+        // the unit. They are the molecule's own sequence at its depth, no near copy, and the
+        // unique unitig stays joined to the array at both of its ends.
+        let unique = seq(12_000, 95);
+        let unit = seq(455, 96);
+        let array: Vec<u8> = unit.iter().cycle().take(455 * 10).copied().collect();
+        let g = [unique, array].concat();
+        let dir = tmpdir("array-exit");
+        let rep = run(
+            vec![fastq(&dir, &tile(&g, 3000, 50))],
+            AssembleParams {
+                k: 1001,
+                s: 31,
+                min_count: Some(3),
+                ..params()
+            },
+            &dir.join("a.gfa"),
+            &dir.join("a.json"),
+        )
+        .unwrap();
+        let gfa = fs::read_to_string(dir.join("a.gfa")).unwrap();
+        assert_eq!(rep.cleaning.variant_arms_removed, 0, "{gfa}");
+        // the longest unitig (the unique sequence) has a link at each end
+        let segs = gfa_segments(&gfa);
+        let longest = (0..segs.len()).max_by_key(|&i| segs[i].len()).unwrap();
+        let name = format!("u{longest}");
+        let ends: BTreeSet<(bool, bool)> = gfa
+            .lines()
+            .filter(|l| l.starts_with("L\t"))
+            .flat_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                let mut v = Vec::new();
+                if f[1] == name {
+                    v.push((true, f[2] == "+"));
+                }
+                if f[3] == name {
+                    v.push((true, f[4] == "-"));
+                }
+                v
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "{gfa}");
     }
 
     #[test]

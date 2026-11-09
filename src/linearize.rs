@@ -362,6 +362,148 @@ fn bridges(
     Ok((out, self_loops))
 }
 
+/// Most walks `spanned_walks` tries from one anchor end.
+const SPANNED_MAX_STEPS: usize = 100_000;
+
+/// Walks through repeats that reads span from anchor to anchor, by length (the evidence's
+/// `anchor_spans`): the walks from one anchor end through repeats to the other whose bases
+/// between the two anchors (`inner_length`) are what at least `min_reads` reads hold there,
+/// within the evidence's `spacing_tol` (at least 50 bp), with those reads. Crossings say which
+/// segment follows which, never how often a loop is passed: in a tandem array every copy's
+/// junction is alike, so the topological bridges go round it up to `TOPO_MAX_REPEATS` times and
+/// depth says how often (`copy_deviation`), and both fall short where a k-mer outspans the unit.
+/// Sarcophaga caerulescens (PMAT2 benchmark): its control region's 455 bp unit forms a loop of
+/// two segments at 178-212x against 49.7x, depth said 4 copies of each where the 49 reads
+/// across the array, 3,489-3,544 bp between its flanks, say 5, and the circle came out
+/// 20,787 bp of 21,241.
+fn spanned_walks(
+    g: &Graph,
+    report: &Value,
+    repeat: &[bool],
+    min_reads: u64,
+) -> Result<Vec<(Vec<Oriented>, u64)>> {
+    let Some(rows) = report.get("anchor_spans").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let tol = report["params"]["spacing_tol"].as_f64().unwrap_or(0.05);
+    let index: FxHashMap<&str, usize> = g
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let overlaps = overlap_index(g);
+    let mut next: FxHashMap<Oriented, Vec<Oriented>> = FxHashMap::default();
+    for &(x, y) in &g.links {
+        next.entry(x).or_default().push(y);
+        next.entry(flip(y)).or_default().push(flip(x));
+    }
+    for v in next.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    let max_ov = g.overlaps.iter().copied().max().unwrap_or(0) as i64;
+    let fits = |span: i64, inner: i64| (span - inner).abs() as f64 <= (tol * inner.abs() as f64).max(50.0);
+    let mut out = Vec::new();
+    for row in rows {
+        let x = parse_label(&index, row["from"].as_str().context("anchor span without from")?)?;
+        let y = parse_label(&index, row["to"].as_str().context("anchor span without to")?)?;
+        let spans: Vec<i64> = row["spans"]
+            .as_array()
+            .context("anchor span without spans")?
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect();
+        if (spans.len() as u64) < min_reads || repeat[x.0] || repeat[y.0] {
+            continue;
+        }
+        let longest = *spans.iter().max().expect("non-empty");
+        let bound = longest + (tol * longest as f64).max(50.0) as i64;
+        // (walk so far, bases after x's end up to the end of its last segment)
+        let mut stack: Vec<(Vec<Oriented>, i64)> = vec![(vec![x], 0)];
+        let mut steps = 0;
+        while let Some((walk, inner)) = stack.pop() {
+            steps += 1;
+            if steps > SPANNED_MAX_STEPS {
+                break;
+            }
+            let at = walk[walk.len() - 1];
+            for &nx in next.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
+                let ov = overlaps[&(at, nx)] as i64;
+                if !repeat[nx.0] {
+                    if nx != y || walk.len() < 2 {
+                        continue;
+                    }
+                    let full = inner - ov;
+                    let n = spans.iter().filter(|&&s| fits(s, full)).count() as u64;
+                    if n >= min_reads {
+                        let mut w = walk.clone();
+                        w.push(nx);
+                        out.push((w, n));
+                    }
+                    continue;
+                }
+                let grown = inner + g.seqs[nx.0].len() as i64 - ov;
+                if grown - max_ov <= bound {
+                    let mut w = walk.clone();
+                    w.push(nx);
+                    stack.push((w, grown));
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Bridges with `spanned_walks` in: each spanned walk (both directions) becomes a read-measured
+/// bridge, and a topological or weak bridge between the same two anchor ends through repeats
+/// that no span fits leaves; returns the canonical spanned walks.
+fn merge_spanned(br: &mut Vec<Bridge>, spanned: &[(Vec<Oriented>, u64)]) -> Vec<Vec<Oriented>> {
+    if spanned.is_empty() {
+        return Vec::new();
+    }
+    let mut walks: FxHashMap<Vec<Oriented>, u64> = FxHashMap::default();
+    let mut ends: FxHashSet<(Oriented, Oriented)> = FxHashSet::default();
+    let mut canonical = Vec::new();
+    for (w, n) in spanned {
+        let rc = rc_walk(w);
+        canonical.push(w.clone().min(rc.clone()));
+        for v in [rc, w.clone()] {
+            ends.insert((v[0], v[v.len() - 1]));
+            let e = walks.entry(v).or_default();
+            *e = (*e).max(*n);
+        }
+    }
+    br.retain(|b| {
+        let unmeasured = b.topological || b.weak;
+        !(unmeasured && b.walk.len() >= 3 && ends.contains(&(b.walk[0], b.walk[b.walk.len() - 1])))
+            || walks.contains_key(&b.walk)
+    });
+    for b in br.iter_mut() {
+        if let Some(&n) = walks.get(&b.walk) {
+            b.reads = b.reads.max(n);
+            b.topological = false;
+            b.weak = false;
+        }
+    }
+    let have: FxHashSet<Vec<Oriented>> = br.iter().map(|b| b.walk.clone()).collect();
+    for (w, &n) in &walks {
+        if !have.contains(w) {
+            br.push(Bridge {
+                walk: w.clone(),
+                reads: n,
+                topological: false,
+                weak: false,
+            });
+        }
+    }
+    br.sort_by(|x, y| x.walk.cmp(&y.walk));
+    canonical.sort();
+    canonical.dedup();
+    canonical
+}
+
 /// Best path must be at least this much more likely than the runner-up (ln 2: twice as likely)
 /// to be reported as decisive; otherwise co-existing configurations are about equally supported.
 const DECISIVE_LN: f64 = std::f64::consts::LN_2;
@@ -1417,6 +1559,11 @@ pub fn run_phased(
     }
     let (mut br, self_loops) = bridges(&g, &report, &repeat, p.min_reads)?;
     br.retain(|b| phases.allows_walk(&b.walk, false));
+    let spanned: Vec<(Vec<Oriented>, u64)> = spanned_walks(&g, &report, &repeat, p.min_reads)?
+        .into_iter()
+        .filter(|(w, _)| phases.allows_walk(w, false))
+        .collect();
+    let spanned = merge_spanned(&mut br, &spanned);
     // Count each bridge once per distinct endpoint, including self-returning bridges.
     // Scanning all bridges for each anchor is quadratic on fragmented short-read graphs.
     let mut endpoint_support = vec![0u64; g.names.len()];
@@ -1487,8 +1634,8 @@ pub fn run_phased(
     if anchors.iter().all(|&a| optional[a]) {
         optional.iter_mut().for_each(|o| *o = false);
     }
-    // copies each repeat should be laid down, from its depth
-    let expected: Vec<Option<usize>> = match (
+    // copies each repeat should be laid down, from its depth, or from the reads that span it
+    let mut expected: Vec<Option<usize>> = match (
         report["segment_depths"].as_object(),
         report["median_depth"].as_f64(),
     ) {
@@ -1500,6 +1647,29 @@ pub fn run_phased(
             .collect(),
         _ => vec![None; g.names.len()],
     };
+    // passes per spanned anchor pair (its walks are alternatives: the most of any), summed over
+    // the pairs (each a place the repeat is laid down)
+    let mut per_pair: BTreeMap<(Oriented, Oriented), FxHashMap<usize, usize>> = BTreeMap::new();
+    for w in &spanned {
+        let mut passes: FxHashMap<usize, usize> = FxHashMap::default();
+        for o in &w[1..w.len() - 1] {
+            *passes.entry(o.0).or_default() += 1;
+        }
+        let most = per_pair.entry((w[0], w[w.len() - 1])).or_default();
+        for (s, n) in passes {
+            let e = most.entry(s).or_default();
+            *e = (*e).max(n);
+        }
+    }
+    let mut by_span: FxHashMap<usize, usize> = FxHashMap::default();
+    for most in per_pair.values() {
+        for (&s, &n) in most {
+            *by_span.entry(s).or_default() += n;
+        }
+    }
+    for (s, n) in by_span {
+        expected[s] = Some(n);
+    }
     let frac = exit_fractions(&br);
     let label = |walk: &[Oriented]| {
         walk.iter()
@@ -2970,6 +3140,40 @@ mod tests {
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
         r
+    }
+
+    #[test]
+    fn reads_across_a_tandem_array_say_how_often_its_loop_is_laid_down() {
+        // A circle of one 1,000 bp anchor and a 300 bp repeat that loops on itself. Depth says
+        // two copies (100x against 50x); twelve reads hold 2,990-3,012 bp between the anchor's
+        // two ends, ten copies, more than the topological bridges go round (`TOPO_MAX_REPEATS`).
+        let gfa = gfa_text(&[("A", 1000), ("R", 300)], &[("A+", "R+"), ("R+", "R+"), ("R+", "A+")]);
+        let ev = |spans: Option<Vec<i64>>| {
+            let mut v = json!({
+                "repeat_segments": ["R"],
+                "segment_depths": {"A": 50.0, "R": 100.0},
+                "median_depth": 50.0,
+                "phased_paths": [],
+                "links": link_reads(&[("A+", "R+", 20), ("R+", "R+", 20), ("R+", "A+", 20)]),
+                "params": {"spacing_tol": 0.05},
+            });
+            if let Some(s) = spans {
+                v["anchor_spans"] = json!([{"from": "A+", "to": "A+", "spans": s}]);
+            }
+            v
+        };
+        let length = |r: &LinearizeReport| r.components[0].best.as_ref().unwrap().molecules[0].length;
+        let by_depth = run_graph(&gfa, ev(None), "ovasm-array-depth");
+        assert!(length(&by_depth) <= 1000 + TOPO_MAX_REPEATS * 300);
+        let spans: Vec<i64> = (0..12).map(|i| 2990 + 2 * i).collect();
+        let by_reads = run_graph(&gfa, ev(Some(spans)), "ovasm-array-reads");
+        let best = by_reads.components[0].best.as_ref().unwrap();
+        assert!(best.molecules[0].circular);
+        assert_eq!(best.molecules[0].length, 1000 + 10 * 300);
+        assert_eq!(best.topological_bridges, 0, "the spanned walk is read-measured");
+        // too few reads (min_reads 2) leave the graph's answer
+        let one = run_graph(&gfa, ev(Some(vec![3000])), "ovasm-array-one");
+        assert_eq!(length(&one), length(&by_depth));
     }
 
     #[test]
