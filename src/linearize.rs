@@ -1235,15 +1235,17 @@ pub struct ComponentReport {
     /// Larger cover sizes, up to one molecule per anchor, were excluded by the configured
     /// molecule-count limit. Even a complete expansion search cannot rule those covers out.
     pub cover_size_limited: bool,
-    /// The selected cover is the read-joined paths (`partial_paths`), taken because the search
-    /// ran out of budget before finding any cover of the sizes it tried. Those paths visit every
+    /// The selected cover is the read-joined paths (`partial_paths`) of at least
+    /// `MIN_UNBRIDGED_BP`, taken because the search ran out of budget before finding any cover of
+    /// the sizes it tried. Those paths visit every
     /// required anchor once through read-backed bridges, so they are a cover of their own size;
     /// a smaller one may exist unseen, and the component is not decisive.
     pub read_join_cover: bool,
     pub best: Option<CoverReport>,
     /// For a component without a cover: the paths its read bridges make (see `partial_paths`),
     /// so that its sequence is reported. Not a solution: `best` stays empty, `molecules` 0, and
-    /// the component counts among `unsolved_components`.
+    /// the component counts among `unsolved_components`. With `read_join_cover`, the read-joined
+    /// paths under `MIN_UNBRIDGED_BP` (the longer ones are `best`).
     pub partial: Option<CoverReport>,
     /// Bridge/copy score lead of the selected representative over its strongest competitor
     /// with as many linear molecules, across all searched cover sizes. May be negative when
@@ -1666,9 +1668,22 @@ pub fn run_phased(
             // are covers of single anchors (rice SAMEA115396709's mitochondrion, 34 anchors
             // holding 252 of its 316 kb: truncated at four molecules, all of it partial, 54 kb
             // of molecules against 287 kb from a graph in more pieces).
-            if rep.search_truncated && p.max_molecules == 0 {
+            // Only paths of at least `MIN_UNBRIDGED_BP` are molecules, as for an anchor no bridge
+            // reaches: shorter ones are the stubs short-read graphs leave, and stay partial (rice
+            // SAMEA115396710 from 150 bp reads: a nuclear component of 1,686 anchors at 0.58 times
+            // the mitochondrion's depth came out as 853 molecules, 122.5 kb, all under 1 kb).
+            let (long, short): (Vec<Found>, Vec<Found>) = paths.iter().cloned().partition(|f| {
+                describe(f).is_ok_and(|(_, l)| l.length >= MIN_UNBRIDGED_BP)
+            });
+            if rep.search_truncated && p.max_molecules == 0 && !long.is_empty() {
                 rep.read_join_cover = true;
-                ranked.push((walks, report, paths));
+                if !short.is_empty() {
+                    let (walks, report) = cover_report(&short)?;
+                    partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
+                    rep.partial = Some(report);
+                }
+                let (walks, report) = cover_report(&long)?;
+                ranked.push((walks, report, long));
             } else {
                 partial.extend(walks.into_iter().zip(report.molecules.iter().cloned()));
                 rep.partial = Some(report);
@@ -3183,7 +3198,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ovasm-budget-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("g.gfa"),
-            "H\tVN:Z:1.0\nS\tA\tACGTACGT\nS\tB\tGCTAGCTA\nS\tC\tTGCATGCA\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tC\t+\tA\t+\t0M\n").unwrap();
+            gfa_text(&[("A", 600), ("B", 500), ("C", 400)], &[("A+", "B+"), ("B+", "C+"), ("C+", "A+")])).unwrap();
         let ev = json!({"repeat_segments": [], "phased_paths": [], "links": [
             {"from":"A+", "to":"B+", "reads":10},
             {"from":"B+", "to":"C+", "reads":10},
@@ -3202,6 +3217,14 @@ mod tests {
         assert!(c.read_join_cover && c.partial.is_none());
         assert_eq!((report.molecules, report.unsolved_components), (1, 0));
         assert!(report.best.as_ref().unwrap().circular);
+        // the same paths of 24 bp are stubs: partial, the component unsolved
+        std::fs::write(dir.join("g.gfa"),
+            "H\tVN:Z:1.0\nS\tA\tACGTACGT\nS\tB\tGCTAGCTA\nS\tC\tTGCATGCA\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tC\t+\tA\t+\t0M\n").unwrap();
+        let report = run(&dir.join("g.gfa"), &dir.join("e.json"), params,
+            &dir.join("m.fa"), None, &dir.join("l.json")).unwrap();
+        let c = &report.components[0];
+        assert!(!c.read_join_cover && c.partial.is_some());
+        assert_eq!((report.molecules, report.unsolved_components), (0, 1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
