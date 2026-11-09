@@ -245,8 +245,8 @@ pub struct AssembleReport {
     pub cleaning_audit: String,
     /// Dead ends reconnected through k-mers the reads agree on (see `rescue_gaps`).
     pub rescue: RescueStats,
-    /// Dense mode: dead ends joined by an exact overlap shorter than k - 1 (see
-    /// `join_dead_ends`).
+    /// Dead ends joined by an exact overlap shorter than k - 1 (dense mode), or one found
+    /// nowhere else in the graph (long reads; see `join_dead_ends`).
     pub overlap_joins: usize,
     /// Dense mode: gaps between dead ends filled by a local k = 31 assembly (see `fill_gaps`).
     pub gaps_filled: usize,
@@ -599,12 +599,18 @@ fn blunt_links(seqs: &mut [Vec<u8>], links: &[ULink]) -> (Vec<ULink>, usize) {
 /// the k-mers across a junction are missing (short reads thin out over a hard stretch:
 /// Nipponbare 153.9 kb, two unitigs sharing 84 bp at k 127) the two ends still share a shorter
 /// stretch. The two ends of one unitig may join (a circle); one end to itself may not.
+///
+/// With `unique`, the shared stretch must occur nowhere else in the graph (either strand) than
+/// at the two ends it joins: a stretch found elsewhere too is a repeat, and an overlap within a
+/// repeat does not say which copy continues. That, not the overlap's length, keeps a short
+/// overlap from being a false join, so long-read (sparse) mode joins from `GAP_K` bases on.
 fn join_dead_ends(
     seqs: &[Vec<u8>],
     links: &[ULink],
     circular: &[bool],
     min_ov: usize,
     max_ov: usize,
+    unique: bool,
 ) -> Vec<ULink> {
     let mut used: FxHashSet<(usize, bool)> = FxHashSet::default();
     for &((a, b), _) in links {
@@ -620,17 +626,22 @@ fn join_dead_ends(
     };
     // leaving (u, f) uses u's right end when f; entering (v, f) uses v's left end when f
     let exits: Vec<(usize, bool)> = (0..seqs.len())
-        .filter(|&u| !circular[u])
+        .filter(|&u| !circular[u] && seqs[u].len() > min_ov)
         .flat_map(|u| [(u, true), (u, false)])
         .filter(|&e| !used.contains(&e))
         .collect();
-    let overlap = |x: &[u8], y: &[u8]| -> usize {
-        let top = max_ov.min(x.len() - 1).min(y.len() - 1);
-        (min_ov..=top)
-            .rev()
-            .find(|&l| x[x.len() - l..] == y[..l])
-            .unwrap_or(0)
-    };
+    // every overlap of at least min_ov bases starts with the entry's first min_ov bases
+    let entries: Vec<((usize, bool), Vec<u8>)> = exits
+        .iter()
+        .map(|&e| {
+            let y = (e.0, !e.1); // the entry through the same dead end
+            (y, oriented(y))
+        })
+        .collect();
+    let mut by_head: FxHashMap<&[u8], Vec<usize>> = FxHashMap::default();
+    for (i, (_, sy)) in entries.iter().enumerate() {
+        by_head.entry(&sy[..min_ov]).or_default().push(i);
+    }
     // best entry of every dead exit: (overlap, entry), None when tied
     type BestEntry = Option<(usize, (usize, bool))>;
     let mut best: FxHashMap<(usize, bool), BestEntry> = FxHashMap::default();
@@ -638,22 +649,29 @@ fn join_dead_ends(
         let sx = oriented(x);
         let mut top: Option<(usize, (usize, bool))> = None;
         let mut tied = false;
-        for &e in &exits {
-            let y = (e.0, !e.1); // the entry through the same dead end
-            if y.0 == x.0 && y.1 != x.1 {
-                continue; // back into the end it leaves by
-            }
-            let l = overlap(&sx, &oriented(y));
-            if l == 0 {
+        // longest first: an overlap of l bases starts at sx.len() - l
+        let longest = max_ov.min(sx.len() - 1);
+        for l in (min_ov..=longest).rev() {
+            let st = sx.len() - l;
+            let Some(cands) = by_head.get(&sx[st..st + min_ov]) else {
                 continue;
-            }
-            match top {
-                Some((m, _)) if l < m => {}
-                Some((m, _)) if l == m => tied = true,
-                _ => {
-                    top = Some((l, y));
-                    tied = false;
+            };
+            for &i in cands {
+                let (y, sy) = &entries[i];
+                if y.0 == x.0 && y.1 != x.1 {
+                    continue; // back into the end it leaves by
                 }
+                if l >= sy.len() || sx[st..] != sy[..l] {
+                    continue;
+                }
+                match top {
+                    None => top = Some((l, *y)),
+                    Some((_, z)) if z != *y => tied = true,
+                    Some(_) => {}
+                }
+            }
+            if top.is_some() {
+                break; // every shorter overlap loses to this one
             }
         }
         best.insert(x, if tied { None } else { top });
@@ -666,11 +684,31 @@ fn join_dead_ends(
         if back.map(|(_, z)| (z.0, !z.1)) != Some(x) {
             continue;
         }
+        if unique && occurrences(seqs, &oriented(y)[..l], 2) > 2 {
+            continue; // a repeat: found at more places than the two ends it would join
+        }
         let rc = ((y.0, !y.1), (x.0, !x.1));
         let key = if (x, y) <= rc { (x, y) } else { rc };
         out.insert((key, l));
     }
     out.into_iter().collect()
+}
+
+/// Places where `pat` or its reverse complement occurs in `seqs`, counted up to `cap + 1`.
+fn occurrences(seqs: &[Vec<u8>], pat: &[u8], cap: usize) -> usize {
+    let rc = revcomp(pat);
+    let mut n = 0;
+    for s in seqs {
+        for w in s.windows(pat.len()) {
+            if w == pat || w == rc.as_slice() {
+                n += 1;
+                if n > cap {
+                    return n;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// Small k of the local assembly across a gap.
@@ -2476,11 +2514,22 @@ fn run_backbone_layout_guard(
     let gaps_filled = if preserve_overlaps {
         0
     } else if dense {
-        let joins = join_dead_ends(&seqs, &links, &circular, (p.k / 3).max(31), p.k - 2);
+        let joins = join_dead_ends(&seqs, &links, &circular, (p.k / 3).max(31), p.k - 2, false);
         overlap_joins = joins.len();
         links.extend(joins);
         fill_gaps(&mut seqs, &mut links, &circular, &inputs, GAP_MAX, 3)?
     } else {
+        // Long reads leave dead ends whose sequence already overlaps where they should join: at
+        // low depth no read holds a whole k-mer across the junction, yet both sides carry the
+        // shared stretch. The Limnoperna fortunei mitochondrion (PMAT2 benchmark, ~4x, k 1001)
+        // was one 18,713 bp unitig whose two ends shared 198 bp; the gap fill, walking on from
+        // the exit past what it already shared, took 154 more bases off a stray read before it
+        // met the start, and the molecule stayed linear at 18,836 bp (circle 18,515 bp).
+        // Joining the shared stretch first leaves the fill only real gaps. An overlap of up to
+        // 2k bases may hold no sampled k-mer of both ends (one in every k - s + 1 starts).
+        let joins = join_dead_ends(&seqs, &links, &circular, GAP_K, 2 * p.k, true);
+        overlap_joins = joins.len();
+        links.extend(joins);
         fill_gaps(&mut seqs, &mut links, &circular, &inputs, LONG_GAP_MAX, 1)?
     };
     let boundary_bp_moved = if preserve_overlaps {
@@ -3201,17 +3250,107 @@ mod tests {
         let y = [x[940..].to_vec(), seq(1000, 72)].concat();
         let z = [x[960..].to_vec(), seq(1000, 73)].concat();
         let seqs = vec![x, y, z];
-        let joins = join_dead_ends(&seqs, &[], &[false; 3], 33, 99);
+        let joins = join_dead_ends(&seqs, &[], &[false; 3], 33, 99, false);
         assert_eq!(joins, vec![(((0, true), (1, true)), 60)]);
         // too short an overlap is not a join
-        assert!(join_dead_ends(&seqs[..2], &[], &[false; 2], 61, 99).is_empty());
+        assert!(join_dead_ends(&seqs[..2], &[], &[false; 2], 61, 99, false).is_empty());
         // a linear unitig whose ends overlap closes into a circle
         let c = seq(1000, 74);
         let circle = [c.clone(), c[..50].to_vec()].concat();
         assert_eq!(
-            join_dead_ends(&[circle], &[], &[false], 33, 99),
+            join_dead_ends(&[circle], &[], &[false], 33, 99, false),
             vec![(((0, false), (0, false)), 50)] // the canonical side of the self-link
         );
+    }
+
+    #[test]
+    fn a_short_overlap_joins_long_read_dead_ends_only_where_it_is_unique() {
+        // A linear unitig whose two ends share 198 bp: a circle at any length of overlap.
+        let c = seq(5000, 81);
+        let circle = [c.clone(), c[..198].to_vec()].concat();
+        assert_eq!(
+            join_dead_ends(&[circle.clone()], &[], &[false], GAP_K, 2002, true),
+            vec![(((0, false), (0, false)), 198)]
+        );
+        // the shared stretch also lies inside another unitig: a repeat, no join
+        let other = [seq(800, 82), c[..198].to_vec(), seq(800, 83)].concat();
+        let both = [circle.clone(), other.clone()];
+        assert!(join_dead_ends(&both, &[], &[false, true], GAP_K, 2002, true).is_empty());
+        // likewise on the other strand
+        let both_rc = [circle.clone(), revcomp(&other)];
+        assert!(join_dead_ends(&both_rc, &[], &[false, true], GAP_K, 2002, true).is_empty());
+        // without the uniqueness test (dense mode) the overlap alone decides
+        assert_eq!(
+            join_dead_ends(&both, &[], &[false, true], GAP_K, 2002, false),
+            vec![(((0, false), (0, false)), 198)]
+        );
+    }
+
+    #[test]
+    fn a_shallow_circle_whose_ends_overlap_closes_without_extra_sequence() {
+        // Long reads at 2x over a 12 kb circle, none holding a whole sampled k-mer across the
+        // origin: two reads run into it and stop one base short of the first sampled k-mer past
+        // it, two start at the circle's first base. The one unitig's ends share the stretch
+        // between, longer than the gap fill's window, which therefore cannot close it; joined by
+        // that overlap it is the circle, base for base (Limnoperna fortunei, ~4x, k 1001).
+        let (k, s) = (501, 31);
+        let g = seq(12_000, 91);
+        let n = g.len();
+        let circ = [g.clone(), g.clone()].concat();
+        let sampled = closed_syncmers(&circ, k, s);
+        let first = sampled[0]; // the unitig's first node
+        let prev = *sampled.iter().filter(|&&q| q < n + first).last().unwrap();
+        let end = n + first + k - 1; // reads into the origin stop here
+        let shared = prev + k - n - first;
+        assert!(
+            shared > GAP_WINDOW && shared < k - 1,
+            "setup: ends share {shared} bp"
+        );
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        let starts: Vec<usize> = (0..n - 3000).step_by(1200).chain([n - 3000]).collect();
+        for (i, &st) in starts.iter().enumerate() {
+            for (j, len) in [3000, 2500].into_iter().enumerate() {
+                let r = if st + 3000 == n {
+                    g[n - len..].to_vec() // the last two end at the origin
+                } else {
+                    g[st..st + len].to_vec()
+                };
+                reads.push(if (i + j) % 2 == 0 { r } else { revcomp(&r) });
+            }
+        }
+        reads.push(circ[n - 2500..end].to_vec());
+        reads.push(revcomp(&circ[n - 2000..end]));
+        let dir = tmpdir("shallow-overlap");
+        let rep = run(
+            vec![fastq(&dir, &reads)],
+            AssembleParams {
+                k,
+                s,
+                min_count: Some(2),
+                ..params()
+            },
+            &dir.join("a.gfa"),
+            &dir.join("a.json"),
+        )
+        .unwrap();
+        let gfa = fs::read_to_string(dir.join("a.gfa")).unwrap();
+        assert_eq!(rep.unitigs, 1, "{gfa}");
+        assert_eq!(rep.overlap_joins, 1, "{gfa}");
+        let u = gfa_segments(&gfa).remove(0);
+        let links: Vec<&str> = gfa.lines().filter(|l| l.starts_with("L\t")).collect();
+        assert_eq!(links.len(), 1, "closed by a self link");
+        let ov: usize = links[0]
+            .split('\t')
+            .nth(5)
+            .unwrap()
+            .trim_end_matches('M')
+            .parse()
+            .unwrap();
+        let circle = &u.as_bytes()[..u.len() - ov];
+        assert_eq!(circle.len(), n, "no sequence beyond the circle");
+        let rc = revcomp(circle);
+        assert!(circ.windows(n).any(|w| w == circle || w == rc.as_slice()));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
