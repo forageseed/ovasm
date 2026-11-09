@@ -1153,6 +1153,64 @@ const KMER_GATE_SLOTS_LOG2: u32 = if cfg!(test) { 21 } else { 31 };
 /// shallower than an organelle, a plastid far deeper than a mitochondrion.
 const KMER_GATE_FLOOR: f64 = 0.25;
 const KMER_GATE_CEILING: f64 = 10.0;
+/// The gate's floor is raised to the valley below a target's depth, but no higher than this share
+/// of it (`kmer_gate_floor`).
+const KMER_GATE_FLOOR_MAX: f64 = 0.5;
+
+/// The k-mer gate's floor for a target at k-mer depth `depth`, from the counts of the library's
+/// distinct k-mers (`KmerCounts::sampled`): the least dense depth, per unit of log depth, between
+/// the nucleus (`assemble::sequence_depth` of them all) and `KMER_GATE_FLOOR_MAX` times the target,
+/// and no lower than `KMER_GATE_FLOOR` times it. Below a target the library holds the nucleus and
+/// its repeats, whose k-mers grow fewer the more copies they have; the target's own k-mers stand
+/// around its depth. Where the two meet, fewer k-mers stand than on either side, and a read whose
+/// new k-mers stand below that is more likely the nucleus's. A fixed quarter of the target's depth
+/// let the nucleus in when that depth was right: rice SAMEA115396709's mitochondrion at 224 (its
+/// plastid-derived stretches no longer counted) had a floor of 56, about six nuclear copies, and
+/// its pan reconstruction took 1.75 M reads (0.83 M at a floor of 121), whose graph broke into
+/// 2,618 unitigs; the mitochondrion's recall fell from 0.77 to 0.02.
+fn kmer_gate_floor(counts: &mut [u32], depth: f64) -> f64 {
+    let low = KMER_GATE_FLOOR * depth;
+    counts.sort_unstable();
+    let solid: Vec<u32> = counts.iter().copied().filter(|&c| c >= 3).collect();
+    let nuclear = crate::assemble::sequence_depth(&solid);
+    let high = KMER_GATE_FLOOR_MAX * depth;
+    if solid.is_empty() || nuclear <= 0.0 || nuclear >= high {
+        return low;
+    }
+    // 5% bins of log depth from the nucleus to the cap
+    const BIN: f64 = 1.05;
+    let n = ((high / nuclear).ln() / BIN.ln()).floor() as usize;
+    if n < 2 {
+        return low;
+    }
+    let mut hist = vec![0u64; n];
+    for &c in &solid {
+        let x = f64::from(c);
+        if x > nuclear && x <= high {
+            let i = ((x / nuclear).ln() / BIN.ln()) as usize;
+            if i < n {
+                hist[i] += 1;
+            }
+        }
+    }
+    // k-mers per count in each bin: a bin narrower than one count holds none of them, and an
+    // empty bin is no valley (`assemble::sequence_depth`)
+    let at = |i: usize| nuclear * BIN.powi(i as i32);
+    let density: Vec<Option<f64>> = (0..n)
+        .map(|i| {
+            let counts = at(i + 1).ceil() - at(i).ceil();
+            (counts >= 1.0).then(|| hist[i] as f64 / counts)
+        })
+        .collect();
+    // the valley is the least dense bin above the nucleus; where several are (an empty gap
+    // between the nucleus and the target), the middle of them in log depth
+    let Some(min) = density[1..].iter().flatten().copied().min_by(f64::total_cmp) else {
+        return low;
+    };
+    let first = (1..n).find(|&i| density[i] == Some(min)).unwrap();
+    let last = (1..n).rev().find(|&i| density[i] == Some(min)).unwrap();
+    at((first + last) / 2).max(low)
+}
 /// Fewer new k-mers than this: the read adds nothing to judge, and extends.
 const KMER_GATE_MIN_NEW: usize = 5;
 
@@ -1180,11 +1238,18 @@ fn kmer_frontier(
     bait: &mut BaitSet,
     t: usize,
     depth: f64,
+    floor: Option<f64>,
     max_ends: usize,
 ) -> (crate::frontier::Extension, usize) {
     let known = bait.target_kmers(t);
     let budget = size_cap(&bait.targets[t].name).unwrap_or(KMER_FRONTIER_BUDGET) as usize;
-    let p = crate::frontier::Params { max_ends, ..Default::default() };
+    let walk = crate::frontier::Params::default();
+    // the walk's own share of the depth, or the gate's floor when that is higher
+    let p = crate::frontier::Params {
+        max_ends,
+        floor: floor.map_or(walk.floor, |f| walk.floor.max(f / depth)),
+        ..walk
+    };
     let ext = crate::frontier::extend_from_kmers(table, &known, depth, budget, &p);
     drop(known);
     let added = ext.sequences.iter().map(|s| bait.add_sequence_counted(t, s)).sum();
@@ -1193,7 +1258,7 @@ fn kmer_frontier(
 
 /// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
 /// those the target's bait lacks, at the target's depth `depth` by the table's counts.
-fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64) -> bool {
+fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64, floor: f64) -> bool {
     let bit = 1u8 << t;
     let mut new: Vec<u32> = CanonicalKmers::new(seq, bait.k)
         .filter(|&(_, km)| bait.get(km) & bit == 0)
@@ -1204,7 +1269,7 @@ fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, s
     }
     new.sort_unstable();
     let m = f64::from(new[new.len() / 2]);
-    m >= KMER_GATE_FLOOR * depth && m <= KMER_GATE_CEILING * depth
+    m >= floor && m <= KMER_GATE_CEILING * depth
 }
 
 /// Keep the k-mers new to a target's bait that stand at its depth in the k-mer gate's table
@@ -1218,11 +1283,17 @@ fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, s
 /// and the growth guard stopped them). An error k-mer stands near zero in the whole read set's
 /// table, a nuclear k-mer at the nuclear depth: both below the floor. No-op without a table or
 /// a depth.
-fn keep_at_target_depth(table: Option<&crate::frontier::KmerCounts>, depth: Option<f64>, kmers: &mut Vec<u64>) {
+fn keep_at_target_depth(
+    table: Option<&crate::frontier::KmerCounts>,
+    depth: Option<f64>,
+    floor: Option<f64>,
+    kmers: &mut Vec<u64>,
+) {
     if let (Some(table), Some(d)) = (table, depth) {
+        let floor = floor.unwrap_or(KMER_GATE_FLOOR * d);
         kmers.retain(|&km| {
             let c = f64::from(table.get(km));
-            c >= KMER_GATE_FLOOR * d && c <= KMER_GATE_CEILING * d
+            c >= floor && c <= KMER_GATE_CEILING * d
         });
     }
 }
@@ -1776,6 +1847,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
+    // and each one's floor (`kmer_gate_floor`)
+    let mut kmer_floor: Vec<Option<f64>> = vec![None; n_targets];
     let mut gpu = (crate::gpu::requested() && replay.is_some() && cfg.iterations > 1)
         .then(|| match crate::gpu::Gpu::open() {
             Ok(g) => {
@@ -1846,16 +1919,19 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 None => read_batches(&cfg.inputs),
             };
             let table = crate::frontier::KmerCounts::from_source(source, KMER_GATE_SLOTS_LOG2, bait.k)?;
+            let mut library: Vec<u32> = table.sampled.iter().map(|&km| table.get(km)).collect();
             for t in 0..n_targets {
                 let reads = res.all_sample[t].reads();
                 kmer_target_depth[t] = kmer_depth(&table, &bait, t, &reads);
+                kmer_floor[t] = kmer_target_depth[t].map(|d| kmer_gate_floor(&mut library, d));
             }
             eprintln!(
-                "[ovasm] k-mer gate: {} k-mers of {} reads counted in {:.0}s; target depths {:?}",
+                "[ovasm] k-mer gate: {} k-mers of {} reads counted in {:.0}s; target depths {:?}, floors {:?}",
                 bait.k,
                 table.reads,
                 table.seconds,
-                kmer_target_depth
+                kmer_target_depth,
+                kmer_floor.iter().map(|f| f.map(|x| x.round())).collect::<Vec<_>>()
             );
             kmer_table = Some(table);
         }
@@ -1870,7 +1946,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     continue;
                 };
                 let max_ends = walk_ends[t].map_or(usize::MAX, |e| (e as f64 * KMER_FRONTIER_MAX_END_GROWTH) as usize);
-                let (ext, n) = kmer_frontier(table, &mut bait, t, d, max_ends);
+                let (ext, n) = kmer_frontier(table, &mut bait, t, d, kmer_floor[t], max_ends);
                 walked[t] = n;
                 if ext.skipped == Some("ends_growing") {
                     walk_stopped[t] = true;
@@ -2023,7 +2099,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
-                        if !kmer_extends(table, &bait, t, &r.seq, d) {
+                        if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d)) {
                             gated_out[t] += 1;
                             return;
                         }
@@ -2053,7 +2129,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         new.sort_unstable();
                         new.dedup();
                     }
-                    keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], &mut new);
+                    keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                     if runaway_bait_gain(previous, added[t] + new.len()) {
                         saturated[t] = true;
@@ -2123,7 +2199,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                             new.sort_unstable();
                             new.dedup();
                         }
-                        keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], &mut new);
+                        keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
                         let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                         if runaway_bait_gain(previous, added[t].saturating_add(new.len())) {
                             saturated[t] = true;
@@ -2705,10 +2781,10 @@ mod tests {
         let depth = kmer_depth(&table, &bait, t, &reads).unwrap();
         assert!((depth - 200.0).abs() < 10.0, "{depth}");
         // 120 bp on the bait and 30 bp further into the organelle: extends
-        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth));
+        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth, KMER_GATE_FLOOR * depth));
         // 120 bp on the bait and 30 bp into the nucleus past the NUMT: does not
         let numt_edge = [&organelle[880..1000], &nucleus[..30]].concat();
-        assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth));
+        assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth, KMER_GATE_FLOOR * depth));
     }
 
     #[test]
@@ -4375,15 +4451,15 @@ mod tests {
         new.sort_unstable();
         new.dedup();
         let mut kept = new.clone();
-        keep_at_target_depth(Some(&table), Some(100.0), &mut kept);
+        keep_at_target_depth(Some(&table), Some(100.0), None, &mut kept);
         let mut want = kmers(&organelle);
         want.sort_unstable();
         want.dedup();
         assert_eq!(kept, want);
         // without a table or a depth nothing is dropped
         let mut all = new.clone();
-        keep_at_target_depth(None, Some(100.0), &mut all);
-        keep_at_target_depth(Some(&table), None, &mut all);
+        keep_at_target_depth(None, Some(100.0), None, &mut all);
+        keep_at_target_depth(Some(&table), None, None, &mut all);
         assert_eq!(all, new);
     }
 
@@ -4510,6 +4586,25 @@ mod tests {
         assert_eq!(count_reads(&gated.outputs[0].output, b's'), 540);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_gate_floor_is_the_valley_between_the_nucleus_and_the_target() {
+        // a nucleus at ~10 (3 M k-mers), its repeats falling as depth^-3 up to 2,000 copies,
+        // a mitochondrion at ~224 (4,000 k-mers): the valley is under the mitochondrion's peak
+        let mut c: Vec<u32> = (0..3_000_000u32).map(|i| 7 + i % 7).collect();
+        for x in 14u64..20_000 {
+            c.extend(std::iter::repeat(x as u32).take((3_000_000_000 / (x * x * x)) as usize));
+        }
+        c.extend((0..4000u32).map(|i| 180 + i % 90));
+        let f = kmer_gate_floor(&mut c.clone(), 224.0);
+        assert!(f > 0.25 * 224.0 && f <= 0.5 * 224.0 + 1.0, "{f}");
+        // a library without repeats between: the middle of the empty gap, under the quarter
+        let mut clean: Vec<u32> = (0..3_000_000u32).map(|i| 7 + i % 7).collect();
+        clean.extend((0..4000u32).map(|i| 180 + i % 90));
+        assert_eq!(kmer_gate_floor(&mut clean, 224.0), 0.25 * 224.0);
+        // a target hardly deeper than the nucleus: the quarter
+        assert_eq!(kmer_gate_floor(&mut c.clone(), 15.0), 0.25 * 15.0);
     }
 
     #[test]

@@ -91,7 +91,14 @@ pub struct KmerCounts {
     pub reads: u64,
     pub bases: u64,
     pub seconds: f64,
+    /// The distinct k-mers of a hash-chosen `1 / SAMPLED_KMERS` of all k-mers (`from_source`):
+    /// their counts are the library's k-mer histogram, each k-mer once, whatever its depth.
+    pub sampled: Vec<u64>,
 }
+
+/// One k-mer in this many is kept in `KmerCounts::sampled`: a rice library (~400 Mb nuclear,
+/// ~500 kb mitochondrion) gives ~3 M nuclear and ~4,000 mitochondrial k-mers.
+pub const SAMPLED_KMERS: u64 = 128;
 
 #[inline]
 fn mix64(mut z: u64) -> u64 {
@@ -117,6 +124,7 @@ impl KmerCounts {
             reads: 0,
             bases: 0,
             seconds: 0.0,
+            sampled: Vec::new(),
         }
     }
 
@@ -130,11 +138,28 @@ impl KmerCounts {
         let start = Instant::now();
         let mut table = Self::with_k(slots_log2, k);
         let (batches, reader) = source;
+        let mut sampled: rustc_hash::FxHashSet<u64> = Default::default();
+        let bound = u64::MAX / SAMPLED_KMERS;
         for batch in batches {
             table.reads += batch.len() as u64;
             table.bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
-            batch.par_iter().for_each(|r| table.add_seq(&r.seq));
+            let picked: Vec<Vec<u64>> = batch
+                .par_iter()
+                .map(|r| {
+                    let mut v = Vec::new();
+                    for (_, key) in CanonicalKmers::new(&r.seq, table.k) {
+                        table.add(key);
+                        if mix64(key ^ 0x5bd1_e995) < bound {
+                            v.push(key);
+                        }
+                    }
+                    v
+                })
+                .collect();
+            sampled.extend(picked.into_iter().flatten());
         }
+        table.sampled = sampled.into_iter().collect();
+        table.sampled.sort_unstable();
         reader
             .join()
             .map_err(|_| anyhow::anyhow!("k-mer counting reader panicked"))??;
