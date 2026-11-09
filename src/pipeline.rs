@@ -1734,7 +1734,14 @@ fn assemble_organelle(
         read_type: cfg.read_type,
         filter: filter.as_ref(),
         nuclear_share: nuclear_share(&recruited.recruitment),
-        depth_reference: cfg.depth_reference.get(organelle).map(PathBuf::as_path),
+        // without a reference of its own, the seeds the reads were recruited by: the nodes they
+        // share with the graph are the organelle's, whatever else the reads hold (fewer than
+        // `assemble::DEPTH_REFERENCE_MIN_NODES` leave the depth to the node counts)
+        depth_reference: cfg
+            .depth_reference
+            .get(organelle)
+            .or_else(|| cfg.seeds.get(organelle).and_then(|v| v.first()))
+            .map(PathBuf::as_path),
         experimental_deep_bubble_fraction,
     };
     let ladder = match cfg.read_type {

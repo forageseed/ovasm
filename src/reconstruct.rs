@@ -2080,7 +2080,14 @@ pub fn run(cfg: &Config) -> Result<Value> {
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
             prune_gene_free: false,
-            depth_reference: Default::default(),
+            // the reference's own sequence sets the node depth: the target reads hold nuclear
+            // reads beside the organelle's, which stand for more sequence at their own depth
+            // (rice SAMEA115396709 from 100 bp reads: 1.75 M reads, node depth ~22 against the
+            // mitochondrion's ~70, 2,618 unitigs, recall 0.02)
+            depth_reference: BTreeMap::from([(
+                o.to_string(),
+                cfg.out.join("reference").join(format!("{o}.fasta")),
+            )]),
         }, retry_floor, cfg.experimental_deep_bubble_fraction.get(o).copied());
         let denovo_path = dir.join("de-novo/organelle.gfa");
         let integration = export_individual(
