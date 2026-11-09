@@ -1773,6 +1773,8 @@ pub fn run_phased(
         .iter()
         .flat_map(|b| [b.walk[0].0, b.walk[b.walk.len() - 1].0])
         .collect();
+    // single segments that are molecules of their own, and why
+    let mut lone: Vec<(usize, &'static str)> = Vec::new();
     for &a in anchors
         .iter()
         .filter(|&&a| !bridged.contains(&a) && !optional[a])
@@ -1785,6 +1787,27 @@ pub fn run_phased(
             })?);
             continue;
         }
+        lone.push((a, "unbridged_sequence"));
+    }
+    // A repeat no chosen bridge crosses is laid down nowhere, yet its sequence is in the genome at
+    // least once. Where the reads already leave the genome in linear pieces it is one more piece,
+    // as an anchor no bridge reaches is (rice SAMEA115396709's mitochondrion from 100 bp reads:
+    // 10.6 kb of its 316 kb in repeats of 1.1-3.1 kb at 1.5-3 times its depth, in no molecule).
+    // A result of circles alone stays as it is: there an unplaced repeat is a configuration the
+    // reads do not take, reported in `repeats_not_placed`. Pieces under `MIN_UNBRIDGED_BP` stay
+    // out, as stubs do above.
+    if !lone.is_empty() || chosen.iter().any(|(_, l)| !l.circular) {
+        let laid: FxHashSet<usize> = chosen
+            .iter()
+            .flat_map(|(w, _)| w.iter().map(|o| o.0))
+            .collect();
+        for r in (0..g.names.len()).filter(|&r| repeat[r] && !laid.contains(&r)) {
+            if g.seqs[r].len() >= MIN_UNBRIDGED_BP {
+                lone.push((r, "unplaced_repeat"));
+            }
+        }
+    }
+    for (a, model) in lone {
         let walk = vec![(a, true)];
         let lin = Linearization {
             path: label(&walk),
@@ -1796,7 +1819,7 @@ pub fn run_phased(
         };
         chosen.push((walk, lin.clone()));
         comps.push(ComponentReport {
-            ranking_model: "unbridged_sequence",
+            ranking_model: model,
             evidence_tied_candidates: 0,
             read_model_budget_exhausted: false,
             read_path_cover: None,
@@ -2727,6 +2750,44 @@ mod tests {
         assert!(partial
             .unwrap()
             .starts_with(">partial.1 circular=false length=120 path=U+ "));
+    }
+
+    #[test]
+    fn an_unresolved_result_keeps_each_unplaced_repeat_once() {
+        // X A is a linear piece; R is a repeat no bridge crosses. Its sequence is still in the
+        // genome: with linear pieces it comes out once, as a piece of its own.
+        let gfa = gfa_text(&[("X", 1500), ("A", 1400), ("R", 1200), ("S", 300)], &[("X+", "A+")]);
+        let ev = json!({
+            "repeat_segments": ["R", "S"],
+            "segment_depths": {"X": 20.0, "A": 21.0, "R": 45.0, "S": 44.0},
+            "median_depth": 20.0,
+            "phased_paths": [],
+            "links": link_reads(&[("X+", "A+", 30)]),
+        });
+        let (r, molecules, _) = run_files(&gfa, &ev, "ovasm-unplaced-repeat", 0);
+        let paths: Vec<String> = r.components.iter()
+            .flat_map(|c| c.best.iter().flat_map(|b| b.molecules.iter().map(|m| m.path.clone())))
+            .collect();
+        assert!(paths.contains(&"X+ A+".to_string()) && paths.contains(&"R+".to_string()), "{paths:?}");
+        // S is a stub under MIN_UNBRIDGED_BP
+        assert!(!paths.iter().any(|p| p.contains("S")));
+        assert!(r.components.iter().any(|c| c.ranking_model == "unplaced_repeat"));
+        assert_eq!(r.repeats_not_placed, names(&["S"]));
+        assert!(molecules.unwrap().contains("path=R+"));
+
+        // a circle: the unplaced repeat is a configuration the reads do not take
+        let gfa = gfa_text(&[("X", 1500), ("A", 1400), ("R", 1200)], &[("X+", "A+"), ("A+", "X+")]);
+        let ev = json!({
+            "repeat_segments": ["R"],
+            "segment_depths": {"X": 20.0, "A": 21.0, "R": 45.0},
+            "median_depth": 20.0,
+            "phased_paths": [],
+            "links": link_reads(&[("X+", "A+", 30), ("A+", "X+", 30)]),
+        });
+        let (r, _, _) = run_files(&gfa, &ev, "ovasm-unplaced-repeat-circle", 0);
+        assert!(r.best.as_ref().unwrap().circular);
+        assert_eq!(r.molecules, 1);
+        assert_eq!(r.repeats_not_placed, names(&["R"]));
     }
 
     #[test]
