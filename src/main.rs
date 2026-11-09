@@ -741,6 +741,17 @@ fn protein_seed_passes(lineage: seeddb::Lineage) -> usize {
     }
 }
 
+/// Whether the mitochondrial graph goes through the gene-free component filter
+/// (`RunConfig::prune_gene_free`): protein seeds of an animal or fungal lineage, whose small
+/// mitochondrion the lineage panel's genes mark, whatever the number of recruitment passes. The
+/// shallow case recruits in one pass without the depth gate and takes in the most nuclear reads:
+/// Acipenser ruthenus (PMAT2 benchmark, 2.82 Gb, the mitochondrion at 7x), 480 reads of which 14
+/// mitochondrial, assembled into the 16,785 bp circle beside 24 gene-free nuclear pieces of 143 kb,
+/// all kept while the filter followed the pass count (more than one).
+fn prune_gene_free(lineage: seeddb::Lineage, protein_passes: Option<usize>) -> bool {
+    protein_passes.is_some() && !matches!(lineage, seeddb::Lineage::Landplants)
+}
+
 fn run(args: RunArgs) -> Result<()> {
     let run_started = std::time::Instant::now();
     if let Some(n) = args.threads {
@@ -988,7 +999,8 @@ fn run(args: RunArgs) -> Result<()> {
         salt: args.salt,
         sample: args.sample,
         component_panel: args.component_panel,
-        prune_gene_free: protein_passes.is_some_and(|n| n > 1),
+        prune_gene_free: prune_gene_free(args.lineage, protein_passes),
+        shallow_seeds: shallow,
         depth_reference,
     });
     let result = result::write(&out, &report, run_started.elapsed().as_secs_f64())?;
@@ -1418,6 +1430,7 @@ fn components(args: ComponentsArgs) -> Result<()> {
             min_other_genes: args.min_other_genes,
             reject_other_only: args.reject_other_only,
             reject_beside_closed_reference: args.reject_beside_closed_reference,
+            judge_depth: true,
             k: args.k,
             min_orf: args.min_orf,
             min_hits: args.min_hits,
@@ -2501,6 +2514,18 @@ mod tests {
         assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Landplants), 1);
         assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Metazoa), 3);
         assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Fungi), 3);
+    }
+
+    #[test]
+    fn gene_free_pieces_are_pruned_for_animal_and_fungal_protein_seeds_however_many_passes() {
+        use crate::seeddb::Lineage;
+        // shallow whole-read seeds recruit in one pass and still need the filter (Acipenser ruthenus)
+        assert!(super::prune_gene_free(Lineage::Metazoa, Some(1)));
+        assert!(super::prune_gene_free(Lineage::Metazoa, Some(3)));
+        assert!(super::prune_gene_free(Lineage::Fungi, Some(1)));
+        assert!(!super::prune_gene_free(Lineage::Landplants, Some(1)));
+        // library seeds: no filter
+        assert!(!super::prune_gene_free(Lineage::Metazoa, None));
     }
 
     use super::{parse_bases, parse_genome_size};

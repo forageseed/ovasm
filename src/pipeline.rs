@@ -164,8 +164,12 @@ pub struct RunConfig {
     /// Seeded mitochondrial graphs go through the component filter with the `seed_lineage`
     /// panel, gene-free components removed beside a closed reference
     /// (`ComponentParams::reject_beside_closed_reference`): set by `run` for animal and fungal
-    /// protein seeds, whose recruitment takes more than one pass.
+    /// protein seeds, however many recruitment passes (`prune_gene_free` of `run`).
     pub prune_gene_free: bool,
+    /// The protein seeds came from the whole-read scan and were recruited without the depth gate
+    /// (`ProteinSeedReport::shallow`): the `prune_gene_free` filter then does not judge depth
+    /// (`ComponentParams::judge_depth`).
+    pub shallow_seeds: bool,
     /// Per organelle, sequence known to be its own (`assemble graph --depth-reference`).
     pub depth_reference: BTreeMap<String, PathBuf>,
 }
@@ -481,14 +485,15 @@ impl ComponentFilter {
     }
 
     /// The filter of a seeded small mitochondrion (`RunConfig::prune_gene_free`): the lineage's
-    /// built-in panel and its gene threshold.
-    fn gene_free(organelle: &str, lineage: &str) -> Result<Self> {
+    /// built-in panel and its gene threshold; depth judged unless `judge_depth` is false.
+    fn gene_free(organelle: &str, lineage: &str, judge_depth: bool) -> Result<Self> {
         let k = ComponentParams::default().k;
         Ok(Self {
             organelle: organelle.to_string(),
             panel: Panel::for_lineage(lineage, k, &[])?,
             params: ComponentParams {
                 reject_beside_closed_reference: true,
+                judge_depth,
                 min_hits: Panel::lineage_min_hits(lineage),
                 ..ComponentParams::default()
             },
@@ -1719,7 +1724,7 @@ fn assemble_organelle(
             cfg.component_panel.as_deref(),
         )?)
     } else if cfg.prune_gene_free && organelle == "mitochondrion" {
-        Some(ComponentFilter::gene_free(organelle, cfg.seed_lineage.name())?)
+        Some(ComponentFilter::gene_free(organelle, cfg.seed_lineage.name(), !cfg.shallow_seeds)?)
     } else {
         None
     };
@@ -2678,6 +2683,7 @@ mod tests {
             sample: "desktop".into(),
             component_panel: None,
             prune_gene_free: false,
+            shallow_seeds: false,
             depth_reference: Default::default(),
         }
     }

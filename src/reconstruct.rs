@@ -2080,6 +2080,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
             prune_gene_free: false,
+            shallow_seeds: false,
             // the reference's own sequence sets the node depth: the target reads hold nuclear
             // reads beside the organelle's, which stand for more sequence at their own depth
             // (rice SAMEA115396709 from 100 bp reads: 1.75 M reads, node depth ~22 against the

@@ -59,6 +59,13 @@ pub struct ComponentParams {
     /// is open, as a gene-free piece may then be the rest of the chromosome.
     #[serde(skip_serializing_if = "is_false")]
     pub reject_beside_closed_reference: bool,
+    /// Components that the gene rules leave are judged on depth against the reference
+    /// (`depth_factor`, `gene_depth_factor`). Off where the target is no deeper than the nucleus
+    /// in these reads (protein seeds from the whole-read scan, recruited without the depth gate):
+    /// depth then does not tell the organelle from the nucleus, and the target's own pieces sit at
+    /// a few reads each, so a shallow part of it would go as "depth below the reference".
+    #[serde(skip_serializing_if = "is_true")]
+    pub judge_depth: bool,
     /// A component without genes is kept when its depth is within this factor of the
     /// reference's, either way. Components without genes that are in no published genome sat
     /// at 0.09-0.45 of the reference depth (0.45: a 14.5 kb circle beside the Climacium
@@ -90,6 +97,7 @@ impl Default for ComponentParams {
             out_unassigned_gfa: None,
             reject_other_only: false,
             reject_beside_closed_reference: false,
+            judge_depth: true,
             depth_factor: 2.0,
             gene_depth_factor: 2.5,
             min_other_genes: 5,
@@ -159,6 +167,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// What the rule looks at in one component.
 #[derive(Debug, Clone)]
 pub struct Stat {
@@ -220,6 +232,8 @@ pub fn decide(stats: &[Stat], p: &ComponentParams) -> (Option<usize>, Vec<(bool,
                 })
             } else if s.other_genes >= p.min_other_genes && s.other_genes >= 2 * s.target_genes {
                 (false, "other_organelle")
+            } else if !p.judge_depth {
+                (true, "depth_not_judged")
             } else if s.target_genes > 0 {
                 if d * p.gene_depth_factor >= ref_depth {
                     (true, "target_genes")
@@ -737,6 +751,30 @@ mod tests {
             closed: false,
             target_names: (0..target_genes).map(|i| format!("g{i}")).collect(),
         }
+    }
+
+    #[test]
+    fn without_depth_judgement_only_the_gene_rules_remove() {
+        let mut stats = vec![
+            stat(16_785, 7.0, 12, 0),
+            stat(20_000, 2.0, 0, 0),
+            stat(3_000, 30.0, 0, 0),
+            stat(3_600, 1.0, 1, 0),
+        ];
+        let p = ComponentParams {
+            reject_beside_closed_reference: true,
+            judge_depth: false,
+            ..ComponentParams::default()
+        };
+        // an open reference: nothing goes on depth, shallow or deep
+        let (_, open) = decide(&stats, &p);
+        assert_eq!(open.iter().map(|x| x.0).collect::<Vec<_>>(), vec![true; 4]);
+        assert_eq!(open[1].1, "depth_not_judged");
+        // a closed reference (Acipenser ruthenus): its gene-free neighbours go on the gene rule
+        stats[0].closed = true;
+        let (_, closed) = decide(&stats, &p);
+        assert_eq!(closed.iter().map(|x| x.0).collect::<Vec<_>>(), vec![true, false, false, false]);
+        assert_eq!(closed[1].1, "no_genes_beside_closed_reference");
     }
 
     #[test]
