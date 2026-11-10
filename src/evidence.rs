@@ -426,9 +426,10 @@ pub(crate) struct Crossing {
     share: f32,
 }
 
-pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
+/// Collinear k-mer hits of a read on every junction: (junction, along) -> sorted
+/// [(diagonal, junction position)].
+fn junction_hits(read: &[u8], idx: &Index) -> FxHashMap<(u32, bool), Vec<(i64, u32)>> {
     let k = idx.k as i64;
-    // (junction, along) -> [(diagonal, junction position)]
     let mut hits: FxHashMap<(u32, bool), Vec<(i64, u32)>> = FxHashMap::default();
     for (rpos, kmer) in CanonicalKmers::new(read, idx.k) {
         let Some(entries) = idx.map.get(&kmer) else {
@@ -445,9 +446,78 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
             hits.entry((ji, along)).or_default().push((diag, jpos));
         }
     }
-    let mut out = Vec::new();
-    for ((ji, along), mut h) in hits {
+    for h in hits.values_mut() {
         h.sort_unstable();
+    }
+    hits
+}
+
+/// Chains of hits on one diagonal (within `diag_tol`), as index ranges into sorted hits.
+fn diagonal_chains(h: &[(i64, u32)], diag_tol: i64) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < h.len() {
+        let mut end = start + 1;
+        while end < h.len() && h[end].0 - h[end - 1].0 <= diag_tol {
+            end += 1;
+        }
+        out.push(start..end);
+        start = end;
+    }
+    out
+}
+
+/// Hits on the unique left and right side of a junction when the chain anchors on both sides
+/// as a crossing needs (`anchor_left`/`anchor_right`, `min_side_hits`), else None.
+fn anchored_sides(
+    chain: &[(i64, u32)],
+    junction: &Junction,
+    k: i64,
+    p: &EvidenceParams,
+) -> Option<(usize, usize, i64, i64)> {
+    let joint = junction.left_len as i64;
+    let unique_left_end = joint - junction.overlap as i64;
+    let min_j = chain.iter().map(|x| x.1 as i64).min()?;
+    let max_j = chain.iter().map(|x| x.1 as i64 + k).max()?;
+    let left = chain
+        .iter()
+        .filter(|x| (x.1 as i64 + k) <= unique_left_end)
+        .count();
+    let right = chain.iter().filter(|x| x.1 as i64 >= joint).count();
+    (unique_left_end - min_j >= junction.anchor_left
+        && max_j - joint >= junction.anchor_right
+        && left >= p.min_side_hits
+        && right >= p.min_side_hits)
+        .then_some((left, right, min_j, max_j))
+}
+
+/// How many times one read crosses each link: its anchored chains on separate diagonals,
+/// the more of the two orientations. `crossings` keeps one crossing per link and orientation
+/// (the best chain), so a read through a tandem array, which passes the array's unit
+/// junction once per copy, shows as one pass there; this counts each pass. Haliclona
+/// indistincta (ERR12666651, PMAT2 panel): one read held five copies of the 986 bp unit of its
+/// control-region array, eleven reads three, while the walks recorded at most one.
+pub(crate) fn crossing_copies(read: &[u8], idx: &Index, p: &EvidenceParams) -> FxHashMap<usize, u32> {
+    let k = idx.k as i64;
+    let mut out: FxHashMap<usize, u32> = FxHashMap::default();
+    for ((ji, _along), h) in junction_hits(read, idx) {
+        let junction = &idx.junctions[ji as usize];
+        let n = diagonal_chains(&h, p.diag_tol)
+            .into_iter()
+            .filter(|r| anchored_sides(&h[r.clone()], junction, k, p).is_some())
+            .count() as u32;
+        if n > 0 {
+            let e = out.entry(junction.link).or_default();
+            *e = (*e).max(n);
+        }
+    }
+    out
+}
+
+pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
+    let k = idx.k as i64;
+    let mut out = Vec::new();
+    for ((ji, along), h) in junction_hits(read, idx) {
         let junction = &idx.junctions[ji as usize];
         let joint = junction.left_len as i64;
         let unique_left_end = joint - junction.overlap as i64;
@@ -455,33 +525,18 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
         let mut best_share = 0f32;
         // k-mers between two junction positions
         let spanned = |from: i64, to: i64| (to - from - k + 1).max(1) as f32;
-        let mut start = 0;
-        while start < h.len() {
-            let mut end = start + 1;
-            while end < h.len() && h[end].0 - h[end - 1].0 <= p.diag_tol {
-                end += 1;
-            }
-            let chain = &h[start..end];
-            let min_j = chain.iter().map(|x| x.1 as i64).min().unwrap();
-            let max_j = chain.iter().map(|x| x.1 as i64 + k).max().unwrap();
-            let left = chain
-                .iter()
-                .filter(|x| (x.1 as i64 + k) <= unique_left_end)
-                .count();
-            let right = chain.iter().filter(|x| x.1 as i64 >= joint).count();
-            if unique_left_end - min_j >= junction.anchor_left
-                && max_j - joint >= junction.anchor_right
-                && left >= p.min_side_hits
-                && right >= p.min_side_hits
-                && left.min(right) > best_left.min(best_right)
-            {
+        for range in diagonal_chains(&h, p.diag_tol) {
+            let chain = &h[range];
+            let Some((left, right, min_j, max_j)) = anchored_sides(chain, junction, k, p) else {
+                continue;
+            };
+            if left.min(right) > best_left.min(best_right) {
                 best_left = left;
                 best_right = right;
                 best_diag = chain[chain.len() / 2].0;
                 best_share = (left as f32 / spanned(min_j, unique_left_end))
                     .min(right as f32 / spanned(joint, max_j));
             }
-            start = end;
         }
         if best_left > 0 {
             let ov = junction.overlap as i64;
@@ -1195,6 +1250,14 @@ pub struct RepeatPairing {
 }
 
 #[derive(Serialize)]
+pub struct LinkCopies {
+    pub from: String,
+    pub to: String,
+    /// [crossings in one read, reads with exactly that many], for counts of two or more.
+    pub reads_by_crossings: Vec<(u32, u64)>,
+}
+
+#[derive(Serialize)]
 pub struct EvidenceReport {
     pub graph: String,
     /// Graph-bound, contributing-record-deduplicated continuous linkage. Legacy local
@@ -1229,6 +1292,10 @@ pub struct EvidenceReport {
     /// counted once per read, merging its reverse complement. Unlike phased_paths, these
     /// preserve linkage between multiple repeat contexts; marginal counts cannot recover it.
     pub observed_walks: Vec<Traversal>,
+    /// Links some single read crosses two or more times (a tandem array's unit junction, once
+    /// per copy the read holds), with the reads at each count (`crossing_copies`). A molecule
+    /// has at least as many copies as one read shows (`linearize::lay_read_copies`).
+    pub link_copies_in_reads: Vec<LinkCopies>,
     pub params: serde_json::Value,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
@@ -1304,7 +1371,11 @@ pub fn run(
         Vec<Vec<Oriented>>,
         Vec<usize>,
         Vec<usize>,
+        FxHashMap<usize, u32>,
     );
+    // Reads by how many times one read crosses a link, for links some read crosses twice or
+    // more (`crossing_copies`).
+    let mut link_copies: BTreeMap<usize, BTreeMap<u32, u64>> = BTreeMap::new();
     // Walks of each informative read; phased paths need the repeats, and the repeats need the
     // link support of the whole scan.
     let mut read_walks: Vec<Vec<Vec<Oriented>>> = Vec::new();
@@ -1324,10 +1395,22 @@ pub fn run(
                     .filter(|w| w.len() >= 3)
                     .collect();
                 let (adj, adj_ambiguous) = adjacencies(&r.seq, &adjacency);
-                (cs, ambiguous, tr, ws, adj, adj_ambiguous)
+                let copies = if cs.is_empty() {
+                    FxHashMap::default()
+                } else {
+                    crossing_copies(&r.seq, &idx, &p)
+                };
+                (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies)
             })
             .collect();
-        for (record, (cs, ambiguous, tr, ws, adj, adj_ambiguous)) in batch.iter().zip(per_read) {
+        for (record, (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies)) in
+            batch.iter().zip(per_read)
+        {
+            for (link, n) in copies {
+                if n >= 2 {
+                    *link_copies.entry(link).or_default().entry(n).or_default() += 1;
+                }
+            }
             let local_adjacencies: Vec<_> = adj.iter().map(|&i| g.links[i]).collect();
             thread_counter.observe(&record.id, &record.seq, &read_steps(&g, &cs),
                 !ambiguous.is_empty(), &ws, &local_adjacencies, p.short_read_adjacency)?;
@@ -1583,6 +1666,14 @@ pub fn run(
                 })
                 .collect()
         },
+        link_copies_in_reads: link_copies
+            .into_iter()
+            .map(|(li, by)| LinkCopies {
+                from: g.label(g.links[li].0),
+                to: g.label(g.links[li].1),
+                reads_by_crossings: by.into_iter().collect(),
+            })
+            .collect(),
         params: serde_json::json!({
             "k": p.k, "flank": p.flank, "min_anchor": p.min_anchor, "diag_tol": p.diag_tol,
             "min_side_hits": p.min_side_hits, "spacing_tol": p.spacing_tol, "bootstrap": p.bootstrap,
@@ -2189,6 +2280,31 @@ mod tests {
 
     fn cat(parts: &[&[u8]]) -> Vec<u8> {
         parts.concat()
+    }
+
+    /// X -> U, U -> U, U -> Y: a tandem unit. A read through four copies crosses U -> U three
+    /// times; `crossings` keeps one of them, `crossing_copies` counts all three.
+    #[test]
+    fn crossing_copies_count_each_pass_of_a_tandem_unit() {
+        let (x, u, y) = (rng_seq(800, 601), rng_seq(400, 602), rng_seq(800, 603));
+        let g = Graph {
+            names: vec!["x".into(), "u".into(), "y".into()],
+            seqs: vec![x.clone(), u.clone(), y.clone()],
+            links: vec![((0, true), (1, true)), ((1, true), (1, true)), ((1, true), (2, true))],
+            overlaps: vec![0, 0, 0],
+        };
+        let p = params();
+        let idx = build_index(&g, &p);
+        let read = cat(&[&x[300..], &u, &u, &u, &u, &y[..500]]);
+        let copies = crossing_copies(&read, &idx, &p);
+        assert_eq!(copies.get(&1), Some(&3));
+        assert_eq!(copies.get(&0), Some(&1));
+        assert_eq!(copies.get(&2), Some(&1));
+        let once = crossings(&read, &idx, &p).iter().filter(|c| c.link == 1).count();
+        assert_eq!(once, 1);
+        // its reverse complement crosses as often
+        let back = crossing_copies(&revcomp(&read), &idx, &p);
+        assert_eq!(back.get(&1), Some(&3));
     }
 
     #[test]
