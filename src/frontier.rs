@@ -524,11 +524,23 @@ fn walk(
     'ends: for &end in &ends {
         // (k-mer, how many reference k-mers in a row the walk has just taken to reach it)
         let (mut stack, mut walked) = (vec![(end, 0usize)], 0usize);
-        // reference k-mers this end's walk went through (`JOIN_RUN`), each once
+        // What this end's walk has been through is kept by word (strand-specific), not by
+        // canonical k-mer: in a palindrome (a stretch that reads the same on both strands, k or
+        // longer) the words past its middle are the reverse complements of those before it, so
+        // by canonical k-mer the walk took them for words already walked and stopped there.
+        // PMAT2 benchmark, Lepiota venenata SRR30015126 (DNBSEQ 2 x 150 bp, `run short`): the
+        // mitochondrion (PP933241.1, 51,173 bp, ~290x) holds a 26 bp palindrome at 49,999; the
+        // walks from both sides of the 3 kb that recruitment had not reached (47,779-50,811)
+        // stopped at it, 1,696 words in, and bridged nothing in 20 passes, while extension from
+        // reads crept ~30 bp a pass, so the assembly lacked those 3 kb (93.5% of the reference).
+        // By word, the same walks bridge 3,460 k-mers. A word is still walked once per end, so
+        // the walk ends as before.
+        // reference words this end's walk went through (`JOIN_RUN`), each once
         let mut through: FxHashSet<u64> = FxHashSet::default();
-        // bridges only: this end's new k-mers, the word each word was first reached from, and
-        // the new k-mers on the paths back from its rejoins
-        let (mut mine, mut from, mut bridge) = (FxHashSet::default(), FxHashMap::default(), FxHashSet::default());
+        // this end's new words; bridges only: the word each word was first reached from, the new
+        // k-mers on the paths back from its rejoins, and the words those paths went through
+        let (mut mine, mut from, mut bridge, mut traced) =
+            (FxHashSet::default(), FxHashMap::default(), FxHashSet::default(), FxHashSet::default());
         while let Some((word, run)) = stack.pop() {
             let next: Vec<(u64, u32)> = w
                 .successors(word)
@@ -557,15 +569,18 @@ fn walk(
                         let mut at = if bridges_only { word } else { end };
                         while at != end {
                             let k = w.canonical(at);
-                            if !known.contains(&k) && !bridge.insert(k) {
-                                break; // the rest of the way back is already a bridge
+                            if !known.contains(&k) {
+                                if !traced.insert(at) {
+                                    break; // the rest of the way back is already a bridge
+                                }
+                                bridge.insert(k);
                             }
                             match from.get(&at) {
                                 Some(&before) => at = before,
                                 None => break,
                             }
                         }
-                    } else if through.insert(key) {
+                    } else if through.insert(x) {
                         if bridges_only {
                             from.entry(x).or_insert(word);
                         }
@@ -574,15 +589,22 @@ fn walk(
                     continue;
                 }
                 if bridges_only {
-                    if new.contains(&key) || !mine.insert(key) {
+                    // a k-mer an earlier end bridged is that end's
+                    if new.contains(&key) || !mine.insert(x) {
                         continue;
                     }
                     from.entry(x).or_insert(word);
                 } else {
-                    if !new.insert(key) {
+                    if !mine.insert(x) {
                         continue;
                     }
-                    if new.len() >= budget {
+                    // a k-mer an earlier end walked is that end's; one this end walked on the
+                    // other strand is a palindrome's (see above), and the walk goes on
+                    if !new.insert(key) {
+                        if !mine.contains(&w.rc(x)) {
+                            continue;
+                        }
+                    } else if new.len() >= budget {
                         ext.budget_reached = true;
                         ext.ends_extended += 1;
                         break 'ends;
@@ -719,6 +741,35 @@ mod tests {
                 table.add_seq(&revcomp(&genome[a..a + len]));
             }
         }
+    }
+
+    #[test]
+    fn a_walk_crosses_a_palindrome() {
+        // Lepiota venenata SRR30015126: a 26 bp palindrome in the 3 kb no recruited read held;
+        // the walks from both sides stopped at it and bridged nothing
+        let k = 21;
+        let left = random(1500, 61);
+        let arm = random(13, 62);
+        let palindrome = [arm.clone(), revcomp(&arm)].concat();
+        let right = random(1500, 63);
+        let organelle = [left.clone(), random(600, 64), palindrome, random(600, 65), right.clone()].concat();
+        let table = KmerCounts::with_k(22, k);
+        tile(&table, &organelle, 150, 3, 1);
+        let known: FxHashSet<u64> = [&organelle[..1500], &organelle[organelle.len() - 1500..]]
+            .into_iter()
+            .flat_map(|s| CanonicalKmers::new(s, k).map(|(_, x)| x))
+            .collect();
+        let ext = extend_from_kmers(&table, &known, 100.0, 1_000_000, &Params::default());
+        let w = Words::new(k);
+        let held: FxHashSet<u64> = known
+            .iter()
+            .copied()
+            .chain(ext.sequences.iter().flat_map(|s| w.forward(s).into_iter().map(|(_, x)| w.canonical(x))))
+            .collect();
+        assert!(
+            CanonicalKmers::new(&organelle, k).all(|(_, x)| held.contains(&x)),
+            "{ext:?}"
+        );
     }
 
     #[test]
