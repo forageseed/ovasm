@@ -1776,6 +1776,17 @@ fn runaway_bait_gain(previous: Option<usize>, gain: usize) -> bool {
     previous.is_some_and(|p| gain >= 20_000 && gain as f64 > 1.5 * p as f64)
 }
 
+/// `runaway_bait_gain`, unless the pass's frontier walk had fewer ends than the last one
+/// (`closing`). A bait growing into the nucleus opens more ends a pass as its repeat families
+/// rejoin each other (JN-L's 6,552, 13,189, 48,996: `KMER_FRONTIER_MAX_END_GROWTH`), while an
+/// organelle whose gaps are being bridged has fewer: PMAT2 benchmark, Lepiota venenata
+/// SRR30015126 (DNBSEQ reads, fungal seed library, mitochondrion of 51 kb), ends 420, 342, 337
+/// and bait gains 1,699, 7,156, 22,084 (21,897 of them bridges of the walk) once walks crossed
+/// palindromes; the gain alone stopped extension at pass 3 with the molecule in 8 pieces.
+fn runaway_growth(previous: Option<usize>, gain: usize, closing: bool) -> bool {
+    !closing && runaway_bait_gain(previous, gain)
+}
+
 pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let start = Instant::now();
     std::fs::create_dir_all(&cfg.out_dir)?;
@@ -1913,6 +1924,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let mut depths = pass_depths(gate.as_ref(), &res);
         // bait k-mers each target's frontier walk added (`kmer_frontier`)
         let mut walked = vec![0usize; n_targets];
+        // whose walk this pass had fewer ends than its last one (`runaway_growth`)
+        let mut closing = vec![false; n_targets];
         if cfg.kmer_gate && kmer_table.is_none() && !last {
             let source = match replay.as_ref().filter(|r| r.ready) {
                 Some(cache) => cache.sequences(),
@@ -1960,6 +1973,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     eprintln!("[ovasm] warning: {w}");
                     warnings.push(w);
                 } else if ext.skipped.is_none() {
+                    closing[t] = walk_ends[t].is_some_and(|e| ext.ends < e);
                     walk_ends[t] = Some(ext.ends);
                 }
                 eprintln!(
@@ -2137,7 +2151,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                     keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
-                    if runaway_bait_gain(previous, added[t] + new.len()) {
+                    if runaway_growth(previous, added[t] + new.len(), closing[t]) {
                         saturated[t] = true;
                         stopped[t] = Some("growing");
                         let w = format!(
@@ -2744,6 +2758,14 @@ mod tests {
         a.samples.sort_unstable();a.samples.truncate(100);
         b.samples.sort_unstable();b.samples.truncate(100);
         assert_eq!(a.samples,b.samples); assert_eq!(a.samples.len(),100);
+    }
+
+    #[test]
+    fn a_gain_spike_while_the_walk_closes_is_not_runaway() {
+        // Lepiota venenata SRR30015126, pass 3: ends 342 -> 337
+        assert!(runaway_growth(Some(7_156), 22_084, false));
+        assert!(!runaway_growth(Some(7_156), 22_084, true));
+        assert!(!runaway_growth(Some(20_000), 15_001, false));
     }
 
     #[test]
