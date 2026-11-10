@@ -2030,21 +2030,14 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // ends when its bait stops growing, not by `saturation`.
                 let recount = !boot_used[t].is_empty();
                 let now = res.recruited[t].reads;
-                // Steady growth and a bait still gaining k-mers mean edges still moving out along
-                // the target, until its frontier walk has found the edges multiplying into the
-                // nucleus (`KMER_FRONTIER_MAX_END_GROWTH`): from then on they are the nucleus's
-                // repeats, and the target has settled when its reads grow by under `saturation`.
-                // Rice SAMEA115396709's mitochondrion (100 bp reads), its walk stopped at pass 2
-                // with 2,777 ends grown to 3,631, gained 0.1-0.5% of its reads and 500-1,700
-                // bait k-mers a pass, each pass half or more of the one before, through all 20.
-                let into_nucleus = walk_stopped[t];
-                let reads_settled = settled(
-                    now,
-                    previous[t],
-                    last_growth[t],
-                    cfg.saturation,
-                    cfg.extend_gate && !into_nucleus,
-                );
+                // A frontier walk that stopped (`KMER_FRONTIER_MAX_END_GROWTH`) says the walk would
+                // follow nuclear repeats, not that the reads' own edges are nuclear: those still
+                // close the target's gaps pass by pass. Rice SAMEA115396710's mitochondrion (150 bp
+                // reads), its walk stopped at pass 4 and its reads settled by `saturation` at pass
+                // 12, missed 20.6 kb of its 356 kb in 31 gaps of 0.3-3 kb that passes up to 20
+                // fill (11x of recruited reads over them, against 192x).
+                let reads_settled =
+                    settled(now, previous[t], last_growth[t], cfg.saturation, cfg.extend_gate);
                 // With the depth sketch, the genome the reads stand for must have settled too: a
                 // target that took in many deep reads grows by a small share of its reads while
                 // its genome still grows (Medicago polymorpha's mitochondrion: 31,212 reads at
@@ -2063,7 +2056,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 // The independent bait-growth guard and iteration limit still apply.
                 let prior_bait_gain = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                 if can_stop_after_read_saturation(recount, reads_settled, size_settled,
-                    cfg.kmer_gate && !into_nucleus, prior_bait_gain) {
+                    cfg.kmer_gate, prior_bait_gain) {
                     saturated[t] = true;
                     stopped[t] = Some("saturated");
                 }
