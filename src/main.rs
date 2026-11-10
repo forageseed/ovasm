@@ -769,7 +769,8 @@ fn route_short_reads(args: &mut RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Recruitment passes from protein seeds (see `run`), land plants.
+/// Recruitment passes from shallow protein seeds (whole-read scan, no depth gate; see `run`):
+/// every further pass extends into the nucleus.
 const PROTEIN_SEED_PASSES: usize = 1;
 /// The same for animals and fungi: seeds are genes +- 2 kb, and in a small mitochondrion whose
 /// genes sit apart (long control regions, fungal introns and intergenic stretches) the first pass
@@ -779,11 +780,17 @@ const PROTEIN_SEED_PASSES: usize = 1;
 /// and stopped there (bait complete). Passes stop earlier once no read is added.
 const PROTEIN_SEED_PASSES_SMALL_MITO: usize = 3;
 
-/// Recruitment passes from protein seeds for `lineage`.
-fn protein_seed_passes(lineage: seeddb::Lineage) -> usize {
+/// Recruitment passes from (gated) protein seeds for `lineage`: land plants the usual gated passes
+/// (None, `pipeline::GATED_RECRUIT_PASSES`, stopping once the bait stops growing). Seeds are genes
+/// +- a read, and a land-plant mitochondrion of 200-500 kb is mostly intergenic: one pass left it
+/// partial on 9 of 10 DToL angiosperms (2107407, 2026-11-10: Juncus bufonius 0.27, Euphorbia
+/// lathyris 0.13 of the Oatk molecule) where 60 gated passes reach 0.999 and 0.886; the moss
+/// Polytrichum commune, whose one-pass precision once argued for a single pass, assembles the same
+/// (0.9996) after 60.
+fn protein_seed_passes(lineage: seeddb::Lineage) -> Option<usize> {
     match lineage {
-        seeddb::Lineage::Landplants => PROTEIN_SEED_PASSES,
-        seeddb::Lineage::Metazoa | seeddb::Lineage::Fungi => PROTEIN_SEED_PASSES_SMALL_MITO,
+        seeddb::Lineage::Landplants => None,
+        seeddb::Lineage::Metazoa | seeddb::Lineage::Fungi => Some(PROTEIN_SEED_PASSES_SMALL_MITO),
     }
 }
 
@@ -794,8 +801,8 @@ fn protein_seed_passes(lineage: seeddb::Lineage) -> usize {
 /// Acipenser ruthenus (PMAT2 benchmark, 2.82 Gb, the mitochondrion at 7x), 480 reads of which 14
 /// mitochondrial, assembled into the 16,785 bp circle beside 24 gene-free nuclear pieces of 143 kb,
 /// all kept while the filter followed the pass count (more than one).
-fn prune_gene_free(lineage: seeddb::Lineage, protein_passes: Option<usize>) -> bool {
-    protein_passes.is_some() && !matches!(lineage, seeddb::Lineage::Landplants)
+fn prune_gene_free(lineage: seeddb::Lineage, protein_seeds_used: bool) -> bool {
+    protein_seeds_used && !matches!(lineage, seeddb::Lineage::Landplants)
 }
 
 fn run(mut args: RunArgs) -> Result<()> {
@@ -879,13 +886,11 @@ fn run(mut args: RunArgs) -> Result<()> {
         );
     }
     let mut builtin_seeds = std::collections::BTreeSet::new();
-    // Recruitment passes when every seeded organelle has protein seeds, land plants: one. Protein seeds are the
-    // sample's own organelle reads, so the first pass already finds the organelle (leave-out test on
-    // five mosses, 2026-11-05: mitochondrial recall 0.96-1.0 after one pass, the same after 60),
-    // and every further pass of gated extension only adds reads that are not (precision after one /
-    // two / 60 passes: Polytrichum commune 0.92 / 0.59 / 0.59, Bryoerythrophyllum caledonicum 0.98 /
-    // 0.81 / 0.34). Animals and fungi: up to three (`protein_seed_passes`).
+    // Recruitment passes when every seeded organelle has protein seeds (`protein_seed_passes`): land
+    // plants the usual gated passes, animals and fungi up to three, shallow seeds one. Set (Some) only
+    // where the passes are capped; `protein_seeds_used` says whether protein seeds took over.
     let mut protein_passes = None;
+    let mut protein_seeds_used = false;
     let mut shallow = false;
     // per organelle: the seeds of its protein-seed cluster with the most genes, whose node depth
     // is the organelle's in assembly (`assemble graph --depth-reference`)
@@ -979,11 +984,12 @@ fn run(mut args: RunArgs) -> Result<()> {
                 // extends into the nucleus: PMAT2 benchmark, Orcinus orca, 237 reads after one pass,
                 // 7,237 (660 kb) after three, killed at 30.6 GB. Whole-read seeds that pass the gate
                 // (Acanthosoma haemorrhoidale) are not shallow and get the gate and the usual passes.
-                protein_passes = Some(if shallow {
-                    PROTEIN_SEED_PASSES
+                protein_seeds_used = true;
+                protein_passes = if shallow {
+                    Some(PROTEIN_SEED_PASSES)
                 } else {
                     protein_seed_passes(args.lineage)
-                });
+                };
             } else {
                 eprintln!(
                     "[ovasm] run: no protein seeds for {}: the --lineage seed library seeds it, with the usual recruitment passes",
@@ -1048,7 +1054,7 @@ fn run(mut args: RunArgs) -> Result<()> {
         salt: args.salt,
         sample: args.sample,
         component_panel: args.component_panel,
-        prune_gene_free: prune_gene_free(args.lineage, protein_passes),
+        prune_gene_free: prune_gene_free(args.lineage, protein_seeds_used),
         shallow_seeds: shallow,
         depth_reference,
     });
@@ -2571,22 +2577,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn protein_seed_passes_one_for_plants_more_for_small_mitochondria() {
-        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Landplants), 1);
-        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Metazoa), 3);
-        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Fungi), 3);
+    fn protein_seed_passes_usual_for_plants_capped_for_small_mitochondria() {
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Landplants), None);
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Metazoa), Some(3));
+        assert_eq!(super::protein_seed_passes(crate::seeddb::Lineage::Fungi), Some(3));
     }
 
     #[test]
     fn gene_free_pieces_are_pruned_for_animal_and_fungal_protein_seeds_however_many_passes() {
         use crate::seeddb::Lineage;
         // shallow whole-read seeds recruit in one pass and still need the filter (Acipenser ruthenus)
-        assert!(super::prune_gene_free(Lineage::Metazoa, Some(1)));
-        assert!(super::prune_gene_free(Lineage::Metazoa, Some(3)));
-        assert!(super::prune_gene_free(Lineage::Fungi, Some(1)));
-        assert!(!super::prune_gene_free(Lineage::Landplants, Some(1)));
+        assert!(super::prune_gene_free(Lineage::Metazoa, true));
+        assert!(super::prune_gene_free(Lineage::Fungi, true));
+        assert!(!super::prune_gene_free(Lineage::Landplants, true));
         // library seeds: no filter
-        assert!(!super::prune_gene_free(Lineage::Metazoa, None));
+        assert!(!super::prune_gene_free(Lineage::Metazoa, false));
     }
 
     use super::{parse_bases, parse_genome_size};

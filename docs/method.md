@@ -264,13 +264,15 @@ Controls:
 
 | case | `--recruit-iterations` |
 |---|---|
-| land plants with protein seeds | 1 (`PROTEIN_SEED_PASSES`) |
+| land plants with protein seeds | 60 (`GATED_RECRUIT_PASSES`), stopping once the bait stops growing |
 | metazoa, fungi with protein seeds | up to 3 (`PROTEIN_SEED_PASSES_SMALL_MITO`); fewer once no read is added |
 | seeds from the whole-read scan (`shallow`) | 1, any lineage |
 | seeds from the library | 60 (`GATED_RECRUIT_PASSES`) for gated HiFi, else 20 |
 
-Empirical evidence. Plants: mitochondrial recall 0.96-1.0 after one pass and the same after 60; precision after 1, 2, 60 passes
-Polytrichum commune 0.92/0.59/0.59, Bryoerythrophyllum caledonicum 0.98/0.81/0.34. Animals and fungi: seeds are genes $\pm$ 2 kb and a
+Empirical evidence. Plants: a land-plant mitochondrion of 200-500 kb is mostly intergenic, and seeds are genes $\pm$ a read. One pass
+left it partial on 9 of 10 DToL angiosperms (Oatk molecule covered: Juncus bufonius 0.27, Euphorbia lathyris 0.13), where the usual gated
+passes reach 0.999 and 0.886. Mosses (the earlier case for one pass, recruitment precision after 1, 2, 60 passes Polytrichum commune
+0.92/0.59/0.59) assemble the same after 60 (Polytrichum 0.9996): the extra reads are not kept in the assembly. Animals and fungi: seeds are genes $\pm$ 2 kb and a
 mitochondrion whose genes sit apart misses part of the molecule after one pass (Rhizopus microsporus 186 reads for 29 of 43 kb, Ganoderma
 resinaceum 60 of 87 kb, Bibio marci 13 of 16 kb). Whole-read seeds are capped at one pass because later passes enter the nucleus (Orcinus
 orca: 237 reads after one pass, 7,237 reads/660 kb after three, killed at 30.6 GB). The 60-pass cap is a bound, not derived: a read joins only
