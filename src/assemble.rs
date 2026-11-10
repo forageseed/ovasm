@@ -1768,19 +1768,32 @@ fn run_auto_k_cleaning(
             &out_gfa.with_extension("correct.json"),
         )?;
         let before = r.bases;
-        let rc = ladder(std::slice::from_ref(&corrected), &mut tried)?;
-        if 2 * rc.bases < before {
-            // Correction needs depth for its solid k-mers: at about 5x it trimmed away what the
-            // reads held (Canis lupus mitochondrion from 10 Mb of HiFi reads, the PMAT2 benchmark's
-            // lowest-depth test: 11 reads, 75 kb -> 5 reads, 1.4 kb, no unitig). The uncorrected
-            // reads' graph is the better one then.
-            eprintln!(
-                "[ovasm] correction kept under half of the bases (too shallow to correct); assembling the reads as they are"
-            );
-            r = ladder(&inputs, &mut tried)?;
+        // Correction can keep no read at all, and an empty FASTA is no input to the ladder
+        // (PMAT2 benchmark, Limnoperna fortunei ERR9713993, its 0.13 Gbp random draw: 5
+        // mitochondrial reads at ~2x, "solid >= 11 (1 k-mers)" at k 25 trimmed 99.5%, and the
+        // run stopped on "cannot read assembly.corrected.fa: Failed to read the first two
+        // bytes"): the same case as keeping under half of the bases.
+        let kept_some = fs::metadata(&corrected).is_ok_and(|m| m.len() > 0);
+        let rc = if kept_some {
+            Some(ladder(std::slice::from_ref(&corrected), &mut tried)?)
         } else {
-            r = rc;
-            r.corrected_reads = Some(corrected.display().to_string());
+            None
+        };
+        match rc {
+            Some(mut rc) if 2 * rc.bases >= before => {
+                rc.corrected_reads = Some(corrected.display().to_string());
+                r = rc;
+            }
+            _ => {
+                // Correction needs depth for its solid k-mers: at about 5x it trimmed away what the
+                // reads held (Canis lupus mitochondrion from 10 Mb of HiFi reads, the PMAT2 benchmark's
+                // lowest-depth test: 11 reads, 75 kb -> 5 reads, 1.4 kb, no unitig). The uncorrected
+                // reads' graph is the better one then.
+                eprintln!(
+                    "[ovasm] correction kept under half of the bases (too shallow to correct); assembling the reads as they are"
+                );
+                r = ladder(&inputs, &mut tried)?;
+            }
         }
     }
     add_junctions(&mut r, &inputs, out_gfa, context)?;
