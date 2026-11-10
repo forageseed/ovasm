@@ -723,6 +723,52 @@ struct RunArgs {
     threads: Option<u16>,
 }
 
+/// Longest median read length that `run hifi` takes for short reads (`route_short_reads`).
+/// Short-read platforms give at most 2 x 300 bp (MiSeq) and 400 bp (DNBSEQ single-end); HiFi
+/// reads are a few kilobases at the least (the PMAT2 benchmark's animal and fungal read sets
+/// hold reads of about 12 kb on average: Rutpela maculata ERR9284046, 61 Mb in 5,217 reads).
+const SHORT_READ_MAX_MEDIAN: usize = 1_000;
+
+/// `run hifi` on short reads assembles them as `run short` does. The sparse HiFi graph samples
+/// closed syncmers and goes no lower than k 101 (`K_LADDER`), so a 150 bp read gives it one or
+/// two samples and no edge: PMAT2 benchmark, Lepiota venenata SRR30015126 (filed on ENA as
+/// "PacBio RS" subreads, in fact DNBSEQ 2 x 150 bp, read names E250003777L1C001R..., every
+/// read 150 bp): `run hifi` recruited 1,809 reads and failed with "no k gave the mitochondrion
+/// reads an assembly graph" (k 101: 102 distinct k-mers, no unitig), while PMAT2, an overlap
+/// assembler, put the same kind of reads together at ~414x. The dense graph of `run short`
+/// takes every k-mer and k from the read length.
+fn route_short_reads(args: &mut RunArgs) -> Result<()> {
+    let median = assemble::median_read_length(&args.reads)?;
+    if median > SHORT_READ_MAX_MEDIAN {
+        return Ok(());
+    }
+    if args.extend_gate_fold.is_some()
+        || args.nuclear_depth.is_some()
+        || args.genome_size.is_some()
+        || args.no_extend_gate
+    {
+        bail!(
+            "the reads are short (median {median} bp of the first 10,000 reads of {}), not HiFi: \
+             assemble them with `ovasm run short`; --extend-gate-fold, --nuclear-depth, \
+             --genome-size and --no-extend-gate set the HiFi depth gate and do not apply",
+            args.reads[0].display()
+        );
+    }
+    eprintln!(
+        "[ovasm] run: the reads are short (median {median} bp of the first 10,000 reads of {}), \
+         not HiFi: assembling them as `ovasm run short` does (dense graph, k from the read length)",
+        args.reads[0].display()
+    );
+    if args.protein_seeds {
+        eprintln!(
+            "[ovasm] run: --protein-seeds seeds HiFi reads only: seeding the short reads from the --lineage seed library"
+        );
+        args.protein_seeds = false;
+    }
+    args.read_type = pipeline::ReadType::Sr;
+    Ok(())
+}
+
 /// Recruitment passes from protein seeds (see `run`), land plants.
 const PROTEIN_SEED_PASSES: usize = 1;
 /// The same for animals and fungi: seeds are genes +- 2 kb, and in a small mitochondrion whose
@@ -752,12 +798,15 @@ fn prune_gene_free(lineage: seeddb::Lineage, protein_passes: Option<usize>) -> b
     protein_passes.is_some() && !matches!(lineage, seeddb::Lineage::Landplants)
 }
 
-fn run(args: RunArgs) -> Result<()> {
+fn run(mut args: RunArgs) -> Result<()> {
     let run_started = std::time::Instant::now();
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n as usize)
             .build_global()?;
+    }
+    if args.read_type == pipeline::ReadType::Hifi {
+        route_short_reads(&mut args)?;
     }
     if args.recruit_max_depth.is_nan() || args.recruit_max_depth < 0.0 {
         bail!("--recruit-max-depth must be 0 (no cap) or positive");
@@ -2576,6 +2625,38 @@ mod tests {
         assert!(parse_bases("0").is_err());
         assert!(parse_bases("-3g").is_err());
         assert!(parse_bases("big").is_err());
+    }
+
+    #[test]
+    fn run_hifi_on_short_reads_assembles_them_as_short_reads() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("ovasm-route-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (short, long) = (dir.join("short.fa"), dir.join("long.fa"));
+        // Lepiota venenata SRR30015126: 150 bp reads filed as PacBio
+        std::fs::write(&short, (0..5).map(|i| format!(">r{i}\n{}\n", "ACGT".repeat(37) + "AC")).collect::<String>()).unwrap();
+        std::fs::write(&long, (0..5).map(|i| format!(">r{i}\n{}\n", "ACGT".repeat(3000))).collect::<String>()).unwrap();
+        let parse = |reads: &std::path::Path, extra: &[&str]| {
+            let mut argv = vec!["ovasm", "run", "hifi", "-i", reads.to_str().unwrap(), "-o", "out", "-x", "fungi"];
+            argv.extend_from_slice(extra);
+            match super::Cli::try_parse_from(argv).unwrap().command {
+                super::Command::Run(super::RunCommand::Hifi(args)) => args,
+                _ => panic!("wrong command"),
+            }
+        };
+        let mut a = parse(&short, &["--protein-seeds"]);
+        super::route_short_reads(&mut a).unwrap();
+        assert_eq!(a.read_type, crate::pipeline::ReadType::Sr);
+        assert!(!a.protein_seeds, "protein seeds are a HiFi stage");
+        let mut a = parse(&long, &["--protein-seeds"]);
+        super::route_short_reads(&mut a).unwrap();
+        assert_eq!(a.read_type, crate::pipeline::ReadType::Hifi);
+        assert!(a.protein_seeds);
+        // HiFi depth-gate options on short reads: an error, not a silent switch
+        let mut a = parse(&short, &["--nuclear-depth", "20"]);
+        let e = super::route_short_reads(&mut a).unwrap_err().to_string();
+        assert!(e.contains("ovasm run short"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

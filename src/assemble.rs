@@ -149,6 +149,14 @@ pub(crate) fn sample_read(seq: &[u8], p: &AssembleParams) -> Vec<Sample> {
 /// ~1,150x gave k 127 (one molecule); Salvia 100 bp reads at ~150x gave k 77 (every junction),
 /// where k 99 and 127 left no graph at all.
 pub fn dense_k(inputs: &[PathBuf]) -> Result<(usize, usize)> {
+    let median = median_read_length(inputs)?;
+    let k = median.saturating_sub(23).max(21);
+    Ok((if k % 2 == 0 { k - 1 } else { k }.max(21), median))
+}
+
+/// Median length of the first 10,000 reads of the first input (`dense_k`, and `run hifi`'s
+/// check that its reads are long ones).
+pub fn median_read_length(inputs: &[PathBuf]) -> Result<usize> {
     let first = inputs.first().context("no read file")?;
     let mut parser = needletail::parse_fastx_file(first)
         .with_context(|| format!("cannot read {}", first.display()))?;
@@ -163,9 +171,7 @@ pub fn dense_k(inputs: &[PathBuf]) -> Result<(usize, usize)> {
         bail!("{} holds no reads", first.display());
     }
     lens.sort_unstable();
-    let median = lens[lens.len() / 2];
-    let k = median.saturating_sub(23).max(21);
-    Ok((if k % 2 == 0 { k - 1 } else { k }.max(21), median))
+    Ok(lens[lens.len() / 2])
 }
 
 /// Every k-mer of a read (dense mode, `s` = 0), skipping those with a non-ACGT base. Short
