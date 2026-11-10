@@ -60,6 +60,12 @@ fn sampled(seq: &[u8], k: usize, threshold: u64) -> impl Iterator<Item = u64> + 
         .filter(move |&km| mix64(km) < threshold)
 }
 
+/// Fewest distinct sampled k-mers `DepthGate::copy_depth` judges a read by. A read inside a
+/// tandem array holds only its unit's k-mers, a few of which the sketch samples (a 455 bp unit:
+/// about 7, by chance 1 or 2), and HiFi counts them exactly; a satellite's ratio is tens of times
+/// over the ceiling at any of its k-mers.
+pub const MIN_COPY_KMERS: usize = 1;
+
 struct Sketch {
     counts: FxHashMap<u64, u32>,
     bases: u64,
@@ -728,6 +734,35 @@ impl DepthGate {
             organelle_like: passes(&f, &self.params),
             median: f.median,
         })
+    }
+
+    /// Median over the read's sampled k-mer positions of the k-mer's library depth over its copies
+    /// in the read (`TandemCheck`), k-mers seen once in the library left out as errors; `None`
+    /// with fewer than `MIN_COPY_KMERS` such k-mers. Positions, not distinct k-mers: a read from
+    /// a satellite into its unique flank holds the satellite's few k-mers many times and the
+    /// flank's once each, and is as much satellite as it has bases of it.
+    pub fn copy_depth(&self, seq: &[u8]) -> Option<f64> {
+        let kmers: Vec<u64> = sampled(seq, self.params.k, self.threshold).collect();
+        let mut copies: FxHashMap<u64, u32> = FxHashMap::default();
+        for &km in &kmers {
+            *copies.entry(km).or_default() += 1;
+        }
+        let judged = copies
+            .keys()
+            .filter(|km| self.sketch.counts.get(km).copied().unwrap_or(0) >= 2)
+            .count();
+        if judged < MIN_COPY_KMERS {
+            return None;
+        }
+        let mut ratios: Vec<f64> = kmers
+            .iter()
+            .filter_map(|km| {
+                let d = self.sketch.counts.get(km).copied().unwrap_or(0);
+                (d >= 2).then(|| d as f64 / copies[km] as f64)
+            })
+            .collect();
+        ratios.sort_by(f64::total_cmp);
+        Some(ratios[ratios.len() / 2])
     }
 
     /// Word length of the sketch.

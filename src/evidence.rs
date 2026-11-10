@@ -1247,6 +1247,51 @@ pub struct Traversal {
     pub reads: u64,
 }
 
+/// Read distances between leaving one anchor into the repeats beyond it and entering the next
+/// anchor out of them (see `anchor_spans`).
+#[derive(Serialize)]
+pub struct AnchorSpan {
+    /// The anchor left, oriented in the direction of travel.
+    pub from: String,
+    /// The anchor entered.
+    pub to: String,
+    /// Bases each read holds between the end of `from` and the start of `to`, ascending.
+    pub spans: Vec<i64>,
+}
+
+/// Anchor-to-anchor read distances across repeats: in each read, a crossing from an anchor into
+/// a repeat, the next crossing into an anchor, and only repeats crossed between them. How many
+/// times a read passes a tandem array's loop is what no crossing tells (every copy's junction
+/// looks the same) but its length does: a read holds as many bases between the array's two
+/// flanks as the array has. Linearization lays the loop down that many times (see
+/// `linearize::bridges`).
+fn anchor_spans(
+    repeat: &[bool],
+    read_steps: &[Vec<Step>],
+) -> BTreeMap<(Oriented, Oriented), Vec<i64>> {
+    let mut out: BTreeMap<(Oriented, Oriented), Vec<i64>> = BTreeMap::new();
+    for steps in read_steps {
+        for (i, s) in steps.iter().enumerate() {
+            if repeat[s.0 .0] || !repeat[s.1 .0] {
+                continue;
+            }
+            let Some(j) = (i + 1..steps.len()).find(|&j| !repeat[steps[j].1 .0]) else {
+                continue;
+            };
+            if steps[i + 1..=j].iter().any(|t| !repeat[t.0 .0]) {
+                continue;
+            }
+            let (x, y) = (s.0, steps[j].1);
+            let key = (x, y).min((flip(y), flip(x)));
+            out.entry(key).or_default().push(steps[j].2 - s.3);
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_unstable();
+    }
+    out
+}
+
 #[derive(Serialize)]
 pub struct RepeatPairing {
     /// Middle segment (repeat) in the orientation the pairing is reported.
@@ -1309,6 +1354,8 @@ pub struct EvidenceReport {
     /// per copy the read holds), with the reads at each count (`crossing_copies`). A molecule
     /// has at least as many copies as one read shows (`linearize::lay_read_copies`).
     pub link_copies_in_reads: Vec<LinkCopies>,
+    /// Read distances from one anchor across repeats to the next (see `anchor_spans`).
+    pub anchor_spans: Vec<AnchorSpan>,
     pub params: serde_json::Value,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
@@ -1385,11 +1432,14 @@ pub fn run(
         Vec<usize>,
         Vec<usize>,
         FxHashMap<usize, (u32, Vec<i64>)>,
+        Vec<Step>,
     );
     // Reads by how many times one read crosses a link, for links some read crosses twice or
     // more (`crossing_copies`).
     let mut link_copies: BTreeMap<usize, BTreeMap<u32, u64>> = BTreeMap::new();
     let mut link_spacing: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
+    // crossings of each read that crosses two or more joints, for `anchor_spans`
+    let mut spanning_steps: Vec<Vec<Step>> = Vec::new();
     // Walks of each informative read; phased paths need the repeats, and the repeats need the
     // link support of the whole scan.
     let mut read_walks: Vec<Vec<Vec<Oriented>>> = Vec::new();
@@ -1414,10 +1464,10 @@ pub fn run(
                 } else {
                     crossing_copies(&r.seq, &idx, &p)
                 };
-                (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies)
+                (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies, steps)
             })
             .collect();
-        for (record, (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies)) in
+        for (record, (cs, ambiguous, tr, ws, adj, adj_ambiguous, copies, steps)) in
             batch.iter().zip(per_read)
         {
             for (link, (n, spacing)) in copies {
@@ -1425,6 +1475,9 @@ pub fn run(
                     *link_copies.entry(link).or_default().entry(n).or_default() += 1;
                     link_spacing.entry(link).or_default().extend(spacing);
                 }
+            }
+            if steps.len() >= 2 {
+                spanning_steps.push(steps);
             }
             let local_adjacencies: Vec<_> = adj.iter().map(|&i| g.links[i]).collect();
             thread_counter.observe(&record.id, &record.seq, &read_steps(&g, &cs),
@@ -1619,6 +1672,7 @@ pub fn run(
         });
     }
 
+    let spans = anchor_spans(&repeat, &spanning_steps);
     let links: Vec<LinkSupport> = g
         .links
         .iter()
@@ -1694,6 +1748,14 @@ pub fn run(
                 },
             })
             .collect(),
+        anchor_spans: spans
+            .into_iter()
+            .map(|((x, y), spans)| AnchorSpan {
+                from: g.label(x),
+                to: g.label(y),
+                spans,
+            })
+            .collect(),
         params: serde_json::json!({
             "k": p.k, "flank": p.flank, "min_anchor": p.min_anchor, "diag_tol": p.diag_tol,
             "min_side_hits": p.min_side_hits, "spacing_tol": p.spacing_tol, "bootstrap": p.bootstrap,
@@ -1713,6 +1775,23 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anchor_spans_measure_the_bases_between_two_anchors_across_repeats() {
+        // anchors 0 and 2, repeat 1 as a loop: a read leaves 0 at 5,000, crosses the loop's
+        // own junction twice and enters 2 at 7,275; another meets anchor 2 in between
+        let (a, r, b) = ((0, true), (1, true), (2, true));
+        let repeat = [false, true, false];
+        let through = vec![(a, r, 5000, 5000), (r, r, 5455, 5455), (r, r, 5910, 5910), (r, b, 7275, 7275)];
+        let broken = vec![(a, r, 100, 100), (r, b, 300, 300), (b, r, 900, 900), (r, a, 1000, 1000)];
+        let spans = anchor_spans(&repeat, &[through.clone(), through, broken]);
+        // read backwards, the same span is the walk from 2- to 0-; the smaller key holds both
+        let key = ((0, true), (2, true));
+        assert_eq!(spans[&key], vec![200, 2275, 2275]);
+        assert_eq!(spans[&((0, false), (2, false))], vec![100]);
+        // a crossing between two anchors with no repeat is no span
+        assert!(anchor_spans(&repeat, &[vec![(a, b, 10, 10), (b, a, 50, 50)]]).is_empty());
+    }
+
     #[test]
     fn reverse_complement_preserves_iupac_graph_alleles() {
         assert_eq!(super::revcomp(b"ACGTRYSWKMBDHVN"), b"NBDHVKMWSRYACGT");
