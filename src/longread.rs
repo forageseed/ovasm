@@ -623,7 +623,8 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
 }
 
 fn correction_output_usable(count: u64, fasta: &Path) -> Result<bool> {
-    Ok(count > 0 && std::fs::metadata(fasta)?.len() > 0)
+    let bytes = std::fs::metadata(fasta)?.len();
+    Ok(count > 0 && bytes > 0)
 }
 
 fn require_self_correction(count: u64, fasta: &Path) -> Result<()> {
@@ -1193,7 +1194,9 @@ mod tests {
         assert_eq!(report["fallback"]["reason"], "hybrid correction produced no reads");
         assert!(super::use_hybrid_correction(1, &p, &p, &mut serde_json::json!({})).unwrap());
         std::fs::remove_file(&p).unwrap();
+        assert!(super::require_self_correction(0, &p).is_err());
         assert!(super::require_self_correction(1, &p).is_err());
+        assert!(super::use_hybrid_correction(0, &p, &p, &mut serde_json::json!({})).is_err());
         assert!(super::use_hybrid_correction(1, &p, &p, &mut serde_json::json!({})).is_err());
     }
 
