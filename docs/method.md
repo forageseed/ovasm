@@ -178,6 +178,29 @@ reads reach 5-8 hits, mitochondrial genes 13-140 on the best stretch (PMAT2 refe
 is a few kb of one or two genes; a 10 kb animal HiFi read holds five or more); no distribution is cited. If any whole-read seed is found
 (`ProteinSeedReport::shallow`), recruitment runs without the depth gate and with one pass.
 
+### 2.6 Audit seed source with original read coordinates
+
+`scripts/audit_seed_source.py MANIFEST --out AUDIT.json` checks native protein seed crops
+against predeclared source windows. Each seed header supplies an original read identifier
+and a `span=START-END` interval. The tool requires a unique original record and exact crop
+sequence at those coordinates. It also requires an exact, unambiguous source window
+inside the original read and the crop.
+
+The manifest uses `ovasm.seed-source-audit.v1` and names the comparison scope. Its `seeds`
+and `raw_reads` entries lock the seed FASTA and each original FASTX file by path and SHA-256.
+A `raw_reads` entry can select a one-based `id_field` when an archive prefixes its own ID.
+The `references` entries add an ID and either a `target` or `competing` role to a locked FASTA.
+Every registered `windows` entry provides an ID, reference ID, record ID, half-open
+reference interval, interior boundary coordinate, and a locked `provenance` file.
+Select intervals that cross source-informative boundaries before evaluating crops.
+
+`--out-fasta RETAINED.fa` writes a separate FASTA that omits crops with a supported competing
+context. It preserves target-supported and unresolved records byte for byte. The audit
+records exact placements in the named panel, both strands, and uncertainty from repeated
+IDs, repeated windows, mixed source observations, or missing crop evidence. Source claims
+are scoped to the supplied references and provenance. Use an independent evidence set
+when validating the windows or measuring the source filter.
+
 ## 3. Seed recruitment
 
 Source: `recruit.rs`, `bait.rs`, `seeddb.rs`, `main.rs::run`, `pipeline.rs::recruit_all`.
