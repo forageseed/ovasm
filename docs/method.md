@@ -153,18 +153,25 @@ At most `sample` = 3,000 reads per cluster are scanned, every `step`-th in input
 4. `panel::call_from` returns plastid, mitochondrion, mixed or none: a counting class is the call if the other does not count or if it
    has at least twice the other's genes; both counting without that margin is mixed. `ClusterCall.seeded` does not use this call:
    each counting class seeds independently (Ulota crispa: part of the mitochondrion at the plastid's 1,878x).
-5. Reversed control: the same reads reversed (not complemented) are scanned and called. A call other than none means chance or
-   low-complexity sequence fakes genes. It is reported, not used as a filter.
+5. The reversed control scans the same read with its sequence reversed. A gene contributes its forward count minus its
+   reversed count when the forward count is at least twice the reversed count. Otherwise it contributes zero. A class that
+   meets the gene and density thresholds in the reversed scan does not seed from the cluster.
 6. Seed = a read cropped to the span of its class's stretches plus `flank` = 2,000 on each side (**unstated**). Seeds go to
    `protein_seeds.<organelle>.fasta`.
 7. Depth reference: for each organelle, the seeded cluster with the most genes (ties: the deeper) writes
    `protein_seeds.<o>.depth.fasta`, used for assembly node depth (section 4.3).
 
+The `protein_seeds.json` report includes the loaded panel families per organelle in `panel_gene_sets`. Gene labels
+are the exact panel labels. Each depth cluster reports per-family stretch and FASTX record counts before control
+subtraction and minimum-stretch filtering. It also counts records with the same family detected in both scans.
+These are input records. Physical molecule identity and source require separate evidence. The whole-read
+fallback is outside this paired report because it scans forward only.
+
 ### 2.5 Whole-read scan (`protein_seed::whole_read_seeds`)
 
 For organelles no cluster seeded, every read is scanned with $\text{min\_hits}' = \max(\text{min\_hits}, 12)$
 (`WHOLE_READ_MIN_HITS`). A read is a seed when its class is that organelle and it holds at least `WHOLE_READ_MIN_GENES` = 3 distinct
-genes of the class; the whole read is kept, at most `WHOLE_READ_MAX_SEEDS` = 3,000. Evidence for 12: chance stretches of nuclear
+genes of the class. The seed is cropped to the gene span with the configured flanks, up to `WHOLE_READ_MAX_SEEDS` = 3,000 seeds. Evidence for 12: chance stretches of nuclear
 reads reach 5-8 hits, mitochondrial genes 13-140 on the best stretch (PMAT2 reference genomes); at 5 hits and 2 genes, 1,514 of
 74,216 Gibbula magus reads passed against 19 mitochondrial (empirical). Cases: organelle about as deep as the nucleus (Orcinus orca,
 19 mitochondrial reads in 1 Gb; Sterechinus neumayeri, 9 in 2.5 Gb). The value 3 rests on a rule of thumb in the constant's doc (a NUMT

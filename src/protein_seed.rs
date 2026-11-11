@@ -84,6 +84,25 @@ impl Default for ProteinSeedParams {
 }
 
 #[derive(Serialize)]
+pub struct PanelGeneSet {
+    pub organelle: &'static str,
+    pub family_count: usize,
+    pub families: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ClusterGeneCount {
+    pub organelle: &'static str,
+    pub family: String,
+    pub forward_stretches: u64,
+    pub reversed_stretches: u64,
+    pub forward_records: u64,
+    pub reversed_records: u64,
+    /// Input records contributing this family in both orientations.
+    pub both_orientation_records: u64,
+}
+
+#[derive(Serialize)]
 pub struct ClusterCall {
     /// Centre of the depth peak (sketch depth).
     pub depth: f64,
@@ -108,6 +127,8 @@ pub struct ClusterCall {
     pub reversed_control_genes: (usize, usize),
     /// The reversed control's stretches per gene (both classes, most first).
     pub reversed_control_segments: Vec<(String, u64)>,
+    /// Per-family counts after assigning each record a class, before subtraction or filtering.
+    pub gene_evidence: Vec<ClusterGeneCount>,
     /// Seed reads this cluster gave.
     pub seed_reads: usize,
 }
@@ -119,6 +140,13 @@ pub struct ProteinSeedReport {
     pub params: ProteinSeedParams,
     pub panel_proteins: usize,
     pub panel_genes: usize,
+    /// Effective family identities after panel exclusions, separated by organelle.
+    pub panel_gene_sets: Vec<PanelGeneSet>,
+    /// Records are FASTX input records, with no claim of original-molecule deduplication.
+    pub gene_evidence_record_unit: &'static str,
+    /// The audit covers the existing depth-cluster scan, not the whole-read fallback.
+    pub gene_evidence_scope: &'static str,
+    pub reverse_control: &'static str,
     /// The alignment E-value a gene stretch needs (`panel::Panel::max_evalue`); null: shared
     /// k-mers alone decide.
     pub panel_max_evalue: Option<f64>,
@@ -355,6 +383,89 @@ fn class_seeds(
     counts(forward) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
 }
 
+fn panel_gene_sets(panel: &Panel) -> Vec<PanelGeneSet> {
+    ORGANELLES
+        .iter()
+        .map(|&organelle| {
+            let mut families: Vec<_> = (0..panel.gene_count())
+                .map(|gene| gene as u16)
+                .filter(|&gene| panel.gene_organelle(gene) == organelle)
+                .map(|gene| panel.gene_name(gene).to_owned())
+                .collect();
+            families.sort_unstable();
+            PanelGeneSet {
+                organelle,
+                family_count: families.len(),
+                families,
+            }
+        })
+        .collect()
+}
+
+struct GeneTally {
+    stretches: Vec<u64>,
+    records: Vec<u64>,
+    last_record: Vec<Option<usize>>,
+}
+
+impl GeneTally {
+    fn new(genes: usize) -> Self {
+        Self {
+            stretches: vec![0; genes],
+            records: vec![0; genes],
+            last_record: vec![None; genes],
+        }
+    }
+
+    fn add(
+        &mut self,
+        panel: &Panel,
+        record: usize,
+        class: Option<&str>,
+        genes: impl Iterator<Item = u16>,
+        mut on_first_in_record: impl FnMut(usize),
+    ) {
+        for gene in genes {
+            if Some(panel.gene_organelle(gene)) != class {
+                continue;
+            }
+            let gene = usize::from(gene);
+            self.stretches[gene] += 1;
+            if self.last_record[gene] != Some(record) {
+                self.records[gene] += 1;
+                self.last_record[gene] = Some(record);
+                on_first_in_record(gene);
+            }
+        }
+    }
+}
+
+fn cluster_gene_counts(
+    panel: &Panel,
+    forward: &GeneTally,
+    reversed: &GeneTally,
+    both: &[u64],
+) -> Vec<ClusterGeneCount> {
+    let mut counts: Vec<_> = (0..panel.gene_count())
+        .map(|i| {
+            let gene = i as u16;
+            ClusterGeneCount {
+                organelle: panel.gene_organelle(gene),
+                family: panel.gene_name(gene).to_owned(),
+                forward_stretches: forward.stretches[i],
+                reversed_stretches: reversed.stretches[i],
+                forward_records: forward.records[i],
+                reversed_records: reversed.records[i],
+                both_orientation_records: both[i],
+            }
+        })
+        .collect();
+    counts.sort_unstable_by(|a, b| {
+        a.organelle.cmp(b.organelle).then_with(|| a.family.cmp(&b.family))
+    });
+    counts
+}
+
 /// Protein seeds for the organelles in `want` (the others are not looked for in the whole-read
 /// scan; depth clusters may still seed them).
 pub fn run(
@@ -468,7 +579,10 @@ pub fn run(
         let n = mine.len() as u64;
         // only the stretches of each read's own class count, so a homologous gene of the other
         // organelle (or a plastid insertion in a mitochondrial read) does not add to its class
-        let (mut segs, mut ctrl) = (vec![0u64; panel.gene_count()], vec![0u64; panel.gene_count()]);
+        let (mut segs, mut ctrl) = (
+            GeneTally::new(panel.gene_count()),
+            GeneTally::new(panel.gene_count()),
+        );
         let classes: Vec<Option<&'static str>> = mine
             .iter()
             .map(|s| {
@@ -476,22 +590,22 @@ pub fn run(
                 read_class(&genes, panel, p.min_read_stretches)
             })
             .collect();
-        for (s, class) in mine.iter().zip(&classes) {
-            for &(g, _, _) in &s.stretches {
-                if Some(panel.gene_organelle(g)) == *class {
-                    segs[g as usize] += 1;
-                }
-            }
+        let mut both = vec![0u64; panel.gene_count()];
+        for (record, (s, class)) in mine.iter().zip(&classes).enumerate() {
+            segs.add(panel, record, *class, s.stretches.iter().map(|x| x.0), |_| {});
             let cclass = read_class(&s.control, panel, p.min_read_stretches);
-            for &g in &s.control {
-                if Some(panel.gene_organelle(g)) == cclass {
-                    ctrl[g as usize] += 1;
-                }
-            }
+            ctrl.add(panel, record, cclass, s.control.iter().copied(), |gene| {
+                both[gene] += u64::from(segs.last_record[gene] == Some(record));
+            });
         }
-        let (mitochondrion, plastid, md, pd, call) =
-            panel::call_segments(panel, excess_over_control(&segs, &ctrl), n, &p.panel);
-        let (cm, cp, cmd, cpd, ccall) = panel::call_segments(panel, ctrl, n, &p.panel);
+        let gene_evidence = cluster_gene_counts(panel, &segs, &ctrl, &both);
+        let (mitochondrion, plastid, md, pd, call) = panel::call_segments(
+            panel,
+            excess_over_control(&segs.stretches, &ctrl.stretches),
+            n,
+            &p.panel,
+        );
+        let (cm, cp, cmd, cpd, ccall) = panel::call_segments(panel, ctrl.stretches, n, &p.panel);
         // a class that counts here (enough genes, enough stretches per read) and not in the
         // reversed control seeds from its reads, also where both count (a cluster holding parts of
         // both genomes at one depth)
@@ -547,6 +661,7 @@ pub fn run(
             reversed_control_call: ccall,
             reversed_control_genes: (cm.genes, cp.genes),
             reversed_control_segments: cm.gene_segments.iter().chain(&cp.gene_segments).cloned().collect(),
+            gene_evidence,
             seed_reads: given,
         });
     }
@@ -579,6 +694,10 @@ pub fn run(
         params: p.clone(),
         panel_proteins,
         panel_genes,
+        panel_gene_sets: panel_gene_sets(panel),
+        gene_evidence_record_unit: "input_fastx_record",
+        gene_evidence_scope: "depth_cluster_records_after_read_classification",
+        reverse_control: "reverse_sequence_without_complement",
         panel_max_evalue: panel.max_evalue(),
         gate: gate.report.clone(),
         reads,
@@ -779,6 +898,65 @@ mod tests {
             segments,
             gene_segments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gene_evidence_reports_effective_per_organelle_panel_sizes() {
+        let text = ">mito|cox1|KeepA\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|cox1|KeepB\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|nad1|ExcludeA\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >plastid|cox1|KeepA\nMCCCCCCCCCCCCCCCCCCCCC\n";
+        let panel = Panel::parse(text, 6, &[]).unwrap();
+        let smaller = Panel::parse(text, 6, &["Exclude".to_owned()]).unwrap();
+        let counts = panel_gene_sets(&panel);
+        let filtered = panel_gene_sets(&smaller);
+        assert_eq!(counts[0].organelle, "mitochondrion");
+        assert_eq!(counts[0].family_count, 2);
+        assert_eq!(counts[0].families, ["cox1", "nad1"]);
+        assert_eq!(counts[1].organelle, "plastid");
+        assert_eq!(counts[1].family_count, 1);
+        assert_eq!(counts[1].families, ["cox1"]);
+        assert_eq!(filtered[0].family_count, 1);
+        assert_eq!(filtered[0].families, ["cox1"]);
+        assert_eq!(filtered[1].families, ["cox1"]);
+    }
+
+    #[test]
+    fn gene_evidence_counts_each_orientation_and_record_before_filtering() {
+        let text = ">mito|cox1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|nad1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >plastid|rbcL|Sp\nMCCCCCCCCCCCCCCCCCCCCC\n";
+        let panel = Panel::parse(text, 6, &[]).unwrap();
+        let mut forward = GeneTally::new(panel.gene_count());
+        let mut reversed = GeneTally::new(panel.gene_count());
+        let mut both = vec![0u64; panel.gene_count()];
+        forward.add(&panel, 0, Some("mitochondrion"), [0, 0, 2].into_iter(), |_| {});
+        reversed.add(&panel, 0, Some("mitochondrion"), [0, 0, 1, 1].into_iter(), |gene| {
+            both[gene] += u64::from(forward.last_record[gene] == Some(0));
+        });
+        forward.add(&panel, 1, Some("mitochondrion"), [0, 1].into_iter(), |_| {});
+        reversed.add(&panel, 1, Some("plastid"), [2].into_iter(), |gene| {
+            both[gene] += u64::from(forward.last_record[gene] == Some(1));
+        });
+        let counts = cluster_gene_counts(&panel, &forward, &reversed, &both);
+        assert_eq!(counts[0].family, "cox1");
+        assert_eq!(counts[0].forward_stretches, 3);
+        assert_eq!(counts[0].forward_records, 2);
+        assert_eq!(counts[0].reversed_stretches, 2);
+        assert_eq!(counts[0].reversed_records, 1);
+        assert_eq!(counts[0].both_orientation_records, 1);
+        assert_eq!(counts[1].forward_stretches, 1);
+        assert_eq!(counts[1].reversed_stretches, 2);
+        assert_eq!(counts[1].reversed_records, 1);
+        assert_eq!(counts[1].both_orientation_records, 0);
+        assert_eq!(counts[2].family, "rbcL");
+        assert_eq!(counts[2].forward_records, 0);
+        assert_eq!(counts[2].reversed_records, 1);
+        assert_eq!(counts[2].both_orientation_records, 0);
+        assert_eq!(
+            excess_over_control(&forward.stretches, &reversed.stretches),
+            [0, 0, 0]
+        );
     }
 
     #[test]

@@ -383,6 +383,11 @@ impl Panel {
         Ok(self)
     }
 
+    /// The exact panel label of a gene family. Its organelle is a separate part of the identity.
+    pub(crate) fn gene_name(&self, gene: u16) -> &str {
+        &self.genes[gene as usize].name
+    }
+
     /// Proteins and distinct genes in the panel.
     pub(crate) fn sizes(&self) -> (usize, usize) {
         (self.proteins, self.genes.len())
