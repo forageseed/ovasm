@@ -64,7 +64,8 @@ class GeometryCliTests(unittest.TestCase):
         (self.root / relative_path).write_bytes(content)
         return dict(path=relative_path, sha256=sha256(content).hexdigest())
 
-    def plan(self, *, shared_guard=False, same_scope_competitor=False, donor=True, query_mismatch=False, empty=False):
+    def plan(self, *, shared_guard=False, same_scope_competitor=False, donor=True,
+             query_mismatch=False, empty=False, graph_contains_original=True):
         nucleus = self.nuclear
         if shared_guard:
             # Exact obsolete right anchor on the reverse strand, absent from the PAF.
@@ -85,7 +86,8 @@ class GeometryCliTests(unittest.TestCase):
             "chr": dict(role="nuclear", source=nuclear_component, source_record="c1"),
             "chr2": dict(role="nuclear", source=nuclear_component, source_record="c2"),
         })
-        paf = "original\t100\t0\t100\t-\tmt\t128\t10\t110\t100\t100\t60\tcg:Z:100M\n"
+        matches = sum(a == b for a, b in zip(reverse(self.query), self.mt[10:110]))
+        paf = f"original\t100\t0\t100\t-\tmt\t128\t10\t110\t{matches}\t100\t60\tcg:Z:100M\n"
         if same_scope_competitor:
             paf += (f"original\t100\t0\t100\t-\tchr\t{len(nucleus)}\t{len(self.nuclear)}\t"
                     f"{len(nucleus)}\t86\t100\t2\tcg:Z:100M\n")
@@ -100,7 +102,7 @@ class GeometryCliTests(unittest.TestCase):
                                mode="exact_context", exclusive_sides=["left", "right"],
                                graph_required=True, physical_boundaries=[], require_full_query=True)],
                  graph=dict(gfa=self.file("graph.gfa", b"S\tnode\t" + self.mt + b"\n"),
-                            reads=[self.file("graph.fastq", self.original +
+                            reads=[self.file("graph.fastq", (self.original if graph_contains_original else b"") +
                                              (fastq("donor", "m123456/22", self.query) if donor else b""))],
                             provenance=self.file("graph-proof.txt", b"synthetic graph input relation\n")),
                  window_provenance=self.file("window-proof.txt", b"registered independent window location\n"))
@@ -169,6 +171,61 @@ class GeometryCliTests(unittest.TestCase):
         r = self.run_cli()
         self.assertEqual(r["original_molecules_enrolled"], 0)
         self.assertEqual(r["records"], [])
+
+
+    def test_full_edit_export_binds_exact_report_and_original_record(self):
+        self.plan(graph_contains_original=False)
+        report, manifest = self.run_full_edit()
+        self.assertTrue(report["native_admission_created"])
+        self.assertFalse(report["competition_complete"])
+        row = report["records"][0]
+        model = row["full_edit_competition"]
+        self.assertEqual(model["status"], "qualified_within_edit_model")
+        self.assertEqual(model["radius"], 0)
+        self.assertEqual(set(model["competing_roles"]), {"nuclear", "plastid"})
+        self.assertTrue(all(v["status"] == "complete" and v["best_hit"] is None
+                            for v in model["competing_roles"].values()))
+        self.assertEqual(manifest["schema"], "ovasm.read-admission.v1")
+        record, = manifest["records"]
+        for key in ("read_id_hex", "sequence_sha256", "quality_sha256"):
+            self.assertEqual(record[key], row[key])
+        out = self.root / "full.geometry.json"
+        self.assertEqual(record["provenance"], {"path": str(out), "sha256": sha256(out.read_bytes()).hexdigest()})
+
+    def test_unreported_continuous_edit_competitor_prevents_export(self):
+        oriented = self.mutate(self.mt[10:110], [0, 1, 2, 3])
+        self.query = reverse(oriented)
+        self.original = fastq("original", "m123456/17", self.query)
+        self.nuclear += self.mutate(oriented, [36, 68])
+        self.plan(graph_contains_original=False)
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        self.assertFalse(report["native_admission_created"])
+        row = report["records"][0]
+        window = row["windows"]["window"]
+        self.assertTrue(window["graph_corroborated_observation"])
+        self.assertEqual(window["witnesses"][0]["reported_paf_roles_covering_same_scope"], ["mitochondrion"])
+        model = row["full_edit_competition"]
+        self.assertEqual(model["radius"], 4)
+        self.assertEqual(model["status"], "competing_within_edit_bound")
+        self.assertEqual(model["competing_roles"]["nuclear"]["best_hit"]["edit_distance"], 2)
+
+    def run_full_edit(self):
+        out = self.root / "full.geometry.json"
+        admission = self.root / "read-admission.json"
+        p = subprocess.run([sys.executable, "-B", str(SCRIPT), str(self.root / "plan.json"),
+                            "--out", str(out), "--full-edit-competition", "--out-admission", str(admission)],
+                           capture_output=True, text=True, check=False)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return json.loads(out.read_bytes()), json.loads(admission.read_bytes()) if admission.exists() else None
+
+    @staticmethod
+    def mutate(sequence, offsets):
+        mutated = bytearray(sequence)
+        for pos in offsets:
+            mutated[pos] = ord("C") if mutated[pos] == ord("A") else ord("A")
+        return bytes(mutated)
+
 
 
 if __name__ == "__main__":

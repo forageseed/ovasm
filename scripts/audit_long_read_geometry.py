@@ -1,20 +1,21 @@
-"""Audit same-original long-read geometry from a frozen, reported PAF.
+"""Audit long-read geometry and optionally verify whole-read edit competition.
 
-This adapter emits a geometry report. It never treats a heuristic mapper's
-missing hit as an excluded source and never writes a native admission manifest.
+A verified target CIGAR can supply a bound. Complete competition at that bound
+comes from searching the named reference bytes, independently of mapper hits.
 """
 
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+import json
 from pathlib import Path
 import re
 import sys
 
-from prepare_read_admission import LockedFile, fasta, fastq, open_input, read_json, write_json
+from prepare_read_admission import LockedFile, fasta, fastq, open_input, read_json
 from source_competition import Anchor, QueryScope, contains, parse_paf, verify_witness
-from validate_source_exclusion import Abstain, Graph, enumerate_routes
+from validate_source_exclusion import Abstain, Graph, enumerate_routes, new_output, publish_outputs
 
 ROLES = ("mitochondrion", "plastid", "nuclear")
 BITS = {role: 1 << i for i, role in enumerate(ROLES)}
@@ -304,7 +305,7 @@ def nearest_anchor(aln, seq, ref, boundary, side, k, exclusive):
     return None
 
 
-def observe(w, raw, alignments, panel, roles, index):
+def observe(w, raw, alignments, panel, roles, index, verified_full=None):
     seq = raw.seq
     ref = panel[w.reference]
     role = roles[w.reference]
@@ -355,6 +356,8 @@ def observe(w, raw, alignments, panel, roles, index):
         if proof is None:
             blocked["single_cigar_geometry_incompatible"] += 1
             continue
+        if verified_full is not None and scope.interval == (0, len(seq)):
+            verified_full.append(aln)
         roles_covering_scope = sorted({roles[a.reference] for a in alignments if a.continuous_over(scope.interval)})
         witnesses[proof] = asdict(proof) | {"cigar": "".join(
             f"{max(x.oriented_query[1]-x.oriented_query[0], x.reference[1]-x.reference[0])}{x.op}"
@@ -434,7 +437,101 @@ def load_named_panel(spec, lock):
     return panel, roles, component_inventory
 
 
-def report(plan_path):
+def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
+    """Attach scoped whole-read competition to each geometry result."""
+    from long_read_edit import cigar_edit_upper_bound, search_competitors
+
+    by_target = defaultdict(dict)
+    decisions = {}
+    for row in rows:
+        query = row["query"]
+        raw = selected[query][0]
+        own = observed.get(query, {})
+        targets = {roles[windows[key].reference] for key in own}
+        if not targets:
+            decisions[query] = {"status": "unresolved_no_full_target_geometry"}
+            continue
+        if len(targets) > 1:
+            decisions[query] = {"status": "unresolved_conflicting_geometry"}
+            continue
+        target = next(iter(targets))
+        observations = row["windows"]
+        if any(roles[windows[key].reference] != target and result["witnesses"]
+               for key, result in observations.items()):
+            decisions[query] = {"status": "unresolved_conflicting_geometry", "target": target}
+            continue
+        supported = {key: alignments for key, alignments in own.items()
+                     if observations[key]["graph_spelling_unique"]
+                     and observations[key]["other_graph_input_exact_donors"]}
+        if not supported:
+            decisions[query] = {"status": "unresolved_no_independent_graph_support", "target": target}
+            continue
+        sequence = raw.seq.upper()
+        if not DNA.fullmatch(sequence):
+            decisions[query] = {"status": "unresolved_unobservable", "target": target}
+            continue
+        radius, key, alignment = min(
+            ((cigar_edit_upper_bound(aln, sequence, panel[aln.reference]), key, aln)
+             for key, alignments in supported.items() for aln in alignments),
+            key=lambda item: (item[0], item[1], alignment_key(item[2])),
+        )
+        decisions[query] = {
+            "target": target, "radius": radius,
+            "verified_target_upper_bound": {
+                "window": key, "reference": alignment.reference, "strand": alignment.strand,
+                "interval": alignment.reference_interval, "unit_edit_count": radius,
+            },
+        }
+        by_target[target][query] = (sequence, radius)
+
+    rows_by_query = {row["query"]: row for row in rows}
+    for target, queries in by_target.items():
+        competitors = {name: sequence for name, sequence in panel.items() if roles[name] != target}
+        results = search_competitors(queries, competitors, {name: roles[name] for name in competitors}, budget)
+        require(results.keys() == queries.keys(), "incomplete full-edit search result")
+        for query, result in results.items():
+            require(set(result) == set(ROLES) - {target}, "incomplete full-edit comparison roles")
+            decision = decisions[query]
+            decision["competing_roles"] = {role: asdict(value) for role, value in result.items()}
+            if any(value.best_hit is not None for value in result.values()):
+                status = "competing_within_edit_bound"
+            elif any(value.status == "budget_exhausted" for value in result.values()):
+                status = "unresolved_edit_budget"
+            elif any(value.status != "complete" for value in result.values()):
+                status = "unresolved_unobservable"
+            elif rows_by_query[query]["windows"][decision["verified_target_upper_bound"]["window"]]["graph_input_original"]:
+                status = "already_graph_input"
+            else:
+                status = "qualified_within_edit_model"
+            decision["status"] = status
+
+    for row in rows:
+        row["full_edit_competition"] = decisions[row["query"]]
+    counts = Counter(decision["status"] for decision in decisions.values())
+    return {
+        "scope": "full-query unit Levenshtein to contiguous substrings of named literal competing references",
+        "target_bound": "unit edits in one verified whole-original target alignment for a graph-supported window",
+        "budget": asdict(budget),
+        "model_searches": sum(map(len, by_target.values())),
+        "decision_counts": counts,
+        "eligible_records": counts["qualified_within_edit_model"],
+    }
+
+
+def admission_records(result):
+    rows = [row for row in result["records"]
+            if row["full_edit_competition"]["status"] == "qualified_within_edit_model"]
+    # A stable alphanumeric query order keeps appended records reproducible across streams.
+    def query_order(row):
+        name = row["query"]
+        return tuple(int(p) if i % 2 else p for i, p in enumerate(re.split(r"([0-9]+)", name))), name
+
+    return [{key: row[key] for key in ("read_id_hex", "sequence_sha256", "quality_sha256")}
+            | {"target": row["full_edit_competition"]["target"]}
+            for row in sorted(rows, key=query_order)]
+
+
+def report(plan_path, edit_budget=None):
     locked_inputs = []
     root = plan_path.resolve().parent
 
@@ -484,11 +581,17 @@ def report(plan_path):
     index = AnchorIndex(windows, selected, alignments, panel, roles)
     rows = []
     counts = defaultdict(Counter)
+    observed = defaultdict(dict) if edit_budget else None
     for query, (raw, ids) in sorted(selected.items()):
         results = {}
         for key in ids:
             w = windows[key]
-            result = observe(w, raw, alignments.get(query, []), panel, roles, index)
+            full = ([] if observed is not None and w.require_full_query and w.mode == "exact_context"
+                    and set(w.exclusive_sides) == {"left", "right"}
+                    and roles[w.reference] in ROLES[:2] else None)
+            result = observe(w, raw, alignments.get(query, []), panel, roles, index, full)
+            if full:
+                observed[query][key] = full
             result["graph_input_original"] = raw.molecule in graph_ids
             result["other_graph_input_exact_donors"] = sorted(set(donors[key]) - {raw.molecule})
             route = routes.get(key, {})
@@ -508,17 +611,22 @@ def report(plan_path):
                                                               and raw.molecule not in graph_ids)
             results[key] = result
         rows.append(raw.binding() | {"windows": results})
+    edit_report = (assess_full_edits(rows, selected, observed, windows, panel, roles, edit_budget)
+                   if edit_budget else None)
     for artifact in locked_inputs:
         artifact.check()
     implementation = {}
-    for module in (sys.modules[LockedFile.__module__], sys.modules[Graph.__module__],
-                   sys.modules[verify_witness.__module__], sys.modules[__name__]):
+    modules = [sys.modules[LockedFile.__module__], sys.modules[Graph.__module__],
+               sys.modules[verify_witness.__module__], sys.modules[__name__]]
+    if edit_budget:
+        modules.append(sys.modules["long_read_edit"])
+    for module in modules:
         path = Path(module.__file__).resolve()
         implementation[path.name] = dict(path=str(path), sha256=sha256(path.read_bytes()).hexdigest())
     panel_summary = {role: dict(records=sum(r == role for r in roles.values()),
                                 bp=sum(len(panel[name]) for name, r in roles.items() if r == role))
                      for role in ROLES}
-    return dict(schema="ovasm.long-read-geometry-report.v1", plan=raw_plan.binding(), scope=plan["scope"],
+    result = dict(schema="ovasm.long-read-geometry-report.v1", plan=raw_plan.binding(), scope=plan["scope"],
                 competition_scope="Reported PAF geometry and literal external anchors in the named panel.",
                 competition_complete=False, native_admission_created=False, paf_rows=paf_rows,
                 original_molecules_scanned=len(identities), original_molecules_enrolled=len(selected),
@@ -526,21 +634,61 @@ def report(plan_path):
                 graph_input_donors=donors, counts=counts, records=rows,
                 panel_records_by_role=panel_summary, panel_component_inventory=component_inventory,
                 implementation=implementation, immutable_inputs=[x.binding() for x in locked_inputs])
+    if edit_report is not None:
+        result["full_edit_competition"] = edit_report
+    return result
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan", type=Path)
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True, help="New JSON audit path")
+    parser.add_argument("--full-edit-competition", action="store_true",
+                        help="Search named competitors within each verified full-read target edit bound")
+    parser.add_argument("--out-admission", type=Path,
+                        help="New native manifest path for qualifying graph-supported original records")
+    parser.add_argument("--max-edit-seed-hits", type=int, help="Exact seed hits per query and role (default 500000)")
+    parser.add_argument("--max-edit-text-bases", type=int, help="Verification bases per query and role (default 2000000)")
     args = parser.parse_args()
     try:
-        require(not args.out.exists(), "output report already exists")
-        result = report(args.plan)
-        write_json(args.out, result)
+        out = new_output(args.out)
+        admission = new_output(args.out_admission) if args.out_admission else None
+        require(out != admission, "audit and admission need different output paths")
+        require(args.full_edit_competition or all(value is None for value in
+                (admission, args.max_edit_seed_hits, args.max_edit_text_bases)),
+                "admission and edit budgets require --full-edit-competition")
+        budget = None
+        if args.full_edit_competition:
+            from long_read_edit import EditBudget
+            require(all(value is None or value > 0 for value in
+                        (args.max_edit_seed_hits, args.max_edit_text_bases)),
+                    "edit budgets must be positive")
+            budget = EditBudget(max_seed_hits=args.max_edit_seed_hits or 500_000,
+                                max_text_bases=args.max_edit_text_bases or 2_000_000)
+        result = report(args.plan, budget)
+        records = admission_records(result) if admission else []
+        result["native_admission_created"] = bool(records)
+        audit_data = json_bytes(result)
+        outputs = [(out, audit_data)]
+        if records:
+            proof = {"path": str(out), "sha256": sha256(audit_data).hexdigest()}
+            manifest = {"schema": "ovasm.read-admission.v1", "scope": result["scope"],
+                        "records": [row | {"provenance": proof} for row in records]}
+            outputs.append((admission, json_bytes(manifest)))
+        publish_outputs(outputs)
     except (OSError, ValueError) as error:
         parser.exit(1, f"long-read geometry audit: {error}\n")
-    print(f'{result["original_molecules_scanned"]} originals, '
-          f'{result["original_molecules_enrolled"]} enrolled; competition unresolved')
+    summary = f'{result["original_molecules_scanned"]} originals, {result["original_molecules_enrolled"]} enrolled'
+    if budget:
+        model = result["full_edit_competition"]
+        summary += f', {model["model_searches"]} full-edit searches, {model["eligible_records"]} eligible'
+    else:
+        summary += ', PAF competition unresolved'
+    print(summary)
 
 
 if __name__ == "__main__":
