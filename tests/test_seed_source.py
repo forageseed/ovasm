@@ -28,6 +28,7 @@ class SeedSourceAudit(unittest.TestCase):
         self.competing_ref = self.write("nuclear.fa", b">chr2\n" + self.competing + b"\n")
         self.manifest = {
             "schema": TOOL["MANIFEST"], "scope": "frozen synthetic source comparison",
+            "target": "mitochondrion",
             "references": [dict(self.ref(self.target_ref), id="mt", role="target"),
                            dict(self.ref(self.competing_ref), id="chr2", role="competing")],
             "windows": [self.window("t", "mt", "mt"), self.window("c", "chr2", "chr2")],
@@ -94,7 +95,9 @@ class SeedSourceAudit(unittest.TestCase):
         subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
                         "--out", str(out), "--out-fasta", str(view)], check=True)
         self.assertEqual(view.read_bytes(), b"".join(retained))
-        self.assertEqual(json.loads(out.read_text())["retained_fasta_sha256"], self.ref(view)["sha256"])
+        result = json.loads(out.read_text())
+        self.assertEqual(result["target"], "mitochondrion")
+        self.assertEqual(result["retained_fasta_sha256"], self.ref(view)["sha256"])
 
     def test_explicit_original_identifier_field_supports_archive_prefix(self):
         path = self.assemble([(b"SRR123.1 movie/1", self.competing)],

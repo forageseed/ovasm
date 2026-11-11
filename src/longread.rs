@@ -1089,6 +1089,7 @@ fn assemble(
         read_set: ReadSet::Target,
         seeds: own_seeds,
         builtin_seeds: builtin.clone(),
+        seed_source_audits: Default::default(),
         seed_lineage: o.lineage,
         recruit: pipeline::RecruitBy::Seeds,
         recruit_depth: None,

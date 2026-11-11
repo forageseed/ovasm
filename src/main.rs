@@ -36,6 +36,7 @@ mod replay;
 mod replicate;
 mod repeat_depth;
 mod retained;
+mod seed_source;
 mod seeddb;
 mod seedfree;
 mod thread_evidence;
@@ -43,7 +44,7 @@ mod uncertain;
 mod unify;
 mod unzip;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -592,6 +593,9 @@ struct RunArgs {
     /// Both organelles are always seeded unless --single-seed, so that each claims its own reads.
     #[arg(short = 'S', long = "seeds")]
     seeds: Vec<String>,
+    /// Audit JSON as ORGANELLE=PATH for one retained FASTA supplied with --seeds.
+    #[arg(long = "seed-source-audit")]
+    seed_source_audits: Vec<String>,
     /// Lineage: plant (default), animal or fungi; 0/1/2 as PMAT2 -x. Sets seeds, protein panel, genetic code.
     ///
     /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
@@ -753,6 +757,14 @@ fn prune_gene_free(lineage: seeddb::Lineage, protein_passes: Option<usize>) -> b
     protein_passes.is_some() && !matches!(lineage, seeddb::Lineage::Landplants)
 }
 
+fn seed_organelle(name: &str) -> &str {
+    match name {
+        "mt" | "mito" => "mitochondrion",
+        "pt" | "cp" | "chloroplast" => "plastid",
+        other => other,
+    }
+}
+
 fn run(args: RunArgs) -> Result<()> {
     let run_started = std::time::Instant::now();
     if let Some(n) = args.threads {
@@ -804,13 +816,32 @@ fn run(args: RunArgs) -> Result<()> {
             }
         };
         // the short names of `-g` work here too (mt=PATH, pt=PATH)
-        let name = match name {
-            "mt" | "mito" => "mitochondrion",
-            "pt" | "cp" | "chloroplast" => "plastid",
-            other => other,
-        };
-        seeds.entry(name.to_string()).or_default().push(path.into());
+        seeds.entry(seed_organelle(name).to_string()).or_default().push(path.into());
     }
+    if !args.seed_source_audits.is_empty()
+        && (args.read_set != pipeline::ReadSet::WholeGenome
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!("--seed-source-audit requires whole-genome seed recruitment");
+    }
+    let mut checked = std::collections::BTreeMap::new();
+    for spec in &args.seed_source_audits {
+        let (name, path) = spec.split_once('=')
+            .with_context(|| format!("--seed-source-audit expects ORGANELLE=PATH, got {spec:?}"))?;
+        let name = seed_organelle(name);
+        if !protein_seed::ORGANELLES.contains(&name) {
+            bail!("--seed-source-audit: invalid organelle {name:?}");
+        }
+        if checked.contains_key(name) {
+            bail!("--seed-source-audit: more than one audit for {name}");
+        }
+        let [view] = seeds.get(name).map(Vec::as_slice).unwrap_or_default() else {
+            bail!("--seed-source-audit requires exactly one --seeds FASTA for {name}");
+        };
+        let verified = seed_source::verify(Path::new(path), view, name)?;
+        checked.insert(name.to_string(), verified);
+    }
+    let mut seed_source_audits = std::collections::BTreeMap::new();
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
     // protein seeds: asked for, or the default for animals and fungi (HiFi whole-genome reads
@@ -829,6 +860,11 @@ fn run(args: RunArgs) -> Result<()> {
         bail!(
             "--protein-seeds seeds the recruitment of HiFi whole-genome reads: run hifi, not with --read-set target or --recruit discover"
         );
+    }
+    for (name, view) in checked {
+        let (path, provenance) = view.materialize(&args.out)?;
+        seeds.insert(name.clone(), vec![path]);
+        seed_source_audits.insert(name, provenance);
     }
     let mut builtin_seeds = std::collections::BTreeSet::new();
     // Recruitment passes when every seeded organelle has protein seeds, land plants: one. Protein seeds are the
@@ -871,15 +907,18 @@ fn run(args: RunArgs) -> Result<()> {
                 p.panel.k,
                 &[],
             )?;
+            let searched: Vec<_> = wanted.iter().copied()
+                .filter(|name| !seed_source_audits.contains_key(*name))
+                .collect();
             let report = protein_seed::run(
                 &args.reads,
                 &panel,
                 &p,
-                &wanted,
+                &searched,
                 &args.out.join("protein-seeds"),
             )?;
             eprintln!("{}", report.summary());
-            for &o in &wanted {
+            for &o in &searched {
                 // the complete organelle holds its whole gene set; a repeat or an insert array
                 // that a cluster of its own stands for, a part of it
                 let best = report
@@ -975,6 +1014,7 @@ fn run(args: RunArgs) -> Result<()> {
         read_set: args.read_set,
         seeds,
         builtin_seeds,
+        seed_source_audits,
         seed_lineage: args.lineage,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,

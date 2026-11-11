@@ -201,6 +201,19 @@ IDs, repeated windows, mixed source observations, or missing crop evidence. Sour
 are scoped to the supplied references and provenance. Use an independent evidence set
 when validating the windows or measuring the source filter.
 
+For an audited view prepared with a manifest target of `mitochondrion` or `plastid`, pass
+the retained FASTA to normal seed recruitment. Supply the audit with the same organelle.
+
+~~~sh
+ovasm run hifi --reads sample.fastq.gz --out assembly \
+  --seeds mt=RETAINED.fa --seed-source-audit mt=AUDIT.json
+~~~
+
+OVASM checks the digest, target, and complete ordered list of retained records. It uses
+a copy of the verified bytes in the run directory and records the audit in
+`summary.json` under `seed_database.seed_source_audit`. The audit describes the source
+comparison that produced the seed view. The run may use a different reads file.
+
 ## 3. Seed recruitment
 
 Source: `recruit.rs`, `bait.rs`, `seeddb.rs`, `main.rs::run`, `pipeline.rs::recruit_all`.

@@ -230,6 +230,8 @@ def audit(path):
     scope = manifest.get("scope")
     require(manifest.get("schema") == MANIFEST and isinstance(scope, str) and scope.strip(),
             "unknown manifest schema or empty named scope")
+    target = manifest.get("target")
+    require(target is None or target in ("mitochondrion", "plastid"), "invalid source audit target")
     base = path.parent
     windows = load_windows(manifest, load_panel(manifest, base), base)
     seeds = load_seeds(manifest["seeds"], base)
@@ -255,6 +257,8 @@ def audit(path):
         "counts": counts, "retained_records": len(kept), "records": rows,
         "retained_fasta_sha256": retained_sha.hexdigest(),
     }
+    if target is not None:
+        report["target"] = target
     return report, kept
 
 

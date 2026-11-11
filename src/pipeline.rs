@@ -122,6 +122,8 @@ pub struct RunConfig {
     pub seeds: BTreeMap<String, Vec<PathBuf>>,
     /// The organelles whose `seeds` are the built-in library (`summary.json` says `builtin`).
     pub builtin_seeds: BTreeSet<String>,
+    /// Provenance of each explicitly audited retained seed FASTA.
+    pub(crate) seed_source_audits: BTreeMap<String, crate::seed_source::Provenance>,
     /// The built-in library `builtin_seeds` came from (`summary.json` records it).
     pub seed_lineage: crate::seeddb::Lineage,
     pub recruit: RecruitBy,
@@ -1195,13 +1197,18 @@ fn recruit_all(
                 let own = seed_files(organelle);
                 source = own.join(", ");
                 let seed_source = |o: &str| {
-                    if cfg.builtin_seeds.contains(o) {
+                    if cfg.seed_source_audits.contains_key(o) {
+                        "audited_source_view"
+                    } else if cfg.builtin_seeds.contains(o) {
                         "builtin"
                     } else {
                         "custom"
                     }
                 };
                 seed_info.insert("source".into(), seed_source(organelle).into());
+                if let Some(audit) = cfg.seed_source_audits.get(organelle) {
+                    seed_info.insert("seed_source_audit".into(), json!(audit));
+                }
                 if cfg.builtin_seeds.contains(organelle) {
                     seed_info.insert("version".into(), cfg.seed_lineage.version().into());
                     seed_info.insert("lineage".into(), cfg.seed_lineage.name().into());
@@ -1217,11 +1224,15 @@ fn recruit_all(
                 seed_info.insert(
                     "competing_seed".into(),
                     if cfg.seeds.contains_key(other) {
-                        json!({
+                        let mut competitor = json!({
                             "organelle": other,
                             "source": seed_source(other),
                             "files": seed_files(other),
-                        })
+                        });
+                        if let Some(audit) = cfg.seed_source_audits.get(other) {
+                            competitor["seed_source_audit"] = json!(audit);
+                        }
+                        competitor
                     } else {
                         Value::Null
                     },
@@ -2671,6 +2682,7 @@ mod tests {
             read_set: ReadSet::Target,
             seeds: BTreeMap::new(),
             builtin_seeds: BTreeSet::new(),
+            seed_source_audits: BTreeMap::new(),
             seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
