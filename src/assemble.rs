@@ -2244,8 +2244,12 @@ fn run_backbone_layout_guard(
                 // errors (0.999^1001 = 0.37 error-free), each a node of count 1 (Trichoderma
                 // longibrachiatum: the median of all its seed nodes was 1, threshold 1, 127
                 // unitigs; Acleris sparsana killed at 30.6 GB)
+                // and at most as many as there are reads: one read meets a node once unless the
+                // node repeats inside it, so a count above the read count is a tandem repeat, not
+                // depth (Gibbula magus, 8 reads at ~4x: a repeat at count 90 taken as the
+                // sequence depth, min count 9, every node gone at every k)
                 if seen.insert(h) {
-                    if let Some(v) = nodes.get(&h).filter(|v| v.0 >= 3) {
+                    if let Some(v) = nodes.get(&h).filter(|v| v.0 >= 3 && u64::from(v.0) <= reads) {
                         at.push(v.0);
                     }
                 }
