@@ -602,6 +602,9 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
     argv.run()?;
     let report = read_json(&json)?;
     let last = report["rounds"].as_array().and_then(|r| r.last()).cloned();
+    let count = last.as_ref().and_then(|l| l["reads_out"].as_u64())
+        .ok_or_else(|| anyhow::anyhow!("correction report has no valid final reads_out: {}", json.display()))?;
+    if short.is_none() { require_self_correction(count, fasta)?; }
     Ok(json!({
         "reads": path_str(fasta),
         "report": path_str(&json),
@@ -617,6 +620,24 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
         "bases_out": last.as_ref().map(|l| l["stats"]["bases_out"].clone()),
         "seconds": report["elapsed_seconds"],
     }))
+}
+
+fn correction_output_usable(count: u64, fasta: &Path) -> Result<bool> {
+    Ok(count > 0 && std::fs::metadata(fasta)?.len() > 0)
+}
+
+fn require_self_correction(count: u64, fasta: &Path) -> Result<()> {
+    if !correction_output_usable(count, fasta)? {
+        anyhow::bail!("self-correction produced no reads: {}; assembly cannot continue", fasta.display());
+    }
+    Ok(())
+}
+
+fn use_hybrid_correction(count: u64, fasta: &Path, self_corrected: &Path, report: &mut Value) -> Result<bool> {
+    if correction_output_usable(count, fasta)? { return Ok(true); }
+    log("hybrid correction produced no reads; retaining self-corrected reads");
+    report["fallback"] = json!({"reason": "hybrid correction produced no reads", "reads": path_str(self_corrected)});
+    Ok(false)
 }
 
 fn path_str(p: &Path) -> String {
@@ -936,7 +957,10 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 let fasta = o.out.join("correct/hybrid").join(format!("{organelle}.fasta"));
                 let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta, o.salt)?;
                 c["purpose"] = "assembly".into();
-                r.corrected = fasta;
+                let n = c["reads_out"].as_u64().ok_or_else(|| anyhow::anyhow!("invalid hybrid reads_out"))?;
+                if use_hybrid_correction(n, &fasta, &r.corrected, &mut c)? {
+                    r.corrected = fasta;
+                }
                 r.corrections.push(c);
             }
         }
@@ -1154,6 +1178,25 @@ fn assemble(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_correction_is_not_usable() {
+        let p = std::env::temp_dir().join(format!("ovasm-empty-correction-{}", std::process::id()));
+        std::fs::write(&p, b"").unwrap();
+        assert!(!super::correction_output_usable(0, &p).unwrap());
+        assert!(!super::correction_output_usable(1, &p).unwrap());
+        std::fs::write(&p, b">r\nACGT\n").unwrap();
+        assert!(!super::correction_output_usable(0, &p).unwrap());
+        assert!(super::correction_output_usable(1, &p).unwrap());
+        assert!(super::require_self_correction(0, &p).unwrap_err().to_string().contains("self-correction produced no reads"));
+        let mut report = serde_json::json!({});
+        assert!(!super::use_hybrid_correction(0, &p, &p, &mut report).unwrap());
+        assert_eq!(report["fallback"]["reason"], "hybrid correction produced no reads");
+        assert!(super::use_hybrid_correction(1, &p, &p, &mut serde_json::json!({})).unwrap());
+        std::fs::remove_file(&p).unwrap();
+        assert!(super::require_self_correction(1, &p).is_err());
+        assert!(super::use_hybrid_correction(1, &p, &p, &mut serde_json::json!({})).is_err());
+    }
+
     #[test]
     fn the_lower_k_is_chosen_only_when_the_higher_one_lost_sequence() {
         // Nipponbare ONT: 321,855 bp at 201, 404,510 at 101; ZM4 ONT: 299,707 and 300,178
