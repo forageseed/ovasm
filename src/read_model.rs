@@ -56,6 +56,50 @@ pub struct ReadModel {
     min_reads: u64,
 }
 
+/// Index of positions where a supported thread can extend a required anchor.
+/// Each occurrence retains the entire oriented record path for prefix checks.
+pub(crate) struct ThreadEnds {
+    paths: Vec<Vec<Oriented>>,
+    positions: BTreeMap<(Oriented, Option<Oriented>), Vec<(usize, usize)>>,
+}
+
+impl ThreadEnds {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    pub(crate) fn has_anchor(&self, anchor: Oriented, previous: Option<Oriented>) -> bool {
+        self.positions.contains_key(&(anchor, previous))
+    }
+
+    /// Return exact ends of individual records whose entire inbound path is
+    /// the suffix of this candidate through its last required anchor.
+    pub(crate) fn tails<'a>(&'a self, walk: &[Oriented], budget: &mut u64) -> Option<BTreeSet<&'a [Oriented]>> {
+        let anchor = *walk.last().unwrap();
+        let previous = walk.len().checked_sub(2).map(|i| walk[i]);
+        let mut tails = BTreeSet::new();
+        for &(path, offset) in self.positions.get(&(anchor, previous)).into_iter().flatten() {
+            if !spend(budget, 1) {
+                return None;
+            }
+            let (prefix, tail) = self.paths[path].split_at(offset + 1);
+            if prefix.len() > walk.len() {
+                continue;
+            }
+            if !spend(budget, prefix.len()) {
+                return None;
+            }
+            if walk.ends_with(prefix) {
+                if !spend(budget, tail.len()) {
+                    return None;
+                }
+                tails.insert(tail);
+            }
+        }
+        Some(tails)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ReadPathCover {
     pub scope: &'static str,
@@ -201,6 +245,34 @@ impl ReadModel {
         Self {paths:self.paths.iter().filter(|(w,_,_)|
             w.iter().any(|o|!repeats[o.0] && belongs.contains(&o.0))).cloned().collect(),
             links:self.links.iter().filter(|((a,b),_)|nodes.contains(&a.0)&&nodes.contains(&b.0)).map(|(&e,&n)|(e,n)).collect(),min_reads:self.min_reads}
+    }
+
+    pub(crate) fn thread_ends(&self, anchors: &[usize], optional: &[bool]) -> ThreadEnds {
+        let mut index = ThreadEnds { paths: Vec::new(), positions: BTreeMap::new() };
+        if !anchors.iter().any(|&a| optional[a]) {
+            return index;
+        }
+        let required: BTreeSet<_> = anchors.iter().copied().filter(|&a| !optional[a]).collect();
+        let mut oriented: Vec<_> = self.paths.iter().filter(|(_, n, _)| *n >= self.min_reads)
+            .flat_map(|(walk, _, _)| [walk.clone(), walk.iter().rev().map(|&node| flip(node)).collect()])
+            .collect();
+        oriented.sort_unstable();
+        oriented.dedup();
+        for path in oriented {
+            let id = index.paths.len();
+            let mut indexed = false;
+            for (i, &anchor) in path[..path.len() - 1].iter().enumerate() {
+                if required.contains(&anchor.0) {
+                    let previous = i.checked_sub(1).map(|j| path[j]);
+                    index.positions.entry((anchor, previous)).or_default().push((id, i));
+                    indexed = true;
+                }
+            }
+            if indexed {
+                index.paths.push(path);
+            }
+        }
+        index
     }
 
     /// A minimal explanatory family is a representation of observed paths, not a count

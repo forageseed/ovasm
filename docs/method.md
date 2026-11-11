@@ -629,6 +629,9 @@ $\hat p$, take the 2.5% and 97.5% quantiles). Every read is also recorded as a s
   topologically (`TOPO_READS` = 1, at most `TOPO_MAX_REPEATS` = 8 repeats) at an anchor end that fewer than `ABSENCE_READS` = 10 reads cross. Topological and weak bridges make a molecule non-decisive.
 - Connected components of the anchor graph are solved separately. Within one, a cover is a set of molecules visiting each anchor once through bridges (one molecule is a Hamiltonian path in the small
   anchor graph); repeats are laid down as often as the chosen bridges cross them; a molecule is circular when a bridge returns from its last anchor to its first. Covers of every size compete together.
+- Once the required-anchor covers have been enumerated, the remaining search budget can extend an open cover to an observed record end. The entire inbound thread must match the existing oriented
+  path. Its tail must follow existing bridges to unused optional anchors and respect phase constraints. These additional open candidates carry the same representation and topology limits as the original
+  covers. On exhaustion, the original covers remain available and the search is marked incomplete.
 - Ranking when thread evidence is present (always, since `check evidence` writes it): `read_model::ReadFit::order`, lexicographic and not a likelihood: more joint records explained, then more
   thread records, then more adjacency-record occurrences, then fewer unobserved junctions, then fewer weak junctions; then fewer copy-number deviations, then fewer molecules (a representation
   tie-break). Search work is bounded by `WORK_BUDGET` = $10^7$; on exhaustion `ranking_model = "legacy_after_read_budget_exhaustion"`.

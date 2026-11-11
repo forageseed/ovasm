@@ -508,7 +508,9 @@ fn search_phased(
     for (i, b) in br.iter().enumerate() {
         out_of.entry(b.walk[0]).or_default().push(i);
     }
-    search_phased_indexed(n_seg, anchors, optional, br, m, max_steps, phases, &out_of, false)
+    let (covers, truncated, _) =
+        search_phased_indexed(n_seg, anchors, optional, br, m, max_steps, phases, &out_of, None);
+    (covers, truncated)
 }
 
 fn search_phased_indexed(
@@ -520,8 +522,8 @@ fn search_phased_indexed(
     max_steps: u64,
     phases: &crate::phase::Constraints,
     out_of: &FxHashMap<Oriented, Vec<usize>>,
-    topology_neutral: bool,
-) -> (Vec<Vec<Found>>, bool) {
+    thread_ends: Option<&crate::read_model::ThreadEnds>,
+) -> (Vec<Vec<Found>>, bool, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
         out_of: &'a FxHashMap<Oriented, Vec<usize>>,
@@ -698,16 +700,113 @@ fn search_phased_indexed(
         }
     }
 
+    fn charge(budget: &mut u64, work: usize) -> Option<()> {
+        *budget = budget.checked_sub(work as u64)?;
+        Some(())
+    }
+
+    /// Match a record end against existing anchor bridges. Only repeats
+    /// occur inside a bridge, so two different bridges cannot both be a
+    /// prefix of the same sequence of oriented segments.
+    fn terminal_bridges(
+        c: &Ctx, start: Oriented, mut tail: &[Oriented], occupied: &FxHashSet<usize>, budget: &mut u64,
+    ) -> Option<Vec<usize>> {
+        let mut at = start;
+        let mut added = FxHashSet::default();
+        let mut bridges = Vec::new();
+        while !tail.is_empty() {
+            let mut matched = None;
+            for &id in c.out_of.get(&at).into_iter().flatten() {
+                let walk = &c.br[id].walk;
+                charge(budget, 1)?;
+                if walk.len() - 1 > tail.len() {
+                    continue;
+                }
+                charge(budget, walk.len() - 1)?;
+                if tail.starts_with(&walk[1..]) {
+                    matched = Some(id);
+                    break;
+                }
+            }
+            let Some(id) = matched else { return Some(Vec::new()); };
+            let walk = &c.br[id].walk;
+            at = *walk.last().unwrap();
+            if !c.optional[at.0] || occupied.contains(&at.0) || !added.insert(at.0) {
+                return Some(Vec::new());
+            }
+            bridges.push(id);
+            tail = &tail[walk.len() - 1..];
+        }
+        Some(bridges)
+    }
+
+    fn extend_terminal_covers(
+        c: &Ctx, threads: &crate::read_model::ThreadEnds, covers: &mut Vec<Vec<Found>>, mut budget: u64,
+    ) -> Option<()> {
+        // Complete the original search first. The remaining budget can only add
+        // open alternatives and cannot erase an original cover.
+        for i in 0..covers.len() {
+            charge(&mut budget, 1)?;
+            let cover = &covers[i];
+            let last = cover.last().unwrap();
+            if last.circular {
+                continue;
+            }
+            let (at, previous) = last.bridges.last().map_or((last.start, None), |&j| {
+                let walk = &c.br[j].walk;
+                (walk[walk.len() - 1], Some(walk[walk.len() - 2]))
+            });
+            if c.optional[at.0] || !threads.has_anchor(at, previous) {
+                continue;
+            }
+            charge(&mut budget, 1 + last.bridges.len())?;
+            let length = 1 + last.bridges.iter().map(|&j| c.br[j].walk.len() - 1).sum::<usize>();
+            charge(&mut budget, length)?;
+            let mut walk = candidate_walk(c.br, last);
+            let tails = threads.tails(&walk, &mut budget)?;
+            if tails.is_empty() {
+                continue;
+            }
+            charge(&mut budget, cover.len())?;
+            let cost = cover.iter().map(|f| f.bridges.len() + 1).sum::<usize>();
+            charge(&mut budget, cost)?;
+            let occupied = cover.iter().flat_map(|f| {
+                std::iter::once(f.start.0).chain(f.bridges.iter().map(|&j| c.br[j].walk.last().unwrap().0))
+            }).collect();
+            let cover = cover.clone();
+            for tail in tails {
+                let bridges = terminal_bridges(c, at, tail, &occupied, &mut budget)?;
+                if bridges.is_empty() {
+                    continue;
+                }
+                if c.phases.active_nodes > 0 {
+                    charge(&mut budget, length + tail.len())?;
+                    walk.extend_from_slice(tail);
+                    let allowed = c.phases.allows_walk(&walk, false);
+                    walk.truncate(length);
+                    if !allowed {
+                        continue;
+                    }
+                }
+                charge(&mut budget, cost + bridges.len())?;
+                let mut extended = cover.clone();
+                extended.last_mut().unwrap().bridges.extend(bridges);
+                covers.push(extended);
+            }
+        }
+        Some(())
+    }
+
     let ctx = Ctx {
         phases,
-        out_of: &out_of,
+        out_of,
         br,
         optional,
         anchors,
         want: anchors.iter().filter(|&&a| !optional[a]).count(),
         m,
         max_steps,
-        topology_neutral,
+        topology_neutral: thread_ends.is_some(),
     };
     let mut st = State {
         used: vec![false; n_seg],
@@ -737,7 +836,10 @@ fn search_phased_indexed(
             break;
         }
     }
-    (st.found, st.truncated)
+    let terminal_truncated = !st.truncated && thread_ends.is_some_and(|threads| {
+        !threads.is_empty() && extend_terminal_covers(&ctx, threads, &mut st.found, max_steps - st.steps).is_none()
+    });
+    (st.found, st.truncated, terminal_truncated)
 }
 
 /// Longest tail `cut_tail` takes off a circle, as a fraction of the circle's anchor sequence.
@@ -1670,6 +1772,7 @@ pub fn run_phased(
     }
     for (comp, depth) in anchor_components.into_iter().zip(component_depth) {
         let component_model=read_model.as_ref().map(|m|m.for_anchors(&comp,&repeat));
+        let thread_ends = component_model.as_ref().map(|model| model.thread_ends(&comp, &optional));
         let mut rep = ComponentReport {
             ranking_model: if read_model.is_some() {crate::read_model::MODEL} else {"legacy_bridge_copy"},
             evidence_tied_candidates: 0,
@@ -1730,8 +1833,8 @@ pub fn run_phased(
         let mut last = envelope.min(comp.len());
         let mut m = rep.min_molecules;
         while m <= last {
-            let (mut found, mut truncated) = search_phased_indexed(
-                g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, read_model.is_some(),
+            let (mut found, mut truncated, mut terminal_truncated) = search_phased_indexed(
+                g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, thread_ends.as_ref(),
             );
             // Automatic mode retries only compact graphs with a modest number of candidates.
             // Explicit --max-steps remains a hard limit. Release the first batch before retrying
@@ -1741,12 +1844,12 @@ pub fn run_phased(
             {
                 rep.adaptive_retry = true;
                 drop(found);
-                (found, truncated) = search_phased_indexed(
+                (found, truncated, terminal_truncated) = search_phased_indexed(
                     g.names.len(), &comp, &optional, &br, m,
-                    p.max_steps.saturating_mul(2), &phases, &search_out_of, read_model.is_some(),
+                    p.max_steps.saturating_mul(2), &phases, &search_out_of, thread_ends.as_ref(),
                 );
             }
-            rep.search_truncated |= truncated;
+            rep.search_truncated |= truncated || terminal_truncated;
             for cover in found {
                 let mut key: Vec<(bool, Vec<Oriented>)> = cover.iter()
                     .map(|f| (f.circular, canonical_key(&candidate_walk(&br, f), f.circular)))
@@ -3415,6 +3518,112 @@ mod tests {
                 "accepted_records":paths.iter().map(|(_,n)|n).sum::<u64>(),
                 "links":links.iter().map(|(a,b,n)|json!({"from":a,"to":b,"records":n})).collect::<Vec<_>>(),
                 "paths":paths.iter().map(|(p,n)|json!({"path":p,"reads":n})).collect::<Vec<_>>()}})
+    }
+
+    fn terminal_evidence(gfa: &str, links: &[(&str, &str, u64)], paths: &[(&str, u64)]) -> Value {
+        let mut ev = model_evidence(gfa, &[], links, paths);
+        ev["segment_depths"] = json!({"X":10,"A":100,"B":100,"Y":10});
+        ev["median_depth"] = json!(100);
+        ev
+    }
+
+    fn terminal_covers(report: &LinearizeReport) -> impl Iterator<Item = &CoverReport> {
+        let component = &report.components[0];
+        component.best.iter().chain(&component.alternatives)
+    }
+
+    #[test]
+    fn native_model_represents_whole_threads_after_required_anchors() {
+        let gfa = gfa_text(&[("X",100),("A",100),("B",100),("Y",100)],
+                           &[("X+","A+"),("A+","B+"),("B+","Y+")]);
+        let links = [("X+","A+",2),("A+","B+",2),("B+","Y+",2)];
+        let cases = [
+            ("ovasm-ends-forward", "X+ A+ B+ Y+", 2, true),
+            ("ovasm-ends-reverse", "Y- B- A- X-", 2, true),
+            ("ovasm-ends-low", "X+ A+ B+ Y+", 1, false),
+        ];
+        for (name, path, n, expected) in cases {
+            let result = run_on(&gfa, &terminal_evidence(&gfa, &links, &[(path,n)]), name);
+            let full = terminal_covers(&result).flat_map(|c| &c.molecules)
+                .filter(|m| m.length == 400).collect::<Vec<_>>();
+            assert_eq!(full.len(), usize::from(expected), "{name}");
+            assert!(full.iter().all(|m| !m.circular));
+            assert!(!result.physical_topology_identified);
+            let model = result.components[0].read_path_cover.as_ref().unwrap();
+            assert_eq!(model.represented_thread_records, if expected {2} else {0}, "{name}");
+        }
+    }
+
+    #[test]
+    fn native_model_does_not_promote_a_record_prefix_to_a_terminal_candidate() {
+        let gfa = gfa_text(&[("X",100),("A",100),("B",100),("Y",100),("Z",100)],
+                           &[("X+","A+"),("A+","B+"),("B+","Y+"),("Y+","Z+")]);
+        let links = [("X+","A+",2),("A+","B+",2),("B+","Y+",2),("Y+","Z+",2)];
+        let mut ev = terminal_evidence(&gfa, &links, &[("X+ A+ B+ Y+ Z+",2)]);
+        ev["segment_depths"]["Z"] = json!(10);
+        let mut old = terminal_evidence(&gfa, &links, &[]);
+        old["segment_depths"]["Z"] = json!(10);
+        let baseline = run_on(&gfa, &old, "ovasm-ends-prefix-baseline");
+        let complete = run_on(&gfa, &ev, "ovasm-ends-prefix-complete");
+        let model = complete.components[0].read_path_cover.as_ref().unwrap();
+        assert_eq!(model.represented_thread_records, 2);
+        let paths = |r: &LinearizeReport| terminal_covers(r).flat_map(|c| &c.molecules)
+            .map(|m| m.path.clone()).collect::<BTreeSet<_>>();
+        let before = paths(&baseline);
+        let after = paths(&complete);
+        let added: Vec<_> = after.difference(&before).collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].split_whitespace().count(), 5, "{}", added[0]);
+    }
+
+    #[test]
+    fn native_model_terminal_budget_keeps_the_original_cover_search() {
+        let gfa = gfa_text(&[("X",100),("A",100),("B",100),("Y",100)],
+                           &[("X+","A+"),("A+","B+"),("B+","Y+")]);
+        let links = [("X+","A+",2),("A+","B+",2),("B+","Y+",2)];
+        let ev = terminal_evidence(&gfa, &links, &[("X+ A+ B+ Y+",2)]);
+        let old = terminal_evidence(&gfa, &links, &[]);
+        let file = std::env::temp_dir().join(format!("ovasm-ends-budget-{}.gfa",std::process::id()));
+        std::fs::write(&file, &gfa).unwrap();
+        let graph = parse_gfa(&file).unwrap();
+        std::fs::remove_file(file).unwrap();
+        let anchors: Vec<_> = (0..graph.names.len()).collect();
+        let optional: Vec<_> = graph.names.iter().map(|n| n=="X" || n=="Y").collect();
+        let repeats = vec![false; anchors.len()];
+        let before = crate::read_model::ReadModel::load(&graph, &old, &repeats, 2).unwrap()
+            .unwrap().thread_ends(&anchors,&optional);
+        let after = crate::read_model::ReadModel::load(&graph, &ev, &repeats, 2).unwrap()
+            .unwrap().thread_ends(&anchors,&optional);
+        let (bridges, _) = bridges(&graph, &ev, &repeats, 2).unwrap();
+        let mut out = FxHashMap::<_,Vec<_>>::default();
+        for (i,b) in bridges.iter().enumerate() {
+            out.entry(b.walk[0]).or_default().push(i);
+        }
+        let phases = crate::phase::Constraints::default();
+        let solve = |budget, threads| search_phased_indexed(
+            anchors.len(),&anchors,&optional,&bridges,1,budget,&phases,&out,Some(threads));
+        let budget = (1..200).find(|&n| !solve(n,&before).1).unwrap();
+        let (original, truncated, terminal_truncated) = solve(budget,&before);
+        assert!(!truncated && !terminal_truncated && !original.is_empty());
+        let (extended, truncated, terminal_truncated) = solve(budget,&after);
+        assert!(!truncated && terminal_truncated);
+        let paths = |covers: Vec<Vec<Found>>| covers.into_iter().map(|c| c.into_iter()
+            .map(|f| (f.circular, candidate_walk(&bridges,&f))).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(paths(original), paths(extended));
+    }
+
+    #[test]
+    fn native_model_terminal_threads_do_not_add_circles() {
+        let gfa = gfa_text(&[("X",100),("A",100),("B",100),("Y",100)],
+                           &[("X+","A+"),("A+","B+"),("B+","Y+"),("Y+","X+")]);
+        let links = [("X+","A+",2),("A+","B+",2),("B+","Y+",2),("Y+","X+",2)];
+        let baseline = run_on(&gfa, &terminal_evidence(&gfa, &links, &[]), "ovasm-ends-circle-base");
+        let extended = run_on(&gfa, &terminal_evidence(&gfa, &links, &[("X+ A+ B+ Y+",2)]),
+                              "ovasm-ends-circle-read");
+        let circles = |r: &LinearizeReport| terminal_covers(r).flat_map(|c| &c.molecules)
+            .filter(|m| m.circular).map(|m| m.path.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(circles(&baseline), circles(&extended));
+        assert!(!extended.physical_topology_identified);
     }
 
     #[test]
