@@ -23,8 +23,19 @@ pub(crate) struct Bounds {
 pub(crate) struct Measure {
     pub(crate) segment_depth: Option<f64>,
     pub(crate) anchor_range: Option<Bounds>,
+    pub(crate) direct_comparator: bool,
     pub(crate) reciprocal_comparator: bool,
     pub(crate) repeated_visit_records: u64,
+}
+
+impl Measure {
+    pub(crate) fn can_promote(self) -> bool {
+        self.direct_comparator && self.repeated_visit_records >= MIN_FLANK_RECORDS
+    }
+
+    pub(crate) fn can_demote(self) -> bool {
+        self.reciprocal_comparator && self.repeated_visit_records == 0
+    }
 }
 
 #[derive(Serialize)]
@@ -196,6 +207,7 @@ impl FlankCalibration {
                 Measure {
                     segment_depth: v[s],
                     anchor_range,
+                    direct_comparator: direct.is_some(),
                     reciprocal_comparator: opposite.is_some(),
                     repeated_visit_records: repeated[s],
                 }
@@ -218,7 +230,7 @@ impl FlankCalibration {
             });
         }
         let report = Self {
-            mode: "reciprocal_flank_depth_range_v2",
+            mode: "reciprocal_flank_depth_range_v3",
             graph_fingerprint: graph_fingerprint(gfa),
             minimum_distinct_records: MIN_FLANK_RECORDS,
             segments,

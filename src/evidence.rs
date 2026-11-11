@@ -875,8 +875,9 @@ fn median_depth(g: &Graph, depth: &[f64]) -> f64 {
         .map_or(0.0, |x| x.0)
 }
 
-// Unresolved local depth keeps the legacy operational role. A conditional
-// demotion requires a reciprocal comparator and no repeated-visit witness.
+// Unresolved local depth keeps the legacy operational role. A new repeat role
+// requires bilateral depth and directly observed repeated visits. A demotion
+// requires a reciprocal comparator and no repeated-visit witness.
 struct RepeatDepth<'a> {
     values: Option<&'a [f64]>,
     median: f64,
@@ -893,10 +894,9 @@ impl<'a> RepeatDepth<'a> {
         Self { values, median: values.map_or(0.0, |d| median_depth(g, d)), flanks }
     }
 
-    fn local(&self, segment: usize) -> Option<(f64, crate::repeat_depth::Bounds, bool)> {
-        let m = self.flanks?[segment];
-        let can_demote = m.reciprocal_comparator && m.repeated_visit_records == 0;
-        Some((m.segment_depth?, m.anchor_range?, can_demote))
+    fn local(&self, segment: usize) -> Option<(f64, crate::repeat_depth::Bounds, Measure)> {
+        let measurement = self.flanks?[segment];
+        Some((measurement.segment_depth?, measurement.anchor_range?, measurement))
     }
 
     fn at_least(&self, segment: usize, fold: f64) -> bool {
@@ -904,11 +904,11 @@ impl<'a> RepeatDepth<'a> {
     }
 
     fn at_least_or(&self, segment: usize, fold: f64, without_depth: bool) -> bool {
-        if let Some((d, range, can_demote)) = self.local(segment) {
-            if d >= fold * range.maximum {
+        if let Some((d, range, measurement)) = self.local(segment) {
+            if measurement.can_promote() && d >= fold * range.maximum {
                 return true;
             }
-            if can_demote && d < fold * range.minimum {
+            if measurement.can_demote() && d < fold * range.minimum {
                 return false;
             }
         }
@@ -916,11 +916,11 @@ impl<'a> RepeatDepth<'a> {
     }
 
     fn at_most(&self, segment: usize, fold: f64) -> bool {
-        if let Some((d, range, can_demote)) = self.local(segment) {
-            if can_demote && d <= fold * range.minimum {
+        if let Some((d, range, measurement)) = self.local(segment) {
+            if measurement.can_demote() && d <= fold * range.minimum {
                 return true;
             }
-            if d > fold * range.maximum {
+            if measurement.can_promote() && d > fold * range.maximum {
                 return false;
             }
         }
@@ -2404,11 +2404,30 @@ mod flank_depth_fallback_tests {
         let candidate = [Measure {
             segment_depth: Some(80.0),
             anchor_range: Some(crate::repeat_depth::Bounds { minimum: 80.0, maximum: 80.0 }),
+            direct_comparator: true,
             reciprocal_comparator: false,
             repeated_visit_records: 0,
         }];
         let depth = RepeatDepth { values: None, median: 0.0, flanks: Some(&candidate) };
         assert!(depth.at_least_or(0, REPEAT_FOLD, true));
         assert!(!depth.at_least(0, REPEAT_FOLD));
+    }
+
+    #[test]
+    fn repeat_promotion_needs_bilateral_depth_and_multiple_revisited_records() {
+        let range = crate::repeat_depth::Bounds { minimum: 9.0, maximum: 10.0 };
+        for (direct, visits, expected) in [(false, 0, false), (false, 2, false),
+                                          (true, 0, false), (true, 1, false), (true, 2, true)] {
+            let candidate = [Measure {
+                segment_depth: Some(22.0),
+                anchor_range: Some(range),
+                direct_comparator: direct,
+                reciprocal_comparator: !direct,
+                repeated_visit_records: visits,
+            }];
+            let depth = RepeatDepth { values: Some(&[22.0]), median: 22.0, flanks: Some(&candidate) };
+            assert_eq!(depth.at_least(0, REPEAT_FOLD), expected);
+            assert_eq!(depth.at_most(0, CROSSROAD_ONE_COPY), !expected);
+        }
     }
 }
