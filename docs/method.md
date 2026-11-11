@@ -414,6 +414,44 @@ written. The remaining outcomes are `competing_target`, `downsampled` and `base_
 Final output counts include admitted records. Iteration counts, bait closure and
 sketch-based depth describe the ordinary bait search.
 
+### 3.8 Screen original reads at registered junctions
+
+Run `python3 scripts/prepare_read_admission.py PLAN.json --out SCREEN_DIR` to prepare
+a native read admission manifest. Use the same original four-line FASTQ inputs for
+screening and recruitment. Plain and gzip inputs are supported. The plan uses schema
+`ovasm.read-source-screen.v1`, a nonempty `scope`, and a `target` of `mitochondrion`
+or `plastid`.
+
+- `reads` lists original FASTQs. `panel` gives one FASTA for each of
+  `mitochondrion`, `plastid`, and `nuclear`. A FASTA can contain several reference records.
+  Each file uses an object with `path` and lowercase `sha256`.
+- `windows` lists registered target junctions. Each object has an `id`, target FASTA
+  `reference` identifier, and integers `start0`, `boundary0`, and `end0`. Coordinates
+  are zero-based and half-open. Supply at least one base on either side of the boundary.
+- Optional `qualification` binds an independent comparison file with schema
+  `ovasm.read-source-qualification.v1`. That file declares `scope`, `target`,
+  `panel_sha256` keyed by the same three roles, a `provenance` file binding, and
+  `records`. Each record has `read_id_hex`, `sequence_sha256`, `quality_sha256`, the
+  complete registered `window` object, and a `verdict` of `target_supported`,
+  `competing`, or `unresolved`. The evidence author supplies the verdict using
+  independent evidence for the same original record and interval.
+
+Relative paths resolve beside the JSON file that declares them. The screen searches
+all input reads for registered windows in either orientation, then compares the
+complete exact read end and exact window against the named panel. Only a unique
+target placement for both, at the registered coordinates and with an independently
+qualified original record, is eligible. Exact comparison applies to literal panel
+bases. Assembly gaps, unrepresented sequence and approximate matches remain outside
+that comparison. A matching competing or unresolved declaration also withholds the
+record. The report keeps up to two placements per role, enough to establish
+ambiguity. Multiple windows on the same record yield at most one native declaration.
+
+`source-screen.json` records the frozen inputs, exact placements and individual
+decisions. If screening finishes with eligible records, `read-admission.json` is
+ready for `--read-admission-manifest`. Reaching the candidate cap before all reads
+are checked produces a truncated report and no admission manifest. This route
+currently handles exact complete reads at registered windows.
+
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 
 ### 4.1 Closed-syncmer sparse graph
