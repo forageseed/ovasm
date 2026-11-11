@@ -26,7 +26,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use anyhow::{bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1265,6 +1267,9 @@ pub struct LinearizeReport {
     pub ranking_model: &'static str,
     pub physical_topology_identified: bool,
     pub configurations_fasta: Option<String>,
+    /// Requested FASTA of ranked component covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_fasta: Option<String>,
     pub graph: String,
     pub evidence: String,
     pub anchors: Vec<String>,
@@ -1364,6 +1369,99 @@ fn partial_fasta_path(out_fasta: &Path) -> std::path::PathBuf {
     out_fasta.with_file_name(name)
 }
 
+fn configuration_fasta_path(out_fasta: &Path) -> PathBuf {
+    let stem = out_fasta.file_stem().unwrap_or_default().to_string_lossy();
+    out_fasta.with_file_name(format!("{stem}.configurations.fasta"))
+}
+
+/// Resolve existing symlinks and compare paths even before the output directories exist.
+fn candidate_path_identity(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = std::path::absolute(path)?;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(mut resolved) => {
+                resolved.extend(suffix.into_iter().rev());
+                return Ok(resolved);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&ancestor).is_err() =>
+            {
+                let name = ancestor.file_name().with_context(|| {
+                    format!("cannot resolve output location {}", path.display())
+                })?;
+                suffix.push(name.to_os_string());
+                ancestor.pop();
+            }
+            Err(error) => return Err(error).with_context(|| format!("resolving {}", path.display())),
+        }
+    }
+}
+
+fn cover_fasta_records(
+    g: &Graph,
+    cover: &CoverReport,
+    label_index: &FxHashMap<&str, usize>,
+    prefix: &str,
+    tag: &str,
+) -> Result<String> {
+    let records = cover.molecules.iter().map(|molecule| {
+        let walk = molecule.path.split_whitespace()
+            .map(|label| parse_label(label_index, label))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((walk, molecule.clone()))
+    }).collect::<Result<Vec<_>>>()?;
+    fasta_records(g, &records, prefix, true, tag)
+}
+
+fn write_candidate_fasta(
+    g: &Graph,
+    components: &[ComponentReport],
+    label_index: &FxHashMap<&str, usize>,
+    path: &Path,
+) -> Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let pending = parent.join(format!(
+        ".ovasm-candidates-{}-{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, AtomicOrdering::Relaxed)
+    ));
+    let file = fs::OpenOptions::new().write(true).create_new(true).open(&pending)?;
+    let result = (|| -> Result<()> {
+        let mut writer = BufWriter::new(file);
+        for (ci, component) in components.iter().enumerate() {
+            let ranked_count = component.alternatives.len()
+                + usize::from(component.best.is_some() && !component.read_join_cover);
+            let tag = format!(
+                " representation=ranked_component_cover physical_topology_identified=false search_truncated={} cover_size_limited={} read_model_budget_exhausted={} alternatives_truncated={}",
+                component.search_truncated,
+                component.cover_size_limited,
+                component.read_model_budget_exhausted,
+                ranked_count < component.candidates,
+            );
+            for (rank, cover) in component.best.iter().chain(&component.alternatives).enumerate() {
+                if rank == 0 && component.read_join_cover {
+                    continue;
+                }
+                let prefix = format!("component_candidate.{}.{}", ci + 1, rank + 1);
+                let fasta = cover_fasta_records(g, cover, label_index, &prefix, &tag)?;
+                writer.write_all(fasta.as_bytes())?;
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+        fs::rename(&pending, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&pending);
+    }
+    result.with_context(|| format!("writing ranked candidates to {}", path.display()))
+}
+
 /// `out_partial`: FASTA for the partial paths (default: see `partial_fasta_path`). A file left
 /// there by an earlier run is removed when this run has none, so that it cannot be taken for
 /// this run's.
@@ -1375,7 +1473,7 @@ pub fn run(
     out_partial: Option<&Path>,
     out_json: &Path,
 ) -> Result<LinearizeReport> {
-    run_phased(gfa, evidence, p, out_fasta, out_partial, out_json, None)
+    run_phased(gfa, evidence, p, out_fasta, out_partial, out_json, None, None)
 }
 
 pub fn run_phased(
@@ -1386,7 +1484,20 @@ pub fn run_phased(
     out_partial: Option<&Path>,
     out_json: &Path,
     phase_report: Option<&Path>,
+    out_candidate: Option<&Path>,
 ) -> Result<LinearizeReport> {
+    let partial_fasta = out_partial.map_or_else(|| partial_fasta_path(out_fasta), Path::to_path_buf);
+    let configuration_path = configuration_fasta_path(out_fasta);
+    if let Some(candidate) = out_candidate {
+        let identity = candidate_path_identity(candidate)?;
+        for occupied in [gfa, evidence, out_fasta, out_json, &partial_fasta, &configuration_path]
+            .into_iter().chain(phase_report)
+        {
+            if candidate_path_identity(occupied)? == identity {
+                bail!("candidate FASTA must be separate from {}", occupied.display());
+            }
+        }
+    }
     let g = parse_gfa(gfa)?;
     let phases = phase_report
         .map(|p| crate::phase::Constraints::load(&g, p))
@@ -1896,8 +2007,6 @@ pub fn run_phased(
         fs::create_dir_all(out_fasta.parent().unwrap_or(Path::new(".")))?;
         fs::write(out_fasta, fasta_records(&g, &chosen, "linear", false, "")?)?;
     }
-    let partial_fasta =
-        out_partial.map_or_else(|| partial_fasta_path(out_fasta), Path::to_path_buf);
     if partial.is_empty() {
         // none in this run: one left by an earlier run would pass for this run's
         fs::remove_file(&partial_fasta).ok();
@@ -1913,23 +2022,22 @@ pub fn run_phased(
     let label_index:FxHashMap<_,_>=g.names.iter().enumerate().map(|(i,n)|(n.as_str(),i)).collect();
     for (ci,component) in comps.iter().enumerate() {
         for (fi,cover) in component.witness_configurations.iter().enumerate() {
-            let records=cover.molecules.iter().map(|m| {
-                let walk=m.path.split_whitespace().map(|s|parse_label(&label_index,s)).collect::<Result<Vec<_>>>()?;
-                Ok((walk,m.clone()))
-            }).collect::<Result<Vec<_>>>()?;
-            configuration_fasta.push_str(&fasta_records(&g,&records,&format!("configuration.{}.{}",ci+1,fi+1),true,
+            let prefix = format!("configuration.{}.{}", ci + 1, fi + 1);
+            configuration_fasta.push_str(&cover_fasta_records(&g, cover, &label_index, &prefix,
                 " representation=read_path_cover physical_topology_identified=false")?);
         }
     }
-    let stem=out_fasta.file_stem().unwrap_or_default().to_string_lossy();
-    let configuration_path=out_fasta.with_file_name(format!("{stem}.configurations.fasta"));
     let has_configurations=!configuration_fasta.is_empty();
     if !has_configurations {fs::remove_file(&configuration_path).ok();}
     else {fs::write(&configuration_path,configuration_fasta)?;}
+    if let Some(path) = out_candidate {
+        write_candidate_fasta(&g, &comps, &label_index, path)?;
+    }
     let out = LinearizeReport {
         ranking_model: if read_model.is_some() {crate::read_model::MODEL} else {"legacy_bridge_copy"},
         physical_topology_identified: false,
         configurations_fasta: has_configurations.then(||configuration_path.display().to_string()),
+        candidate_fasta: out_candidate.map(|path| path.display().to_string()),
         graph: gfa.display().to_string(),
         evidence: evidence.display().to_string(),
         anchors: anchors.iter().map(|&s| g.names[s].clone()).collect(),

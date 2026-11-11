@@ -1596,6 +1596,11 @@ struct LinearizeArgs {
     /// there are partial paths; a file from an earlier run is removed otherwise.
     #[arg(long)]
     out_partial_fasta: Option<PathBuf>,
+    /// Export the selected and reported alternative covers of each component to a separate
+    /// FASTA, respecting --max-alternatives. Excludes partial paths and read-join fallbacks.
+    /// Records identify their component, cover, and molecule. An empty result writes an empty file.
+    #[arg(long)]
+    out_candidate_fasta: Option<PathBuf>,
     /// Ignore phased paths and links supported by fewer reads.
     #[arg(long, default_value_t = 2)]
     min_reads: u64,
@@ -1632,6 +1637,7 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
         args.out_partial_fasta.as_deref(),
         &args.out_json,
         args.phases.as_deref(),
+        args.out_candidate_fasta.as_deref(),
     )?;
     eprintln!(
         "[ovasm] {} anchors, {} bridges, {} components, {} candidates; {} molecules{}",
