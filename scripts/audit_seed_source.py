@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit native protein seed crops against locked local source contexts."""
 from argparse import ArgumentParser
+from collections import defaultdict
 from contextlib import contextmanager
 from hashlib import file_digest, sha256
 from pathlib import Path
@@ -15,6 +16,8 @@ MANIFEST = "ovasm.seed-source-audit.v1"
 COMPLEMENT = bytes.maketrans(b"ACGT", b"TGCA")
 SPAN = re.compile(rb"span=(\d+)-(\d+)")
 ROLES = {"target", "competing"}
+EXCLUDE_COMPETING = "exclude-competing"
+TARGET_ONLY = "target-supported-only"
 
 
 def require(condition, message):
@@ -179,19 +182,64 @@ def load_originals(references, base, wanted):
     return originals
 
 
-def assess_seed(name, span, seed, originals, windows):
+def load_strict_originals(references, base, seeds):
+    """Join exact proposals without storing every original with a repeated name."""
+    require(isinstance(references, list) and references, "provide at least one original read file")
+    wanted = {name for name, _, _, _ in seeds}
+    proposed = defaultdict(set)
+    for name, span, seed, _ in seeds:
+        if span is not None and span[0] < span[1] and span[1] - span[0] == len(seed):
+            proposed[name].add(span)
+    keys = {(name, span, seed) for name, span, seed, _ in seeds}
+    originals, observed_names, files = {}, set(), set()
+    for index, reference in enumerate(references):
+        with locked_file(reference, base) as (_, source):
+            stat = os.fstat(source.fileno())
+            identity = stat.st_dev, stat.st_ino
+            require(identity not in files, "strict source audit repeats an original input file")
+            files.add(identity)
+            field = reference.get("id_field", 1)
+            require(type(field) is int and field > 0, "original id_field must be a positive integer")
+            for ordinal, (name, sequence) in enumerate(raw_records(source, field - 1)):
+                if name not in wanted:
+                    continue
+                observed_names.add(name)
+                for span in proposed[name]:
+                    if span[1] > len(sequence):
+                        continue
+                    key = (name, span, sequence[slice(*span)])
+                    if key in keys:
+                        originals[key] = None if key in originals else (index, ordinal, sequence)
+    return originals, observed_names
+
+
+def assess_seed(name, span, seed, originals, windows, strict_names=None):
     row = {
         "read_id": name.decode("ascii", errors="backslashreplace"),
         "read_id_hex": name.hex(), "crop": span, "seed_sha256": sha256(seed).hexdigest(),
         "state": "unresolved", "reason": "original_missing", "observations": [],
     }
-    if name not in originals:
-        return row
-    binding = originals[name]
-    if binding is None:
-        row["reason"] = "original_identifier_repeated"
-        return row
-    index, original = binding
+    if strict_names is None:
+        if name not in originals:
+            return row
+        binding = originals[name]
+        if binding is None:
+            row["reason"] = "original_identifier_repeated"
+            return row
+        index, original = binding
+    else:
+        if name not in strict_names:
+            return row
+        key = name, span, seed
+        if key not in originals:
+            row["reason"] = "crop_does_not_bind_to_original"
+            return row
+        binding = originals[key]
+        if binding is None:
+            row["reason"] = "crop_matches_multiple_original_records"
+            return row
+        index, ordinal, original = binding
+        row["original_record_index"] = ordinal
     row["original_input_index"] = index
     row["original_sha256"] = sha256(original).hexdigest()
     if span is None or not 0 <= span[0] < span[1] <= len(original) or original[slice(*span)] != seed:
@@ -224,7 +272,7 @@ def assess_seed(name, span, seed, originals, windows):
     return row
 
 
-def audit(path):
+def audit(path, retention_policy=EXCLUDE_COMPETING):
     data = path.read_bytes()
     manifest = json.loads(data)
     scope = manifest.get("scope")
@@ -232,19 +280,27 @@ def audit(path):
             "unknown manifest schema or empty named scope")
     target = manifest.get("target")
     require(target is None or target in ("mitochondrion", "plastid"), "invalid source audit target")
+    require(retention_policy in (EXCLUDE_COMPETING, TARGET_ONLY), "unknown retention policy")
+    strict = retention_policy == TARGET_ONLY
+    require(not strict or target is not None, "target-supported-only requires a named organelle target")
     base = path.parent
     windows = load_windows(manifest, load_panel(manifest, base), base)
     seeds = load_seeds(manifest["seeds"], base)
-    originals = load_originals(manifest["raw_reads"], base, {seed[0] for seed in seeds})
+    strict_names = None
+    if strict:
+        originals, strict_names = load_strict_originals(manifest["raw_reads"], base, seeds)
+    else:
+        originals = load_originals(manifest["raw_reads"], base, {seed[0] for seed in seeds})
     rows = []
     kept = []
     counts = {"target_supported": 0, "competing_supported": 0, "unresolved": 0}
     retained_sha = sha256()
     for name, span, sequence, fasta in seeds:
-        row = assess_seed(name, span, sequence, originals, windows)
+        row = assess_seed(name, span, sequence, originals, windows, strict_names)
         rows.append(row)
         counts[row["state"]] += 1
-        if row["state"] != "competing_supported":
+        allowed = row["state"] == "target_supported" if strict else row["state"] != "competing_supported"
+        if allowed:
             kept.append(fasta)
             retained_sha.update(fasta)
     report = {
@@ -259,6 +315,8 @@ def audit(path):
     }
     if target is not None:
         report["target"] = target
+    if strict:
+        report["retention_policy"] = "target_supported_only"
     return report, kept
 
 
@@ -288,14 +346,16 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--out", type=Path, required=True, help="new JSON audit path")
-    parser.add_argument("--out-fasta", type=Path, help="new FASTA containing target-supported and unresolved crops")
+    parser.add_argument("--out-fasta", type=Path, help="new FASTA containing crops admitted by the retention policy")
+    parser.add_argument("--retention-policy", choices=(EXCLUDE_COMPETING, TARGET_ONLY), default=EXCLUDE_COMPETING,
+                        help="retain target-supported and unresolved crops, or require positive target evidence")
     args = parser.parse_args()
     try:
         paths = [args.out] + ([args.out_fasta] if args.out_fasta else [])
         require(len({path.resolve() for path in paths}) == len(paths), "output paths must differ")
         for path in paths:
             require(not (path.exists() or path.is_symlink()), f"output already exists: {path}")
-        report, retained = audit(args.manifest)
+        report, retained = audit(args.manifest, args.retention_policy)
         outputs = [(args.out, [json.dumps(report, indent=2, sort_keys=True).encode() + b"\n"])]
         if args.out_fasta:
             outputs.append((args.out_fasta, retained))

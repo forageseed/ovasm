@@ -201,6 +201,15 @@ IDs, repeated windows, mixed source observations, or missing crop evidence. Sour
 are scoped to the supplied references and provenance. Use an independent evidence set
 when validating the windows or measuring the source filter.
 
+For positive-only release, add `--retention-policy target-supported-only`.
+The producer retains only crops that spell a unique target window completely
+within their audited original span. If original IDs repeat, strict mode
+requires the ID, span and literal crop to match exactly one original record.
+The audit records its file index, record ordinal and sequence digest. Missing,
+ambiguous, mixed or competing evidence leaves the crop out of the strict view.
+An empty strict view is reportable. OVASM requires at least one qualifying crop
+for that organelle before starting recruitment.
+
 For an audited view prepared with a manifest target of `mitochondrion` or `plastid`, pass
 the retained FASTA to normal seed recruitment. Supply the audit with the same organelle.
 
@@ -209,7 +218,10 @@ ovasm run hifi --reads sample.fastq.gz --out assembly \
   --seeds mt=RETAINED.fa --seed-source-audit mt=AUDIT.json
 ~~~
 
-OVASM checks the digest, target, and complete ordered list of retained records. It uses
+OVASM checks the digest, target, and complete ordered list of retained records.
+For a strict view it also checks original-coordinate spans and the literal
+target window spelling within each crop. This check uses the source evidence
+in the named audit panel and applies to the organelle named on the command. It uses
 a copy of the verified bytes in the run directory and records the audit in
 `summary.json` under `seed_database.seed_source_audit`. The audit describes the source
 comparison that produced the seed view. The run may use a different reads file.

@@ -99,6 +99,43 @@ class SeedSourceAudit(unittest.TestCase):
         self.assertEqual(result["target"], "mitochondrion")
         self.assertEqual(result["retained_fasta_sha256"], self.ref(view)["sha256"])
 
+    def test_strict_binds_distinct_crops_with_reused_ids_and_excludes_outside_evidence(self):
+        crops = [self.crop(b"same", self.target), self.crop(b"same", self.competing),
+                 self.crop(b"ambiguous", self.target), self.crop(b"outside", self.novel, start=64),
+                 self.crop(b"mixed", self.target)]
+        path = self.assemble([(b"same", self.target), (b"same", self.competing),
+                             (b"ambiguous", self.target + self.novel),
+                             (b"ambiguous", self.target + self.competing),
+                             (b"outside", self.target + self.novel),
+                             (b"mixed", self.target + self.competing)], crops, as_gzip=True)
+        legacy, _ = TOOL["audit"](path)
+        self.assertNotIn("retention_policy", legacy)
+        self.assertEqual(legacy["records"][0]["reason"], "original_identifier_repeated")
+        report, retained = TOOL["audit"](path, TOOL["TARGET_ONLY"])
+        self.assertEqual(report["retention_policy"], "target_supported_only")
+        self.assertEqual(report["counts"], {"target_supported": 1, "competing_supported": 1, "unresolved": 3})
+        self.assertEqual(retained, [crops[0]])
+        self.assertEqual(report["records"][0]["original_record_index"], 0)
+        self.assertEqual(report["records"][1]["original_record_index"], 1)
+        self.assertEqual(report["records"][2]["reason"], "crop_matches_multiple_original_records")
+        self.assertEqual(report["records"][3]["reason"], "source_window_ambiguous_or_outside_crop")
+        self.assertEqual(report["records"][4]["reason"], "mixed_source_contexts")
+        out, view = self.root / "strict.json", self.root / "strict.fa"
+        subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
+                        "--retention-policy", "target-supported-only", "--out", str(out),
+                        "--out-fasta", str(view)], check=True)
+        self.assertEqual(view.read_bytes(), crops[0])
+
+    def test_strict_empty_is_reportable_and_repeated_input_alias_fails(self):
+        path = self.assemble([(b"unknown", self.novel)], [self.crop(b"unknown", self.novel)])
+        report, retained = TOOL["audit"](path, TOOL["TARGET_ONLY"])
+        self.assertEqual(report["retained_fasta_sha256"], sha256(b"").hexdigest())
+        self.assertEqual(retained, [])
+        self.manifest["raw_reads"].append(dict(self.manifest["raw_reads"][0]))
+        path.write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(ValueError, "repeats an original input file"):
+            TOOL["audit"](path, TOOL["TARGET_ONLY"])
+
     def test_explicit_original_identifier_field_supports_archive_prefix(self):
         path = self.assemble([(b"SRR123.1 movie/1", self.competing)],
                              [self.crop(b"movie/1", self.competing)])
