@@ -30,6 +30,35 @@ When requested, graph corroboration requires one exhaustively spelled graph rout
 
 Geometry-only records retain `unresolved_reported_paf_only` for competition. Alignment heuristics, secondary caps and partial reference coverage can hide competitors. The optional whole-read comparison establishes a separate result under the named reference and edit model. The audit never promotes a missing PAF placement to proven absence.
 
+## Bind graph-frontier candidates
+
+For graph-derived windows, add a `frontier_events` file binding to the plan.
+Its schema is `ovasm.frontier-event-bindings.v1` with `discovery_report`,
+`discovery_evidence`, and `records` fields. Resolve all file bindings from the
+geometry plan directory. Use the complete output of `discover_graph_frontier.py`
+on the same GFA and ordered original FASTQs. A mapper FASTA and PAF superset
+may supply geometry, but only registered originals enter this audit. Their
+other reported alignments and matching diagnostic windows can still oppose a
+target claim.
+
+Each registration contains:
+
+| Fields | Value |
+| --- | --- |
+| `input_index0`, `record_index0` | Zero-based FASTQ input index and record ordinal. |
+| `read_id_hex`, `sequence_sha256`, `quality_sha256`, `molecule` | Complete original header, raw sequence and quality digests, and movie/ZMW. |
+| `event_index0`, `event_sha256` | Zero-based event index and digest of compact sorted JSON with the four original identity fields above, `event_index0`, and `event` from the discovery ledger. Omit the final newline. |
+| `window_id`, `side` | Registered full-query `exact_context` graph window of length discovery k, with k-base exclusive anchors on both sides, and the left or right side of the raw event from which to derive its disjoint graph core. |
+| `paf_row_sha256` | Digest of the complete literal PAF line including its line ending. Register each distinct line separately. |
+
+The audit recomputes events for those originals and verifies the graph core and
+adjacent discovery anchor on one oriented node. An independent graph-input
+original must spell that entire footprint. One registered full-query CIGAR must
+project both the core and the affected raw interval exactly. Only that CIGAR
+can supply a source-competition bound. The donor supports the graph footprint.
+The affected sequence is recorded separately and receives no graph-path claim
+from that donor.
+
 ## Whole-read edit competition
 
 Use `--full-edit-competition` to verify competing placements directly in the named

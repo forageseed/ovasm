@@ -2,6 +2,7 @@
 
 from collections import Counter, defaultdict
 from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
 import random
@@ -14,6 +15,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from audit_long_read_geometry import canonical, exact_word_counts, packed_words, reverse
+from discover_graph_frontier import DEFAULT_TRAVERSAL_STATES, evaluate
 
 SCRIPT = SCRIPTS / "audit_long_read_geometry.py"
 
@@ -322,6 +324,154 @@ class GeometryCliTests(unittest.TestCase):
         self.assertEqual(model["radius"], 4)
         self.assertEqual(model["status"], "competing_within_edit_bound")
         self.assertEqual(model["competing_roles"]["nuclear"]["best_hit"]["edit_distance"], 2)
+
+    def frontier_plan(self, *, explicit=True, negative=False, core_only_donor=False,
+                      bind_gapped=False, duplicate_geometry=False, nuclear_diagnostic=None):
+        left, right = random_dna(17, 60), random_dna(23, 60)
+        ordinary = left + right
+        target = left + random_dna(34, 21) + right
+        first = reverse(target) if negative else target
+        strand = "-" if negative else "+"
+        originals = self.file("originals.fastq", fastq("A", "m123456/17", first) +
+                              fastq("B", "m123456/19", ordinary))
+        queries = self.file("queries.fa", fasta("A", first) + fasta("B", ordinary))
+        gfa = self.file("graph.gfa", b"S\tcore\t" + ordinary + b"\n")
+        discovery = self.root / "discovery-plan.json"
+        discovery.write_text(json.dumps({"schema": "ovasm.graph-frontier-discovery.v1",
+                                         "scope": "Synthetic original differences", "graph": gfa,
+                                         "raw_reads": [originals], "scan_k": 9}))
+        evidence = BytesIO()
+        report = evaluate(discovery, evidence, DEFAULT_TRAVERSAL_STATES, False)
+        row, = (json.loads(line) for line in evidence.getvalue().splitlines())
+        self.assertEqual(row["record_index0"], 0)
+        event, = row["events"]
+        start = event["affected_raw_interval0"][0]
+        raw_core = start - 9, start
+        core = (len(first) - raw_core[1], len(first) - raw_core[0]) if negative else raw_core
+        evidence_file = self.file("discovery.jsonl", evidence.getvalue())
+        report["evidence"] = evidence_file | {"path": str(self.root / evidence_file["path"])}
+        report_file = self.file("discovery.json", json.dumps(report).encode())
+        donor = target[slice(*core)] if core_only_donor else ordinary
+        fixed = f"A\t141\t0\t141\t{strand}\tmt\t141\t0\t141\t"
+        matches = 141 if nuclear_diagnostic is None else 139
+        exact = (fixed + f"{matches}\t141\t60\tcg:Z:141M\n").encode()
+        gapped = (fixed + "140\t142\t20\tcg:Z:1I1D140M\n").encode()
+        alias = gapped.replace(b"\t20\tcg:", b"\t23\tcg:")
+        second = b"B\t120\t0\t120\t+\tmt\t141\t0\t141\t120\t141\t60\tcg:Z:60M21D60M\n"
+        diagnostic_row = b"A\t141\t0\t141\t+\tchr\t141\t0\t141\t138\t141\t60\tcg:Z:141M\n"
+        lines = exact + gapped + (alias if duplicate_geometry else b"") + second
+        if nuclear_diagnostic:
+            lines += diagnostic_row
+        p = dict(schema="ovasm.long-read-geometry.v1", scope="One real graph event and one matching graph-spelled read",
+                 original_fastqs=[originals], mapper_queries=queries,
+                 windows=[dict(id="window", reference="mt", interval=core, anchor_bp=9, mode="exact_context",
+                               exclusive_sides=["left", "right"], graph_required=True,
+                               physical_boundaries=[], require_full_query=True)],
+                 paf=dict(data=self.file("reads.paf", lines), provenance=self.file("paf-proof.txt", b"fixture\n")),
+                 graph=dict(gfa=gfa, reads=[self.file("graph.fastq", fastq("donor", "m123456/22", donor))],
+                            provenance=self.file("graph-proof.txt", b"fixture\n")),
+                 window_provenance=self.file("window-proof.txt", b"derived from a frozen event\n"))
+        mitochondrial, nuclear = target, random_dna(27, 250)
+        if nuclear_diagnostic is not None:
+            mitochondrial = self.mutate(target, [15, 122])
+            nuclear = self.mutate(target, [35, 96, 108])
+            p["windows"].append(dict(p["windows"][0], id="nuclear_diagnostic", reference="chr",
+                                     interval=[70, 79], graph_required=False))
+        references = {"mt": ("mitochondrion", mitochondrial), "pt": ("plastid", random_dna(19, 220)),
+                      "chr": ("nuclear", nuclear)}
+        p["panel"] = dict(fasta=self.file("panel.fa", b"".join(fasta(n, v) for n, (_, v) in references.items())),
+                          records={n: dict(role=role, source=self.file(n + ".fa", fasta(n, seq)), source_record=n)
+                                   for n, (role, seq) in references.items()})
+        fields = ("read_id_hex", "sequence_sha256", "quality_sha256")
+        raw_identity = {k: row[k] for k in fields} | {"molecule": "m123456/17"}
+        event_hash = sha256(json.dumps(raw_identity | {"event_index0": 0, "event": event},
+                                      sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        selected_paf = alias if bind_gapped and duplicate_geometry else gapped if bind_gapped else exact
+        registration = raw_identity | {"input_index0": 0, "record_index0": 0, "event_index0": 0,
+                                       "event_sha256": event_hash, "window_id": "window", "side": "left",
+                                       "paf_row_sha256": sha256(selected_paf).hexdigest()}
+        binding = {"schema": "ovasm.frontier-event-bindings.v1", "discovery_report": report_file,
+                   "discovery_evidence": evidence_file, "records": [registration]}
+        if explicit:
+            p["frontier_events"] = self.file("frontier.json", json.dumps(binding).encode())
+        (self.root / "plan.json").write_text(json.dumps(p))
+        return p, binding
+
+    def test_window_only_can_admit_an_original_without_a_frontier_event(self):
+        self.frontier_plan(explicit=False)
+        report, manifest = self.run_full_edit()
+        self.assertEqual(report["full_edit_competition"]["eligible_records"], 2)
+        self.assertEqual([bytes.fromhex(r["read_id_hex"]).split()[0] for r in manifest["records"]], [b"A", b"B"])
+
+    def test_frontier_binding_excludes_graph_spelled_original_and_preserves_reverse_strand(self):
+        self.frontier_plan(negative=True)
+        report, manifest = self.run_full_edit()
+        self.assertEqual(report["original_molecules_scanned"], 2)
+        self.assertEqual(report["original_molecules_enrolled"], 1)
+        self.assertEqual(report["frontier_event_binding"]["ignored_paf_rows"], 1)
+        row, = report["records"]
+        self.assertEqual(row["query"], "A")
+        upper = row["full_edit_competition"]["verified_target_upper_bound"]
+        self.assertEqual(upper["strand"], "-")
+        self.assertEqual(upper["frontier_events"][0]["independent_donor_molecules"], ["m123456/22"])
+        self.assertEqual(manifest["records"][0]["read_id_hex"], row["read_id_hex"])
+
+    def test_only_bound_paf_can_supply_the_edit_bound_even_with_identical_geometry_rows(self):
+        _, binding = self.frontier_plan(bind_gapped=True, duplicate_geometry=True)
+        report, manifest = self.run_full_edit()
+        self.assertIsNotNone(manifest)
+        upper = report["records"][0]["full_edit_competition"]["verified_target_upper_bound"]
+        self.assertEqual(upper["unit_edit_count"], 2)
+        self.assertEqual(upper["cigar"], "1I1D140M")
+        event, = upper["frontier_events"]
+        self.assertEqual(event["paf_row_sha256"], binding["records"][0]["paf_row_sha256"])
+
+    def test_core_only_donor_cannot_support_a_frontier_event(self):
+        self.frontier_plan(core_only_donor=True)
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        self.assertTrue(row["windows"]["window"]["other_graph_input_exact_donors"])
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_verified_frontier_target_geometry")
+        self.assertEqual(report["frontier_event_binding"]["verified_without_independent_donor"], 1)
+
+    def test_unregistered_other_role_diagnostic_can_veto_the_registered_target(self):
+        self.frontier_plan(nuclear_diagnostic=True)
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        self.assertTrue(row["windows"]["nuclear_diagnostic"]["witnesses"])
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_conflicting_geometry")
+        self.assertEqual(report["frontier_event_binding"]["verified_with_independent_donor"], 1)
+
+    def test_unobserved_diagnostic_preserves_the_bound_target_search(self):
+        self.frontier_plan(nuclear_diagnostic=False)
+        report, manifest = self.run_full_edit()
+        self.assertIsNotNone(manifest)
+        row = report["records"][0]
+        self.assertEqual(row["windows"]["nuclear_diagnostic"]["witnesses"], [])
+        model = row["full_edit_competition"]
+        self.assertEqual(model["status"], "qualified_within_edit_model")
+        self.assertEqual(model["radius"], 2)
+        self.assertIsNone(model["competing_roles"]["nuclear"]["best_hit"])
+
+    def test_wrong_event_or_paf_binding_publishes_no_artifacts(self):
+        plan, binding = self.frontier_plan()
+        original = binding["records"][0]
+        for key in ("event_sha256", "paf_row_sha256", "quality_sha256", "record_index0"):
+            with self.subTest(key=key):
+                binding["records"] = [original | {key: 1 if key == "record_index0" else "0" * 64}]
+                plan["frontier_events"] = self.file("frontier.json", json.dumps(binding).encode())
+                plan_path = self.root / "plan.json"
+                plan_path.write_text(json.dumps(plan))
+                out = self.root / "audit.json"
+                admission = self.root / "admission.json"
+                args = [sys.executable, "-B", str(SCRIPT), str(plan_path), "--out", str(out),
+                        "--full-edit-competition", "--out-admission", str(admission)]
+                result = subprocess.run(args, capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("frontier", result.stderr)
+                self.assertFalse(out.exists() or admission.exists())
 
     def run_full_edit(self):
         out = self.root / "full.geometry.json"

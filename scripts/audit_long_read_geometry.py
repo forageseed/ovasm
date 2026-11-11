@@ -135,38 +135,58 @@ def records(source):
         yield Original(rid.split()[0].decode("ascii"), m[0].decode("ascii"), rid, seq, qual)
 
 
-def enrolled(sources, windows, panel):
+def enrolled(sources, windows, panel, query_input, frontier):
     words = {w.id: (panel[w.reference][slice(*w.interval)],
                     tuple(panel[w.reference][slice(*w.guard(side))] for side in ("left", "right")))
              for w in windows.values()}
     selected = {}
     identities = {}
     query_ids = set()
-    for source in sources:
-        for raw in records(source):
+    for input_index, source in enumerate(sources):
+        for ordinal, raw in enumerate(records(source)):
             require(raw.query not in query_ids and raw.molecule not in identities,
                     "duplicate query ID or original molecule")
             query_ids.add(raw.query)
             identities[raw.molecule] = raw.binding()
             seq = raw.seq.upper()
+            if raw.query in query_input:
+                require(query_input[raw.query] == seq, "mapper query bytes or enrollment differ from original FASTQs")
+            if frontier is not None:
+                frontier.record_original(input_index, ordinal, raw)
+                if raw.query not in frontier.queries:
+                    continue
             hits = [wid for wid, (word, guards) in words.items() if matches_window(seq, word, guards)]
             if hits:
                 selected[raw.query] = raw, hits
+    if frontier is None:
+        require(query_input.keys() == selected.keys(), "mapper query bytes or enrollment differ from original FASTQs")
+    else:
+        frontier.finish_originals()
+        require(selected.keys() == frontier.queries and selected.keys() <= query_input.keys() <= query_ids,
+                "frontier enrollment and mapper query names differ from bound originals")
     return selected, identities
 
 
-def parse_alignments(paf, selected, panel):
+def parse_alignments(paf, query_input, selected, panel, requested_hashes):
     rows = defaultdict(set)
-    seen = 0
+    named = {}
+    seen = ignored = 0
     with open_input(paf) as stream:
         for line in stream:
             aln = parse_paf(line.decode("ascii"))
-            require(aln.query in selected and aln.reference in panel, "PAF row outside named originals or panel")
-            require(aln.query_length == len(selected[aln.query][0].seq)
+            require(aln.query in query_input and aln.reference in panel, "PAF row outside named originals or panel")
+            require(aln.query_length == len(query_input[aln.query])
                     and aln.reference_length == len(panel[aln.reference]), "PAF lengths differ from bound bytes")
-            rows[aln.query].add(aln)
             seen += 1
-    return {q: sorted(v, key=alignment_key) for q, v in rows.items()}, seen
+            if aln.query in selected:
+                rows[aln.query].add(aln)
+            else:
+                ignored += 1
+            if requested_hashes:
+                digest = sha256(line).hexdigest()
+                if digest in requested_hashes:
+                    named[digest] = aln
+    return {q: sorted(v, key=alignment_key) for q, v in rows.items()}, named, seen, ignored
 
 
 def alignment_key(aln):
@@ -388,7 +408,7 @@ def observe(w, raw, alignments, panel, roles, index, verified_full=None):
                 competition_state="unresolved_reported_paf_only")
 
 
-def graph_context(graph, graph_reads, windows, panel, originals):
+def graph_context(graph, graph_reads, windows, panel, originals, frontier):
     gfa = None
     try:
         with open_input(graph) as stream:
@@ -406,6 +426,8 @@ def graph_context(graph, graph_reads, windows, panel, originals):
             identity = raw.binding()
             if raw.molecule in originals:
                 require(identity == originals[raw.molecule], "graph input bytes differ for original molecule")
+            if frontier is not None:
+                frontier.record_graph_original(raw)
             seq = raw.seq.upper()
             for key, word in words.items():
                 if word in seq or reverse(word) in seq:
@@ -452,7 +474,7 @@ def load_named_panel(spec, lock):
     return panel, roles, component_inventory
 
 
-def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
+def assess_full_edits(rows, selected, observed, windows, panel, roles, budget, frontier_proofs):
     """Attach scoped whole-read competition to each geometry result."""
     from long_read_edit import cigar_edit_upper_bound, search_competitors
 
@@ -464,7 +486,9 @@ def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
         own = observed.get(query, {})
         targets = {roles[windows[key].reference] for key in own}
         if not targets:
-            decisions[query] = {"status": "unresolved_no_full_target_geometry"}
+            status = ("unresolved_no_verified_frontier_target_geometry" if frontier_proofs is not None
+                      else "unresolved_no_full_target_geometry")
+            decisions[query] = {"status": status}
             continue
         if len(targets) > 1:
             decisions[query] = {"status": "unresolved_conflicting_geometry"}
@@ -498,6 +522,8 @@ def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
                 "cigar": cigar_text(alignment), "witness": asdict(proof),
             },
         }
+        if frontier_proofs is not None:
+            decisions[query]["verified_target_upper_bound"]["frontier_events"] = frontier_proofs[query, key, alignment]
         by_target[target][query] = (sequence, radius)
 
     rows_by_query = {row["query"]: row for row in rows}
@@ -537,6 +563,9 @@ def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
 def admission_records(result):
     rows = [row for row in result["records"]
             if row["full_edit_competition"]["status"] == "qualified_within_edit_model"]
+    if "frontier_event_binding" in result:
+        require(all(row["full_edit_competition"]["verified_target_upper_bound"].get("frontier_events")
+                    for row in rows), "frontier-qualified original is missing its event proof")
     # A stable alphanumeric query order keeps appended records reproducible across streams.
     def query_order(row):
         name = row["query"]
@@ -563,7 +592,7 @@ def report(plan_path, edit_budget=None):
             "incorrect geometry plan schema")
     required = {"schema", "scope", "panel", "windows", "original_fastqs", "mapper_queries",
                 "paf", "graph", "window_provenance"}
-    require(set(plan) == required and isinstance(plan["scope"], str) and plan["scope"].strip(),
+    require(set(plan) - {"frontier_events"} == required and isinstance(plan["scope"], str) and plan["scope"].strip(),
             "invalid geometry plan fields or empty scope")
     require(isinstance(plan["windows"], list) and plan["windows"]
             and isinstance(plan["original_fastqs"], list) and plan["original_fastqs"],
@@ -581,19 +610,25 @@ def report(plan_path, edit_budget=None):
         require(w.id not in windows, "duplicate window ID")
         windows[w.id] = w
     originals = [lock(p) for p in plan["original_fastqs"]]
-    selected, identities = enrolled(originals, windows, panel)
+    frontier = graph_file = None
+    if "frontier_events" in plan:
+        from frontier_event_binding import FrontierBindings
+
+        graph_file = lock(graph["gfa"])
+        frontier = FrontierBindings.load(lock(plan["frontier_events"]), lock, graph_file, originals, windows)
     query_file = lock(plan["mapper_queries"])
     with open_input(query_file) as stream:
         query_empty = not stream.read(1)
     query_input = {} if query_empty else {k: bytes(v) for k, v in fasta(query_file)}
-    require(query_input.keys() == selected.keys() and all(query_input[k] == v[0].seq.upper()
-            for k, v in selected.items()), "mapper query bytes or enrollment differ from original FASTQs")
-    alignments, paf_rows = parse_alignments(lock(plan["paf"]["data"]), selected, panel)
+    selected, identities = enrolled(originals, windows, panel, query_input, frontier)
+    alignments, named_paf, paf_rows, ignored_paf = parse_alignments(
+        lock(plan["paf"]["data"]), query_input, selected, panel, frontier.paf_hashes if frontier is not None else ())
     lock(plan["paf"]["provenance"])
     lock(graph["provenance"])
-    routes, donors, graph_ids = graph_context(lock(graph["gfa"]), [lock(x) for x in graph["reads"]],
-                                              windows, panel, identities)
+    routes, donors, graph_ids = graph_context(graph_file or lock(graph["gfa"]), [lock(x) for x in graph["reads"]],
+                                              windows, panel, identities, frontier)
     lock(plan["window_provenance"])
+    frontier_proofs = frontier.verify_alignments(named_paf, panel, windows) if frontier is not None else None
     index = AnchorIndex(windows, selected, alignments, panel, roles)
     rows = []
     counts = defaultdict(Counter)
@@ -607,6 +642,8 @@ def report(plan_path, edit_budget=None):
                     and set(w.exclusive_sides) == {"left", "right"}
                     and roles[w.reference] in ROLES[:2] else None)
             result = observe(w, raw, alignments.get(query, []), panel, roles, index, full)
+            if full and frontier_proofs is not None:
+                full = [(aln, proof) for aln, proof in full if (query, key, aln) in frontier_proofs]
             if full:
                 observed[query][key] = full
             result["graph_input_original"] = raw.molecule in graph_ids
@@ -628,7 +665,7 @@ def report(plan_path, edit_budget=None):
                                                               and raw.molecule not in graph_ids)
             results[key] = result
         rows.append(raw.binding() | {"windows": results})
-    edit_report = (assess_full_edits(rows, selected, observed, windows, panel, roles, edit_budget)
+    edit_report = (assess_full_edits(rows, selected, observed, windows, panel, roles, edit_budget, frontier_proofs)
                    if edit_budget else None)
     for artifact in locked_inputs:
         artifact.check()
@@ -637,6 +674,8 @@ def report(plan_path, edit_budget=None):
                sys.modules[verify_witness.__module__], sys.modules[__name__]]
     if edit_budget:
         modules.append(sys.modules["long_read_edit"])
+    if frontier is not None:
+        modules.extend(sys.modules[name] for name in ("frontier_event_binding", "discover_graph_frontier"))
     for module in modules:
         path = Path(module.__file__).resolve()
         implementation[path.name] = dict(path=str(path), sha256=sha256(path.read_bytes()).hexdigest())
@@ -651,6 +690,11 @@ def report(plan_path, edit_budget=None):
                 graph_input_donors=donors, counts=counts, records=rows,
                 panel_records_by_role=panel_summary, panel_component_inventory=component_inventory,
                 implementation=implementation, immutable_inputs=[x.binding() for x in locked_inputs])
+    if frontier is not None:
+        result["frontier_event_binding"] = frontier.summary() | {
+            "ignored_mapper_queries": len(query_input) - len(selected),
+            "ignored_paf_rows": ignored_paf,
+        }
     if edit_report is not None:
         result["full_edit_competition"] = edit_report
     return result
