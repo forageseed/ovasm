@@ -255,6 +255,7 @@ pub struct Inputs<'a> {
 }
 
 pub fn assess(inp: &Inputs, panel: Option<&Panel>) -> Result<Value> {
+    crate::repeat_depth::validate_report_graph(inp.gfa, inp.evidence)?;
     let g = parse_gfa(inp.gfa)?;
     let index: FxHashMap<&str, usize> =
         g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();

@@ -1507,6 +1507,7 @@ pub fn run_phased(
         &fs::read_to_string(evidence)
             .with_context(|| format!("cannot read {}", evidence.display()))?,
     )?;
+    crate::repeat_depth::validate_report_graph(gfa, &report)?;
     let repeat_names: BTreeSet<&str> = report["repeat_segments"]
         .as_array()
         .context("evidence has no repeat_segments")?

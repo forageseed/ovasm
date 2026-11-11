@@ -34,6 +34,7 @@ mod recruit;
 mod result;
 mod replay;
 mod replicate;
+mod repeat_depth;
 mod retained;
 mod seeddb;
 mod seedfree;
@@ -1715,6 +1716,9 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct EvidenceArgs {
+    /// Experimentally calibrate repeat labels with distinct, read-supported long-read flanks.
+    #[arg(long, conflicts_with = "short_read_adjacency")]
+    flank_repeat_depth: bool,
     /// Count exact overlap-edge words separately from long-span repeat phasing.
     #[arg(long)]
     short_read_adjacency: bool,
@@ -1866,7 +1870,7 @@ fn evidence(args: EvidenceArgs) -> Result<()> {
     if !(1..=kmer::MAX_K).contains(&args.k) {
         bail!("--k must be between 1 and {}", kmer::MAX_K);
     }
-    let report = evidence::run(
+    let report = evidence::run_with_flank_calibration(
         &args.gfa,
         args.reads,
         evidence::EvidenceParams {
@@ -1882,6 +1886,7 @@ fn evidence(args: EvidenceArgs) -> Result<()> {
             max_repeat_len: args.max_repeat_len,
         },
         &args.out,
+        args.flank_repeat_depth,
     )?;
     eprintln!(
         "[ovasm] links supported {}/{}; branches {}; repeat pairings {}; phased paths {}; {} of {} reads informative; {:.1}s",

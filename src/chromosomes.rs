@@ -196,6 +196,7 @@ pub fn call(
     depths: Option<&BTreeMap<String, f64>>,
     seeds: Option<&FxHashSet<u64>>,
 ) -> Result<ChromosomeReport> {
+    crate::repeat_depth::validate_report_graph(gfa, evidence)?;
     let text = fs::read_to_string(gfa).with_context(|| format!("cannot read {}", gfa.display()))?;
     let mut length = BTreeMap::new();
     let mut dp = BTreeMap::new();
