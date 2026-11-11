@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/recruit_frontier_closure.py"
 SPEC = importlib.util.spec_from_file_location("ovasm_recruit_frontier_closure", SCRIPT)
@@ -168,6 +169,132 @@ class FrontierClosureTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(out.read_bytes(), before)
+
+    def add_bridge(self, manifest_path, index, fasta, sequence, *, record="chosen"):
+        manifest = json.loads(manifest_path.read_text())
+        item = manifest["edge_evidence"][index]
+        certificate = manifest_path.parent / item["path"]
+        body = json.loads(certificate.read_text())
+        seed = certificate.parent / f"seed-{index}.fa"
+        seed.write_bytes(fasta)
+        body["bridge_sequence"] = {"path": seed.name, "sha256": TOOL.sha(fasta),
+                                   "record": record, "sequence_sha256": TOOL.sha(sequence)}
+        certificate.write_text(json.dumps(body))
+        item["sha256"] = TOOL.sha(certificate.read_bytes())
+        manifest_path.write_text(json.dumps(manifest))
+        return seed
+
+    def run_seed_cli(self, manifest, report, fasta, *budget):
+        cmd = [sys.executable, "-B", "-I", str(SCRIPT), str(manifest),
+               "--out", str(report), "--out-seeds", str(fasta), *budget]
+        return subprocess.run(cmd, capture_output=True)
+
+    def test_seed_export_deduplicates_and_limits_to_evaluated_admissions(self):
+        edges = [("ab", "a", "b"), ("ac", "a", "c"), ("held", "a", "d"),
+                 ("excluded", "a", "e"), ("pending", "b", "f"), ("hidden", "g", "h")]
+        evidence = [(edge, "admitted", "target_exact_bridge") for edge in ("ab", "ac")]
+        evidence += [("held", "unresolved", "opportunity_only"),
+                     ("excluded", "excluded", "competing_context")]
+        evidence += [(edge, "admitted", "target_exact_bridge") for edge in ("pending", "hidden")]
+        path = self.fixture("seed-wave", edges, evidence)
+        self.add_bridge(path, 0, b">other\nG\n>chosen source\nac gt\nAC\n", b"ACGTAC")
+        self.add_bridge(path, 1, b">chosen\nACGTAC\n", b"ACGTAC")
+        # Stale seed references on non-exported edges cannot become exports or errors.
+        for index in range(2, 6):
+            self.add_bridge(path, index, b">chosen\nAAAA\n", b"AAAA").unlink()
+        report = self.root / "wave.json"
+        fasta = self.root / "wave.fasta"
+        result = self.run_seed_cli(path, report, fasta, "--round-budget", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta = json.loads(report.read_text())
+        digest = TOOL.sha(b"ACGTAC")
+        self.assertEqual(fasta.read_bytes(), f">bridge_{digest}\nACGTAC\n".encode())
+        self.assertEqual(meta["admitted_edges"], ["ab", "ac"])
+        self.assertEqual(meta["unevaluated_frontier_edges"], ["pending"])
+        export = meta["seed_export"]
+        self.assertTrue(export["budget_truncated"])
+        self.assertEqual(export["record_count"], 1)
+        self.assertEqual(export["fasta_sha256"], TOOL.sha(fasta.read_bytes()))
+        self.assertEqual(export["records"][0]["admitted_edges"], ["ab", "ac"])
+        self.assertEqual(len(export["records"][0]["source_records"]), 2)
+        original = TOOL.verify(path, round_budget=1)
+        self.assertNotIn("seed_export", original)
+        self.assertEqual(original["decision_sha256"], meta["decision_sha256"])
+
+    def test_seed_export_requires_agreement_of_all_admitted_certificates(self):
+        edge = ("bridge", "a", "b")
+        evidence = [("bridge", "admitted", "target_exact_bridge")] * 2
+        for label, fasta, sequence, message in [
+            ("missing", None, None, b"missing bridge_sequence"),
+            ("bad-sequence-sha", b">chosen\nCC\n", b"GG", b"normalized sequence SHA-256 mismatch"),
+            ("duplicate", b">chosen\nCC\n>chosen other\nCC\n", b"CC", b"must occur exactly once"),
+            ("missing-record", b">another\nCC\n", b"CC", b"must occur exactly once"),
+            ("ambiguous", b">chosen\nCN\n", b"CN", b"only A, C, G and T"),
+            ("conflict", b">chosen\nGG\n", b"GG", b"conflicting bridge sequences"),
+            ("file-sha", b">chosen\nCC\n", b"CC", b"SHA-256 mismatch"),
+        ]:
+            with self.subTest(label=label):
+                path = self.fixture(label, [edge], evidence)
+                self.add_bridge(path, 0, b">chosen\nCC\n", b"CC")
+                if fasta is not None:
+                    seed = self.add_bridge(path, 1, fasta, sequence)
+                    if label == "file-sha":
+                        seed.write_bytes(b">chosen\nGG\n")
+                self.assertEqual(TOOL.verify(path)["admitted_edges"], ["bridge"])
+                report = path.parent / "out.json"
+                output = path.parent / "out.fasta"
+                result = self.run_seed_cli(path, report, output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(report.exists())
+                self.assertFalse(output.exists())
+
+    def test_seed_export_empty_when_no_edge_is_admitted(self):
+        path = self.fixture("seed-empty", [("held", "a", "b")],
+                            [("held", "unresolved", "opportunity_only")], coverage="partial")
+        report = self.root / "empty.json"
+        fasta = self.root / "empty.fasta"
+        result = self.run_seed_cli(path, report, fasta)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(fasta.read_bytes(), b"")
+        meta = json.loads(report.read_text())
+        self.assertEqual(meta["state"], "unresolved")
+        self.assertEqual(meta["seed_export"]["record_count"], 0)
+        self.assertFalse(meta["seed_export"]["budget_truncated"])
+
+    def test_seed_export_refuses_existing_or_aliased_output_and_rolls_back(self):
+        path = self.fixture("seed-paths", [], [])
+        report = self.root / "conflict.json"
+        fasta = self.root / "conflict.fasta"
+        fasta.write_bytes(b"existing FASTA")
+        result = self.run_seed_cli(path, report, fasta)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(report.exists())
+        self.assertEqual(fasta.read_bytes(), b"existing FASTA")
+        fasta.unlink()
+        report.write_bytes(b"existing report")
+        result = self.run_seed_cli(path, report, fasta)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(fasta.exists())
+        self.assertEqual(report.read_bytes(), b"existing report")
+        report.unlink()
+        result = self.run_seed_cli(path, report, report)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(report.exists())
+
+        real_link = TOOL.os.link
+
+        def fail_report_link(src, dst):
+            if dst == report:
+                raise FileExistsError("publication race")
+            real_link(src, dst)
+
+        with patch.object(TOOL.os, "link", side_effect=fail_report_link):
+            with self.assertRaises(FileExistsError):
+                TOOL.publish([(fasta, b"new seed"), (report, b"new report")])
+        self.assertFalse(fasta.exists())
+        self.assertFalse(report.exists())
+        self.assertEqual(list(self.root.glob(".conflict.*")), [])
 
     def test_small_graphs_match_independent_reachability_oracle(self):
         edges = {edge.id: edge for edge in [

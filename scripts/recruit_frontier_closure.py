@@ -160,6 +160,7 @@ def read_evidence(ref, directory, binding, edges, provenance_cache):
 
     detail = {
         "certificate": info, "decision": decision, "basis": basis,
+        "_bridge_sequence": record.get("bridge_sequence"),
         "explanation": name(record.get("explanation"), "evidence explanation"),
         "opportunity_fragment_ids": opportunities, "support_fragment_ids": support,
         "opportunity_count": len(opportunities), "support_count": len(support),
@@ -231,7 +232,71 @@ def closure(seeds, edges, ledger, scope_complete, round_budget=None, edge_budget
     return decisions, evaluated
 
 
-def verify(manifest_path, round_budget=None, edge_budget=None):
+def bridge_record(receipt, cache, edge_id):
+    label = f"edge {edge_id}: bridge sequence"
+    if receipt["_bridge_sequence"] is None:
+        raise ValueError(f"{label}: admitted certificate is missing bridge_sequence")
+    spec = object_value(receipt["_bridge_sequence"], label)
+    record_id = name(spec.get("record"), f"{label} FASTA record")
+    sequence_sha = spec.get("sequence_sha256")
+    if not isinstance(sequence_sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sequence_sha):
+        raise ValueError(f"{label}: expected a normalized sequence SHA-256 digest")
+    directory = Path(receipt["certificate"]["path"]).parent
+    identity = reference_identity(spec, directory, label)
+    if identity not in cache:
+        _, raw, info = lock(spec, directory, label)
+        cache[identity] = raw, info
+    raw, info = cache[identity]
+    token = record_id.encode("utf-8")
+    selected = False
+    pieces = []
+    matches = 0
+    for line in raw.splitlines():
+        if line.startswith(b">"):
+            fields = line[1:].split(None, 1)
+            selected = bool(fields) and fields[0] == token
+            matches += selected
+        elif selected:
+            pieces.append(b"".join(line.split()))
+    if matches != 1:
+        raise ValueError(f"{label}: FASTA record {record_id!r} must occur exactly once")
+    sequence = b"".join(pieces).upper()
+    if not re.fullmatch(rb"[ACGT]+", sequence):
+        raise ValueError(f"{label}: exact bridge must contain only A, C, G and T")
+    if sha(sequence) != sequence_sha:
+        raise ValueError(f"{label}: normalized sequence SHA-256 mismatch")
+    return sequence, {"edge_id": edge_id, "certificate": receipt["certificate"],
+                      "fasta": info, "record": record_id}
+
+
+def seed_export(decisions, records):
+    cache = {}
+    by_sequence = {}
+    for edge_id in decisions["admitted_edges"]:
+        sequence = None
+        for receipt in records[edge_id]:
+            candidate, source = bridge_record(receipt, cache, edge_id)
+            if sequence is not None and candidate != sequence:
+                raise ValueError(f"edge {edge_id}: conflicting bridge sequences")
+            sequence = candidate
+            by_sequence.setdefault(sequence, []).append(source)
+    fasta = bytearray()
+    metadata = []
+    for sequence, sources in sorted(by_sequence.items(), key=lambda item: sha(item[0])):
+        digest = sha(sequence)
+        identifier = f"bridge_{digest}"
+        fasta.extend(f">{identifier}\n".encode("ascii"))
+        for start in range(0, len(sequence), 80):
+            fasta.extend(sequence[start:start + 80] + b"\n")
+        metadata.append({"record": identifier, "bp": len(sequence), "sequence_sha256": digest,
+                         "admitted_edges": sorted({source["edge_id"] for source in sources}),
+                         "source_records": sources})
+    return bytes(fasta), {"record_count": len(metadata), "fasta_sha256": sha(fasta),
+                         "budget_truncated": decisions["state"] == "truncated",
+                         "records": metadata}
+
+
+def replay(manifest_path, round_budget=None, edge_budget=None, *, export_seeds=False):
     if any(budget is not None and (type(budget) is not int or budget < 0)
            for budget in (round_budget, edge_budget)):
         raise ValueError("budgets must be nonnegative integers")
@@ -288,7 +353,8 @@ def verify(manifest_path, round_budget=None, edge_budget=None):
     for edge_id in sorted(edges):
         edge = edges[edge_id]
         row = {"id": edge_id, "from": edge.source, "to": edge.destination,
-               "evidence": records.get(edge_id, [])}
+               "evidence": [{key: value for key, value in record.items() if key != "_bridge_sequence"}
+                            for record in records.get(edge_id, [])]}
         if edge_id in evaluated:
             row.update(evaluated[edge_id])
         elif edge_id in pending:
@@ -302,7 +368,7 @@ def verify(manifest_path, round_budget=None, edge_budget=None):
         "edges": [{"id": e["id"], "from": e["from"], "to": e["to"],
                    "state": e["state"], "reason": e["reason"]} for e in edge_audit],
     }
-    return {
+    report = {
         "schema": REPORT, "manifest_sha256": sha(raw), "graph": graph, "eligibility": eligibility,
         "read_pool": read_pool, "scope": scope_id, "scope_receipt": scope_receipt, "seed_set_sha256": binding["seed_set_sha256"],
         "round_budget": round_budget, "edge_budget": edge_budget, **decisions, "edges": edge_audit,
@@ -311,19 +377,45 @@ def verify(manifest_path, round_budget=None, edge_budget=None):
         "source_evidence_recomputed": False,
     }
 
+    if export_seeds:
+        fasta, report["seed_export"] = seed_export(decisions, records)
+        return report, fasta
+    return report, None
 
-def publish(path, result):
-    temporary = None
+
+def verify(manifest_path, round_budget=None, edge_budget=None):
+    report, _ = replay(manifest_path, round_budget, edge_budget)
+    return report
+
+
+def publish(outputs):
+    if len({path.resolve() for path, _ in outputs}) != len(outputs):
+        raise ValueError("report and seed FASTA outputs must be distinct paths")
+    for path, _ in outputs:
+        if os.path.lexists(path):
+            raise FileExistsError(f"output already exists: {path}")
+    staged = []
+    linked = []
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", prefix=f".{path.name}.", dir=path.parent, delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            json.dump(result, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-        os.link(temporary, path)
+        for path, content in outputs:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{path.name}.", dir=path.parent, delete=False,
+            ) as stream:
+                staged.append((path, Path(stream.name)))
+                stream.write(content)
+        for path, temporary in staged:
+            os.link(temporary, path)
+            linked.append((path, temporary))
+    except BaseException:
+        for path, temporary in reversed(linked):
+            try:
+                if os.path.samestat(path.lstat(), temporary.lstat()):
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
     finally:
-        if temporary is not None:
+        for _, temporary in staged:
             temporary.unlink(missing_ok=True)
 
 
@@ -331,12 +423,19 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--out", required=True, type=Path, help="new report path")
+    parser.add_argument("--out-seeds", type=Path, help="new FASTA of verified, admitted bridge sequences")
     parser.add_argument("--round-budget", type=int, help="maximum number of whole waves")
     parser.add_argument("--edge-budget", type=int, help="maximum edges evaluated in whole waves")
     args = parser.parse_args()
     try:
-        result = verify(args.manifest.resolve(), args.round_budget, args.edge_budget)
-        publish(args.out, result)
+        result, fasta = replay(args.manifest.resolve(), args.round_budget, args.edge_budget,
+                               export_seeds=args.out_seeds is not None)
+        data = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        outputs = [(args.out, data)]
+        if args.out_seeds is not None:
+            # Publish the report last. Its seed digest attests the preceding FASTA.
+            outputs.insert(0, (args.out_seeds, fasta))
+        publish(outputs)
     except (OSError, ValueError) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")
 

@@ -7,7 +7,7 @@ python3 -B -I scripts/recruit_frontier_closure.py manifest.json \
   --out frontier-report.json --round-budget 6 --edge-budget 500
 ~~~
 
-The report describes closure within the declared graph and read pool. The checker verifies hashes, receipt binding, and reachability. Source, molecule independence, and statistical calibration come from the supplying evidence. This command is separate from default recruitment and never writes a modified read or seed file.
+The report describes closure within the declared graph and read pool. The checker verifies hashes, receipt binding, and reachability. Source, molecule independence, and statistical calibration come from the supplying evidence. This command is separate from default recruitment. An optional export writes a new bridge FASTA from verified external receipts.
 
 ## Inputs
 
@@ -57,3 +57,31 @@ Each complete round evaluates all currently reachable frontier edges together an
 - `truncated` preserves evaluated decisions and names the next unevaluated frontier. An edge beyond that frontier is `not_reached` in the current result.
 
 The output records seed and reachable sets, separate admitted and held edges, round transitions, and per-edge evidence with counts and provenance. The decision digest excludes file paths and receipt order. It is a reproducibility aid alongside the exact input file digests.
+
+## Exporting admitted bridge seeds
+
+Add `--out-seeds admitted.fa` to export the exact sequences of the edges the replay has evaluated and admitted.
+
+~~~sh
+python3 -B -I scripts/recruit_frontier_closure.py manifest.json \
+  --out frontier-report.json --out-seeds admitted.fa --round-budget 6
+~~~
+
+Each certificate for an exported edge must supply a `bridge_sequence` object:
+
+~~~json
+{
+  "bridge_sequence": {
+    "path": "exact-bridges.fa",
+    "sha256": "<SHA-256 of the complete FASTA file>",
+    "record": "bridge-17",
+    "sequence_sha256": "<SHA-256 of the normalized record sequence>"
+  }
+}
+~~~
+
+The path is relative to the edge receipt. The record is the first token of a FASTA header and must occur exactly once in that file. Normalize the selected sequence by removing whitespace and uppercasing ASCII bases, then hash the resulting A, C, G and T bytes without a header or newline. The same edge's admitted certificates must agree on the oriented sequence. Identical normalized sequences from multiple edges appear once in the FASTA.
+
+The report's `seed_export` gives the output FASTA digest, the record-to-edge mapping, and the source file and receipt for each record. `budget_truncated` indicates that a later wave was left unevaluated. The FASTA contains the verified admissions already evaluated in that budget. It is empty when there are no admissions. Held, excluded, unevaluated, and unreachable edges supply no sequences. The replay's ordinary decision digest is independent of this opt-in export.
+
+Both outputs must be new, distinct paths. The checker validates the complete export before publishing either file and places the report last as the receipt for the FASTA. A handled publication failure rolls back the links installed by that invocation. The report preserves the replay's scope and status. The exported sequences come from external certificates, and the checker does not rerun their read or source analyses. Adding the FASTA to a k-mer bait can recruit ambiguous or competing reads that share its k-mers. Use the FASTA as a diagnostic input. It does not automatically admit reads or establish their physical source.
