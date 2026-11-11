@@ -635,6 +635,14 @@ impl Panel {
         self.genes.len()
     }
 
+    /// Panel genes of an organelle ("mitochondrion" or "plastid"): 42 and 70 in the land-plant
+    /// panel, 14 and 0 in the metazoa one.
+    pub(crate) fn organelle_gene_count(&self, organelle: &str) -> usize {
+        (0..self.genes.len())
+            .filter(|&g| self.gene_organelle(g as u16) == organelle)
+            .count()
+    }
+
     /// A gene's organelle: "mitochondrion" or "plastid".
     pub(crate) fn gene_organelle(&self, g: u16) -> &'static str {
         match self.genes[g as usize].class {

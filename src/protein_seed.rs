@@ -334,6 +334,12 @@ fn excess_over_control(forward: &[u64], control: &[u64]) -> Vec<u64> {
         .collect()
 }
 
+/// Share of a class's panel genes from which a cluster holding them is that organelle at a diluted
+/// density (`class_seeds`).
+pub const NEAR_COMPLETE_GENES: f64 = 0.75;
+/// Lowest stretches per read of such a near-complete class, as a share of `min_density`.
+pub const DILUTED_DENSITY: f64 = 0.25;
+
 /// Whether a class seeds from a depth cluster: its (genes, stretches per read) count
 /// (`PanelParams::min_genes`, `min_density`), the cluster stands for at least `MIN_CLUSTER_SPAN`,
 /// and the same reads reversed (not complemented) do not count for the class too. Reversal keeps a
@@ -345,14 +351,30 @@ fn excess_over_control(forward: &[u64], control: &[u64]) -> Vec<u64> {
 /// nad6/nad4l/atp8; controls 5 and 9 genes; 646 recruited reads, none mitochondrial, the
 /// mitochondrion about 5x) and Canis lupus 49x (its mitochondrion the 332x cluster); the controls
 /// of all 76 other seeded clusters (69 samples) counted no class.
+///
+/// A class also counts below `min_density` (down to `DILUTED_DENSITY` of it) when the cluster holds
+/// nearly its whole panel gene set (`NEAR_COMPLETE_GENES` of `panel_genes`) at at least twice the
+/// other class's density (`other_density`): a large mitochondrion sharing its depth with other
+/// reads spreads its genes thin, but no repeat holds most of an organelle's genes. Carex
+/// laevigata (DToL): the 664x cluster, 2.9 Mb, 34 of 42 mitochondrial genes at 0.195 against
+/// plastid insertions' 0.063, reversed control none, the only mitochondrial cluster and so no
+/// protein seeds without this (the whole-read scan's 1,142 reads at about 15x, 0.02 of the Oatk
+/// molecule). Plastid genes in mitochondrial clusters (insertions) reach 23 of 70.
 fn class_seeds(
     forward: (&ClassReport, f64),
     reversed: (&ClassReport, f64),
     span: f64,
+    panel_genes: usize,
+    other_density: f64,
     p: &PanelParams,
 ) -> bool {
     let counts = |(r, d): (&ClassReport, f64)| r.genes >= p.min_genes && d >= p.min_density;
-    counts(forward) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
+    let (r, d) = forward;
+    let diluted = r.genes >= p.min_genes
+        && r.genes as f64 >= NEAR_COMPLETE_GENES * panel_genes as f64
+        && d >= DILUTED_DENSITY * p.min_density
+        && d >= 2.0 * other_density;
+    (counts(forward) || diluted) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
 }
 
 /// Protein seeds for the organelles in `want` (the others are not looked for in the whole-read
@@ -496,10 +518,12 @@ pub fn run(
         // reversed control seeds from its reads, also where both count (a cluster holding parts of
         // both genomes at one depth)
         let span = cluster_bases[c] as f64 / 2f64.powf(peak);
-        let seeded: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd)), ((&plastid, pd), (&cp, cpd))]
+        let seeded: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd), pd), ((&plastid, pd), (&cp, cpd), md)]
             .iter()
             .zip(ORGANELLES)
-            .filter(|((fwd, rev), _)| class_seeds(*fwd, *rev, span, &p.panel))
+            .filter(|((fwd, rev, other), o)| {
+                class_seeds(*fwd, *rev, span, panel.organelle_gene_count(o), *other, &p.panel)
+            })
             .map(|(_, o)| o)
             .collect();
         let mut given = 0;
@@ -798,15 +822,35 @@ mod tests {
         let p = PanelParams::default();
         let none = class(0, 0);
         // a mitochondrial cluster: many genes forwards, a few chance ones reversed (Canis lupus 332x)
-        assert!(class_seeds((&class(12, 4226), 4.17), (&class(3, 12), 0.01), 18_910.0, &p));
+        let seeds = |f: (&ClassReport, f64), r: (&ClassReport, f64), span: f64, p: &PanelParams| {
+            class_seeds(f, r, span, 14, 0.0, p)
+        };
+        assert!(seeds((&class(12, 4226), 4.17), (&class(3, 12), 0.01), 18_910.0, &p));
         // Acipenser ruthenus 70x: 7 genes at 0.47 forwards, 9 reversed at the same density
-        assert!(!class_seeds((&class(7, 136), 0.47), (&class(9, 140), 0.49), 52_337.0, &p));
+        assert!(!seeds((&class(7, 136), 0.47), (&class(9, 140), 0.49), 52_337.0, &p));
         // reversed genes without the density do not count, and do not stop it
-        assert!(class_seeds((&class(7, 136), 0.47), (&class(9, 20), 0.07), 52_337.0, &p));
+        assert!(seeds((&class(7, 136), 0.47), (&class(9, 20), 0.07), 52_337.0, &p));
         // the forward class must count, and the cluster stand for enough sequence
-        assert!(!class_seeds((&class(4, 400), 2.0), (&none, 0.0), 52_337.0, &p));
-        assert!(!class_seeds((&class(12, 400), 0.2), (&none, 0.0), 52_337.0, &p));
-        assert!(!class_seeds((&class(5, 762), 2.14), (&none, 0.0), 23.0, &p));
+        assert!(!seeds((&class(4, 400), 2.0), (&none, 0.0), 52_337.0, &p));
+        assert!(!seeds((&class(10, 400), 0.2), (&none, 0.0), 52_337.0, &p));
+        assert!(!seeds((&class(5, 762), 2.14), (&none, 0.0), 23.0, &p));
+    }
+
+    #[test]
+    fn a_near_complete_gene_set_seeds_at_a_diluted_density() {
+        let p = PanelParams::default();
+        let none = class(0, 0);
+        // Carex laevigata 664x: 34 of 42 mitochondrial genes at 0.195, plastid insertions 0.063
+        assert!(class_seeds((&class(34, 584), 0.195), (&none, 0.0), 2_911_120.0, 42, 0.063, &p));
+        // the same density with a partial gene set does not
+        assert!(!class_seeds((&class(25, 584), 0.195), (&none, 0.0), 2_911_120.0, 42, 0.063, &p));
+        // plastid insertions in a mitochondrial cluster: 23 of 70 genes, below the mitochondrion's
+        assert!(!class_seeds((&class(23, 849), 0.283), (&none, 0.0), 542_570.0, 70, 1.2, &p));
+        // nearly complete but not twice the other class's density
+        assert!(!class_seeds((&class(34, 584), 0.195), (&none, 0.0), 2_911_120.0, 42, 0.12, &p));
+        // too thin even for a near-complete set, or counting reversed too
+        assert!(!class_seeds((&class(34, 100), 0.05), (&none, 0.0), 2_911_120.0, 42, 0.0, &p));
+        assert!(!class_seeds((&class(34, 584), 0.195), (&class(9, 900), 0.4), 2_911_120.0, 42, 0.0, &p));
     }
 
     fn scan(seeds: &[(&'static str, usize, usize)]) -> WholeReadScan {
