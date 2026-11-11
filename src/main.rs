@@ -38,6 +38,7 @@ mod retained;
 mod seeddb;
 mod seedfree;
 mod thread_evidence;
+mod tip_rescue;
 mod uncertain;
 mod unify;
 mod unzip;

@@ -463,6 +463,9 @@ const ATTEMPT_FILES: [&str; 10] = [
     "molecules.partial.fasta",
 ];
 const BEST_ATTEMPT_DIR: &str = ".best_attempt";
+/// Where the assembly with the open ends' reads is made (`tip_rescue`); left with its reads
+/// and `rescue.json` when it is kept.
+const OPEN_END_RESCUE_DIR: &str = "open_end_rescue";
 
 /// The component filter for graphs of discovered reads: the organelle it keeps and the
 /// protein panel that tells the components' genes.
@@ -877,6 +880,8 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
     out.insert("iterations_run".into(), report["iterations_run"].clone());
     out.insert("core_depth".into(), report["core_depth"][index].clone());
     out.insert("extension_deep_depth".into(), report["extension_deep_depth"][index].clone());
+    // the partial reads recruitment set aside, for the open-end rescue (`tip_rescue`)
+    out.insert("numt_pool".into(), report["numt_output"].clone());
     let gate = &report["depth_gate"];
     out.insert(
         "depth_gate".into(),
@@ -1718,6 +1723,7 @@ fn assemble_organelle(
     mut files: BTreeMap<String, String>,
     sr_min_graph_bases: Option<u64>,
     experimental_deep_bubble_fraction: Option<f64>,
+    other_reads: &[PathBuf],
 ) -> Result<Value> {
     let t0 = Instant::now();
     fs::create_dir_all(dir)?;
@@ -1755,10 +1761,84 @@ fn assemble_organelle(
             .map(PathBuf::as_path),
         experimental_deep_bubble_fraction,
     };
-    let ladder = match cfg.read_type {
+    let mut ladder = match cfg.read_type {
         ReadType::Hifi => k_ladder(&mut attempts, true, start)?,
         ReadType::Sr => sr_ladder_with_evidence_floor(&mut attempts, sr_min_graph_bases)?,
     };
+    // reads the open ends of the mitochondrion's graph left among the NUMT candidates
+    // (`tip_rescue`): assembled again with them, kept when that closes open ends
+    let mut reads_used = recruited.reads.clone();
+    let pool = recruited.recruitment["numt_pool"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.exists());
+    if let (ReadType::Hifi, "mitochondrion", true, Some(pool), Some((_, bases))) =
+        (cfg.read_type, organelle, ladder.accepted, pool, recruited.kept)
+    {
+        let open = ladder.result().open_ends;
+        if open > 0 {
+            let graph = if filter.is_some() {
+                dir.join("assembly.filtered.gfa")
+            } else {
+                dir.join("assembly.gfa")
+            };
+            let sub = dir.join(OPEN_END_RESCUE_DIR);
+            fs::create_dir_all(&sub)?;
+            let rescued = sub.join("reads.fastq");
+            let cap = (crate::tip_rescue::MAX_SHARE * bases as f64) as u64;
+            let depth = recruited.recruitment["read_depth"].as_f64();
+            let nuclear = recruited.recruitment["depth_gate"]["nuclear_peak_depth"].as_f64();
+            let r = crate::tip_rescue::collect(&graph, &pool, other_reads, depth, nuclear, &rescued, cap)?;
+            log(&format!(
+                "{open} open end(s): {} read(s) ({} bp) of the NUMT candidates at them in {} round(s){}",
+                r.reads,
+                r.bases,
+                r.rounds,
+                if r.capped { ", stopped at the cap" } else { "" }
+            ));
+            let mut kept = false;
+            if r.reads > 0 && !r.capped {
+                let mut with = recruited.reads.clone();
+                with.push(rescued.clone());
+                let mut again = GraphAttempts {
+                    reads: &with,
+                    dir: &sub,
+                    ..attempts
+                };
+                let l = k_ladder(&mut again, true, start)?;
+                let o = l.result();
+                kept = l.accepted && o.open_ends < open;
+                log(&format!(
+                    "with them: {} open end(s), {} molecule(s) of {} bp; {}",
+                    o.open_ends,
+                    o.molecules,
+                    o.molecule_bases,
+                    if kept { "kept" } else { "the first assembly stays" }
+                ));
+                if kept {
+                    for f in ATTEMPT_FILES {
+                        let (from, to) = (sub.join(f), dir.join(f));
+                        if to.exists() {
+                            fs::remove_file(&to)?;
+                        }
+                        if from.exists() {
+                            fs::rename(&from, &to)?;
+                        }
+                    }
+                    ladder = l;
+                    reads_used = with;
+                }
+            }
+            write_json(
+                &sub.join("rescue.json"),
+                &json!({"open_ends": open, "rounds": r.rounds, "reads": r.reads, "bases": r.bases,
+                    "capped": r.capped, "kept": kept, "pool": pool}),
+            )?;
+            if !kept {
+                fs::remove_dir_all(&sub)?;
+            }
+        }
+    }
     if let Some(floor) = sr_min_graph_bases {
         write_json(&dir.join("pan_retry_floor.json"), &json!({
             "floor_bases": floor, "chosen": ladder.chosen, "accepted": ladder.accepted,
@@ -1831,7 +1911,7 @@ fn assemble_organelle(
             let k = ladder.result().k;
             run_replicates(
                 cfg,
-                &recruited.reads,
+                &reads_used,
                 dir,
                 &assembly,
                 (ladder.chosen > 0 || start.is_some()).then_some(k),
@@ -2152,16 +2232,25 @@ pub(crate) fn run_with_experimental_deep_bubble(cfg: &RunConfig, sr_min_graph_ba
         let r = recruited
             .remove(organelle)
             .expect("one entry per organelle")?;
-        return assemble_organelle(cfg, organelle, &r, &cfg.out, files, sr_min_graph_bases, experimental_deep_bubble_fraction);
+        return assemble_organelle(cfg, organelle, &r, &cfg.out, files, sr_min_graph_bases, experimental_deep_bubble_fraction, &[]);
     }
     let mut results = Map::new();
     let mut failed = Vec::new();
+    // each organelle's reads, for the other's open-end rescue (`tip_rescue`)
+    let reads_of: BTreeMap<&str, Vec<PathBuf>> = recruited
+        .iter()
+        .filter_map(|(o, r)| r.as_ref().ok().map(|r| (*o, r.reads.clone())))
+        .collect();
     for &organelle in organelles {
+        let other_reads = reads_of
+            .get(other_organelle(organelle))
+            .cloned()
+            .unwrap_or_default();
         let result = recruited
             .remove(organelle)
             .expect("one entry per organelle")
             .and_then(|r| {
-                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone(), sr_min_graph_bases, experimental_deep_bubble_fraction)
+                assemble_organelle(cfg, organelle, &r, &cfg.out.join(organelle), files.clone(), sr_min_graph_bases, experimental_deep_bubble_fraction, &other_reads)
             });
         match result {
             Ok(report) => {
@@ -3046,7 +3135,7 @@ mod tests {
             discovered: true,
             recruitment: Value::Null,
         };
-        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new(), None, None)
+        let s = assemble_organelle(&cfg, "mitochondrion", &recruited, &cfg.out, BTreeMap::new(), None, None, &[])
             .unwrap();
         let filter = &s["component_filter"];
         assert_eq!(filter["kept_components"], json!(1), "{filter}");
