@@ -1743,7 +1743,7 @@ fn run_auto_k_cleaning(
     let mut r = ladder(&inputs, &mut tried)?;
     if r.node_depth < target {
         let corrected = out_gfa.with_extension("corrected.fa");
-        crate::correct::run(
+        let correction = crate::correct::run(
             inputs.clone(),
             Vec::new(),
             &[17, 25],
@@ -1762,19 +1762,26 @@ fn run_auto_k_cleaning(
             &out_gfa.with_extension("correct.json"),
         )?;
         let before = r.bases;
-        let rc = ladder(std::slice::from_ref(&corrected), &mut tried)?;
-        if 2 * rc.bases < before {
-            // Correction needs depth for its solid k-mers: at about 5x it trimmed away what the
-            // reads held (Canis lupus mitochondrion from 10 Mb of HiFi reads, the PMAT2 benchmark's
-            // lowest-depth test: 11 reads, 75 kb -> 5 reads, 1.4 kb, no unitig). The uncorrected
-            // reads' graph is the better one then.
-            eprintln!(
-                "[ovasm] correction kept under half of the bases (too shallow to correct); assembling the reads as they are"
-            );
-            r = ladder(&inputs, &mut tried)?;
+        // Correction can remove every read. The original ladder has already written its graph.
+        let corrected_graph = if correction.rounds.last().is_some_and(|round| round.reads_out > 0) {
+            Some(ladder(std::slice::from_ref(&corrected), &mut tried)?)
         } else {
-            r = rc;
-            r.corrected_reads = Some(corrected.display().to_string());
+            None
+        };
+        match corrected_graph {
+            Some(mut rc) if 2 * rc.bases >= before => {
+                rc.corrected_reads = Some(corrected.display().to_string());
+                r = rc;
+            }
+            Some(_) => {
+                eprintln!(
+                    "[ovasm] correction kept under half of the bases (too shallow to correct); assembling the reads as they are"
+                );
+                r = ladder(&inputs, &mut tried)?;
+            }
+            None => {
+                eprintln!("[ovasm] correction kept no reads; retaining the original read graph");
+            }
         }
     }
     add_junctions(&mut r, &inputs, out_gfa, context)?;
@@ -2646,6 +2653,31 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn automatic_k_keeps_the_raw_graph_when_correction_drops_every_read() {
+        let dir = tmpdir("empty-correction");
+        let gfa = dir.join("raw.gfa");
+        let json = dir.join("raw.json");
+        let report = run_auto_k(
+            vec![fastq(&dir, &[seq(1_400, 163)])],
+            31,
+            None,
+            None,
+            AUTO_K_NODE_DEPTH,
+            &gfa,
+            &json,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(gfa.with_extension("corrected.fa")).unwrap().len(), 0);
+        assert!(report.corrected_reads.is_none());
+        assert_eq!(report.reads, 1);
+        assert_eq!(report.bases, 1_400);
+        assert!(report.unitigs > 0);
+        assert!(gfa.is_file());
+        assert!(json.is_file());
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Tile reads over a circular genome, both strands, at the given depth.
