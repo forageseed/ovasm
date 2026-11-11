@@ -1434,6 +1434,16 @@ enum Gauge {
     Deep,
 }
 
+fn frontier_reason(gauge: Gauge) -> Option<crate::retained::FrontierReason> {
+    use crate::retained::FrontierReason;
+    match gauge {
+        Gauge::Extends => None,
+        Gauge::Gated => Some(FrontierReason::ReadDepthProfile),
+        Gauge::Shallow => Some(FrontierReason::BelowTargetDepth),
+        Gauge::Deep => Some(FrontierReason::AboveTargetDepth),
+    }
+}
+
 fn gauge(d: Option<ReadDepth>, floor: Option<f64>, ceiling: Option<f64>) -> Gauge {
     match d {
         Some(d) if d.organelle_like => {
@@ -1818,7 +1828,15 @@ fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
     CanonicalKmers::new(seq, bait.k).any(|(_, km)| bait.get(km) & bit == 0)
 }
 
-pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
+pub fn run(bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
+    run_with_frontier_audit(bait, cfg, false)
+}
+
+pub(crate) fn run_with_frontier_audit(
+    mut bait: BaitSet, cfg: RecruitConfig, audit_frontier: bool,
+) -> Result<RecruitReport> {
+    use crate::retained::{FrontierAudit, FrontierReason};
+
     let start = Instant::now();
     std::fs::create_dir_all(&cfg.out_dir)?;
     let mut iterations = Vec::new();
@@ -1843,6 +1861,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         Vec::new()
     };
     let n_targets = bait.targets.len();
+    let mut frontier_audit = audit_frontier.then(|| FrontierAudit::new(n_targets));
     let numt_path = cfg.out_dir.join("numt_candidates.fastq");
     // Reads already used to extend each target's bait: later passes count only new reads, so a
     // deep, already complete target (a plastid at 20,000x) is not re-counted every pass.
@@ -2149,13 +2168,21 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     fresh.push(key);
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
                         extension_subsampled[t] = true;
+                        if let Some(audit) = &mut frontier_audit {
+                            audit.record(t, it + 1, FrontierReason::ExtensionSubsampled, key, &r);
+                        }
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
                         if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d)) {
                             gated_out[t] += 1;
-                            if !frontier_withheld[t] {
-                                frontier_withheld[t] = has_unbaited_kmer(&bait, t, &r.seq);
+                            if (!frontier_withheld[t] || frontier_audit.is_some())
+                                && has_unbaited_kmer(&bait, t, &r.seq)
+                            {
+                                frontier_withheld[t] = true;
+                                if let Some(audit) = &mut frontier_audit {
+                                    audit.record(t, it + 1, FrontierReason::KmerDepthGate, key, &r);
+                                }
                             }
                             return;
                         }
@@ -2166,8 +2193,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     };
                     let (verdict, by_new) =
                         extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds);
-                    if verdict != Gauge::Extends && !frontier_withheld[t] {
-                        frontier_withheld[t] = has_unbaited_kmer(&bait, t, &r.seq);
+                    if let Some(reason) = frontier_reason(verdict) {
+                        if (!frontier_withheld[t] || frontier_audit.is_some())
+                            && has_unbaited_kmer(&bait, t, &r.seq)
+                        {
+                            frontier_withheld[t] = true;
+                            if let Some(audit) = &mut frontier_audit {
+                                audit.record(t, it + 1, reason, key, &r);
+                            }
+                        }
                     }
                     match (verdict, by_new) {
                         (Gauge::Extends, by_new) => {
@@ -2216,6 +2250,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                 if !frontier_withheld[t] {
                     frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
                 }
+                if let Some(audit) = &mut frontier_audit {
+                    let records = picked.iter().filter(|seq| has_unbaited_kmer(&bait, t, seq)).count();
+                    audit.count(t, FrontierReason::UnbaitedAfterCommit, false, records as u64);
+                }
                 used[t].extend(fresh);
                 // Within-pass extension from the partial reads at its edges (`FRONTIER_STEPS`),
                 // gated as extension is.
@@ -2254,8 +2292,13 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         if verdict == Gauge::Extends {
                             new_part[t] += u64::from(by_new);
                             picked.push(seq);
-                        } else if !frontier_withheld[t] {
-                            frontier_withheld[t] = has_unbaited_kmer(&bait, t, seq);
+                        } else if (!frontier_withheld[t] || frontier_audit.is_some())
+                            && has_unbaited_kmer(&bait, t, seq)
+                        {
+                            frontier_withheld[t] = true;
+                            if let (Some(audit), Some(reason)) = (&mut frontier_audit, frontier_reason(verdict)) {
+                                audit.count(t, reason, true, 1);
+                            }
                         }
                     }
                     if picked.is_empty() {
@@ -2288,6 +2331,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     };
                     if !frontier_withheld[t] {
                         frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
+                    }
+                    if let Some(audit) = &mut frontier_audit {
+                        let records = picked.iter().filter(|seq| has_unbaited_kmer(&bait, t, seq)).count();
+                        audit.count(t, FrontierReason::UnbaitedAfterCommit, true, records as u64);
                     }
                     added[t] += more;
                     if more == 0 {
@@ -2585,7 +2632,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     }
 
     let mut source_candidates =
-        crate::retained::recruitment(&cfg.out_dir, &numt_path, &bait, &cfg.params)?;
+        crate::retained::recruitment(
+            &cfg.out_dir, &numt_path, &bait, &cfg.params, frontier_audit.as_mut(),
+        )?;
     // This is a bounded audit, not evidence of nuclear origin. The existing candidate pool
     // excludes reads shorter than numt_min_block, including all ordinary short reads.
     if cfg.params.numt_min_block == usize::MAX {
@@ -2778,6 +2827,54 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_frontier_evidence_keeps_recruitment_and_source_outputs() {
+        let dir = std::env::temp_dir().join(format!("ovasm-frontier-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fa");
+        let target = pseudo_random(150, 97);
+        let background = pseudo_random(150, 83);
+        let bait = bait_from(&target, 21);
+        let known = std::str::from_utf8(&target).unwrap();
+        let partial = [&target[..75], &background[75..]].concat();
+        let partial = std::str::from_utf8(&partial).unwrap();
+        let data = format!(">partial\n{partial}\n")
+            + &(0..5200).map(|i| format!(">r{i}\n{known}\n")).collect::<String>();
+        std::fs::write(&reads, data).unwrap();
+        let config = |label: &str| {
+            let mut cfg = test_config(&reads, dir.join(label), 3, false);
+            cfg.params.numt_min_block = 40;
+            cfg.extend_depth = 1.0;
+            cfg
+        };
+        let standard = run(bait.clone(), config("standard")).unwrap();
+        let audited = run_with_frontier_audit(bait, config("audited"), true).unwrap();
+        let relative = Path::new("source_candidates/frontier-evidence.jsonl");
+        assert!(!dir.join("standard").join(relative).exists());
+        assert_eq!(standard.outputs[0].recruitment_state, audited.outputs[0].recruitment_state);
+        assert_eq!(standard.iterations[0].extended_from_reads, audited.iterations[0].extended_from_reads);
+        for file in ["mito.fastq", "numt_candidates.fastq", "source_candidates/nuclear-insertion-candidates.jsonl"] {
+            assert_eq!(std::fs::read(dir.join("standard").join(file)).unwrap(),
+                       std::fs::read(dir.join("audited").join(file)).unwrap());
+        }
+        let evidence = &audited.source_candidates["frontier_evidence"];
+        let subsampled = &evidence["targets"][0]["reasons"][0];
+        assert_eq!(subsampled["reason"], "extension_subsampled");
+        assert_eq!(subsampled["extension_records"],
+            audited.outputs[0].recruited_reads - audited.iterations[0].extended_from_reads[0]);
+        assert_eq!(subsampled["sampled"], 8);
+        let rows = std::fs::read_to_string(dir.join("audited").join(relative)).unwrap();
+        assert_eq!(rows.lines().count(), 8);
+        for line in rows.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["reason"], "extension_subsampled");
+            assert_eq!(row["in_final_partial_pool"], false);
+            assert_eq!(row["flank_origin"], "unknown");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 
     #[test]
     fn recruitment_state_requires_an_observed_closure() {

@@ -2160,6 +2160,9 @@ struct RecruitArgs {
     /// Output directory (per-target FASTQ, numt_candidates.fastq, recruit.json).
     #[arg(long)]
     out: PathBuf,
+    /// Record bounded diagnostic evidence for reads held out of bait extension.
+    #[arg(long)]
+    frontier_audit: bool,
     /// Read platform preset: sets k, block_gap, min_hit_frac and numt_min_block defaults.
     #[arg(long, value_enum, default_value_t = Preset::Hifi)]
     preset: Preset,
@@ -2420,7 +2423,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
         bait.k,
         bait.targets.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
-    let report = recruit::run(
+    let report = recruit::run_with_frontier_audit(
         bait,
         recruit::RecruitConfig {
             bait_growth_guard: false,
@@ -2457,6 +2460,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             nuclear_depth: args.nuclear_depth,
             genome_size: args.genome_size,
         },
+        args.frontier_audit,
     )?;
     for o in &report.outputs {
         let depth = match (o.read_depth, o.implied_size) {

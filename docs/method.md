@@ -304,6 +304,14 @@ Each target in `recruit.json` has a `recruitment_state`.
 
 The `stop_reason` field retains the historical stop label. The `converged` boolean is true only for the `converged` state. The state describes the observed bait search under the run's rules. Final FASTQ sampling is reported separately, and the state cannot establish physical genome completeness.
 
+For a diagnostic run, add `--frontier-audit` to `ovasm find recruit`. The report links
+to `source_candidates/frontier-evidence.jsonl`, with up to eight read examples per
+target and reason. The report counts events, including repeated observations of the
+same record. It reports some stages only as counts. Example coordinates refer to
+the final bait and matching uses the read identifier and sequence. A match does not
+establish the read's physical source. This option uses the existing scans and keeps
+the recruitment and FASTQ rules.
+
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 
 ### 4.1 Closed-syncmer sparse graph
