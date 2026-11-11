@@ -195,6 +195,95 @@ class GeometryCliTests(unittest.TestCase):
         out = self.root / "full.geometry.json"
         self.assertEqual(record["provenance"], {"path": str(out), "sha256": sha256(out.read_bytes()).hexdigest()})
 
+    def adjacent_boundary_plan(self, query, cigar, *, mode="adjacent_boundary", mismatches=0):
+        self.plan(graph_contains_original=False)
+        path = self.root / "plan.json"
+        plan = json.loads(path.read_bytes())
+        raw = reverse(query)
+        length = len(raw)
+        plan["windows"][0]["mode"] = mode
+        plan["original_fastqs"] = [self.file("reads.fastq", fastq("original", "m123456/17", raw))]
+        plan["mapper_queries"] = self.file("queries.fa", fasta("original", raw))
+        paf = (f"original\t{length}\t0\t{length}\t-\tmt\t128\t10\t110\t"
+               f"{min(100, length) - mismatches}\t{max(100, length)}\t60\tcg:Z:{cigar}\n")
+        plan["paf"]["data"] = self.file("reads.paf", paf.encode("ascii"))
+        path.write_text(json.dumps(plan))
+
+    def test_interior_indel_with_two_exact_junctions_qualifies(self):
+        reference = self.mt[10:110]
+        self.adjacent_boundary_plan(reference[:48] + b"A" + reference[48:], "48M1I52M")
+        report, manifest = self.run_full_edit()
+        row = report["records"][0]
+        model = row["full_edit_competition"]
+        self.assertEqual(model["status"], "qualified_within_edit_model")
+        self.assertEqual(model["radius"], 1)
+        self.assertEqual(model["verified_target_upper_bound"]["cigar"], "48M1I52M")
+        self.assertFalse(model["verified_target_upper_bound"]["witness"]["exact_boundary"])
+        self.assertEqual(row["windows"]["window"]["other_graph_input_exact_donors"], ["m123456/22"])
+        self.assertEqual(manifest["records"][0]["sequence_sha256"], row["sequence_sha256"])
+
+    def test_indel_at_junction_remains_geometry_without_admission(self):
+        reference = self.mt[10:110]
+        self.adjacent_boundary_plan(reference[:40] + reference[41:], "40M1D59M")
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        window = row["windows"]["window"]
+        self.assertTrue(window["witnesses"])
+        self.assertEqual(window["excluded_alignment_counts"], {"exact_junction_missing": 1})
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_full_target_geometry")
+
+    def test_junction_insertion_blocks_admission_even_if_core_is_exact(self):
+        reference = self.mt[10:110]
+        self.adjacent_boundary_plan(reference[:40] + b"A" + reference[40:], "40M1I60M")
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        window = row["windows"]["window"]
+        self.assertTrue(window["witnesses"][0]["exact_boundary"])
+        self.assertEqual(window["excluded_alignment_counts"], {"exact_junction_missing": 1})
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_full_target_geometry")
+
+    def test_isolated_graph_core_does_not_corroborate_adjacent_junctions(self):
+        reference = self.mt[10:110]
+        self.adjacent_boundary_plan(reference[:48] + b"A" + reference[48:], "48M1I52M")
+        path = self.root / "plan.json"
+        plan = json.loads(path.read_bytes())
+        plan["graph"]["gfa"] = self.file("graph.gfa", b"S\tnode\t" + self.mt[50:74] + b"\n")
+        plan["graph"]["reads"] = [self.file("graph.fastq", fastq("donor", "m123456/22", self.mt[50:74]))]
+        path.write_text(json.dumps(plan))
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        window = row["windows"]["window"]
+        self.assertTrue(window["witnesses"])
+        self.assertFalse(window["graph_spelling_unique"])
+        self.assertEqual(window["other_graph_input_exact_donors"], [])
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_independent_graph_support")
+
+    def test_interior_indel_with_hidden_equal_competitor_is_withheld(self):
+        reference = self.mutate(self.mt[10:110], [0])
+        oriented = reference[:48] + b"A" + reference[48:]
+        self.nuclear += self.mutate(oriented, [36, 68])
+        self.adjacent_boundary_plan(oriented, "48M1I52M", mismatches=1)
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        self.assertTrue(row["windows"]["window"]["graph_corroborated_observation"])
+        model = row["full_edit_competition"]
+        self.assertEqual(model["radius"], 2)
+        self.assertEqual(model["status"], "competing_within_edit_bound")
+        self.assertEqual(model["competing_roles"]["nuclear"]["best_hit"]["edit_distance"], 2)
+
+    def test_exact_context_still_requires_an_exact_candidate_core(self):
+        reference = self.mt[10:110]
+        self.adjacent_boundary_plan(reference[:48] + b"A" + reference[48:], "48M1I52M", mode="exact_context")
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        self.assertEqual(row["windows"]["window"]["excluded_alignment_counts"], {"exact_core_missing": 1})
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_full_target_geometry")
+
     def test_selected_full_alignment_is_auditable_even_if_geometry_deduplicates(self):
         alternate = "original\t100\t0\t100\t-\tmt\t128\t10\t110\t99\t101\t25\tcg:Z:1I1D99M\n"
         self.plan(graph_contains_original=False, extra_paf=alternate)

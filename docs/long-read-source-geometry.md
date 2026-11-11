@@ -26,7 +26,7 @@ A window declares `id`, `reference`, the half-open `interval`, a positive `ancho
 
 The audit enrolls reads from actual FASTQ sequence by exact whole interval or an ordered same-strand adjacent guard pair. It verifies all query identities and mapper query bytes before inspecting PAF. An exclusive anchor must occur once on its named reference record and only within its declared role in the combined linear panel. Both orientations and overlapping occurrences are searched in every record. Reference aliases or circular-origin placements must be represented explicitly by the input design.
 
-When requested, graph corroboration requires one exhaustively spelled graph route, a different actual graph-input movie/ZMW whose read contains the exact core, and no reported full competing role for the candidate's witness interval. A graph observation is not evidence that a physical compartment is uniquely determined.
+When requested, graph corroboration requires one exhaustively spelled graph route, an exact sequence match in a different graph-input movie/ZMW, and no reported full competing role for the candidate's witness interval. The graph sequence is the registered core for `exact_context` and the core with both adjacent guards for `adjacent_boundary`.
 
 Geometry-only records retain `unresolved_reported_paf_only` for competition. Alignment heuristics, secondary caps and partial reference coverage can hide competitors. The optional whole-read comparison establishes a separate result under the named reference and edit model. The audit never promotes a missing PAF placement to proven absence.
 
@@ -35,9 +35,14 @@ Geometry-only records retain `unresolved_reported_paf_only` for competition. Ali
 Use `--full-edit-competition` to verify competing placements directly in the named
 reference bytes. The bound for each original read is its literal number of
 substitutions, insertions and deletions in a verified whole-read target CIGAR.
-The same registered window must have an exact core, role-exclusive exterior
-anchors on both sides, a unique exact graph route, and a different original
-movie/ZMW supporting that core in the graph input.
+The same registered window must have role-exclusive exterior anchors on both
+sides, a unique exact route through the graph interval, and a different
+original movie/ZMW supporting that same sequence in the graph input.
+For an `exact_context` window, the candidate also supports the full core
+exactly. An `adjacent_boundary` window allows edits between the two junctions
+when the two bases straddling each junction are exact and adjacent in the
+same whole-read CIGAR. The gapped witness records the candidate's aligned
+interval alongside the exact graph spelling.
 
 The search partitions each oriented read into one more exact block than the edit
 bound. Any continuous competing placement within the bound contains at least

@@ -76,6 +76,11 @@ class Window:
         lo, hi = self.interval
         return (lo - self.anchor_bp, lo) if side == "left" else (hi, hi + self.anchor_bp)
 
+    def graph_interval(self):
+        if self.mode == "adjacent_boundary":
+            return self.guard("left")[0], self.guard("right")[1]
+        return self.interval
+
     @classmethod
     def load(cls, obj, panel):
         require(isinstance(obj, dict) and set(obj) == {"id", "reference", "interval", "anchor_bp", "mode", "exclusive_sides",
@@ -363,7 +368,13 @@ def observe(w, raw, alignments, panel, roles, index, verified_full=None):
             continue
         if (verified_full is not None and scope.interval == (0, len(seq))
                 and all(step.op != "N" for step in aln.steps)):
-            verified_full.append((aln, proof))
+            # The two bases straddling each junction must be exact and adjacent.
+            # This permits edits inside the interval while witnessing both joins.
+            if w.mode == "exact_context" or all(
+                    exact_anchor(aln, seq, ref, (pos - 1, pos + 1)) for pos in w.interval):
+                verified_full.append((aln, proof))
+            else:
+                blocked["exact_junction_missing"] += 1
         roles_covering_scope = sorted({roles[a.reference] for a in alignments if a.continuous_over(scope.interval)})
         witnesses[proof] = asdict(proof) | {"cigar": cigar_text(aln),
             "reported_paf_roles_covering_same_scope": roles_covering_scope}
@@ -387,7 +398,7 @@ def graph_context(graph, graph_reads, windows, panel, originals):
     donors = defaultdict(dict)
     graph_ids = set()
     windows = {key: w for key, w in windows.items() if w.graph_required}
-    words = {key: panel[w.reference][slice(*w.interval)] for key, w in windows.items()}
+    words = {key: panel[w.reference][slice(*w.graph_interval())] for key, w in windows.items()}
     for f in graph_reads:
         for raw in records(f):
             require(raw.molecule not in graph_ids, "graph input repeats an original molecule")
@@ -591,7 +602,8 @@ def report(plan_path, edit_budget=None):
         results = {}
         for key in ids:
             w = windows[key]
-            full = ([] if observed is not None and w.require_full_query and w.mode == "exact_context"
+            full = ([] if observed is not None and w.require_full_query
+                    and w.mode in ("exact_context", "adjacent_boundary")
                     and set(w.exclusive_sides) == {"left", "right"}
                     and roles[w.reference] in ROLES[:2] else None)
             result = observe(w, raw, alignments.get(query, []), panel, roles, index, full)
