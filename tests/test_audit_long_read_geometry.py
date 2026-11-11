@@ -65,7 +65,7 @@ class GeometryCliTests(unittest.TestCase):
         return dict(path=relative_path, sha256=sha256(content).hexdigest())
 
     def plan(self, *, shared_guard=False, same_scope_competitor=False, donor=True,
-             query_mismatch=False, empty=False, graph_contains_original=True):
+             query_mismatch=False, empty=False, graph_contains_original=True, extra_paf="", skip=False):
         nucleus = self.nuclear
         if shared_guard:
             # Exact obsolete right anchor on the reverse strand, absent from the PAF.
@@ -88,6 +88,9 @@ class GeometryCliTests(unittest.TestCase):
         })
         matches = sum(a == b for a, b in zip(reverse(self.query), self.mt[10:110]))
         paf = f"original\t100\t0\t100\t-\tmt\t128\t10\t110\t{matches}\t100\t60\tcg:Z:100M\n"
+        if skip:
+            paf = f"original\t100\t0\t100\t-\tmt\t128\t9\t110\t{matches}\t101\t60\tcg:Z:1N100M\n"
+        paf += extra_paf
         if same_scope_competitor:
             paf += (f"original\t100\t0\t100\t-\tchr\t{len(nucleus)}\t{len(self.nuclear)}\t"
                     f"{len(nucleus)}\t86\t100\t2\tcg:Z:100M\n")
@@ -191,6 +194,27 @@ class GeometryCliTests(unittest.TestCase):
             self.assertEqual(record[key], row[key])
         out = self.root / "full.geometry.json"
         self.assertEqual(record["provenance"], {"path": str(out), "sha256": sha256(out.read_bytes()).hexdigest()})
+
+    def test_selected_full_alignment_is_auditable_even_if_geometry_deduplicates(self):
+        alternate = "original\t100\t0\t100\t-\tmt\t128\t10\t110\t99\t101\t25\tcg:Z:1I1D99M\n"
+        self.plan(graph_contains_original=False, extra_paf=alternate)
+        report, manifest = self.run_full_edit()
+        self.assertIsNotNone(manifest)
+        row = report["records"][0]
+        self.assertEqual(len(row["windows"]["window"]["witnesses"]), 1)
+        upper = row["full_edit_competition"]["verified_target_upper_bound"]
+        self.assertEqual(upper["unit_edit_count"], 0)
+        self.assertEqual(upper["cigar"], "100M")
+        self.assertEqual(upper["witness"]["scope"]["read_sha256"], row["sequence_sha256"])
+        self.assertEqual(upper["witness"]["boundary"]["reference"], [50, 74])
+
+    def test_terminal_skip_keeps_geometry_without_full_edit_qualification(self):
+        self.plan(graph_contains_original=False, skip=True)
+        report, manifest = self.run_full_edit()
+        self.assertIsNone(manifest)
+        row = report["records"][0]
+        self.assertTrue(row["windows"]["window"]["witnesses"])
+        self.assertEqual(row["full_edit_competition"]["status"], "unresolved_no_full_target_geometry")
 
     def test_unreported_continuous_edit_competitor_prevents_export(self):
         oriented = self.mutate(self.mt[10:110], [0, 1, 2, 3])

@@ -305,6 +305,11 @@ def nearest_anchor(aln, seq, ref, boundary, side, k, exclusive):
     return None
 
 
+def cigar_text(alignment):
+    return "".join(f"{max(step.oriented_query[1] - step.oriented_query[0], step.reference[1] - step.reference[0])}{step.op}"
+                   for step in alignment.steps)
+
+
 def observe(w, raw, alignments, panel, roles, index, verified_full=None):
     seq = raw.seq
     ref = panel[w.reference]
@@ -356,12 +361,11 @@ def observe(w, raw, alignments, panel, roles, index, verified_full=None):
         if proof is None:
             blocked["single_cigar_geometry_incompatible"] += 1
             continue
-        if verified_full is not None and scope.interval == (0, len(seq)):
-            verified_full.append(aln)
+        if (verified_full is not None and scope.interval == (0, len(seq))
+                and all(step.op != "N" for step in aln.steps)):
+            verified_full.append((aln, proof))
         roles_covering_scope = sorted({roles[a.reference] for a in alignments if a.continuous_over(scope.interval)})
-        witnesses[proof] = asdict(proof) | {"cigar": "".join(
-            f"{max(x.oriented_query[1]-x.oriented_query[0], x.reference[1]-x.reference[0])}{x.op}"
-            for x in aln.steps),
+        witnesses[proof] = asdict(proof) | {"cigar": cigar_text(aln),
             "reported_paf_roles_covering_same_scope": roles_covering_scope}
     distance = None
     if w.physical_boundaries:
@@ -470,9 +474,9 @@ def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
         if not DNA.fullmatch(sequence):
             decisions[query] = {"status": "unresolved_unobservable", "target": target}
             continue
-        radius, key, alignment = min(
-            ((cigar_edit_upper_bound(aln, sequence, panel[aln.reference]), key, aln)
-             for key, alignments in supported.items() for aln in alignments),
+        radius, key, alignment, proof = min(
+            ((cigar_edit_upper_bound(aln, sequence, panel[aln.reference]), key, aln, witness)
+             for key, alignments in supported.items() for aln, witness in alignments),
             key=lambda item: (item[0], item[1], alignment_key(item[2])),
         )
         decisions[query] = {
@@ -480,6 +484,7 @@ def assess_full_edits(rows, selected, observed, windows, panel, roles, budget):
             "verified_target_upper_bound": {
                 "window": key, "reference": alignment.reference, "strand": alignment.strand,
                 "interval": alignment.reference_interval, "unit_edit_count": radius,
+                "cigar": cigar_text(alignment), "witness": asdict(proof),
             },
         }
         by_target[target][query] = (sequence, radius)

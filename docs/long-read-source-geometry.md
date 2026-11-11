@@ -46,8 +46,8 @@ then computes full-query unit Levenshtein distance to contiguous substrings
 in the resulting ranges. Equal or better placements withhold a candidate.
 Verified geometry from another role also withholds the record.
 
-Each record's `full_edit_competition` gives its target bound, competing placements
-and decision. `--max-edit-seed-hits` and `--max-edit-text-bases` set work limits
+Each record's `full_edit_competition` gives its target bound, the exact selected
+CIGAR and witness, competing placements, and the decision. `--max-edit-seed-hits` and `--max-edit-text-bases` set work limits
 per read and role. Exhausted searches stay unresolved. Use `--out-admission`
 with this mode to export qualifying originals that were absent from the graph
 input. The manifest binds exact original header, sequence and quality bytes to
