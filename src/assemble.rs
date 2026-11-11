@@ -2253,7 +2253,12 @@ fn run_backbone_layout_guard(
         }
         if at.len() >= DEPTH_REFERENCE_MIN_NODES {
             at.sort_unstable();
-            let own = at[at.len() / 2] as f64;
+            // the same estimate as over all nodes, not the plain median: among the solid nodes
+            // of raw seed reads the recurring errors (counts 3 to 5) outnumber the true k-mers,
+            // and the median falls in that tail (Buddleja davidii plastid, 2,532 reads at k
+            // 1001: median 4 at 1,065 seed nodes where the sequence stood at 11, min count 1,
+            // 39,158 nodes, 343 unitigs for a 154 kb circle)
+            let own = sequence_depth(&at);
             eprintln!(
                 "[ovasm] node depth {own:.0} at the {} nodes of {} (count-weighted median of all nodes {node_depth:.0})",
                 at.len(),
