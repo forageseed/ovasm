@@ -452,6 +452,23 @@ ready for `--read-admission-manifest`. Reaching the candidate cap before all rea
 are checked produces a truncated report and no admission manifest. This route
 currently handles exact complete reads at registered windows.
 
+For an additional short-read competition check, set `--phred-error-quantile Q`
+with a probability strictly between zero and one. The script calculates each
+read end's error-count quantile from its Phred+33 qualities, conditional on
+independent calibrated errors. It searches both strands for equal-length placements
+within that number of substitutions. Splitting the read into one more block than
+the allowed substitutions guarantees that every such placement has an exact seed.
+The search confirms each candidate by comparing the full read end.
+
+A competing role, another position or orientation in the target, or an exhausted
+search budget withholds an otherwise eligible record. The report records up to
+two placements per role. `saturated` means at least two were found.
+`--max-substitution-starts` sets the work budget per original read and role, with
+500,000 starts by default. The independent qualification remains part of the
+admission rule. This comparison covers literal equal-length sequence. Indels,
+assembly omissions, sequence changes between individuals, and correlated quality
+errors are outside its model.
+
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 
 ### 4.1 Closed-syncmer sparse graph

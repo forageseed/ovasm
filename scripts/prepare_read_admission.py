@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import gzip
 import hashlib
 import json
@@ -18,6 +18,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 READ_ID = re.compile(r"(?:[0-9a-f]{2})+")
 DNA = re.compile(rb"[ACGT]+")
 COMPLEMENT = bytes.maketrans(b"ACGT", b"TGCA")
+DEFAULT_SUBSTITUTION_STARTS = 500_000
 
 
 def require(condition, message):
@@ -277,13 +278,14 @@ class Candidate:
     sequence_sha256: str
     quality_sha256: str
     windows: list
+    radius: int | None = None
 
     def binding(self):
         return {"read_id_hex": self.id.hex(), "sequence_sha256": self.sequence_sha256,
                 "quality_sha256": self.quality_sha256}
 
 
-def find_candidates(reads, words, cap):
+def find_candidates(reads, words, cap, substitutions):
     patterns = [(key, word, reverse_complement(word)) for key, word in words.items()]
     candidates = {}
     scan = []
@@ -299,7 +301,9 @@ def find_candidates(reads, words, cap):
             if len(candidates) == cap:
                 scan.append({"file": source.binding(), "records": count})
                 return None, scan
-            candidates[rid] = Candidate(rid, normalized, digest(seq), digest(qual), hits)
+            radius = (phred_error_radius(qual, substitutions.quantile)
+                      if substitutions and DNA.fullmatch(normalized) else None)
+            candidates[rid] = Candidate(rid, normalized, digest(seq), digest(qual), hits, radius)
         scan.append({"file": source.binding(), "records": count})
     # A duplicate header outside a window still makes the original identity ambiguous.
     if candidates:
@@ -337,6 +341,130 @@ def search_panel(panel, words):
                 if remaining:
                     matches.extend(sequence_occurrences(seq, name, word, remaining))
     return placements
+
+
+def phred_error_radius(quality, quantile):
+    """Quantile of the independent error count, with exact lower-tail probabilities."""
+    phred = [value - 33 for value in quality]
+    require(all(0 <= q <= 93 for q in phred), "invalid Phred+33 quality byte")
+    certain = phred.count(0)
+    probabilities = [10 ** (-q / 10) for q in phred if q]
+    limit = min(len(probabilities), max(8, int(sum(probabilities)) + 4))
+    while True:
+        mass = [1.0] + [0.0] * limit
+        for seen, probability in enumerate(probabilities, 1):
+            stay = 1 - probability
+            for errors in range(min(seen, limit), 0, -1):
+                mass[errors] = mass[errors] * stay + mass[errors - 1] * probability
+            mass[0] *= stay
+        cumulative = 0.0
+        for errors, probability in enumerate(mass):
+            cumulative += probability
+            if cumulative >= quantile:
+                return certain + errors
+        if limit == len(probabilities):
+            # The exact CDF at the maximum is one, even if arithmetic rounded it down.
+            return len(quality)
+        limit = min(len(probabilities), 2 * limit + 1)
+
+
+def substitution_starts(sequence, word, radius):
+    """All starts within radius are covered by at least one exact disjoint block."""
+    last = len(sequence) - len(word)
+    if last < 0:
+        return
+    if radius >= len(word):
+        yield from range(last + 1)
+        return
+    blocks = radius + 1
+    seen = set()
+    for i in range(blocks):
+        offset = i * len(word) // blocks
+        seed = word[offset:(i + 1) * len(word) // blocks]
+        position = sequence.find(seed, offset, last + offset + len(seed))
+        while position != -1:
+            start = position - offset
+            if start not in seen:
+                seen.add(start)
+                yield start
+            position = sequence.find(seed, position + 1, last + offset + len(seed))
+
+
+def count_substitutions(sequence, start, word, radius):
+    mismatches = 0
+    for i, base in enumerate(word):
+        mismatches += sequence[start + i] != base
+        if mismatches > radius:
+            break
+    return mismatches
+
+
+@dataclass(frozen=True)
+class SubstitutionOptions:
+    quantile: float
+    max_starts: int
+
+    def binding(self):
+        return {"phred_error_quantile": self.quantile, "max_starts_per_role_and_record": self.max_starts,
+                "scope": "equal-length literal substitution neighborhoods; assumes independent calibrated Phred+33 errors"}
+
+
+@dataclass
+class RoleNeighbors:
+    state: str = "complete"
+    checked_starts: int = 0
+    placements: list = field(default_factory=list)
+
+    def add_reference(self, name, sequence, word, radius, max_starts):
+        if self.state != "complete":
+            return
+        reverse = reverse_complement(word)
+        strands = (("+", word),) if reverse == word else (("+", word), ("-", reverse))
+        for strand, oriented in strands:
+            for start in substitution_starts(sequence, oriented, radius):
+                if self.checked_starts == max_starts:
+                    self.state = "budget_exhausted"
+                    return
+                self.checked_starts += 1
+                distance = count_substitutions(sequence, start, oriented, radius)
+                if distance <= radius:
+                    self.placements.append({"reference": name, "start0": start, "end0": start + len(word),
+                                            "strand": strand, "substitutions": distance})
+                    if len(self.placements) == 2:
+                        self.state = "saturated"
+                        return
+
+    def binding(self):
+        return {"state": self.state, "checked_starts": self.checked_starts,
+                "placements": sorted(self.placements, key=lambda p: (p["reference"], p["start0"], p["strand"]))}
+
+
+def substitution_competition(panel, candidates, options):
+    keys = sorted({(c.word, c.radius) for c in candidates.values() if c.radius is not None})
+    searches = {key: {role: RoleNeighbors() for role in ROLES} for key in keys}
+    if keys:
+        for role, reference in panel.items():
+            for name, sequence in fasta(reference):
+                for (word, radius), by_role in searches.items():
+                    by_role[role].add_reference(name, sequence, word, radius, options.max_starts)
+    return searches
+
+
+def apply_substitution_competition(row, candidate, target, searches):
+    if candidate.radius is None:
+        row["substitution_competition"] = {"state": "not_observable"}
+        return
+    roles = searches[candidate.word, candidate.radius]
+    row["substitution_competition"] = {"radius": candidate.radius,
+                                      "roles": {role: hits.binding() for role, hits in roles.items()}}
+    if row["status"] != "target_supported":
+        return
+    if any(hits.state == "budget_exhausted" for hits in roles.values()):
+        row["status"] = "unresolved_substitution_budget"
+    elif any(hits.placements for role, hits in roles.items() if role != target):
+        row["status"] = "competing_substitution_record"
+    elif len(roles[target].placements) != 1:
+        row["status"] = "unresolved_substitution_placement"
 
 
 def unique_target(placements, target):
@@ -387,17 +515,24 @@ def decide_candidate(plan, candidate, words, placements):
     return candidate.binding() | {"full_record_placements": end_hits, "windows": windows, "status": status}
 
 
-def screen(plan, cap):
+def screen(plan, cap, substitutions=None):
     words = window_words(plan)
-    candidates, scan = find_candidates(plan.reads, words, cap)
+    candidates, scan = find_candidates(plan.reads, words, cap, substitutions)
     report = plan.binding() | {"schema": "ovasm.read-source-screen-report.v1",
                               "candidate_cap": cap, "original_records_scanned": scan}
+    if substitutions:
+        report["substitution_competition"] = substitutions.binding()
     if candidates is None:
         return report | {"state": "truncated", "reason": "candidate_cap"}, []
     patterns = set(words.values()) | {c.word for c in candidates.values() if DNA.fullmatch(c.word)}
     placements = search_panel(plan.panel, sorted(patterns))
-    decisions = [decide_candidate(plan, candidate, words, placements)
-                 for _, candidate in sorted(candidates.items())]
+    searches = substitution_competition(plan.panel, candidates, substitutions) if substitutions else None
+    decisions = []
+    for _, candidate in sorted(candidates.items()):
+        row = decide_candidate(plan, candidate, words, placements)
+        if substitutions:
+            apply_substitution_competition(row, candidate, plan.target, searches)
+        decisions.append(row)
     selected = [{key: row[key] for key in ("read_id_hex", "sequence_sha256", "quality_sha256")}
                 for row in decisions if row["status"] == "target_supported"]
     report |= {"state": "complete", "placements_kept_per_role": 2,
@@ -421,12 +556,23 @@ def main():
     parser.add_argument("--out", type=Path, required=True, help="new directory for audit and optional native manifest")
     parser.add_argument("--max-candidates", type=int, default=1024,
                         help="junction-matching records to compare before declaring truncation")
+    parser.add_argument("--phred-error-quantile", type=float,
+                        help="require bounded substitution competition at this Phred error-count quantile")
+    parser.add_argument("--max-substitution-starts", type=int,
+                        help=f"candidate starts to evaluate per role and read (default {DEFAULT_SUBSTITUTION_STARTS})")
     args = parser.parse_args()
     try:
         require(args.max_candidates > 0, "--max-candidates must be positive")
+        quantile = args.phred_error_quantile
+        max_starts = args.max_substitution_starts
+        require(max_starts is None or (quantile is not None and max_starts > 0),
+                "--max-substitution-starts must be positive and requires --phred-error-quantile")
+        require(quantile is None or 0 < quantile < 1, "--phred-error-quantile must be between zero and one")
+        substitutions = (SubstitutionOptions(quantile, max_starts or DEFAULT_SUBSTITUTION_STARTS)
+                         if quantile is not None else None)
         require(not args.out.exists(), f"output directory already exists: {args.out}")
         plan = ScreenPlan.load(args.plan)
-        report, selected = screen(plan, args.max_candidates)
+        report, selected = screen(plan, args.max_candidates, substitutions)
         plan.check()
         out = args.out.resolve()
         out.mkdir(parents=True, exist_ok=False)

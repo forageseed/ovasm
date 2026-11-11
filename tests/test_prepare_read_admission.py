@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import json
 import random
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -58,7 +59,7 @@ class PrepareReadAdmission(unittest.TestCase):
                "verdict": "target_supported"}
         return row | overrides
 
-    def screen(self, *, rows=None, raw=None, cap=None, proof_updates=None, plan_updates=None):
+    def screen(self, *, rows=None, raw=None, cap=None, proof_updates=None, plan_updates=None, options=()):
         self.case_no += 1
         stem = f"case{self.case_no}"
         if raw is None:
@@ -82,7 +83,7 @@ class PrepareReadAdmission(unittest.TestCase):
         args = [sys.executable, "-B", "-I", str(SCRIPT), str(self.root / spec["path"]), "--out", str(out)]
         if cap is not None:
             args += ["--max-candidates", str(cap)]
-        run = subprocess.run(args, capture_output=True, text=True, cwd=self.root, check=False)
+        run = subprocess.run(args + list(options), capture_output=True, text=True, cwd=self.root, check=False)
         return run, out
 
     def result(self, run, out):
@@ -170,6 +171,84 @@ class PrepareReadAdmission(unittest.TestCase):
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("qualification junction window differs", run.stderr)
         self.assertFalse(out.exists())
+
+
+    def test_quality_bounded_reverse_competitor_withholds_exactly_eligible_record(self):
+        qual = b"I" * len(self.seq)
+        row = self.qualify(self.rid, self.seq, qual)
+        raw = fastq(self.rid, self.seq, qual)
+        mutated = self.replace_base(self.seq, self.window["boundary0"])
+        self.panel["nuclear"] = self.file("nuclear.fa", fasta("n", rc(mutated)))
+        plain, native = self.result(*self.screen(rows=[row], raw=raw))
+        self.assertIsNotNone(native)
+        self.assertNotIn("substitution_competition", plain)
+        audit, native = self.result(*self.screen(rows=[row], raw=raw, options=["--phred-error-quantile", "0.999"]))
+        self.assertIsNone(native)
+        decision = audit["records"][0]
+        self.assertEqual(decision["status"], "competing_substitution_record")
+        self.assertEqual(decision["substitution_competition"]["radius"], 1)
+        role = decision["substitution_competition"]["roles"]["nuclear"]
+        self.assertEqual(role["placements"], [{"reference": "n", "start0": 0, "end0": len(self.seq),
+                                                "strand": "-", "substitutions": 1}])
+
+    def test_alternative_target_and_incomplete_search_withhold_record(self):
+        qual = b"I" * len(self.seq)
+        raw = fastq(self.rid, self.seq, qual)
+        proof = [self.qualify(self.rid, self.seq, qual)]
+        options = ["--phred-error-quantile", "0.999"]
+        alternative = self.replace_base(self.seq, self.window["boundary0"])
+        original = self.panel["mitochondrion"]
+        self.panel["mitochondrion"] = self.file("multi.fa", fasta("mt", self.seq) + fasta("mt2", alternative))
+        report, native = self.result(*self.screen(rows=proof, raw=raw, options=options))
+        self.assertIsNone(native)
+        row = report["records"][0]
+        self.assertEqual(row["status"], "unresolved_substitution_placement")
+        self.assertEqual(row["substitution_competition"]["roles"]["mitochondrion"]["state"], "saturated")
+
+        self.panel["mitochondrion"] = original
+        decoy = self.seq[:48] + b"C" * (len(self.seq) - 48)
+        self.panel["nuclear"] = self.file("nuclear.fa", fasta("n1", decoy) + fasta("n2", decoy))
+        report, native = self.result(*self.screen(rows=proof, raw=raw,
+            options=options + ["--max-substitution-starts", "1"]))
+        self.assertIsNone(native)
+        row = report["records"][0]
+        self.assertEqual(row["status"], "unresolved_substitution_budget")
+        self.assertEqual(row["substitution_competition"]["roles"]["nuclear"]["state"], "budget_exhausted")
+
+    def test_maximal_error_radius_observes_all_starts(self):
+        qual = b"!" * len(self.seq)
+        proof = [self.qualify(self.rid, self.seq, qual)]
+        report, native = self.result(*self.screen(rows=proof, raw=fastq(self.rid, self.seq, qual),
+            options=["--phred-error-quantile", "0.999"]))
+        self.assertIsNone(native)
+        row = report["records"][0]
+        self.assertEqual(row["substitution_competition"]["radius"], len(self.seq))
+        self.assertEqual(row["status"], "competing_substitution_record")
+        self.assertEqual(row["substitution_competition"]["roles"]["nuclear"]["state"], "saturated")
+
+    @staticmethod
+    def replace_base(seq, pos):
+        base = b"A" if seq[pos:pos+1] != b"A" else b"C"
+        return seq[:pos] + base + seq[pos+1:]
+
+
+class SubstitutionNeighborhoodOracle(unittest.TestCase):
+    def test_seed_partition_matches_all_starts(self):
+        implementation = runpy.run_path(str(SCRIPT))
+        starts = implementation["substitution_starts"]
+        distance = implementation["count_substitutions"]
+        random_source = random.Random(269)
+        for length in range(2, 10):
+            for radius in range(length + 1):
+                for _ in range(32):
+                    query = bytes(random_source.choice(b"ACGT") for _ in range(length))
+                    sequence = bytes(random_source.choice(b"ACGTN") for _ in range(20))
+                    expected = {i for i in range(len(sequence) - len(query) + 1)
+                                if sum(a != b for a, b in zip(query, sequence[i:i+length])) <= radius}
+                    possible = list(starts(sequence, query, radius))
+                    self.assertEqual(len(possible), len(set(possible)))
+                    self.assertEqual({i for i in possible if distance(sequence, i, query, radius) <= radius}, expected)
+
 
 
 if __name__ == "__main__":
