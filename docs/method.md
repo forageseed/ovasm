@@ -214,6 +214,30 @@ a copy of the verified bytes in the run directory and records the audit in
 `summary.json` under `seed_database.seed_source_audit`. The audit describes the source
 comparison that produced the seed view. The run may use a different reads file.
 
+### 2.7 Audit protein gene sets
+
+Use `ovasm find protein-seeds --gene-set-audit` or add `--protein-gene-set-audit`
+to an active protein seed scan in `ovasm run hifi`. The report records gene sets for
+each sampled depth cluster. If the whole-read fallback runs, it also scans every
+fallback input in reverse sequence order, using the same translation, gene
+assignment, read qualification, and crop rules in both orientations. The fallback
+counts qualifying records before the seed output cap and depth check.
+
+Each gene set lists observed forward families and families with both more forward
+than reversed records and at least `min_gene_segments` excess forward stretches.
+The shared record count is provided for each family. `support_fraction` is the
+supported family count divided by the indexed panel families for that organelle,
+or null if none are indexed. A family present in the loaded panel with no amino
+acid k-mer is reported in `unindexed_families`.
+
+The depth-cluster and fallback scans qualify reads differently. Interpret their
+fractions within each scan. Counts refer to input records, and multiple families
+can share a record. The reversal control measures directional signal under these
+rules. True homologues in nuclear and plastid copies can also produce that signal,
+so assigning physical source requires independent original-read evidence. This
+audit leaves seed selection and FASTA output unchanged.
+
+
 ## 3. Seed recruitment
 
 Source: `recruit.rs`, `bait.rs`, `seeddb.rs`, `main.rs::run`, `pipeline.rs::recruit_all`.

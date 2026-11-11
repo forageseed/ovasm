@@ -623,6 +623,9 @@ struct RunArgs {
     /// Protein panel for the protein seeds; default: the built-in panel of --lineage.
     #[arg(long, hide_short_help = true)]
     protein_seed_panel: Option<PathBuf>,
+    /// Report paired protein gene sets during the HiFi whole-genome protein seed scan.
+    #[arg(long)]
+    protein_gene_set_audit: bool,
     /// Print result.json (the run's outcome for scripts and agents) on standard output too.
     #[arg(long, hide_short_help = true)]
     json: bool,
@@ -871,6 +874,23 @@ fn run(args: RunArgs) -> Result<()> {
             "--protein-seeds seeds the recruitment of HiFi whole-genome reads: run hifi, not with --read-set target or --recruit discover"
         );
     }
+    if args.protein_gene_set_audit && !protein_seeds {
+        bail!("--protein-gene-set-audit requires a protein seed scan");
+    }
+    // the organelles seeded (the asked one and, unless --single-seed, its competitor)
+    // and only those the lineage has (no plastid in metazoa or fungi)
+    let wanted: Vec<&'static str> = match single {
+        Some(o) if args.single_seed => vec![o],
+        _ => protein_seed::ORGANELLES
+            .iter()
+            .copied()
+            .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
+            .collect(),
+    };
+    let scan_proteins = protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o));
+    if args.protein_gene_set_audit && !scan_proteins {
+        bail!("--protein-gene-set-audit requires an organelle without explicitly supplied seeds");
+    }
     for (name, view) in checked {
         let (path, provenance) = view.materialize(&args.out)?;
         seeds.insert(name.clone(), vec![path]);
@@ -891,17 +911,7 @@ fn run(args: RunArgs) -> Result<()> {
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
-        // the organelles seeded (the asked one and, unless --single-seed, its competitor)
-        // and only those the lineage has (no plastid in metazoa or fungi)
-        let wanted: Vec<&'static str> = match single {
-            Some(o) if args.single_seed => vec![o],
-            _ => protein_seed::ORGANELLES
-                .iter()
-                .copied()
-                .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
-                .collect(),
-        };
-        if protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
+        if scan_proteins {
             let p = protein_seed_params(
                 3000,
                 2000,
@@ -926,6 +936,7 @@ fn run(args: RunArgs) -> Result<()> {
                 &p,
                 &searched,
                 &args.out.join("protein-seeds"),
+                args.protein_gene_set_audit,
             )?;
             eprintln!("{}", report.summary());
             for &o in &searched {
@@ -1993,6 +2004,9 @@ struct DiscoverArgs {
 
 #[derive(clap::Args)]
 struct ProteinSeedArgs {
+    /// Report density-independent gene sets with paired fallback orientation evidence.
+    #[arg(long)]
+    gene_set_audit: bool,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -2132,7 +2146,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         .copied()
         .filter(|o| args.lineage.fasta(o).is_some())
         .collect();
-    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out)?;
+    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out, args.gene_set_audit)?;
     eprintln!("{}", report.summary());
     Ok(())
 }

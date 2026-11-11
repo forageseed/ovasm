@@ -388,6 +388,15 @@ impl Panel {
         &self.genes[gene as usize].name
     }
 
+    /// Whether each gene has at least one protein represented in the k-mer index.
+    pub(crate) fn indexed_genes(&self) -> Vec<bool> {
+        let mut indexed = vec![false; self.genes.len()];
+        for (&gene, seq) in self.protein_gene.iter().zip(&self.protein_seqs) {
+            indexed[usize::from(gene)] |= seq.len() >= self.k;
+        }
+        indexed
+    }
+
     /// Proteins and distinct genes in the panel.
     pub(crate) fn sizes(&self) -> (usize, usize) {
         (self.proteins, self.genes.len())
