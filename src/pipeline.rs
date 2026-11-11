@@ -2788,7 +2788,9 @@ mod tests {
             let r = &s["recruitment"];
             assert_eq!(r["extend_gate"], json!(true), "{organelle}");
             assert_eq!(r["bootstrap"], json!(true), "{organelle}");
-            assert_eq!(r["converged"], json!(true), "{organelle}");
+            assert_eq!(r["stop_reason"], "saturated", "{organelle}");
+            assert_eq!(r["recruitment_state"], "unresolved", "{organelle}");
+            assert_eq!(r["converged"], json!(false), "{organelle}");
             assert_eq!(r["sampled_by"], Value::Null, "{organelle}");
             assert!(r["read_depth"].as_f64().unwrap() < 250.0, "{organelle}");
         }

@@ -306,6 +306,8 @@ struct ScanResult {
     /// Each extending target's NUMT candidates that this pass classified anew: the partial reads
     /// at the edges its bait last grew to (`FRONTIER_STEPS`).
     frontier: Vec<Sample<FRONTIER_READS>>,
+    /// A partial target candidate was observed, including unchanged cached calls.
+    partial_candidates: Vec<bool>,
     /// Accepted short reads partially explained by gap-bridged bait, per target.
     accepted_partial: Vec<AcceptedPartialAudit>,
     numt: TargetCounts,
@@ -735,6 +737,7 @@ fn scan(
         all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         frontier: (0..n_targets).map(|_| Sample::default()).collect(),
+        partial_candidates: vec![false; n_targets],
         accepted_partial: (0..n_targets).map(|_| AcceptedPartialAudit::default()).collect(),
         numt: TargetCounts::default(),
         reads: 0,
@@ -920,6 +923,7 @@ fn scan(
                     }
                     out.numt.reads += 1;
                     out.numt.bases += len;
+                    out.partial_candidates[t] = true;
                     if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
                         out.frontier[t].offer(name_key(&rec.id), &rec.seq);
                     }
@@ -1019,6 +1023,31 @@ pub(crate) fn write_rec(w: &mut impl Write, r: &Rec) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecruitmentState {
+    Converged,
+    Unresolved,
+    Truncated,
+}
+
+impl RecruitmentState {
+    fn from_stop(
+        reason: &str,
+        pass_budget_exhausted: bool,
+        closure_observed: bool,
+        bootstrap_budget_exhausted: bool,
+    ) -> Self {
+        match reason {
+            "iteration_limit" | "single_pass" | "size_cap" => Self::Truncated,
+            "bootstrap_limit" if bootstrap_budget_exhausted => Self::Truncated,
+            "bait_complete" if pass_budget_exhausted => Self::Truncated,
+            "bait_complete" if closure_observed => Self::Converged,
+            _ => Self::Unresolved,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetOutput {
     pub name: String,
@@ -1036,7 +1065,10 @@ pub struct TargetOutput {
     /// --saturation), bait_complete (extension added nothing), size_cap (stood for more than
     /// `size_cap`), iteration_limit (still growing when the passes ran out) or single_pass.
     pub stop_reason: &'static str,
-    /// False for iteration_limit, size_cap, growing and bootstrap_limit: reads may be incomplete or hold others.
+    /// Closure of the observed bait under the configured eligibility rules, before FASTQ
+    /// downsampling. Unresolved or truncated runs have no such closure evidence.
+    pub recruitment_state: RecruitmentState,
+    /// True exactly when recruitment_state is converged.
     pub converged: bool,
     pub sampling_fraction: f64,
     /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
@@ -1781,6 +1813,11 @@ fn runaway_bait_gain(previous: Option<usize>, gain: usize) -> bool {
     previous.is_some_and(|p| gain >= 20_000 && gain as f64 > 1.5 * p as f64)
 }
 
+fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
+    let bit = 1u8 << target;
+    CanonicalKmers::new(seq, bait.k).any(|(_, km)| bait.get(km) & bit == 0)
+}
+
 pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     let start = Instant::now();
     std::fs::create_dir_all(&cfg.out_dir)?;
@@ -1871,6 +1908,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // (`KMER_FRONTIER_MAX_END_GROWTH`)
     let mut walk_ends: Vec<Option<usize>> = vec![None; n_targets];
     let mut walk_stopped = vec![false; n_targets];
+    // Extension remembers processed names, so a withheld read may not be tested again.
+    let mut extension_subsampled = vec![false; n_targets];
+    let mut frontier_withheld = vec![false; n_targets];
+    let mut bootstrap_budget_exhausted = vec![false; n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -2107,11 +2148,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                     fresh.push(key);
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
+                        extension_subsampled[t] = true;
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
                         if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d)) {
                             gated_out[t] += 1;
+                            if !frontier_withheld[t] {
+                                frontier_withheld[t] = has_unbaited_kmer(&bait, t, &r.seq);
+                            }
                             return;
                         }
                     }
@@ -2119,7 +2164,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         picked.push(r.seq);
                         return;
                     };
-                    match extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds) {
+                    let (verdict, by_new) =
+                        extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds);
+                    if verdict != Gauge::Extends && !frontier_withheld[t] {
+                        frontier_withheld[t] = has_unbaited_kmer(&bait, t, &r.seq);
+                    }
+                    match (verdict, by_new) {
                         (Gauge::Extends, by_new) => {
                             new_part[t] += u64::from(by_new);
                             picked.push(r.seq);
@@ -2140,7 +2190,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         new.sort_unstable();
                         new.dedup();
                     }
+                    let before = new.len();
                     keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
+                    frontier_withheld[t] |= new.len() < before;
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                     if runaway_bait_gain(previous, added[t] + new.len()) {
                         saturated[t] = true;
@@ -2160,6 +2212,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         picked.iter().map(Vec::as_slice),
                         cfg.extend_min_count,
                     );
+                }
+                if !frontier_withheld[t] {
+                    frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
                 }
                 used[t].extend(fresh);
                 // Within-pass extension from the partial reads at its edges (`FRONTIER_STEPS`),
@@ -2187,15 +2242,22 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         }
                     }
                     pending = rest;
-                    let judged: Vec<(&[u8], bool)> = ready
+                    let judged: Vec<(&[u8], Gauge, bool)> = ready
                         .into_par_iter()
-                        .filter_map(|s| match extends(g, &bait, t, s, deep, bounds) {
-                            (Gauge::Extends, by_new) => Some((s, by_new)),
-                            _ => None,
+                        .map(|s| {
+                            let (verdict, by_new) = extends(g, &bait, t, s, deep, bounds);
+                            (s, verdict, by_new)
                         })
                         .collect();
-                    new_part[t] += judged.iter().filter(|j| j.1).count() as u64;
-                    let picked: Vec<&[u8]> = judged.into_iter().map(|j| j.0).collect();
+                    let mut picked = Vec::new();
+                    for (seq, verdict, by_new) in judged {
+                        if verdict == Gauge::Extends {
+                            new_part[t] += u64::from(by_new);
+                            picked.push(seq);
+                        } else if !frontier_withheld[t] {
+                            frontier_withheld[t] = has_unbaited_kmer(&bait, t, seq);
+                        }
+                    }
                     if picked.is_empty() {
                         break;
                     }
@@ -2222,8 +2284,11 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         }
                         bait.add_kmers(t, &new)
                     } else {
-                        bait.extend_from_reads(t, picked, cfg.extend_min_count)
+                        bait.extend_from_reads(t, picked.iter().copied(), cfg.extend_min_count)
                     };
+                    if !frontier_withheld[t] {
+                        frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
+                    }
                     added[t] += more;
                     if more == 0 {
                         break;
@@ -2348,6 +2413,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if picked.len() > leftover_boot_count[t] || picked_bases > leftover_boot_bases[t] {
                         saturated[t] = true;
                         stopped[t] = Some("bootstrap_limit");
+                        bootstrap_budget_exhausted[t] = true;
                         warnings.push(format!("{}: third leftover retry held by candidate count or base budget; candidate origins remain unresolved", bait.targets[t].name));
                         continue;
                     }
@@ -2356,6 +2422,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if runaway_bait_gain(Some(leftover_boot_gain[t]), kmers.len()) {
                         saturated[t] = true;
                         stopped[t] = Some("bootstrap_limit");
+                        bootstrap_budget_exhausted[t] = true;
                         warnings.push(format!("{}: third leftover retry held by bait growth budget; candidate origins remain unresolved", bait.targets[t].name));
                         continue;
                     }
@@ -2608,6 +2675,19 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         w.flush()?;
         std::fs::remove_file(&pass)?;
         let stop_reason = stopped[t].unwrap_or("bait_complete");
+        // The last permitted scan skips extension. A budget stop with no previous bait gain
+        // can still have the legacy bait_complete reason without observing a fixed point.
+        let checked_walk = !cfg.kmer_gate
+            || (!walk_stopped[t] && kmer_walks[t].last().is_some_and(|walk| {
+                walk.skipped.is_none() && !walk.budget_reached
+                    && walk.capped_ends == 0 && walk.tips_removed == 0
+            }));
+        let closure_observed = !ran_out && cfg.iterations > 1 && counts.reads > 0
+            && !res.partial_candidates[t] && !extension_subsampled[t] && !frontier_withheld[t]
+            && checked_walk;
+        let recruitment_state = RecruitmentState::from_stop(
+            stop_reason, ran_out, closure_observed, bootstrap_budget_exhausted[t],
+        );
         outputs.push(TargetOutput {
             name: target.name.clone(),
             recruited_reads: counts.reads,
@@ -2617,7 +2697,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             read_depth: final_depths.read[t],
             implied_size: final_depths.implied_size[t],
             stop_reason,
-            converged: !matches!(stop_reason, "iteration_limit" | "size_cap" | "growing" | "bootstrap_limit"),
+            recruitment_state,
+            converged: recruitment_state == RecruitmentState::Converged,
             sampling_fraction: fraction,
             sampled_by,
             kept_reads,
@@ -2697,6 +2778,114 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recruitment_state_requires_an_observed_closure() {
+        let dir = std::env::temp_dir().join(format!("ovasm-recruit-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fa");
+        let target = pseudo_random(150, 97);
+        let background = pseudo_random(150, 83);
+        let bait = bait_from(&target, 21);
+        let data = format!(">target\n{}\n", std::str::from_utf8(&target).unwrap());
+        std::fs::write(&reads, &data).unwrap();
+        let config = |label, passes| test_config(&reads, dir.join(label), passes, false);
+
+        let full = run(bait.clone(), config("full", 3)).unwrap();
+        let exact = &full.outputs[0];
+        assert_eq!(full.iterations_run, 1);
+        assert_eq!(exact.stop_reason, "bait_complete");
+        assert_eq!(exact.recruitment_state, RecruitmentState::Converged);
+        assert!(exact.converged);
+        let json = serde_json::to_value(exact).unwrap();
+        assert_eq!(json["recruitment_state"], "converged");
+        assert_eq!(json["converged"], true);
+
+        let one = run(bait.clone(), config("one", 1)).unwrap();
+        let one = &one.outputs[0];
+        assert_eq!(one.stop_reason, "single_pass");
+        assert_eq!(one.recruitment_state, RecruitmentState::Truncated);
+        assert!(!one.converged);
+        assert_eq!(std::fs::read(&one.output).unwrap(), std::fs::read(&exact.output).unwrap());
+
+        let mut capped = config("output-capped", 3);
+        capped.max_bases = Some(1);
+        let capped = run(bait.clone(), capped).unwrap();
+        assert!(capped.outputs[0].sampling_fraction < 1.0);
+        assert_eq!(capped.outputs[0].recruitment_state, RecruitmentState::Converged);
+
+        let partial = [&target[..75], &background[75..]].concat();
+        std::fs::write(&reads, format!("{data}>partial\n{}\n",
+            std::str::from_utf8(&partial).unwrap())).unwrap();
+        let mut with_partial = config("partial", 3);
+        with_partial.params.numt_min_block = 40;
+        let partial = run(bait.clone(), with_partial).unwrap();
+        assert_eq!(partial.numt_candidates, 1);
+        assert_eq!(partial.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(partial.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+        assert_eq!(std::fs::read(&partial.outputs[0].output).unwrap(), std::fs::read(&exact.output).unwrap());
+
+        let novel = [&target[..130], &background[130..]].concat();
+        std::fs::write(&reads, format!("{data}>below-support\n{}\n",
+            std::str::from_utf8(&novel).unwrap())).unwrap();
+        let below_support = run(bait.clone(), config("below-support", 3)).unwrap();
+        assert_eq!(below_support.outputs[0].recruited_reads, 2);
+        assert_eq!(below_support.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(below_support.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+
+        let common = [&target[..], &background[..10]].concat();
+        let rare = [&common[..], &background[10..30]].concat();
+        let common = std::str::from_utf8(&common).unwrap();
+        let rare = std::str::from_utf8(&rare).unwrap();
+        std::fs::write(&reads, format!(
+            "{data}>common1\n{common}\n>common2\n{common}\n>common3\n{common}\n>rare\n{rare}\n"
+        )).unwrap();
+        let unsupported_tail = run(bait.clone(), config("gain-and-unsupported-tail", 3)).unwrap();
+        assert_eq!(unsupported_tail.iterations_run, 2);
+        assert!(unsupported_tail.iterations[0].bait_kmers_added[0] > 0);
+        assert_eq!(unsupported_tail.iterations[1].extended_from_reads[0], 0);
+        assert_eq!(unsupported_tail.numt_candidates, 0);
+        assert_eq!(unsupported_tail.outputs[0].recruited_reads, 5);
+        assert_eq!(unsupported_tail.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(unsupported_tail.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+
+        let mut multi_bait = bait.clone();
+        let growing = multi_bait.target("growing").unwrap();
+        multi_bait.add_sequence(growing, &background[..130]);
+        let second = std::str::from_utf8(&background).unwrap();
+        std::fs::write(&reads, format!("{data}>grow1\n{second}\n>grow2\n{second}\n>grow3\n{second}\n")).unwrap();
+        let mixed = run(multi_bait, config("mixed", 2)).unwrap();
+        assert_eq!(mixed.iterations_run, 2);
+        assert_eq!(mixed.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(mixed.outputs[growing].stop_reason, "iteration_limit");
+        assert!(mixed.outputs.iter().all(|o| o.recruitment_state == RecruitmentState::Truncated));
+
+        let text: String = (0..5200).map(|i| format!(">r{i}\n{}\n",
+            std::str::from_utf8(&target).unwrap())).collect();
+        std::fs::write(&reads, text).unwrap();
+        let mut sampled = config("extension-sampled", 3);
+        sampled.extend_depth = 1.0;
+        let sampled = run(bait, sampled).unwrap();
+        assert_eq!(sampled.outputs[0].recruited_reads, 5200);
+        assert_eq!(sampled.outputs[0].kept_reads, 5200);
+        assert!(sampled.iterations[0].extended_from_reads[0] < 5200);
+        assert_eq!(sampled.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(sampled.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recruitment_guard_states_distinguish_budget_from_insufficient_evidence() {
+        use RecruitmentState::{Converged, Truncated, Unresolved};
+        let state = RecruitmentState::from_stop;
+        assert_eq!(state("bootstrap_limit", false, false, true), Truncated);
+        assert_eq!(state("bootstrap_limit", false, false, false), Unresolved);
+        assert_eq!(state("size_cap", false, false, false), Truncated);
+        assert_eq!(state("saturated", false, false, false), Unresolved);
+        assert_eq!(state("growing", false, false, false), Unresolved);
+        assert_eq!(state("seeded_from_reads", false, false, false), Unresolved);
+        assert_eq!(state("bait_complete", false, true, false), Converged);
+    }
 
     #[test]
     fn accepted_short_partial_reads_are_audited_without_source_claims() {
@@ -4087,7 +4276,7 @@ mod tests {
         let first = &gated.iterations[0];
         assert_eq!(first.extension_gated_out[0], 0, "organelle-like by depth");
         assert_eq!(first.extension_shallow_out[0], stray as u64);
-        assert!(gated.outputs[0].converged);
+        assert_eq!(gated.outputs[0].recruitment_state, RecruitmentState::Unresolved);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4311,9 +4500,10 @@ mod tests {
         let gated = run(bait, config("gated", true)).unwrap();
         let mito_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'm');
         assert_eq!(plain.outputs[0].stop_reason, "saturated");
+        assert_eq!(plain.outputs[0].recruitment_state, RecruitmentState::Unresolved);
         assert!(mito_reads(&plain) < 480, "{}", mito_reads(&plain));
         assert_eq!(mito_reads(&gated), 960);
-        assert!(gated.outputs[0].converged);
+        assert_ne!(gated.outputs[0].recruitment_state, RecruitmentState::Truncated);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4396,7 +4586,7 @@ mod tests {
         assert!(!cfg.kmer_gate);
         let result = run(bait, cfg).unwrap();
         assert_eq!(count_reads(&result.outputs[0].output, b'm'), 1200);
-        assert!(result.outputs[0].converged);
+        assert_ne!(result.outputs[0].recruitment_state, RecruitmentState::Truncated);
         assert!(result.depth_gate.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4422,7 +4612,9 @@ mod tests {
         assert_eq!(mito_reads(&plain), 1200);
         assert_eq!(mito_reads(&gated), 1200);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
-        assert!(gated.outputs[0].converged && plain.outputs[0].converged);
+        for report in [&gated, &plain] {
+            assert_ne!(report.outputs[0].recruitment_state, RecruitmentState::Truncated);
+        }
         let frontier: u64 = gated.iterations.iter().map(|it| it.frontier_reads[0]).sum();
         assert!(frontier > 0);
         assert!(

@@ -294,6 +294,16 @@ polymorpha plastid reads took 2.5 GB, 8.5 Gb of Carex echinata "plastid" reads 3
 cache (`recruit/input-cache`, a quarter byte per base plus names) is used when the output disk has room for twice the need
 (`default_recruit_cache`).
 
+### Recruitment status in the report
+
+Each target in `recruit.json` has a `recruitment_state`.
+
+- `converged` requires an evaluated pass with no bait gain and no unresolved evidence within the configured search. The check covers recruited reads and the partial candidates assigned to that target by the classifier.
+- `unresolved` covers heuristic saturation, seeds supplied as reads, or evidence withheld during extension. For example, a read can contain a new k-mer that lacks independent support. The run retains this uncertainty when a later pass has no new evidence for that read.
+- `truncated` covers stops due to the scan budget, the target size cap, or explicit bootstrap limits. A single scan classifies reads without extending the bait. The last allowed scan also skips extension, so a target can have the historical `bait_complete` reason and still be truncated.
+
+The `stop_reason` field retains the historical stop label. The `converged` boolean is true only for the `converged` state. The state describes the observed bait search under the run's rules. Final FASTQ sampling is reported separately, and the state cannot establish physical genome completeness.
+
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 
 ### 4.1 Closed-syncmer sparse graph
