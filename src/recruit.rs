@@ -1497,10 +1497,13 @@ fn leftovers_outgrow_their_depth(solid: usize, bases: usize, longest: usize, own
 
 /// Whether the sequence leftovers would add, judged by the library depth of its k-mers (`depths`,
 /// those of its solid new k-mers the depth gate's sketch samples), is one genome at the target's
-/// read depth `own`: its median and upper quartile within `LEFTOVER_DEPTH` of `own`. One genome
-/// at depth d has its k-mers in a Poisson band around d; nuclear repeats beside the target's own
-/// reads are many sequences at many depths, most of them far deeper. The lower quartile is not
-/// judged: sequencing errors and variants seen in two leftovers sit at a few x.
+/// read depth `own`: its median within `LEFTOVER_DEPTH` of `own`, and its upper quartile below
+/// `ONE_COPY_SPREAD` times the median, halfway to a second copy, so that three quarters of it
+/// stand at one depth. One genome at depth d has its k-mers in a Poisson band around d (the
+/// circles of a multipartite mitochondrion each at its own depth); leftovers drawn from many
+/// sequences (nuclear repeats, a mitochondrial read's NUMT neighbours) spread over many depths.
+/// The lower quartile is not judged: sequencing errors and variants seen in two leftovers sit at
+/// a few x.
 ///
 /// `leftovers_outgrow_their_depth` takes the leftovers to be all the reads of what they add, and
 /// they need not be: a leftover is a read with a block of the bait, and a stretch of the genome
@@ -1509,9 +1512,11 @@ fn leftovers_outgrow_their_depth(solid: usize, bases: usize, longest: usize, own
 /// the mitochondrion stopped at 2,530 kb of 2,766 kb, the 200 kb between a 10 kb and a 25 kb
 /// plastid insertion left out; its 853 leftovers (9.7 Mb) stood for at most 70 kb at 359x by
 /// their bases but held 179,660 new k-mers, median 734x and upper quartile 830x beside a 718x
-/// target. The Pseudognaphalium luteoalbum leftovers that run away into the nucleus (135 reads,
-/// 54,302 new k-mers beside 1,146x; admitted, recruitment went from 32,949 to 71,159 reads in
-/// five passes and kept growing) have theirs at median 2,091x, upper quartile 7,201x. Too few
+/// target. Held: the Pseudognaphalium luteoalbum leftovers that run away into the nucleus (135
+/// reads, 54,302 new k-mers beside 1,146x, median 2,091x, upper quartile 7,201x; admitted,
+/// recruitment went from 32,949 to 71,159 reads in five passes and kept growing), and the Acer
+/// campestre second round (1,456 reads, 451,232 new k-mers beside 1,030x, median 516x, upper
+/// quartile 1,620x; admitted, recruitment went from 103,415 to 234,283 reads in a pass). Too few
 /// sampled k-mers (`MIN_DEPTH_SAMPLES`) judge nothing.
 fn new_sequence_at_depth(depths: &mut [u32], own: f64) -> bool {
     if own <= 0.0 || depths.len() < MIN_DEPTH_SAMPLES {
@@ -1519,8 +1524,11 @@ fn new_sequence_at_depth(depths: &mut [u32], own: f64) -> bool {
     }
     depths.sort_unstable();
     let q = |f: f64| depths[((depths.len() - 1) as f64 * f).round() as usize] as f64;
-    q(0.5) >= LEFTOVER_DEPTH.0 * own && q(0.75) <= LEFTOVER_DEPTH.1 * own
+    let (mid, upper) = (q(0.5), q(0.75));
+    (LEFTOVER_DEPTH.0 * own..=LEFTOVER_DEPTH.1 * own).contains(&mid) && upper <= ONE_COPY_SPREAD * mid
 }
+/// See `new_sequence_at_depth`: halfway between one copy and two.
+const ONE_COPY_SPREAD: f64 = 1.5;
 /// Fewest sampled k-mers `new_sequence_at_depth` judges by (the sketch samples one k-mer in 64:
 /// about 2 kb of new sequence).
 const MIN_DEPTH_SAMPLES: usize = 30;
@@ -4679,8 +4687,14 @@ mod tests {
         let spread = |q: [u32; 5]| -> Vec<u32> { (0..800).map(|i| q[i * 5 / 800]).collect() };
         // Carex laevigata leftovers beside 718x, deciles 1, 3, 5, 7, 9 (errors at the low end)
         assert!(new_sequence_at_depth(&mut spread([7, 361, 734, 830, 1131]), 718.0));
+        // a second circle at three quarters of the target's depth
+        assert!(new_sequence_at_depth(&mut spread([9, 480, 540, 570, 650]), 718.0));
         // Pseudognaphalium luteoalbum leftovers beside 1,146x
         assert!(!new_sequence_at_depth(&mut spread([119, 608, 2091, 7201, 21775]), 1146.0));
+        // Acer campestre second round beside 1,030x: median at half the target, spread wide
+        assert!(!new_sequence_at_depth(&mut spread([60, 300, 516, 1620, 3000]), 1030.0));
+        // Carex laevigata second round beside 723x
+        assert!(!new_sequence_at_depth(&mut spread([53, 214, 441, 923, 2338]), 723.0));
         // shallow: nuclear single-copy flanks
         assert!(!new_sequence_at_depth(&mut [60; 200], 718.0));
         // too few to judge
