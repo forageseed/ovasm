@@ -979,10 +979,15 @@ fn name_key(id: &[u8]) -> u64 {
 /// Salt of the subsample used for bait extension (independent of the output downsampling).
 const EXTEND_SALT: u64 = 0xB417_E87E;
 
-/// What a read is downsampled by: its whole name, or with `mates_together` the name's first word.
+/// Downsample mates by the first name token without an optional terminal /1 or /2.
 fn sample_name(id: &[u8], mates_together: bool) -> &[u8] {
     if mates_together {
-        id.split(|b| b.is_ascii_whitespace()).next().unwrap_or(id)
+        let name = id.split(|b| b.is_ascii_whitespace()).next().unwrap_or(id);
+        if name.len() > 2 {
+            name.strip_suffix(b"/1").or_else(|| name.strip_suffix(b"/2")).unwrap_or(name)
+        } else {
+            name
+        }
     } else {
         id
     }
@@ -2800,6 +2805,28 @@ mod tests {
         assert_eq!(unit_hash(sample_name(a, true), 3), unit_hash(sample_name(b, true), 3));
         assert_eq!(sample_name(a, false), a);
         assert_ne!(unit_hash(sample_name(a, false), 3), unit_hash(sample_name(b, false), 3));
+    }
+
+    #[test]
+    fn slash_mates_share_sampling_decisions_without_changing_other_names() {
+        let a = b"instrument/read/1";
+        let b = b"instrument/read/2";
+        assert_eq!(sample_name(a, true), b"instrument/read");
+        assert_eq!(sample_name(b, true), b"instrument/read");
+        for salt in [0, 3, u64::MAX] {
+            let ha = unit_hash(sample_name(a, true), salt);
+            let hb = unit_hash(sample_name(b, true), salt);
+            assert_eq!(ha, hb);
+            for fraction in [0.1, 0.5, 0.9] { assert_eq!(ha < fraction, hb < fraction); }
+        }
+        assert_eq!(sample_name(b"instrument/read/12", true), b"instrument/read/12");
+        assert_eq!(sample_name(b"instrument/1/read", true), b"instrument/1/read");
+        assert_eq!(sample_name(b"plain", true), b"plain");
+        assert_eq!(sample_name(b"/1", true), b"/1");
+        assert_eq!(sample_name(b"/2", true), b"/2");
+        assert_eq!(sample_name(b"x/1 comment", true), b"x");
+        assert_eq!(sample_name(a, false), a);
+        assert_eq!(sample_name(b, false), b);
     }
 
     #[test]
