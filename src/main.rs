@@ -27,6 +27,7 @@ mod phase;
 mod protein_seed;
 mod pipeline;
 mod primary;
+mod read_admission;
 mod read_context;
 mod read_model;
 mod reconstruct;
@@ -596,6 +597,9 @@ struct RunArgs {
     /// Audit JSON as ORGANELLE=PATH for one retained FASTA supplied with --seeds.
     #[arg(long = "seed-source-audit")]
     seed_source_audits: Vec<String>,
+    /// Admit exact original records with independently supplied source evidence in seed recruitment.
+    #[arg(long)]
+    read_admission_manifest: Option<PathBuf>,
     /// Lineage: plant (default), animal or fungi; 0/1/2 as PMAT2 -x. Sets seeds, protein panel, genetic code.
     ///
     /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
@@ -818,6 +822,12 @@ fn run(args: RunArgs) -> Result<()> {
         // the short names of `-g` work here too (mt=PATH, pt=PATH)
         seeds.entry(seed_organelle(name).to_string()).or_default().push(path.into());
     }
+    if args.read_admission_manifest.is_some()
+        && (args.read_set != pipeline::ReadSet::WholeGenome
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!("--read-admission-manifest requires whole-genome seed recruitment");
+    }
     if !args.seed_source_audits.is_empty()
         && (args.read_set != pipeline::ReadSet::WholeGenome
             || args.recruit == pipeline::RecruitBy::Discover)
@@ -1015,6 +1025,7 @@ fn run(args: RunArgs) -> Result<()> {
         seeds,
         builtin_seeds,
         seed_source_audits,
+        read_admission_manifest: args.read_admission_manifest,
         seed_lineage: args.lineage,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
@@ -2178,6 +2189,9 @@ fn discover(args: DiscoverArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct RecruitArgs {
+    /// Admit exact original records with independently supplied source evidence after baiting.
+    #[arg(long)]
+    read_admission_manifest: Option<PathBuf>,
     /// Read files (FASTQ/FASTA, optionally .gz); repeat for several libraries.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -2463,7 +2477,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
         bait.k,
         bait.targets.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
-    let report = recruit::run_with_frontier_audit(
+    let report = recruit::run_with_options(
         bait,
         recruit::RecruitConfig {
             bait_growth_guard: false,
@@ -2501,6 +2515,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             genome_size: args.genome_size,
         },
         args.frontier_audit,
+        args.read_admission_manifest.as_deref(),
     )?;
     for o in &report.outputs {
         let depth = match (o.read_depth, o.implied_size) {

@@ -322,8 +322,9 @@ When protein-seed passes exceed one, the mitochondrial component filter also run
 
 ### 3.5 NUMT flags and competing targets
 
-- `NumtCandidate`: a partial read (cover below `min_cover`) with a contiguous organelle-like block of at least `numt_min_block`: an organelle
-  segment with nuclear flanks. Written to `numt_candidates.fastq` and used by bootstrap and frontier extension.
+- `NumtCandidate` describes a partial read (cover below `min_cover`) with a contiguous organelle-like block of at least `numt_min_block`.
+  The unexplained sequence may reflect a nuclear insertion or sequence missing from the target bait. OVASM writes these reads to
+  `numt_candidates.fastq` and uses them in bootstrap and frontier extension.
 - Both organelles are seeded unless `--single-seed`: a mitochondrion seeded alone extended into the plastid genome through plastid-derived
   stretches (Ajuga and Alisma "mitochondria" were plastids; plastid reads are 10-30x deeper).
 
@@ -354,6 +355,40 @@ same record. It reports some stages only as counts. Example coordinates refer to
 the final bait and matching uses the read identifier and sequence. A match does not
 establish the read's physical source. This option uses the existing scans and keeps
 the recruitment and FASTQ rules.
+
+### 3.7 Admit original reads with external source evidence
+
+Use `--read-admission-manifest MANIFEST.json` with `ovasm find recruit` or with the
+seed recruitment arm of `ovasm run hifi` and `ovasm run short`. Prepare the manifest
+from independent source evidence for the input sample. The manifest has schema
+`ovasm.read-admission.v1`, a nonempty `scope` and a `records` array. Each record has
+the following fields.
+
+| Field | Value |
+| --- | --- |
+| `target` | Exact seed target name, such as `mitochondrion` |
+| `read_id_hex` | Lowercase hexadecimal bytes of the complete FASTA or FASTQ header after its initial marker |
+| `sequence_sha256` | Lowercase SHA-256 of the parsed sequence bytes, preserving case and removing line breaks |
+| `quality_sha256` | Lowercase SHA-256 of the FASTQ quality bytes, or JSON null for FASTA |
+| `provenance` | Object with `path` and lowercase SHA-256 `sha256` for the evidence file. Relative paths resolve beside the canonical manifest. |
+
+Each declared identifier must occur once in the manifest and once across the original
+inputs. OVASM validates the evidence file and exact original record digests. The source
+assessment itself comes from the evidence author. Record bytes come from the original
+input stream. Existing passes establish the final bait call. New admissions are
+appended in manifest order after ordinary downsampling, without extending the bait
+or adding the other mate. An ordinary call for the requested target keeps its usual
+sampling behavior. An ordinary call exclusively for another target takes precedence.
+A partial record keeps its diagnostic entry even when it is explicitly admitted.
+The same sampling hash applies to added records, and an addition must fit within
+the remaining configured base cap.
+
+The optional `read_admission` section of `recruit.json` records manifest and evidence
+digests, the baseline classification and each record's outcome. `already_recruited`
+describes the baseline call before sampling. `admitted` confirms the record was
+written. The remaining outcomes are `competing_target`, `downsampled` and `base_cap`.
+Final output counts include admitted records. Iteration counts, bait closure and
+sketch-based depth describe the ordinary bait search.
 
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 

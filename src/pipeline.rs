@@ -124,6 +124,8 @@ pub struct RunConfig {
     pub builtin_seeds: BTreeSet<String>,
     /// Provenance of each explicitly audited retained seed FASTA.
     pub(crate) seed_source_audits: BTreeMap<String, crate::seed_source::Provenance>,
+    /// Explicitly verified original records for the seed recruitment arm.
+    pub read_admission_manifest: Option<PathBuf>,
     /// The built-in library `builtin_seeds` came from (`summary.json` records it).
     pub seed_lineage: crate::seeddb::Lineage,
     pub recruit: RecruitBy,
@@ -873,6 +875,13 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
         .cloned()
         .unwrap_or_default();
     out.remove("output");
+    if let Some(audit) = report.get("read_admission") {
+        let mut audit = audit.clone();
+        if let Some(records) = audit["records"].as_array_mut() {
+            records.retain(|record| record["target"] == organelle);
+        }
+        out.insert("read_admission".into(), audit);
+    }
     out.insert("extend_gate".into(), report["extend_gate"].clone());
     out.insert("bootstrap".into(), report["bootstrap"].clone());
     out.insert("gated_by_default".into(), gated.into());
@@ -1087,6 +1096,9 @@ fn recruit_all(
             )
             .opt("--salt", cfg.salt.to_string())
             .each("--reads", &cfg.reads);
+        if let Some(path) = &cfg.read_admission_manifest {
+            argv = argv.opt("--read-admission-manifest", path);
+        }
         for (name, paths) in &cfg.seeds {
             for p in paths {
                 let mut spec = OsString::from(format!("{name}="));
@@ -2683,6 +2695,7 @@ mod tests {
             seeds: BTreeMap::new(),
             builtin_seeds: BTreeSet::new(),
             seed_source_audits: BTreeMap::new(),
+            read_admission_manifest: None,
             seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: RecruitBy::Seeds,
             recruit_depth: None,

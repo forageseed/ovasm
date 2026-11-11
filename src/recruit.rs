@@ -684,9 +684,13 @@ fn scan(
     final_outputs: bool,
     gate_sketch: Option<&mut crate::seedfree::GateSketch>,
     gpu: Option<&mut crate::gpu::Gpu>,
+    mut admission: Option<&mut crate::read_admission::Admission>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
+    if let Some(plan) = &mut admission {
+        plan.begin_scan();
+    }
     // the change check of a replay pass, on the GPU while it works (else on the CPU, same answer)
     let mut gpu = gpu.filter(|_| replaying && !final_outputs);
     if let Some(d) = delta {
@@ -879,6 +883,9 @@ fn scan(
                     cache.cover_bounds.push(bound);
                 }
             }
+            if let Some(plan) = &mut admission {
+                plan.observe(&entry.rec, call, !replaying || final_outputs);
+            }
             if call == Call::Other {
                 continue;
             }
@@ -958,6 +965,9 @@ fn scan(
         w.flush()?;
     }
     numt_w.flush()?;
+    if let Some(plan) = admission {
+        plan.finish_scan()?;
+    }
     if profiling() { eprintln!(
         "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s gpu={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
         if final_outputs { "final" } else if replaying { "replay" } else { "source" },
@@ -1102,6 +1112,8 @@ pub struct RecruitReport {
     pub targets: Vec<crate::bait::Target>,
     pub iterations: Vec<IterationStats>,
     pub outputs: Vec<TargetOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_admission: Option<crate::read_admission::Report>,
     pub numt_candidates: u64,
     pub numt_output: String,
     pub source_candidates: serde_json::Value,
@@ -1829,15 +1841,19 @@ fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
 }
 
 pub fn run(bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
-    run_with_frontier_audit(bait, cfg, false)
+    run_with_options(bait, cfg, false, None)
 }
 
-pub(crate) fn run_with_frontier_audit(
+pub(crate) fn run_with_options(
     mut bait: BaitSet, cfg: RecruitConfig, audit_frontier: bool,
+    admission_manifest: Option<&Path>,
 ) -> Result<RecruitReport> {
     use crate::retained::{FrontierAudit, FrontierReason};
 
     let start = Instant::now();
+    let mut admission = admission_manifest
+        .map(|path| crate::read_admission::Admission::load(path, &bait))
+        .transpose()?;
     std::fs::create_dir_all(&cfg.out_dir)?;
     let mut iterations = Vec::new();
     let mut replay = cfg
@@ -1967,6 +1983,7 @@ pub(crate) fn run_with_frontier_audit(
             // only the first pass: without a cache every pass reads the inputs
             if it == 0 { gate_sketch.as_mut() } else { None },
             gpu.as_mut(),
+            admission.as_mut(),
         )?;
         if crate::recruit::profiling() {
             eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
@@ -2623,6 +2640,7 @@ pub(crate) fn run_with_frontier_audit(
             true,
             None,
             None,
+            admission.as_mut(),
         )?;
         anyhow::ensure!(
             final_res.reads == res.reads && final_res.bases == res.bases,
@@ -2712,15 +2730,25 @@ pub(crate) fn run_with_frontier_audit(
         let pass = pass_path(&cfg.out_dir, &target.name);
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
         let (mut kept_reads, mut kept_bases) = (0u64, 0u64);
+        let eligible = |r: &Rec| fraction >= 1.0
+            || unit_hash(sample_name(&r.id, cfg.mates_together), cfg.salt) < fraction;
         let mut failed = Ok(());
         for_each_rec(&pass, |r| {
-            if failed.is_ok() && (fraction >= 1.0 || unit_hash(sample_name(&r.id, cfg.mates_together), cfg.salt) < fraction) {
+            if failed.is_ok() && eligible(&r) {
                 kept_reads += 1;
                 kept_bases += r.seq.len() as u64;
                 failed = write_rec(&mut w, &r);
             }
         })?;
         failed?;
+        let added = if let Some(plan) = &mut admission {
+            let available = cfg.max_bases.unwrap_or(u64::MAX).saturating_sub(kept_bases);
+            plan.append(t, &mut w, eligible, available)?
+        } else {
+            TargetCounts::default()
+        };
+        kept_reads += added.reads;
+        kept_bases += added.bases;
         w.flush()?;
         std::fs::remove_file(&pass)?;
         let stop_reason = stopped[t].unwrap_or("bait_complete");
@@ -2739,10 +2767,14 @@ pub(crate) fn run_with_frontier_audit(
         );
         outputs.push(TargetOutput {
             name: target.name.clone(),
-            recruited_reads: counts.reads,
-            recruited_bases: counts.bases,
+            recruited_reads: counts.reads + added.reads,
+            recruited_bases: counts.bases + added.bases,
             seed_length: target.seed_length,
-            estimated_depth: depth,
+            estimated_depth: if target.seed_length > 0 {
+                (counts.bases + added.bases) as f64 / target.seed_length as f64
+            } else {
+                0.0
+            },
             read_depth: final_depths.read[t],
             implied_size: final_depths.implied_size[t],
             stop_reason,
@@ -2785,6 +2817,7 @@ pub(crate) fn run_with_frontier_audit(
         targets: bait.targets.clone(),
         iterations,
         outputs,
+        read_admission: admission.map(|plan| plan.report()),
         numt_candidates: res.numt.reads,
         numt_output: numt_path.display().to_string(),
         source_candidates,
@@ -2829,6 +2862,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_read_admission_preserves_bait_and_original_quality_across_replay() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!("ovasm-read-admission-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fq");
+        let proof = dir.join("proof.json");
+        let manifest = dir.join("manifest.json");
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let core = pseudo_random(150, 97);
+        let extension = [&core[..135], &pseudo_random(15, 19)].concat();
+        let partial = Rec {
+            id: b"partial/2 source metadata".to_vec(),
+            seq: [&core[..75], &pseudo_random(75, 83)].concat(),
+            qual: Some([b'!'; 75].into_iter().chain([b'I'; 75]).collect()),
+        };
+        let mut data = Vec::new();
+        write_rec(&mut data, &partial).unwrap();
+        let mut admitted = data.clone();
+        for i in 0..3 {
+            write_rec(&mut data, &Rec {
+                id: format!("known-{i}").into_bytes(),
+                seq: extension.clone(),
+                qual: Some(vec![b'J'; 150]),
+            }).unwrap();
+        }
+        std::fs::write(&reads, data).unwrap();
+        let evidence = br#"{"fixture":"exact partial original"}"#;
+        std::fs::write(&proof, evidence).unwrap();
+        let hex: String = partial.id.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
+            "schema": "ovasm.read-admission.v1",
+            "scope": "synthetic original record",
+            "records": [{
+                "target": "mito",
+                "read_id_hex": hex,
+                "sequence_sha256": digest(&partial.seq),
+                "quality_sha256": digest(partial.qual.as_ref().unwrap()),
+                "provenance": {"path": "proof.json", "sha256": digest(evidence)}
+            }]
+        })).unwrap()).unwrap();
+
+        let config = |label: &str| {
+            let mut cfg = test_config(&reads, dir.join(label), 3, false);
+            cfg.params.numt_min_block = 40;
+            cfg
+        };
+        let bait = bait_from(&core, 21);
+        let baseline = run(bait.clone(), config("baseline")).unwrap();
+        let baseline_reads = std::fs::read(dir.join("baseline/mito.fastq")).unwrap();
+        assert!(baseline.iterations_run > 1);
+        assert!(baseline.read_admission.is_none());
+        assert_eq!(std::fs::read(dir.join("baseline/numt_candidates.fastq")).unwrap(), admitted);
+        let mut expected = baseline_reads;
+        expected.append(&mut admitted);
+        for label in ["uncached", "cached"] {
+            let mut cfg = config(label);
+            if label == "cached" {
+                cfg.replay_dir = Some(dir.join("replay"));
+            }
+            let report = run_with_options(bait.clone(), cfg, false, Some(&manifest)).unwrap();
+            assert_eq!(report.iterations_run, baseline.iterations_run);
+            assert_eq!(report.outputs[0].recruitment_state, baseline.outputs[0].recruitment_state);
+            assert_eq!(report.outputs[0].kept_reads, baseline.outputs[0].kept_reads + 1);
+            assert_eq!(std::fs::read(dir.join(label).join("mito.fastq")).unwrap(), expected);
+            assert_eq!(std::fs::read(dir.join(label).join("numt_candidates.fastq")).unwrap(),
+                std::fs::read(dir.join("baseline/numt_candidates.fastq")).unwrap());
+            let audit = serde_json::to_value(report.read_admission.unwrap()).unwrap();
+            assert_eq!(audit["records"][0]["baseline"], "partial");
+            assert_eq!(audit["records"][0]["status"], "admitted");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn optional_frontier_evidence_keeps_recruitment_and_source_outputs() {
         let dir = std::env::temp_dir().join(format!("ovasm-frontier-audit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2849,7 +2957,7 @@ mod tests {
             cfg
         };
         let standard = run(bait.clone(), config("standard")).unwrap();
-        let audited = run_with_frontier_audit(bait, config("audited"), true).unwrap();
+        let audited = run_with_options(bait, config("audited"), true, None).unwrap();
         let relative = Path::new("source_candidates/frontier-evidence.jsonl");
         assert!(!dir.join("standard").join(relative).exists());
         assert_eq!(standard.outputs[0].recruitment_state, audited.outputs[0].recruitment_state);
