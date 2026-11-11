@@ -1064,6 +1064,9 @@ const VARIANT_SHARE: f64 = 0.8;
 /// mitochondrion, at 43, spells about a copy of the unit and was removed as a near copy, and
 /// the 21.2 kb mitochondrion stayed a linear 18.9 kb.
 const VARIANT_OWN_DEPTH: f64 = 0.5;
+/// Unitigs looked at for the deeper way's return to the junction (`clean`, `returns_to`): an
+/// array of units shorter than k is one looping unitig, of longer ones a few.
+const VARIANT_LOOP_UNITIGS: usize = 8;
 
 /// A dead-end branch no deeper than this many times the nuclear share of the node depth is the
 /// nuclear flank of a NUMT (see `clean`).
@@ -1319,6 +1322,28 @@ fn clean(
             .copied()
             .max_by(|x, y| dp[x.0].total_cmp(&dp[y.0]))
     };
+    // Whether the way `start` leads back to the junction `to` within a few unitigs: the deeper way
+    // is then a loop the arm leaves (a tandem array and the way out of it), not a sequence the arm
+    // runs beside. Without it every arm from half the node depth was kept, and where the node depth
+    // is low the near copies stayed: Ganoderma resinaceum (PMAT2 benchmark, node depth 5 from the
+    // protein seeds, the median of its nodes 9), 28 unitigs and 2 molecules became 61 and 27.
+    let returns_to = |start: OEnd, to: OEnd| {
+        let mut seen: Vec<OEnd> = vec![start];
+        let mut i = 0;
+        while i < seen.len() && seen.len() <= VARIANT_LOOP_UNITIGS {
+            let cur = seen[i];
+            i += 1;
+            if cur == to {
+                return true;
+            }
+            for &nx in out.get(&cur).map(|s| s.as_slice()).unwrap_or(&[]) {
+                if !seen.contains(&nx) {
+                    seen.push(nx);
+                }
+            }
+        }
+        seen[i..].contains(&to)
+    };
     let mut junctions: Vec<(&OEnd, &Vec<OEnd>)> = out.iter().filter(|(_, s)| s.len() > 1).collect();
     junctions.sort_unstable_by_key(|(from, _)| **from);
     for (&from, succ) in junctions {
@@ -1332,7 +1357,7 @@ fn clean(
                 || strongest_at[u]
                 || unitigs[u].circular
                 || dp[u] >= 0.5 * dp[best.0]
-                || dp[u] >= VARIANT_OWN_DEPTH * depth
+                || (dp[u] >= VARIANT_OWN_DEPTH * depth && returns_to(best, from))
             {
                 continue;
             }
