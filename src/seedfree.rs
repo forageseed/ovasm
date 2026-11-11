@@ -769,6 +769,15 @@ impl DepthGate {
     pub fn k(&self) -> usize {
         self.params.k
     }
+
+    /// Sketch depths of those of `kmers` the sketch samples (0 for a sampled k-mer it never saw).
+    pub fn sampled_depths(&self, kmers: &[u64]) -> Vec<u32> {
+        kmers
+            .iter()
+            .filter(|&&km| mix64(km) < self.threshold)
+            .map(|km| self.sketch.counts.get(km).copied().unwrap_or(0))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
