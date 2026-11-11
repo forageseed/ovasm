@@ -1494,6 +1494,42 @@ const LEFTOVER_MIN_READS: usize = 5;
 fn leftovers_outgrow_their_depth(solid: usize, bases: usize, longest: usize, own: f64) -> bool {
     own > 0.0 && solid as f64 > bases as f64 / (LEFTOVER_DEPTH.0 * own) + 2.0 * longest as f64
 }
+
+/// Whether the sequence leftovers would add, judged by the library depth of its k-mers (`depths`,
+/// those of its solid new k-mers the depth gate's sketch samples), is one genome at the target's
+/// read depth `own`: its median and upper quartile within `LEFTOVER_DEPTH` of `own`. One genome
+/// at depth d has its k-mers in a Poisson band around d; nuclear repeats beside the target's own
+/// reads are many sequences at many depths, most of them far deeper. The lower quartile is not
+/// judged: sequencing errors and variants seen in two leftovers sit at a few x.
+///
+/// `leftovers_outgrow_their_depth` takes the leftovers to be all the reads of what they add, and
+/// they need not be: a leftover is a read with a block of the bait, and a stretch of the genome
+/// the bait reaches only through short repeats, beyond plastid insertions longer than a read, is
+/// sampled only by those of its reads that hold such a block. Carex laevigata (protein seeds):
+/// the mitochondrion stopped at 2,530 kb of 2,766 kb, the 200 kb between a 10 kb and a 25 kb
+/// plastid insertion left out; its 853 leftovers (9.7 Mb) stood for at most 70 kb at 359x by
+/// their bases but held 179,660 new k-mers, median 734x and upper quartile 830x beside a 718x
+/// target. The Pseudognaphalium luteoalbum leftovers that run away into the nucleus (135 reads,
+/// 54,302 new k-mers beside 1,146x; admitted, recruitment went from 32,949 to 71,159 reads in
+/// five passes and kept growing) have theirs at median 2,091x, upper quartile 7,201x. Too few
+/// sampled k-mers (`MIN_DEPTH_SAMPLES`) judge nothing.
+fn new_sequence_at_depth(depths: &mut [u32], own: f64) -> bool {
+    if own <= 0.0 || depths.len() < MIN_DEPTH_SAMPLES {
+        return false;
+    }
+    depths.sort_unstable();
+    let q = |f: f64| depths[((depths.len() - 1) as f64 * f).round() as usize] as f64;
+    q(0.5) >= LEFTOVER_DEPTH.0 * own && q(0.75) <= LEFTOVER_DEPTH.1 * own
+}
+/// Fewest sampled k-mers `new_sequence_at_depth` judges by (the sketch samples one k-mer in 64:
+/// about 2 kb of new sequence).
+const MIN_DEPTH_SAMPLES: usize = 30;
+
+/// The median and upper quartile of sorted `depths` (`new_sequence_at_depth`), for warnings.
+fn depth_mid_upper(depths: &[u32]) -> (u32, u32) {
+    let q = |f: f64| depths[((depths.len() - 1) as f64 * f).round() as usize];
+    (q(0.5), q(0.75))
+}
 /// The only target the leftover bootstrap applies to. A plastid is one circle; what is left at its
 /// depth beside it is nuclear repeat sequence (rDNA, satellites at thousands of copies), and
 /// bootstrapping from it ran the Pseudognaphalium luteoalbum plastid away to the 1 Mb size cap
@@ -2518,20 +2554,47 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     warnings.push(format!("{}: third leftover retry included candidates without nuclear-origin certification; same-depth nuclear repeats may be included", bait.targets[t].name));
                 } else {
                     if let Some(own) = leftover_own {
-                        let solid = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), 2).len();
+                        let new_kmers = bait.new_from_reads(t, picked.iter().map(Vec::as_slice), 2);
+                        let solid = new_kmers.len();
                         let longest = picked.iter().map(Vec::len).max().unwrap_or(0);
-                        if leftovers_outgrow_their_depth(solid, picked_bases, longest, own) {
+                        // More new sequence than the leftovers' bases stand for is still one
+                        // genome when it stands at the target's depth in the library: a stretch
+                        // the bait reaches only through short shared blocks, sampled by few of
+                        // its reads (`new_sequence_at_depth`).
+                        // (the gate counts k-mers of its own length; at another, nothing is judged)
+                        let mut new_depths = if g.k() == bait.k { g.sampled_depths(&new_kmers) } else { Vec::new() };
+                        new_depths.sort_unstable();
+                        let at_depth = new_sequence_at_depth(&mut new_depths, own);
+                        let outgrow = leftovers_outgrow_their_depth(solid, picked_bases, longest, own);
+                        if outgrow && at_depth {
+                            let (mid, upper) = depth_mid_upper(&new_depths);
+                            let w = format!(
+                                "{}: leftover bootstrap round {}: its {} reads ({} bp) add {} new k-mers, more than their bases stand for, at the target's depth (median {}x, upper quartile {}x beside {:.0}x): sequence the bait reaches through short shared blocks",
+                                bait.targets[t].name, leftover_rounds[t] + 1, picked.len(), picked_bases, solid,
+                                mid, upper, own
+                            );
+                            eprintln!("[ovasm] {w}");
+                            warnings.push(w);
+                        }
+                        if outgrow && !at_depth {
                             saturated[t] = true;
                             stopped[t] = Some("bootstrap_limit");
+                            let spread = if new_depths.len() >= MIN_DEPTH_SAMPLES {
+                                let (mid, upper) = depth_mid_upper(&new_depths);
+                                format!("its new k-mers at median {mid}x, upper quartile {upper}x")
+                            } else {
+                                format!("{} of its new k-mers sampled", new_depths.len())
+                            };
                             let w = format!(
-                                "{}: leftover bootstrap round {} held: its {} reads ({} bp) stand for at most {:.0} bp at {:.0}x and would add {} new k-mers; they are not one genome at the target's depth",
+                                "{}: leftover bootstrap round {} held: its {} reads ({} bp) stand for at most {:.0} bp at {:.0}x and would add {} new k-mers, {}; they are not one genome at the target's depth",
                                 bait.targets[t].name,
                                 leftover_rounds[t] + 1,
                                 picked.len(),
                                 picked_bases,
                                 picked_bases as f64 / (LEFTOVER_DEPTH.0 * own) + 2.0 * longest as f64,
                                 LEFTOVER_DEPTH.0 * own,
-                                solid
+                                solid,
+                                spread
                             );
                             eprintln!("[ovasm] warning: {w}");
                             warnings.push(w);
@@ -4609,6 +4672,20 @@ mod tests {
             plain.iterations.len()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leftovers_beyond_their_bases_must_stand_at_the_targets_depth() {
+        let spread = |q: [u32; 5]| -> Vec<u32> { (0..800).map(|i| q[i * 5 / 800]).collect() };
+        // Carex laevigata leftovers beside 718x, deciles 1, 3, 5, 7, 9 (errors at the low end)
+        assert!(new_sequence_at_depth(&mut spread([7, 361, 734, 830, 1131]), 718.0));
+        // Pseudognaphalium luteoalbum leftovers beside 1,146x
+        assert!(!new_sequence_at_depth(&mut spread([119, 608, 2091, 7201, 21775]), 1146.0));
+        // shallow: nuclear single-copy flanks
+        assert!(!new_sequence_at_depth(&mut [60; 200], 718.0));
+        // too few to judge
+        assert!(!new_sequence_at_depth(&mut [718; MIN_DEPTH_SAMPLES - 1], 718.0));
+        assert!(!new_sequence_at_depth(&mut [718; 100], 0.0));
     }
 
     #[test]
