@@ -107,6 +107,186 @@ fn parse_label(index: &FxHashMap<&str, usize>, label: &str) -> Result<Oriented> 
     Ok((s, fwd))
 }
 
+
+type ClosureEdge = (Oriented, Oriented);
+
+fn closure_edge(from: Oriented, to: Oriented) -> ClosureEdge {
+    (from, to).min((flip(to), flip(from)))
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosureLink {
+    from: String,
+    to: String,
+    overlaps_bp: BTreeSet<usize>,
+    single_record_crossings: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosure {
+    segment: String,
+    link: LocalRepeatClosureLink,
+    state: &'static str,
+    closed_walk_length: Option<usize>,
+    competing_links: Vec<LocalRepeatClosureLink>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosureContext {
+    source: &'static str,
+    path: String,
+    reported_records: u64,
+    closure_segments: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosures {
+    scope: &'static str,
+    min_single_record_crossings: u64,
+    contexts_truncated: bool,
+    closures: Vec<LocalRepeatClosure>,
+    contexts: Vec<LocalRepeatClosureContext>,
+}
+
+fn local_repeat_closures(
+    g: &Graph,
+    report: &Value,
+    repeats: &[bool],
+    graph_bound_records: bool,
+    phases: &crate::phase::Constraints,
+    min_reads: u64,
+    context_budget: u64,
+) -> Option<LocalRepeatClosures> {
+    let seeds: BTreeSet<_> = g.links.iter()
+        .filter_map(|&(a, b)| (a == b && repeats[a.0]).then_some(a.0))
+        .collect();
+    if seeds.is_empty() {
+        return None;
+    }
+    let index: FxHashMap<_, _> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let mut edges: BTreeMap<ClosureEdge, BTreeSet<usize>> = BTreeMap::new();
+    let mut incident: BTreeMap<usize, BTreeSet<ClosureEdge>> = BTreeMap::new();
+    for (&(a, b), &overlap) in g.links.iter().zip(&g.overlaps) {
+        let key = closure_edge(a, b);
+        edges.entry(key).or_default().insert(overlap);
+        for s in [a.0, b.0] {
+            if seeds.contains(&s) {
+                incident.entry(s).or_default().insert(key);
+            }
+        }
+    }
+    let mut record_links = BTreeMap::new();
+    if graph_bound_records {
+        // ReadModel::load has already checked the graph, schema and uniqueness of
+        // these canonical links. Its producer counts each record once per link.
+        for row in report["thread_evidence"]["links"].as_array().into_iter().flatten() {
+            let from = parse_label(&index, row["from"].as_str().unwrap()).unwrap();
+            let to = parse_label(&index, row["to"].as_str().unwrap()).unwrap();
+            record_links.insert(closure_edge(from, to), row["records"].as_u64().unwrap());
+        }
+    }
+    let describe_link = |key: ClosureEdge| LocalRepeatClosureLink {
+        from: g.label(key.0),
+        to: g.label(key.1),
+        overlaps_bp: edges[&key].clone(),
+        single_record_crossings: graph_bound_records.then(|| record_links.get(&key).copied().unwrap_or(0)),
+    };
+    let min_reads = min_reads.max(1);
+    let closures = seeds.iter().map(|&s| {
+        let node = (s, true);
+        let key = closure_edge(node, node);
+        let link = describe_link(key);
+        let overlaps = &link.overlaps_bp;
+        let seq = &g.seqs[s];
+        let valid_overlap = overlaps.iter().next().copied().filter(|&n| {
+            overlaps.len() == 1 && n < seq.len() && seq[..n] == seq[seq.len() - n..]
+        });
+        let competing_links = incident[&s].iter().copied().filter(|&e| e != key)
+            .map(&describe_link).collect::<Vec<_>>();
+        let (state, closed_walk_length) = match valid_overlap {
+            None => ("unresolved_overlap", None),
+            Some(_) if !phases.allows_walk(&[node], true) => ("unresolved_phase_conflict", None),
+            Some(_) if link.single_record_crossings.is_none() => ("unresolved_no_graph_bound_crossings", None),
+            Some(_) if link.single_record_crossings.unwrap_or(0) < min_reads => ("unresolved_insufficient_crossings", None),
+            Some(n) if !competing_links.is_empty() => ("unresolved_competing_context", Some(seq.len() - n)),
+            Some(n) => ("unresolved_local_closed_walk", Some(seq.len() - n)),
+        };
+        LocalRepeatClosure { segment: g.names[s].clone(), link, state, closed_walk_length, competing_links }
+    }).collect();
+
+    // Store each canonical context once, even when it touches several closure
+    // segments. The separate path-scan budget cannot consume cover-search work.
+    let mut context_index = BTreeMap::<(&'static str, Vec<Oriented>), u64>::new();
+    let mut remaining = context_budget;
+    let mut contexts_truncated = false;
+    for (&(entry, segment, exit), &records) in &phases.phases {
+        let walk = vec![entry, segment, exit];
+        if !walk.iter().any(|o| seeds.contains(&o.0)) {
+            continue;
+        }
+        let Some(next) = remaining.checked_sub(3) else {
+            contexts_truncated = true;
+            break;
+        };
+        remaining = next;
+        let reverse = rc_walk(&walk);
+        let support = context_index.entry(("phase_report", walk.min(reverse))).or_default();
+        *support = (*support).max(records);
+    }
+    let inputs = [
+        ("single_record_thread", &report["thread_evidence"]["paths"], graph_bound_records),
+        ("observed_walk", &report["observed_walks"], true),
+        ("phased_path", &report["phased_paths"], true),
+    ];
+    'sources: for (source, rows, available) in inputs {
+        if contexts_truncated || !available {
+            continue;
+        }
+        for row in rows.as_array().into_iter().flatten() {
+            let (Some(path), Some(records)) = (row["path"].as_str(), row["reads"].as_u64()) else {
+                continue;
+            };
+            let mut walk = Vec::new();
+            for token in path.split_whitespace() {
+                let Some(next) = remaining.checked_sub(1) else {
+                    contexts_truncated = true;
+                    break 'sources;
+                };
+                remaining = next;
+                let Ok(node) = parse_label(&index, token) else {
+                    walk.clear();
+                    break;
+                };
+                walk.push(node);
+            }
+            if walk.len() < 2 || !walk.iter().any(|o| seeds.contains(&o.0))
+                || walk.windows(2).any(|w| !edges.contains_key(&closure_edge(w[0], w[1])))
+            {
+                continue;
+            }
+            let reverse = rc_walk(&walk);
+            let entry = context_index.entry((source, walk.min(reverse))).or_default();
+            *entry = (*entry).max(records);
+        }
+    }
+    let contexts = context_index.into_iter().map(|((source, walk), reported_records)| {
+        let touched: BTreeSet<_> = walk.iter().map(|o| o.0).filter(|s| seeds.contains(s)).collect();
+        LocalRepeatClosureContext {
+            source,
+            path: walk.iter().map(|&o| g.label(o)).collect::<Vec<_>>().join(" "),
+            reported_records,
+            closure_segments: touched.into_iter().map(|s| g.names[s].clone()).collect(),
+        }
+    }).collect();
+    Some(LocalRepeatClosures {
+        scope: "local repeat self-loop spellings; no complete molecule or physical topology inference",
+        min_single_record_crossings: min_reads,
+        contexts_truncated,
+        closures,
+        contexts,
+    })
+}
+
 /// Bridges in both directions: phased paths plus direct links between two anchors.
 fn bridges(
     g: &Graph,
@@ -1518,6 +1698,9 @@ pub struct LinearizeReport {
     pub weak_bridges: usize,
     /// Self-loops and paths returning to their own anchor (tandem or sub-circle evidence).
     pub self_loops: Vec<String>,
+    /// Local repeat self-loop hypotheses do not participate in complete covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_repeat_closures: Option<LocalRepeatClosures>,
     /// Anchors without any bridge: no path joins them to the rest, so each is reported as its own
     /// linear molecule (unless shallow); the graph is broken there or the reads do not cover it.
     pub unbridged_anchors: Vec<String>,
@@ -2322,6 +2505,7 @@ pub fn run_phased(
             .filter(|&&s| !br.iter().any(|b| b.walk[0].0 == s))
             .map(|&s| g.names[s].clone())
             .collect(),
+        local_repeat_closures: local_repeat_closures(&g, &report, &repeat, read_model.is_some(), &phases, p.min_reads, p.max_steps),
         self_loops,
         unsolved_components: comps
             .iter()
@@ -3184,6 +3368,107 @@ mod tests {
         assert!(r.best.as_ref().unwrap().circular);
         assert_eq!(r.molecules, 1);
         assert_eq!(r.repeats_not_placed, names(&["R"]));
+    }
+
+
+    fn repeat_closure_fixture() -> Graph {
+        Graph {
+            names: ["A", "R", "B", "S"].map(String::from).to_vec(),
+            seqs: vec![b"ACGT".repeat(6); 4],
+            links: vec![
+                ((1, true), (1, true)),
+                ((1, false), (1, false)),
+                ((0, true), (1, true)),
+                ((1, true), (2, true)),
+                ((3, true), (3, false)),
+            ],
+            overlaps: vec![0; 5],
+        }
+    }
+
+    fn repeat_closure_evidence(g: &Graph, direct: u64) -> Value {
+        json!({
+            "repeat_segments": ["R", "S"],
+            "links": link_reads(&[("R-", "R-", direct), ("R+", "B+", 1), ("A+", "R+", 2)]),
+            "observed_walks": [{"path":"R+ R+ B+", "reads":1}, {"path":"B- R- R-", "reads":1}],
+            "phased_paths": [{"path":"A+ R+ B+", "reads":2}],
+            "thread_evidence": {
+                "schema": crate::thread_evidence::SCHEMA,
+                "graph_fingerprint": crate::unzip::graph_fingerprint(g),
+                "accepted_records": 1,
+                "links": [
+                    {"from":"R-", "to":"R-", "records":direct},
+                    {"from":"R+", "to":"B+", "records":1},
+                    {"from":"A+", "to":"R+", "records":2}
+                ],
+                "paths": [{"path":"R+ R+ B+", "reads":1}]
+            }
+        })
+    }
+
+    #[test]
+    fn local_repeat_closures_keep_competing_links_and_distinct_contexts() {
+        let g = repeat_closure_fixture();
+        let ev = repeat_closure_evidence(&g, 3);
+        let repeat = [false, true, false, true];
+        assert!(crate::read_model::ReadModel::load(&g, &ev, &repeat, 2).unwrap().is_some());
+        let report = local_repeat_closures(&g, &ev, &repeat, true, &Default::default(), 2, 100).unwrap();
+        let [closure] = report.closures.as_slice() else { panic!("expected one same-strand loop") };
+        assert_eq!((closure.segment.as_str(), closure.state, closure.closed_walk_length),
+                   ("R", "unresolved_competing_context", Some(24)));
+        assert_eq!(closure.link.single_record_crossings, Some(3));
+        assert_eq!(closure.competing_links.len(), 2);
+        assert!(closure.competing_links.iter().any(|e| e.single_record_crossings == Some(1)));
+        assert_eq!(report.contexts.len(), 3);
+        assert!(!report.contexts_truncated);
+        assert_eq!(report.contexts.iter().find(|r| r.source == "observed_walk").unwrap().reported_records, 1);
+        let limited = local_repeat_closures(&g, &ev, &repeat, true, &Default::default(), 2, 1).unwrap();
+        assert!(limited.contexts_truncated);
+        assert_eq!(limited.closures[0].competing_links.len(), 2);
+        assert!(local_repeat_closures(&g, &ev, &[false; 4], true, &Default::default(), 2, 100).is_none());
+    }
+
+    #[test]
+    fn local_repeat_closures_withhold_unverified_or_insufficient_crossings_and_ambiguous_overlap() {
+        let mut g = repeat_closure_fixture();
+        let repeat = [false, true, false, true];
+        let ev = repeat_closure_evidence(&g, 1);
+        let get = |g: &Graph, bound| local_repeat_closures(g, &ev, &repeat, bound, &Default::default(), 2, 100).unwrap();
+        assert_eq!(get(&g, true).closures[0].state, "unresolved_insufficient_crossings");
+        assert_eq!(get(&g, false).closures[0].state, "unresolved_no_graph_bound_crossings");
+        assert!(get(&g, false).closures[0].closed_walk_length.is_none());
+        g.overlaps[1] = 4;
+        let ambiguous = get(&g, true);
+        assert_eq!(ambiguous.closures[0].state, "unresolved_overlap");
+        assert_eq!(ambiguous.closures[0].link.overlaps_bp, BTreeSet::from([0, 4]));
+    }
+
+    #[test]
+    fn local_repeat_closures_respect_conflicting_hard_phase() {
+        let g = repeat_closure_fixture();
+        let repeat = [false, true, false, true];
+        let ev = repeat_closure_evidence(&g, 3);
+        let path = std::env::temp_dir().join(format!("ovasm-local-closure-phase-{}.json", std::process::id()));
+        fs::write(&path, json!({
+            "graph_fingerprint": crate::unzip::graph_fingerprint(&g),
+            "min_count": 2,
+            "unique_records": 10,
+            "repeat_nodes": [{
+                "segment":"R", "classification":"resolved",
+                "entries":[{"segment":"A+","adjacency_reads":3},{"segment":"R+","adjacency_reads":3}],
+                "exits":[{"segment":"R+","adjacency_reads":3},{"segment":"B+","adjacency_reads":3}],
+                "phases":[{"entry":"A+","exit":"R+","reads":3,"supported":true},
+                          {"entry":"R+","exit":"B+","reads":3,"supported":true}]
+            }]
+        }).to_string()).unwrap();
+        let phase = crate::phase::Constraints::load(&g, &path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(!phase.allows_walk(&[(1, true)], true));
+        let report = local_repeat_closures(&g, &ev, &repeat, true, &phase, 2, 100).unwrap();
+        assert_eq!(report.closures[0].state, "unresolved_phase_conflict");
+        assert_eq!(report.closures[0].closed_walk_length, None);
+        assert_eq!(report.closures[0].competing_links.len(), 2);
+        assert_eq!(report.contexts.iter().filter(|row| row.source == "phase_report").count(), 2);
     }
 
     #[test]
