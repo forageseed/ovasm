@@ -86,6 +86,10 @@ class CropOriginalsTest(unittest.TestCase):
         self.assertEqual(row["read_id_hex"], b"a note\r".hex())
         self.assertEqual(row["sequence_sha256"], sha256(b"TGAA\r").hexdigest())
         self.assertEqual(row["quality_sha256"], sha256(b"IIII\r").hexdigest())
+        sys.path.insert(0, str(SCRIPT.parent))
+        from prepare_read_admission import LockedFile, fastq
+        source = LockedFile.lock(self.root, {"path": "originals.fq", "sha256": sha256(output).hexdigest()})
+        self.assertEqual(list(fastq(source)), [(b"a note\r", b"TGAA\r", b"IIII\r")])
 
     def test_wrong_compressed_digest_publishes_neither_output(self):
         self.add_set("candidate", b">a span=0-4\nTGAA\n")

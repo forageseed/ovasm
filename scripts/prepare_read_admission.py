@@ -120,10 +120,10 @@ def fasta(locked):
 def fastq(locked):
     with open_input(locked) as stream:
         while head := stream.readline():
-            seq = stream.readline().rstrip(b"\r\n")
+            seq = stream.readline().removesuffix(b"\n").removesuffix(b"\r")
             plus = stream.readline()
-            qual = stream.readline().rstrip(b"\r\n")
-            rid = head.rstrip(b"\r\n")[1:]
+            qual = stream.readline().removesuffix(b"\n").removesuffix(b"\r")
+            rid = head.removesuffix(b"\n").removesuffix(b"\r")[1:]
             require(head.startswith(b"@") and rid and plus.startswith(b"+")
                     and len(seq) == len(qual) > 0, f"malformed FASTQ record in {locked.path}")
             yield rid, seq, qual
