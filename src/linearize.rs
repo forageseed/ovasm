@@ -564,6 +564,15 @@ fn component_reachability(
 }
 
 fn search_phased_indexed_impl(
+    n_seg: usize, anchors: &[usize], optional: &[bool], br: &[Bridge], m: usize,
+    max_steps: u64, phases: &crate::phase::Constraints,
+    out_of: &FxHashMap<Oriented, Vec<usize>>,
+    thread_ends: Option<&crate::read_model::ThreadEnds>, optimize: bool,
+) -> (Vec<Vec<Found>>, bool, bool) {
+    search_phased_indexed_bounded(n_seg, anchors, optional, br, m, max_steps, phases, out_of, thread_ends, optimize, None)
+}
+
+fn search_phased_indexed_bounded(
     n_seg: usize,
     anchors: &[usize],
     optional: &[bool],
@@ -574,6 +583,7 @@ fn search_phased_indexed_impl(
     out_of: &FxHashMap<Oriented, Vec<usize>>,
     thread_ends: Option<&crate::read_model::ThreadEnds>,
     optimize: bool,
+    candidate_limit: Option<usize>,
 ) -> (Vec<Vec<Found>>, bool, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
@@ -584,6 +594,7 @@ fn search_phased_indexed_impl(
         want: usize,
         m: usize,
         max_steps: u64,
+        candidate_limit: Option<usize>,
         topology_neutral: bool,
         optimize: bool,
         reach: Option<&'a (FxHashMap<Oriented, usize>, Vec<Vec<bool>>)>,
@@ -732,6 +743,10 @@ fn search_phased_indexed_impl(
             if s.done.len() + 1 == c.m {
                 let mut cover = s.done.clone();
                 cover.push(mol);
+                if c.candidate_limit.is_some_and(|limit| s.found.len() >= limit) {
+                    s.truncated = true;
+                    return;
+                }
                 s.found.push(cover);
             }
             continue;
@@ -860,6 +875,7 @@ fn search_phased_indexed_impl(
                 charge(&mut budget, cost + bridges.len())?;
                 let mut extended = cover.clone();
                 extended.last_mut().unwrap().bridges.extend(bridges);
+                if c.candidate_limit.is_some_and(|limit| covers.len() >= limit) { return None; }
                 covers.push(extended);
             }
         }
@@ -876,6 +892,7 @@ fn search_phased_indexed_impl(
         want: anchors.iter().filter(|&&a| !optional[a]).count(),
         m,
         max_steps,
+        candidate_limit,
         topology_neutral: thread_ends.is_some(),
         optimize,
         reach: reach.as_ref(),
@@ -1934,17 +1951,23 @@ pub fn run_phased(
             let (mut found, mut truncated, mut terminal_truncated) = search_phased_indexed(
                 g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, thread_ends.as_ref(),
             );
-            // Automatic mode retries only compact graphs with a modest number of candidates.
-            // Explicit --max-steps remains a hard limit. Release the first batch before retrying
-            // so candidate vectors from the two searches never coexist. One retry per component.
-            if truncated && p.adaptive_steps && !rep.adaptive_retry && comp.len() <= 32
-                && br.len() <= 128 && found.len() <= 1_000_000
+            // Retain the existing compact-component retry. For moderately sized
+            // components, retry once with a bounded candidate count so that a larger
+            // step budget does not turn into unbounded candidate memory.
+            // Explicit --max-steps remains authoritative.
+            let compact_retry = comp.len() <= 32 && found.len() <= 1_000_000;
+            let bounded_retry = comp.len() > 32 && comp.len() <= 64 && found.len() <= 1_000_000;
+            if (truncated || terminal_truncated) && p.adaptive_steps && !rep.adaptive_retry
+                && ((compact_retry && br.len() <= 128) || (bounded_retry && br.len() <= 256))
             {
                 rep.adaptive_retry = true;
                 drop(found);
-                (found, truncated, terminal_truncated) = search_phased_indexed(
+                let factor = if bounded_retry { 4 } else { 2 };
+                let cap = bounded_retry.then_some(1_000_000);
+                (found, truncated, terminal_truncated) = search_phased_indexed_bounded(
                     g.names.len(), &comp, &optional, &br, m,
-                    p.max_steps.saturating_mul(2), &phases, &search_out_of, thread_ends.as_ref(),
+                    p.max_steps.saturating_mul(factor), &phases, &search_out_of, thread_ends.as_ref(),
+                    true, cap,
                 );
             }
             rep.search_truncated |= truncated || terminal_truncated;
@@ -3129,6 +3152,22 @@ mod tests {
         assert!(r.best.as_ref().unwrap().circular);
         assert_eq!(r.molecules, 1);
         assert_eq!(r.repeats_not_placed, names(&["R"]));
+    }
+
+    #[test]
+    fn bounded_retry_marks_candidate_limit_as_truncated() {
+        let anchors = [0usize];
+        let optional = [false];
+        let br = vec![Bridge { walk: vec![(0, true), (0, true)], reads: 2, weak: false, topological: false }];
+        let mut out = FxHashMap::default();
+        out.insert((0, true), vec![0]);
+        let phase = crate::phase::Constraints::default();
+        let unbounded = search_phased_indexed_impl(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true);
+        assert!(!unbounded.0.is_empty() && !unbounded.1);
+        let capped = search_phased_indexed_bounded(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true, Some(0));
+        assert!(capped.0.is_empty() && capped.1);
+        let enough = search_phased_indexed_bounded(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true, Some(unbounded.0.len()));
+        assert!(!enough.1 && !enough.2 && enough.0.len() == unbounded.0.len());
     }
 
     #[test]
