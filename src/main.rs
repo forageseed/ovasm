@@ -2064,6 +2064,9 @@ struct ProteinSeedArgs {
     /// Maximum FASTX record crops exported for each organelle in the diagnostic.
     #[arg(long, requires = "whole_read_candidates")]
     whole_read_candidate_cap: Option<usize>,
+    /// Rank diagnostic exports by input order or by stable FASTX record content.
+    #[arg(long, value_enum, requires = "whole_read_candidates")]
+    whole_read_export_order: Option<protein_seed::SampleOrder>,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -2211,6 +2214,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         let cap = args.whole_read_candidate_cap.unwrap_or(protein_seed::WHOLE_READ_MAX_SEEDS);
         let report = protein_seed::run_whole_read_candidates(
             &args.reads, &panel, &p, &want, &args.out, cap,
+            args.whole_read_export_order.unwrap_or_default(),
         )?;
         eprintln!("{}", report.summary());
         return Ok(());

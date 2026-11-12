@@ -32,7 +32,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -442,22 +442,26 @@ struct RankedRecord {
 
 impl RankedRecord {
     fn new(raw: Rec) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(b"ovasm.protein-cluster-sample.v1\0");
-        for field in [&raw.id, &raw.seq] {
-            hash.update((field.len() as u64).to_be_bytes());
-            hash.update(field);
-        }
-        match &raw.qual {
-            None => hash.update([0]),
-            Some(quality) => {
-                hash.update([1]);
-                hash.update((quality.len() as u64).to_be_bytes());
-                hash.update(quality);
-            }
-        }
-        Self { digest: hash.finalize().into(), raw }
+        Self { digest: raw_record_priority(&raw), raw }
     }
+}
+
+fn raw_record_priority(raw: &Rec) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"ovasm.protein-cluster-sample.v1\0");
+    for field in [&raw.id, &raw.seq] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    match &raw.qual {
+        None => hash.update([0]),
+        Some(quality) => {
+            hash.update([1]);
+            hash.update((quality.len() as u64).to_be_bytes());
+            hash.update(quality);
+        }
+    }
+    hash.finalize().into()
 }
 
 impl Ord for RankedRecord {
@@ -1293,6 +1297,152 @@ fn whole_read_seeds(
 
 const WHOLE_READ_CANDIDATE_FILE: &str = "protein_whole_read_candidates";
 
+/// Order canonical FASTA records by bytes without retaining long crops in memory.
+fn compare_spooled_crops(left: &Path, right: &Path) -> Result<Ordering> {
+    let mut left = BufReader::new(std::fs::File::open(left)?);
+    let mut right = BufReader::new(std::fs::File::open(right)?);
+    loop {
+        let a = left.fill_buf()?;
+        let b = right.fill_buf()?;
+        let length = a.len().min(b.len());
+        if length == 0 {
+            return Ok(a.len().cmp(&b.len()));
+        }
+        let order = a[..length].cmp(&b[..length]);
+        if order != Ordering::Equal {
+            return Ok(order);
+        }
+        left.consume(length);
+        right.consume(length);
+    }
+}
+
+struct SpooledCrop {
+    slot: u64,
+    bytes: u64,
+    bases: usize,
+    occurrences: usize,
+}
+
+#[derive(Serialize)]
+struct StableCropExportReport {
+    retained_distinct_priority_crops: usize,
+    spool_writes: u64,
+    peak_spooled_payload_bytes: u64,
+}
+
+/// Hold only the lowest-priority occurrences for a role. Payloads stay in the staging
+/// directory. Identical priority and output bytes share one spool file and occupy
+/// one slot per occurrence.
+struct StableCropExport {
+    root: PathBuf,
+    cap: usize,
+    picked: BTreeMap<[u8; 32], Vec<SpooledCrop>>,
+    count: usize,
+    writes: u64,
+    payload_bytes: u64,
+    peak_bytes: u64,
+}
+
+impl StableCropExport {
+    fn new(root: PathBuf, cap: usize) -> Result<Self> {
+        std::fs::create_dir(&root)?;
+        Ok(Self {
+            root,
+            cap,
+            picked: BTreeMap::new(),
+            count: 0,
+            writes: 0,
+            payload_bytes: 0,
+            peak_bytes: 0,
+        })
+    }
+
+    fn offer(&mut self, read: &Rec, lo: usize, hi: usize) -> Result<()> {
+        self.offer_ranked(raw_record_priority(read), read, lo, hi)
+    }
+
+    fn offer_ranked(&mut self, key: [u8; 32], read: &Rec, lo: usize, hi: usize) -> Result<()> {
+        let full = self.count == self.cap;
+        if full && key > *self.picked.last_key_value().expect("full candidate sample").0 {
+            return Ok(());
+        }
+        let slot = self.writes;
+        let path = self.root.join(slot.to_string());
+        let file = std::fs::File::create_new(&path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        write_whole_read_crop(&mut writer, read, "whole_read_candidates", lo, hi)?;
+        writer.flush()?;
+        let bytes = writer.get_ref().metadata()?.len();
+        drop(writer);
+        self.writes += 1;
+        self.payload_bytes += bytes;
+        self.peak_bytes = self.peak_bytes.max(self.payload_bytes);
+
+        if full {
+            let mut last = self.picked.last_entry().expect("full candidate sample");
+            let same_rank = key == *last.key();
+            let worst = last.get_mut().last_mut().expect("nonempty rank bucket");
+            if same_rank
+                && compare_spooled_crops(&path, &self.root.join(worst.slot.to_string()))? != Ordering::Less
+            {
+                std::fs::remove_file(&path)?;
+                self.payload_bytes -= bytes;
+                return Ok(());
+            }
+            worst.occurrences -= 1;
+            if worst.occurrences == 0 {
+                std::fs::remove_file(self.root.join(worst.slot.to_string()))?;
+                self.payload_bytes -= worst.bytes;
+                last.get_mut().pop();
+                if last.get().is_empty() {
+                    last.remove_entry();
+                }
+            }
+        } else {
+            self.count += 1;
+        }
+
+        let bucket = self.picked.entry(key).or_default();
+        let mut index = 0;
+        while let Some(existing) = bucket.get_mut(index) {
+            match compare_spooled_crops(&path, &self.root.join(existing.slot.to_string()))? {
+                Ordering::Less => break,
+                Ordering::Equal => {
+                    existing.occurrences += 1;
+                    std::fs::remove_file(&path)?;
+                    self.payload_bytes -= bytes;
+                    return Ok(());
+                }
+                Ordering::Greater => index += 1,
+            }
+        }
+        bucket.insert(index, SpooledCrop { slot, bytes, bases: hi - lo, occurrences: 1 });
+        Ok(())
+    }
+
+    fn finish(self, mut writer: impl Write) -> Result<(usize, u64, StableCropExportReport)> {
+        let report = StableCropExportReport {
+            retained_distinct_priority_crops: self.picked.values().map(Vec::len).sum(),
+            spool_writes: self.writes,
+            peak_spooled_payload_bytes: self.peak_bytes,
+        };
+        let mut bases = 0;
+        for crop in self.picked.into_values().flatten() {
+            let path = self.root.join(crop.slot.to_string());
+            for _ in 0..crop.occurrences {
+                let written = std::io::copy(&mut std::fs::File::open(&path)?, &mut writer)?;
+                anyhow::ensure!(written == crop.bytes, "staged candidate crop size changed");
+                bases += crop.bases as u64;
+            }
+            std::fs::remove_file(path)?;
+        }
+        std::fs::remove_dir(self.root)?;
+        Ok((self.count, bases, report))
+    }
+}
+
+
 #[derive(Default, Serialize)]
 struct WholeReadCandidateRole {
     indexed_families: usize,
@@ -1302,6 +1452,8 @@ struct WholeReadCandidateRole {
     omitted_by_cap: u64,
     truncated: bool,
     candidate_fasta: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stable_export: Option<StableCropExportReport>,
 }
 
 #[derive(Serialize)]
@@ -1347,6 +1499,7 @@ pub fn run_whole_read_candidates(
     want: &[&'static str],
     out_dir: &Path,
     cap: usize,
+    export_order: SampleOrder,
 ) -> Result<WholeReadCandidateReport> {
     anyhow::ensure!(cap > 0, "--whole-read-candidate-cap must be at least 1");
     if let Some(parent) = out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -1366,11 +1519,20 @@ pub fn run_whole_read_candidates(
             (role, WholeReadCandidateRole { indexed_families, ..WholeReadCandidateRole::default() })
         }).collect();
         let mut writers = FxHashMap::default();
+        let mut stable = BTreeMap::new();
+        if export_order == SampleOrder::StableRecord {
+            for &role in want {
+                stable.insert(role, StableCropExport::new(staging.join(format!("{role}.spool")), cap)?);
+            }
+        }
         let (reads, bases, paired_gene_evidence) = scan_whole_read_hits(
             inputs, panel, p, want, true,
             |read, WholeReadHit { class, lo, hi }| {
                 let role = roles.get_mut(class).expect("candidate role was requested");
                 role.eligible_records += 1;
+                if let Some(selected) = stable.get_mut(class) {
+                    return selected.offer(read, lo, hi);
+                }
                 if role.exported_records == cap {
                     role.omitted_by_cap += 1;
                     role.truncated = true;
@@ -1389,6 +1551,24 @@ pub fn run_whole_read_candidates(
                 Ok(())
             },
         )?;
+        for (class, selected) in stable {
+            let role = roles.get_mut(class).expect("candidate role was requested");
+            let (records, bases, metrics) = if selected.count == 0 {
+                selected.finish(std::io::sink())?
+            } else {
+                let filename = format!("{WHOLE_READ_CANDIDATE_FILE}.{class}.fasta");
+                let mut writer = std::io::BufWriter::new(std::fs::File::create_new(staging.join(&filename))?);
+                let result = selected.finish(&mut writer)?;
+                role.candidate_fasta = Some(out_dir.join(filename));
+                writers.insert(class, writer);
+                result
+            };
+            role.exported_records = records;
+            role.exported_bases = bases;
+            role.omitted_by_cap = role.eligible_records - records as u64;
+            role.truncated = role.omitted_by_cap != 0;
+            role.stable_export = Some(metrics);
+        }
         for (_, mut writer) in writers {
             writer.flush()?;
             writer.get_ref().sync_all()?;
@@ -1401,7 +1581,10 @@ pub fn run_whole_read_candidates(
             reads,
             bases,
             record_unit: "input_fastx_record",
-            export_order: "merged_input_batch_order",
+            export_order: match export_order {
+                SampleOrder::Legacy => "merged_input_batch_order",
+                SampleOrder::StableRecord => RECORD_PRIORITY_VERSION,
+            },
             min_stretch_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
             min_distinct_families: WHOLE_READ_MIN_GENES,
             min_read_stretches: p.min_read_stretches,
@@ -1441,6 +1624,33 @@ pub fn run_whole_read_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_candidate_spool_preserves_occurrences_and_breaks_exact_hash_ties() {
+        let root = std::env::temp_dir().join(format!("ovasm-stable-crop-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let names = [b"zeta".as_slice(), b"alpha", b"beta", b"alpha", b"alpha"];
+        let mut observed = Vec::new();
+        for (i, order) in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]].into_iter().enumerate() {
+            let mut selected = StableCropExport::new(root.join(i.to_string()), 3).unwrap();
+            for n in order {
+                let raw = Rec { id: names[n].to_vec(), seq: b"ACGT".repeat(4097), qual: None };
+                selected.offer_ranked([0; 32], &raw, 0, raw.seq.len()).unwrap();
+                assert!(selected.count <= 3);
+                assert!(selected.picked.values().map(Vec::len).sum::<usize>() <= 3);
+            }
+            let mut output = Vec::new();
+            let (count, bases, report) = selected.finish(&mut output).unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(bases, 3 * 4 * 4097);
+            assert_eq!(report.retained_distinct_priority_crops, 1);
+            assert_eq!(output.split(|&b| b == b'\n').filter(|line| line.starts_with(b">alpha ")).count(), 3);
+            observed.push(output);
+        }
+        assert_eq!(observed[0], observed[1]);
+        std::fs::remove_dir(root).unwrap();
+    }
+
 
     #[test]
     fn reads_go_to_the_nearest_depth_peak() {
