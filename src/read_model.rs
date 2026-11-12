@@ -123,11 +123,80 @@ pub struct ReadPathCover {
     pub unrepresentable_local_adjacencies: usize,
     pub minimum_family_size_proven: bool,
     pub budget_exhausted: bool,
+    /// Greedy evidence mask preparation uses a separate, bounded work allowance; the
+    /// original matched-set construction is outside both allowances.
+    pub greedy_algorithm: &'static str,
+    /// Separate bounded preparation allowance (2x the initial greedy allowance).
+    pub greedy_preparation_limit: u64,
+    /// Estimated charged work, not a measurement of CPU operations.
+    pub greedy_preparation_estimated_work: u64,
+    /// Charged estimated work; zero when the original set algorithm is used.
+    pub greedy_preparation_work: u64,
     /// Union of candidates participating in all found minimum explanatory families.
     /// This prevents an arbitrary minimum-family tiebreak from erasing ambiguity.
     pub equivalent_candidate_indices: Vec<usize>,
     pub equivalent_minimum_families: u64,
     pub equivalent_families_complete: bool,
+}
+
+/// Greedy cover with bounded *additional* mask preparation. Stable original-index
+/// iteration preserves the old tie break. No candidate is dropped from matched.
+fn greedy_family(matched:&[BTreeSet<usize>],target:&BTreeSet<usize>,budget:&mut u64)
+    -> (BTreeSet<usize>,Vec<usize>,bool,&'static str,u64,u64)
+{
+    let limit=budget.saturating_mul(2);
+    let words=target.len().div_ceil(64);
+    let slots=matched.len().checked_mul(words);
+    // Flat payload, evidence indices and remainder, plus a conservative 64 KiB
+    // allowance for allocator overhead. This is an estimate for added mask
+    // storage, not a strict total-process or allocator byte limit.
+    let lookup_len=target.last().map_or(Some(0),|n|n.checked_add(1));
+    let bytes=slots.and_then(|n|n.checked_mul(8))
+        .and_then(|n|n.checked_add(lookup_len?.checked_mul(std::mem::size_of::<usize>())?))
+        .and_then(|n|n.checked_add(words.checked_mul(8)?))
+        .and_then(|n|n.checked_add(65536));
+    let work=matched.iter().fold((target.len() as u64).saturating_add(matched.len() as u64),
+        |a,s|a.saturating_add(s.len() as u64)).saturating_add(slots.unwrap_or(usize::MAX) as u64)
+        .saturating_add(lookup_len.unwrap_or(usize::MAX) as u64);
+    let dense=bytes.is_some_and(|n|n<=64*1024*1024) && work<=limit;
+    let mut remaining=target.clone();let mut selected=Vec::new();let mut exhausted=false;
+    if dense {
+        let mut indices=vec![usize::MAX;lookup_len.unwrap()];
+        for (i,&j) in target.iter().enumerate(){indices[j]=i;}
+        let mut masks=vec![0u64;slots.unwrap()];
+        for (candidate,fit) in matched.iter().enumerate() {
+            for &j in fit {let i=indices[j];debug_assert_ne!(i,usize::MAX);masks[candidate*words+i/64]|=1u64<<(i%64);}
+        }
+        let mut rem=vec![u64::MAX;words];
+        if target.len()%64!=0 {if let Some(last)=rem.last_mut(){*last=(1u64<<(target.len()%64))-1;}}
+        while !remaining.is_empty() {
+            let mut best=None;
+            for i in 0..matched.len() {
+                if !spend(budget,words+1){exhausted=true;break;}
+                let gain=masks[i*words..(i+1)*words].iter().zip(&rem).map(|(a,b)|(a&b).count_ones() as usize).sum::<usize>();
+                if gain>0 && best.map_or(true,|(_,old)|gain>old){best=Some((i,gain));}
+            }
+            if exhausted{break;}
+            let Some((i,_))=best else{break;};
+            if !spend(budget,words.saturating_add(matched[i].len())){exhausted=true;break;}
+            selected.push(i);
+            for (r,m) in rem.iter_mut().zip(&masks[i*words..(i+1)*words]){*r &= !m;}
+            for j in &matched[i]{remaining.remove(j);}
+        }
+    } else {
+        while !remaining.is_empty() {
+            let mut best=None;
+            for (i,fit) in matched.iter().enumerate() {
+                if !spend(budget,fit.len()+1){exhausted=true;break;}
+                let gain=fit.iter().filter(|i|remaining.contains(i)).count();
+                if gain>0 && best.map_or(true,|(_,old)|gain>old){best=Some((i,gain));}
+            }
+            if exhausted{break;}
+            let Some((i,_))=best else{break;};
+            selected.push(i);for j in &matched[i]{remaining.remove(j);}
+        }
+    }
+    (remaining,selected,exhausted,if dense {"bitset"} else {"set"},limit,work)
 }
 
 fn cover_envelope(masks:&[u64],target:u64,size:usize,budget:&mut u64)->(Vec<usize>,u64,bool) {
@@ -311,18 +380,8 @@ impl ReadModel {
         let matched:Vec<BTreeSet<usize>>=fits.iter().map(|f|f.matched_paths.iter().copied()
             .chain(f.matched_adjacencies.iter().map(|&i|offset+i)).filter(|i|eligible.contains(i)).collect()).collect();
         let target:BTreeSet<_>=matched.iter().flat_map(|f|f.iter().copied()).collect();
-        let mut remaining=target.clone();let mut selected=Vec::new();let mut exhausted=false;
-        while !remaining.is_empty() {
-            let mut best=None;
-            for (i,fit) in matched.iter().enumerate() {
-                if !spend(&mut budget,fit.len()+1) {exhausted=true;break;}
-                let gain=fit.iter().filter(|i|remaining.contains(i)).count();
-                if gain>0 && best.map_or(true,|(_,old)|gain>old) {best=Some((i,gain));}
-            }
-            if exhausted {break;}
-            let Some((i,_))=best else {break;};
-            selected.push(i);for j in &matched[i] {remaining.remove(j);}
-        }
+        let (remaining,mut selected,mut exhausted,algorithm,prep_limit,prep_work)=
+            greedy_family(&matched,&target,&mut budget);
         let mut proven=target.is_empty();
         if !target.is_empty() && remaining.is_empty() && target.len()<=64 && !exhausted {
             let bit:BTreeMap<_,_>=target.iter().enumerate().map(|(i,&j)|(j,i)).collect();
@@ -351,6 +410,9 @@ impl ReadModel {
             supported_local_adjacencies:local(&eligible),represented_local_adjacencies:local(&represented),
             unrepresentable_local_adjacencies:local(&eligible)-local(&target),
             minimum_family_size_proven:proven,budget_exhausted:exhausted,
+            greedy_algorithm:algorithm,greedy_preparation_limit:prep_limit,
+            greedy_preparation_estimated_work:prep_work,
+            greedy_preparation_work:if algorithm=="bitset" {prep_work} else {0},
             equivalent_candidate_indices:equivalent,equivalent_minimum_families:families,equivalent_families_complete:envelope_complete}
     }
 
@@ -498,6 +560,48 @@ impl ReadModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn greedy_bitset_matches_ordered_set_oracle() {
+        fn oracle(m:&[BTreeSet<usize>],t:&BTreeSet<usize>)->Vec<usize>{
+            let mut rem=t.clone();let mut out=Vec::new();
+            while !rem.is_empty(){let mut best=None;for (i,f) in m.iter().enumerate(){let n=f.intersection(&rem).count();if n>0&&best.map_or(true,|(_,b)|n>b){best=Some((i,n));}}
+                let Some((i,_))=best else{break};out.push(i);for j in &m[i]{rem.remove(j);}}
+            out
+        }
+        let mut state=42u64;
+        for n in [0,1,64,65,72,129,257] {
+            for _ in 0..100 {
+                let mut m=Vec::new();
+                for _ in 0..20 {let mut x=BTreeSet::new();for i in 0..n {state=state.wrapping_mul(6364136223846793005).wrapping_add(1);if state>>60<3{x.insert(i);}}m.push(x);}
+                if m.len()>2 {m[1]=m[0].clone();}
+                let target=m.iter().flat_map(|x|x.iter().copied()).collect();let mut budget=10_000_000;
+                let (remaining,selected,exhausted,algorithm,limit,work)=greedy_family(&m,&target,&mut budget);
+                assert_eq!(algorithm,"bitset");assert!(work<=limit);assert!(!exhausted);assert!(remaining.is_empty());assert_eq!(selected,oracle(&m,&target));
+            }
+        }
+    }
+    #[test]
+    fn dense_scan_budget_exhaustion_never_selects_a_partial_round() {
+        let mut matched=vec![[0usize].into_iter().collect::<BTreeSet<_>>();99];
+        matched.push([1usize].into_iter().collect());
+        let target=matched.iter().flat_map(|m|m.iter().copied()).collect();
+        let mut budget=205;
+        let (remaining,selected,exhausted,algorithm,_,_)=greedy_family(&matched,&target,&mut budget);
+        assert_eq!(algorithm,"bitset");assert!(exhausted);assert_eq!(selected,vec![0]);
+        assert_eq!(remaining,[1usize].into_iter().collect());
+    }
+    #[test]
+    fn greedy_budget_and_mask_allocation_fallback_are_bounded() {
+        let m:Vec<BTreeSet<usize>>=vec![[0,1].into_iter().collect(),[1,2].into_iter().collect()];
+        let target=m.iter().flat_map(|x|x.iter().copied()).collect();let mut budget=1;
+        let (remaining,selected,exhausted,algorithm,_,_)=greedy_family(&m,&target,&mut budget);
+        assert_eq!(algorithm,"set");assert!(exhausted);assert_eq!(remaining,target);assert!(selected.is_empty());
+        // Sparse huge ID must fall back before allocating a multi-GiB lookup table.
+        let m:Vec<BTreeSet<usize>>=vec![[0,1usize<<30].into_iter().collect()];
+        let target=m.iter().flat_map(|x|x.iter().copied()).collect();let mut budget=100;
+        let (remaining,selected,exhausted,algorithm,_,_)=greedy_family(&m,&target,&mut budget);
+        assert_eq!(algorithm,"set");assert!(!exhausted);assert!(remaining.is_empty());assert_eq!(selected,vec![0]);
+    }
     fn w(ns:&[usize])->Vec<Oriented>{ns.iter().map(|&n|(n,true)).collect()}
     #[test]
     fn indexed_score_matches_exhaustive_oracle() {
