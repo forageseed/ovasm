@@ -512,6 +512,26 @@ mod tests {
         }
     }
     #[test]
+    fn indexed_score_matches_oracle_across_random_small_covers() {
+        let mut state=0x7139cafeu64;
+        fn next(s:&mut u64)->u64 {*s=s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);*s}
+        fn walk(s:&mut u64,len:usize)->Vec<Oriented> {(0..len).map(|_|{let x=next(s);((x%6) as usize,x&16!=0)}).collect()}
+        for _ in 0..300 {
+            let mut links=BTreeMap::new();
+            for _ in 0..12 {let a=walk(&mut state,2);let n=1+next(&mut state)%5;links.insert(edge(a[0],a[1]),n);}
+            let mut paths=Vec::new();
+            for _ in 0..5 {let n=(next(&mut state)%8) as usize;let w=walk(&mut state,n);let count=1+next(&mut state)%7;let joint=next(&mut state)&1!=0;paths.push((w,count,joint));}
+            let model=ReadModel{paths,links,min_reads:2,index:OnceLock::new()};
+            let nwalks=(1+next(&mut state)%3) as usize;let mut walks=Vec::new();let mut circular=Vec::new();
+            for _ in 0..nwalks {let n=(next(&mut state)%10) as usize;walks.push(walk(&mut state,n));circular.push(next(&mut state)&1!=0);}
+            let mut a=1_000_000;let mut b=1_000_000;
+            let fast=model.score(&walks,&circular,&mut a).unwrap();let slow=model.score_oracle(&walks,&circular,&mut b).unwrap();
+            assert_eq!(serde_json::to_value(&fast).unwrap(),serde_json::to_value(&slow).unwrap());
+            assert_eq!(fast.matched_paths,slow.matched_paths);assert_eq!(fast.matched_adjacencies,slow.matched_adjacencies);
+            let mut short=0;assert!(model.score(&walks,&circular,&mut short).is_none() || walks.iter().all(Vec::is_empty));
+        }
+    }
+    #[test]
     fn indexed_contains_matches_oracle_on_many_deterministic_paths() {
         let mut state=42u64;
         for _ in 0..500 {
