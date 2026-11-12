@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import random
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,7 +95,7 @@ class SeedSourceAudit(unittest.TestCase):
         self.assertEqual(rows["missing"]["reason"], "original_missing")
         out, view = self.root / "audit.json", self.root / "retained.fa"
         subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
-                        "--out", str(out), "--out-fasta", str(view)], check=True)
+                        "--out", str(out), "--out-fasta", str(view), "--python-placements"], check=True)
         self.assertEqual(view.read_bytes(), b"".join(retained))
         result = json.loads(out.read_text())
         self.assertEqual(result["target"], "mitochondrion")
@@ -124,7 +125,7 @@ class SeedSourceAudit(unittest.TestCase):
         out, view = self.root / "strict.json", self.root / "strict.fa"
         subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
                         "--retention-policy", "target-supported-only", "--out", str(out),
-                        "--out-fasta", str(view)], check=True)
+                        "--out-fasta", str(view), "--python-placements"], check=True)
         self.assertEqual(view.read_bytes(), crops[0])
 
     def test_strict_empty_is_reportable_and_repeated_input_alias_fails(self):
@@ -163,7 +164,8 @@ class SeedSourceAudit(unittest.TestCase):
         self.proof.write_bytes(b"modified\n")
         out, view = self.root / "audit.json", self.root / "retained.fa"
         result = subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
-                                 "--out", str(out), "--out-fasta", str(view)], capture_output=True)
+                                 "--out", str(out), "--out-fasta", str(view), "--python-placements"],
+                                capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"SHA-256 mismatch", result.stderr)
         self.assertFalse(out.exists())
@@ -187,6 +189,41 @@ class SeedSourceAudit(unittest.TestCase):
         self.assertEqual(report["records"][0]["reason"], "original_identifier_repeated")
         self.assertEqual(retained, [seed])
 
+
+    def test_default_requires_an_ovasm_executable_and_does_not_fall_back(self):
+        path = self.assemble([(b"seen", self.target)], [self.crop(b"seen", self.target)])
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        out, view = self.root / "audit.json", self.root / "retained.fa"
+        command = [sys.executable, "-B", "-I", str(SCRIPT), str(path), "--out", str(out), "--out-fasta", str(view)]
+        env = {**os.environ, "PATH": str(bin_dir)}
+        cases = (
+            ([], b"OVASM executable not found on PATH"),
+            (["--exact-placement-bin", str(bin_dir / "missing")], b"cannot resolve OVASM executable"),
+            (["--exact-placement-bin", str(bin_dir)], b"not an executable file"),
+            (["--exact-placement-bin", str(bin_dir), "--python-placements"], b"not allowed with argument"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra):
+                failed = subprocess.run([*command, *extra], env=env, capture_output=True, timeout=5)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(message, failed.stderr)
+                self.assertFalse(out.exists())
+                self.assertFalse(view.exists())
+
+        if os.name != "nt":
+            fake = bin_dir / "ovasm"
+            fake.write_text(f"#!{sys.executable}\nraise SystemExit(9)\n")
+            fake.chmod(0o700)
+            failed = subprocess.run(command, env=env, capture_output=True, timeout=5)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(b"OVASM exact placement backend failed (panel", failed.stderr)
+            self.assertFalse(out.exists())
+            self.assertFalse(view.exists())
+
+        subprocess.run([*command, "--python-placements"], env=env, check=True, timeout=5)
+        self.assertTrue(out.exists())
+        self.assertTrue(view.exists())
 
     def test_requested_batch_failure_leaves_no_outputs(self):
         path = self.assemble([(b"seen", self.target)], [self.crop(b"seen", self.target)])
@@ -263,14 +300,24 @@ class SeedSourceAudit(unittest.TestCase):
                   self.crop(b"outside", self.novel, start=64), self.crop(b"mixed", self.target, start=64),
                   self.crop(b"missing", self.novel)]
         path = self.assemble(originals, crops, as_gzip=True)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        shutil.copy2(binary, bin_dir / ("ovasm.exe" if os.name == "nt" else "ovasm"))
+        modes = (
+            ("python", ["--python-placements"], self.root / "empty"),
+            ("default", [], bin_dir),
+            ("explicit", ["--exact-placement-bin", str(binary)], self.root / "empty"),
+        )
         for policy in (TOOL["EXCLUDE_COMPETING"], TOOL["TARGET_ONLY"]):
-            published = []
-            for label, extra in (("python", []), ("batch", ["--exact-placement-bin", str(binary)])):
+            published = {}
+            for label, extra, search_path in modes:
                 out, view = [self.root / f"{policy}-{label}.{suffix}" for suffix in ("json", "fa")]
                 subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path), "--retention-policy", policy,
-                                "--out", str(out), "--out-fasta", str(view), *extra], check=True, timeout=5)
-                published.append((out.read_bytes(), view.read_bytes()))
-            self.assertEqual(*published)
+                                "--out", str(out), "--out-fasta", str(view), *extra],
+                               env={**os.environ, "PATH": str(search_path)}, check=True, timeout=5)
+                published[label] = (out.read_bytes(), view.read_bytes())
+            self.assertEqual(published["default"], published["python"])
+            self.assertEqual(published["explicit"], published["python"])
 
 
 if __name__ == "__main__":

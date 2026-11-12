@@ -9,6 +9,7 @@ import gzip
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -160,21 +161,25 @@ def batch_placement_lookup(binary, scope, sequences, words):
         with path.open("wb") as output:
             for literal in patterns:
                 output.write(literal + b"\n")
-        with subprocess.Popen(
-            [binary, "find", "exact-placements", "--patterns", path, "--scope", scope],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        ) as process:
-            errors = []
-            writer = Thread(target=write_placement_records, args=(process.stdin, sequences, errors))
-            writer.start()
-            try:
-                hits = read_placement_hits(process.stdout, sequences, patterns, scope)
-                require(process.wait() == 0, "exact placement backend exited unsuccessfully")
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                writer.join()
-            require(not errors, f"cannot deliver exact placement input: {errors}")
+        try:
+            with subprocess.Popen(
+                [binary, "find", "exact-placements", "--patterns", path, "--scope", scope],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            ) as process:
+                errors = []
+                writer = Thread(target=write_placement_records, args=(process.stdin, sequences, errors))
+                writer.start()
+                try:
+                    hits = read_placement_hits(process.stdout, sequences, patterns, scope)
+                    status = process.wait()
+                    require(status == 0, f"exact placement backend exit status {status}")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    writer.join()
+                require(not errors, f"cannot deliver exact placement input: {errors}")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"OVASM exact placement backend failed ({scope}, {binary}): {error}") from error
 
     def lookup(word, record=None):
         matches = [(record_index, start, start + len(word), strand)
@@ -453,6 +458,20 @@ def publish(outputs):
             temp.unlink()
 
 
+def resolve_placement_binary(explicit):
+    if explicit is None:
+        found = shutil.which("ovasm")
+        require(found is not None, "OVASM executable not found on PATH. Install OVASM or pass "
+                "--exact-placement-bin PATH. Use --python-placements for the Python comparison backend.")
+        explicit = Path(found)
+    try:
+        binary = explicit.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"cannot resolve OVASM executable {explicit}: {error}") from error
+    require(binary.is_file() and os.access(binary, os.X_OK), f"OVASM executable is not an executable file: {binary}")
+    return binary
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
@@ -460,17 +479,18 @@ def main():
     parser.add_argument("--out-fasta", type=Path, help="new FASTA containing crops admitted by the retention policy")
     parser.add_argument("--retention-policy", choices=(EXCLUDE_COMPETING, TARGET_ONLY), default=EXCLUDE_COMPETING,
                         help="retain target-supported and unresolved crops, or require positive target evidence")
-    parser.add_argument("--exact-placement-bin", type=Path,
-                        help="use this OVASM binary for exact batch placement; errors abort the audit")
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument("--exact-placement-bin", type=Path,
+                         help="OVASM executable for exact batch placement (default: ovasm on PATH)")
+    backend.add_argument("--python-placements", action="store_true",
+                         help="explicitly use the Python comparison backend")
     args = parser.parse_args()
     try:
         paths = [args.out] + ([args.out_fasta] if args.out_fasta else [])
         require(len({path.resolve() for path in paths}) == len(paths), "output paths must differ")
         for path in paths:
             require(not (path.exists() or path.is_symlink()), f"output already exists: {path}")
-        binary = args.exact_placement_bin
-        if binary is not None:
-            binary = binary.resolve(strict=True)
+        binary = None if args.python_placements else resolve_placement_binary(args.exact_placement_bin)
         report, retained = audit(args.manifest, args.retention_policy, binary)
         outputs = [(args.out, [json.dumps(report, indent=2, sort_keys=True).encode() + b"\n"])]
         if args.out_fasta:
