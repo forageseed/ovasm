@@ -8,11 +8,10 @@
 //! organelle proteins were found at once (leave-out test, 2026-11-05). Protein sequence stays
 //! recognisable far beyond nucleotide k-mers, so the seeds are taken from the reads themselves:
 //!
-//! 1. Depth: only organelle-like reads (`DepthGate`: deep and uniformly deep along the read, the
-//!    test of `find discover`) are looked at, so nuclear copies of organelle genes (NUMTs and
-//!    NUPTs, at nuclear depth) never start a seed.
-//! 2. Clusters: those reads are split by their median depth into depth peaks (`find discover`'s
-//!    clusters; a plastid and a mitochondrion form separate peaks).
+//! 1. Depth: the cluster scan starts from reads with deep and uniform sampled k-mer counts
+//!    (`DepthGate`, the test of `find discover`). Equal-depth or high-copy nuclear homologs
+//!    can pass this gate. The whole-read fallback also scans reads outside the gate.
+//! 2. Clusters: those reads are grouped by median depth. Sources can share a depth cluster.
 //! 3. Proteins: up to `sample` reads of each cluster are translated in six frames and their
 //!    stop-free stretches assigned to the protein panel's genes (`ovasm find classify`).
 //! 4. Reads: a read is of a class when at least `min_read_stretches` of its gene stretches are of
@@ -31,6 +30,8 @@
 //! counts in the control seeds nothing there (`class_seeds`). An organelle
 //! without a called cluster gets no protein seeds; `run` then seeds it from the library.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -39,9 +40,10 @@ use anyhow::Result;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::panel::{self, ClassReport, Panel, PanelParams};
-use crate::recruit::{peak_rss_mb, read_batches};
+use crate::recruit::{peak_rss_mb, read_batches, Rec};
 use crate::seedfree::{depth_peaks, DepthGate, GateReport};
 
 pub const ORGANELLES: [&str; 2] = ["mitochondrion", "plastid"];
@@ -53,10 +55,26 @@ pub enum SeedMode {
     PairedCandidates,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleOrder {
+    #[default]
+    Legacy,
+    StableRecord,
+}
+
+impl SampleOrder {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProteinSeedParams {
-    /// Reads scanned per depth cluster at most (evenly spread over the cluster).
+    /// Maximum input-record occurrences scanned per depth cluster.
     pub sample: usize,
+    #[serde(skip_serializing_if = "SampleOrder::is_legacy")]
+    pub sample_order: SampleOrder,
     /// Bases kept on each side of a seed read's gene stretches.
     pub flank: usize,
     /// Reads a depth peak needs to become a cluster.
@@ -79,6 +97,7 @@ impl Default for ProteinSeedParams {
     fn default() -> Self {
         Self {
             sample: 3000,
+            sample_order: SampleOrder::Legacy,
             flank: 2000,
             min_cluster_reads: 20,
             min_read_stretches: 2,
@@ -183,6 +202,8 @@ pub struct ClusterCall {
     /// The sequence those reads stand for: their bases over the depth (`MIN_CLUSTER_SPAN`).
     pub span_bp: u64,
     pub scanned: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stable_sample: Option<StableSampleReport>,
     /// Each class's genes by their stretches in excess of the reversed control's
     /// (`excess_over_control`); the densities and the call are of these.
     pub mitochondrion: ClassReport,
@@ -373,8 +394,7 @@ fn nearest(peaks: &[f64], median: f64) -> usize {
         .expect("peaks is not empty")
 }
 
-/// Which organelle-like reads are scanned: for each cluster, every `step`-th of its reads (in
-/// input order) up to `sample`, `step` spreading the sample over the whole cluster.
+/// Legacy selection: every `step`-th record in cluster input order, up to `sample`.
 fn sample_reads(
     candidates: &[(u64, usize)],
     clusters: usize,
@@ -411,6 +431,215 @@ fn read_class(genes: &[u16], panel: &Panel, min: usize) -> Option<&'static str> 
     } else {
         None
     }
+}
+
+const RECORD_PRIORITY_VERSION: &str = "sha256_raw_fastx_record_v1";
+
+struct RankedRecord {
+    digest: [u8; 32],
+    raw: Rec,
+}
+
+impl RankedRecord {
+    fn new(raw: Rec) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"ovasm.protein-cluster-sample.v1\0");
+        for field in [&raw.id, &raw.seq] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field);
+        }
+        match &raw.qual {
+            None => hash.update([0]),
+            Some(quality) => {
+                hash.update([1]);
+                hash.update((quality.len() as u64).to_be_bytes());
+                hash.update(quality);
+            }
+        }
+        Self { digest: hash.finalize().into(), raw }
+    }
+}
+
+impl Ord for RankedRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.digest.cmp(&other.digest)
+            .then_with(|| self.raw.id.cmp(&other.raw.id))
+            .then_with(|| self.raw.seq.cmp(&other.raw.seq))
+            .then_with(|| self.raw.qual.cmp(&other.raw.qual))
+    }
+}
+
+impl PartialOrd for RankedRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedRecord {}
+
+struct Multiplicity {
+    selected: usize,
+    observed: usize,
+}
+
+#[derive(Serialize)]
+struct StableSampleReport {
+    priority: &'static str,
+    eligible_record_occurrences: usize,
+    selected_record_occurrences: usize,
+    selected_distinct_exact_records: usize,
+    selected_repeated_exact_records: usize,
+    selected_occurrences_of_repeated_records: usize,
+    observed_occurrences_of_selected_repeated_records: usize,
+    exact_records_split_at_cutoff: usize,
+    selected_ids_with_distinct_exact_records: usize,
+    selected_sequences_with_distinct_ids: usize,
+}
+
+/// Keep the lowest-priority record occurrences. Identical records share storage while each
+/// occurrence still counts against the limit and is scanned if selected.
+#[derive(Default)]
+struct StableSample {
+    picked: BTreeMap<RankedRecord, Multiplicity>,
+    selected: usize,
+    eligible: usize,
+}
+
+impl StableSample {
+    fn offer(&mut self, record: RankedRecord, cap: usize) {
+        self.eligible += 1;
+        if cap == 0 {
+            return;
+        }
+        // The worst selected priority can only improve. An identity still selected at the
+        // end could never have been discarded entirely, so its observed count is exact.
+        if let Some(counts) = self.picked.get_mut(&record) {
+            counts.observed += 1;
+        }
+        if self.selected == cap {
+            let mut worst = self.picked.last_entry().expect("the full sample has a record");
+            if &record >= worst.key() {
+                return;
+            }
+            worst.get_mut().selected -= 1;
+            if worst.get().selected == 0 {
+                worst.remove_entry();
+            }
+        } else {
+            self.selected += 1;
+        }
+        self.picked.entry(record)
+            .and_modify(|counts| counts.selected += 1)
+            .or_insert(Multiplicity { selected: 1, observed: 1 });
+    }
+
+    fn finish(self) -> (Vec<Rec>, StableSampleReport) {
+        let mut ids = FxHashMap::default();
+        let mut sequences = FxHashMap::default();
+        let mut report = StableSampleReport {
+            priority: RECORD_PRIORITY_VERSION,
+            eligible_record_occurrences: self.eligible,
+            selected_record_occurrences: self.selected,
+            selected_distinct_exact_records: self.picked.len(),
+            selected_repeated_exact_records: 0,
+            selected_occurrences_of_repeated_records: 0,
+            observed_occurrences_of_selected_repeated_records: 0,
+            exact_records_split_at_cutoff: 0,
+            selected_ids_with_distinct_exact_records: 0,
+            selected_sequences_with_distinct_ids: 0,
+        };
+        for (record, counts) in &self.picked {
+            let id = record.raw.id.as_slice();
+            *ids.entry(id).or_insert(0usize) += 1;
+            let (first_id, multiple_ids) = sequences.entry(record.raw.seq.as_slice()).or_insert((id, false));
+            *multiple_ids |= *first_id != id;
+            if counts.observed > 1 {
+                report.selected_repeated_exact_records += 1;
+                report.selected_occurrences_of_repeated_records += counts.selected;
+                report.observed_occurrences_of_selected_repeated_records += counts.observed;
+                report.exact_records_split_at_cutoff += usize::from(counts.selected < counts.observed);
+            }
+        }
+        report.selected_ids_with_distinct_exact_records = ids.values().filter(|&&n| n > 1).count();
+        report.selected_sequences_with_distinct_ids = sequences.values().filter(|(_, multiple)| *multiple).count();
+        let mut reads = Vec::with_capacity(self.selected);
+        for (record, counts) in self.picked {
+            let mut raw = record.raw;
+            raw.qual = None; // Quality binds the ranking key; translation uses only sequence.
+            reads.extend(std::iter::repeat_with(|| raw.clone()).take(counts.selected - 1));
+            reads.push(raw);
+        }
+        (reads, report)
+    }
+}
+
+/// Visit the eligible ordinals in the existing FASTX pass. The ordinal locates an observation
+/// in this pass; it never ranks it or resolves different exact records with equal hashes.
+fn stable_cluster_samples(
+    inputs: &[PathBuf],
+    candidates: Vec<(u64, usize)>,
+    expected_reads: u64,
+    clusters: usize,
+    cap: usize,
+) -> Result<Vec<StableSample>> {
+    let mut samples: Vec<_> = (0..clusters).map(|_| StableSample::default()).collect();
+    if candidates.is_empty() {
+        return Ok(samples);
+    }
+    let mut candidates = candidates.into_iter().peekable();
+    let (rx, reader) = read_batches(inputs);
+    let mut ordinal = 0u64;
+    for batch in rx {
+        let first = ordinal;
+        ordinal += batch.len() as u64;
+        let eligible: Vec<_> = batch.into_iter().enumerate().filter_map(|(i, record)| {
+            if candidates.peek().is_some_and(|&(o, _)| o == first + i as u64) {
+                let (_, cluster) = candidates.next().expect("matched eligible ordinal");
+                Some((cluster, record))
+            } else {
+                None
+            }
+        }).collect();
+        let ranked: Vec<_> = eligible.into_par_iter()
+            .map(|(cluster, record)| (cluster, RankedRecord::new(record))).collect();
+        for (cluster, record) in ranked {
+            samples[cluster].offer(record, cap);
+        }
+    }
+    reader.join().expect("reader thread panicked")?;
+    anyhow::ensure!(
+        ordinal == expected_reads && candidates.next().is_none(),
+        "protein seed input record count changed between depth and sampling passes"
+    );
+    Ok(samples)
+}
+
+fn scan_records(
+    mine: Vec<(usize, Rec)>,
+    panel: &Panel,
+    p: &ProteinSeedParams,
+) -> Vec<Scanned> {
+    mine.into_par_iter()
+        .map_init(
+            || vec![0u32; panel.gene_count()],
+            |hits, (cluster, r)| {
+                let stretches = panel::gene_stretches(&r.seq, panel, &p.panel, hits);
+                let reversed: Vec<u8> = r.seq.iter().rev().copied().collect();
+                let control = panel::gene_stretches(&reversed, panel, &p.panel, hits)
+                    .into_iter()
+                    .map(|x| x.0)
+                    .collect();
+                let read = (!stretches.is_empty()).then(|| (r.id, r.seq));
+                Scanned { cluster, stretches, control, read }
+            },
+        )
+        .collect()
 }
 
 /// The seed of a read: the span of its stretches of `organelle`'s genes plus `flank` bases each
@@ -633,47 +862,34 @@ pub fn run(
         cluster_reads[c] += 1;
         cluster_bases[c] += len;
     }
-    let picked = sample_reads(&candidates, peaks.len(), p.sample);
-    drop(candidates);
-
-    // pass 4: the sampled reads' gene stretches
+    // Pass 4: sample eligible records and scan their gene stretches.
     let mut scanned: Vec<Scanned> = Vec::new();
-    if !picked.is_empty() {
-        let (rx, reader) = read_batches(inputs);
-        let mut ordinal = 0u64;
-        for batch in rx {
-            let first = ordinal;
-            ordinal += batch.len() as u64;
-            let mine: Vec<(usize, crate::recruit::Rec)> = batch
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| picked.get(&(first + i as u64)).map(|&c| (c, r)))
-                .collect();
-            let done: Vec<Scanned> = mine
-                .into_par_iter()
-                .map_init(
-                    || vec![0u32; panel.gene_count()],
-                    |hits, (cluster, r)| {
-                        let stretches = panel::gene_stretches(&r.seq, panel, &p.panel, hits);
-                        let reversed: Vec<u8> = r.seq.iter().rev().copied().collect();
-                        let control = panel::gene_stretches(&reversed, panel, &p.panel, hits)
-                            .into_iter()
-                            .map(|x| x.0)
-                            .collect();
-                        let read = (!stretches.is_empty()).then(|| (r.id, r.seq));
-                        Scanned {
-                            cluster,
-                            stretches,
-                            control,
-                            read,
-                        }
-                    },
-                )
-                .collect();
-            scanned.extend(done);
+    let mut stable_reports = Vec::new();
+    if p.sample_order == SampleOrder::StableRecord {
+        let samples = stable_cluster_samples(inputs, candidates, reads, peaks.len(), p.sample)?;
+        for (cluster, sample) in samples.into_iter().enumerate() {
+            let (reads, report) = sample.finish();
+            scanned.extend(scan_records(reads.into_iter().map(|r| (cluster, r)).collect(), panel, p));
+            stable_reports.push(report);
         }
-        reader.join().expect("reader thread panicked")?;
+    } else {
+        let picked = sample_reads(&candidates, peaks.len(), p.sample);
+        drop(candidates);
+        if !picked.is_empty() {
+            let (rx, reader) = read_batches(inputs);
+            let mut ordinal = 0u64;
+            for batch in rx {
+                let first = ordinal;
+                ordinal += batch.len() as u64;
+                let mine = batch.into_iter().enumerate()
+                    .filter_map(|(i, r)| picked.get(&(first + i as u64)).map(|&c| (c, r)))
+                    .collect();
+                scanned.extend(scan_records(mine, panel, p));
+            }
+            reader.join().expect("reader thread panicked")?;
+        }
     }
+    let mut stable_reports = stable_reports.into_iter();
 
     // calls and seeds
     let mut fasta: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
@@ -776,6 +992,7 @@ pub fn run(
             reads: cluster_reads[c],
             span_bp: span.round() as u64,
             scanned: n,
+            stable_sample: stable_reports.next(),
             mitochondrion,
             plastid,
             mitochondrion_density: md,
@@ -1081,6 +1298,63 @@ mod tests {
         assert_eq!(of(0), vec![0, 2, 5, 8]);
         // cluster 1 (3, 7, 11): fewer than the sample, all of them
         assert_eq!(of(1), vec![3, 7, 11]);
+    }
+
+    #[test]
+    fn stable_sampling_matches_multiset_oracle_in_both_orders_even_on_hash_collision() {
+        let raw = |id: &[u8], seq: &[u8], qual: Option<&[u8]>| Rec {
+            id: id.to_vec(),
+            seq: seq.to_vec(),
+            qual: qual.map(|q| q.to_vec()),
+        };
+        let records = [
+            raw(b"same id", b"AAA", Some(b"IIH")),
+            raw(b"same id", b"AAA", Some(b"III")),
+            raw(b"same id", b"AAC", None),
+            raw(b"other", b"AAA", None),
+            raw(b"same id", b"AAA", Some(b"III")),
+            raw(b"same id", b"AAA", Some(b"III")),
+        ];
+        let rank = |raw: Rec| RankedRecord { digest: [0; 32], raw };
+        for cap in [0, 1, 2, 3, 4, 6, 20] {
+            let mut expected: Vec<_> = records.iter().cloned().map(rank).collect();
+            expected.sort_unstable();
+            expected.truncate(cap);
+            for ordered in [records.to_vec(), records.iter().rev().cloned().collect()] {
+                let mut sample = StableSample::default();
+                for record in ordered {
+                    sample.offer(rank(record), cap);
+                    assert!(sample.selected <= cap && sample.picked.len() <= cap);
+                }
+                let actual: Vec<_> = sample.picked.iter().flat_map(|(key, counts)| {
+                    assert_eq!(counts.observed,
+                        records.iter().cloned().map(rank).filter(|r| r == key).count());
+                    std::iter::repeat(key).take(counts.selected)
+                }).collect();
+                assert!(actual.into_iter().eq(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn stable_sampling_preserves_and_reports_indistinguishable_occurrences() {
+        let record = Rec { id: b"id".to_vec(), seq: b"AAA".to_vec(), qual: None };
+        let mut sample = StableSample::default();
+        for _ in 0..4 {
+            sample.offer(RankedRecord::new(record.clone()), 2);
+        }
+        let (reads, report) = sample.finish();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(report.eligible_record_occurrences, 4);
+        assert_eq!(report.selected_distinct_exact_records, 1);
+        assert_eq!(report.selected_repeated_exact_records, 1);
+        assert_eq!(report.selected_occurrences_of_repeated_records, 2);
+        assert_eq!(report.observed_occurrences_of_selected_repeated_records, 4);
+        assert_eq!(report.exact_records_split_at_cutoff, 1);
+        assert_ne!(
+            RankedRecord::new(record.clone()).digest,
+            RankedRecord::new(Rec { qual: Some(Vec::new()), ..record }).digest,
+        );
     }
 
     #[test]

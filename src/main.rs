@@ -633,6 +633,9 @@ struct RunArgs {
     /// Report paired protein gene sets during the HiFi whole-genome protein seed scan.
     #[arg(long)]
     protein_gene_set_audit: bool,
+    /// How the HiFi protein seed scan samples depth clusters.
+    #[arg(long, value_enum, default_value_t = protein_seed::SampleOrder::Legacy)]
+    protein_sample_order: protein_seed::SampleOrder,
     /// Print result.json (the run's outcome for scripts and agents) on standard output too.
     #[arg(long, hide_short_help = true)]
     json: bool,
@@ -903,6 +906,9 @@ fn run(args: RunArgs) -> Result<()> {
     if args.protein_gene_set_audit && !scan_proteins {
         bail!("--protein-gene-set-audit requires an organelle without explicitly supplied seeds");
     }
+    if args.protein_sample_order == protein_seed::SampleOrder::StableRecord && !scan_proteins {
+        bail!("--protein-sample-order stable-record requires a HiFi protein seed scan");
+    }
     for (name, view) in checked {
         let (path, provenance) = view.materialize(&args.out)?;
         seeds.insert(name.clone(), vec![path]);
@@ -924,7 +930,7 @@ fn run(args: RunArgs) -> Result<()> {
         && args.recruit != pipeline::RecruitBy::Discover
     {
         if scan_proteins {
-            let p = protein_seed_params(
+            let mut p = protein_seed_params(
                 3000,
                 2000,
                 (args.nuclear_depth, args.genome_size, args.extend_gate_fold),
@@ -932,6 +938,7 @@ fn run(args: RunArgs) -> Result<()> {
                 0.3,
                 panel::Panel::lineage_min_hits(args.lineage.name()),
             )?;
+            p.sample_order = args.protein_sample_order;
             let panel = load_panel(
                 args.protein_seed_panel.as_deref(),
                 args.lineage,
@@ -2072,6 +2079,9 @@ struct ProteinSeedArgs {
     /// Leave panel proteins of species starting with this name out (repeatable).
     #[arg(long = "exclude-species")]
     exclude: Vec<String>,
+    /// Rank depth-cluster records by input order or by stable FASTX record content.
+    #[arg(long, value_enum, default_value_t = protein_seed::SampleOrder::Legacy)]
+    sample_order: protein_seed::SampleOrder,
     /// Reads scanned per depth cluster at most.
     #[arg(long, default_value_t = 3000)]
     sample: usize,
@@ -2169,7 +2179,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
             .num_threads(n)
             .build_global()?;
     }
-    let p = protein_seed_params(
+    let mut p = protein_seed_params(
         args.sample,
         args.flank,
         (args.nuclear_depth, args.genome_size, args.gate_fold),
@@ -2178,6 +2188,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         args.min_hits
             .unwrap_or_else(|| panel::Panel::lineage_min_hits(args.lineage.name())),
     )?;
+    p.sample_order = args.sample_order;
     let panel = load_panel(
         args.panel.as_deref(),
         args.lineage,
