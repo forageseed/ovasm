@@ -2321,7 +2321,10 @@ fn run_backbone_layout_guard(
         }
         if anchor_support.len() >= DEPTH_REFERENCE_MIN_NODES {
             anchor_support.sort_unstable();
-            support_depth = Some(f64::from(anchor_support[anchor_support.len() / 2]));
+            // the seed nodes' own estimate, not the plain median: recurring errors of the raw
+            // seed reads outnumber the true anchors at low counts (Lathyrus linifolius plastid:
+            // median 7 where the anchors stood at 110, min count 2, 53 unitigs)
+            support_depth = Some(seed_node_depth(&anchor_support));
         }
         if at.len() >= DEPTH_REFERENCE_MIN_NODES {
             at.sort_unstable();
@@ -2336,7 +2339,12 @@ fn run_backbone_layout_guard(
                 at.len(),
                 path.display()
             );
-            node_depth = own;
+            // The seeds lower the depth, never raise it: they stand where the organelle's genes
+            // are, which can be deeper than the rest of it (Pseudognaphalium luteoalbum
+            // mitochondrion: seed nodes at 131, all nodes at 10; at 131 min count 13 dropped
+            // 11 kb the reads hold at k 1001), while all the nodes can stand at another organelle's
+            // depth, the case the seeds are for.
+            node_depth = own.min(node_depth);
         }
     }
     // Use read-record support to lower an occurrence-based cutoff inflated by repeats. A
