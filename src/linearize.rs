@@ -473,6 +473,22 @@ fn weighted_median_depth(g: &Graph, depth: impl Fn(usize) -> f64, segs: &[usize]
         .map_or(0.0, |x| x.0)
 }
 
+/// Scale evidence work with the number of candidate covers on bounded components.
+/// A common fixed budget could discard *all* read-based rankings simply because a
+/// previously omitted cover size was included. Large components and candidate sets
+/// retain the original budget; the expanded budget has a hard upper bound.
+fn candidate_work_budget(base: u64, anchors: usize, candidates: usize) -> u64 {
+    if anchors <= 64 && candidates <= 100_000 {
+        base.saturating_mul(candidates.div_ceil(20_000).clamp(1, 5) as u64)
+    } else {
+        base
+    }
+}
+
+fn scoring_work_budget(anchors: usize, candidates: usize) -> u64 {
+    candidate_work_budget(crate::read_model::WORK_BUDGET, anchors, candidates)
+}
+
 /// All covers of `anchors` (one component) by exactly `m` molecules that together visit every
 /// required anchor once (either orientation); optional anchors may be passed through, each at most
 /// once. A molecule ends where it closes back to its start or, failing that, as a path.
@@ -744,6 +760,7 @@ fn search_phased_indexed_bounded(
                 let mut cover = s.done.clone();
                 cover.push(mol);
                 if c.candidate_limit.is_some_and(|limit| s.found.len() >= limit) {
+                    eprintln!("[ovasm] warning: adaptive search reached its candidate limit");
                     s.truncated = true;
                     return;
                 }
@@ -875,7 +892,10 @@ fn search_phased_indexed_bounded(
                 charge(&mut budget, cost + bridges.len())?;
                 let mut extended = cover.clone();
                 extended.last_mut().unwrap().bridges.extend(bridges);
-                if c.candidate_limit.is_some_and(|limit| covers.len() >= limit) { return None; }
+                if c.candidate_limit.is_some_and(|limit| covers.len() >= limit) {
+                    eprintln!("[ovasm] warning: adaptive terminal extension reached its candidate limit");
+                    return None;
+                }
                 covers.push(extended);
             }
         }
@@ -1947,6 +1967,13 @@ pub fn run_phased(
         // searched as before; explicit limits stay authoritative.
         let mut last = envelope.min(comp.len());
         let mut m = rep.min_molecules;
+        // A requested larger envelope can exhaust work at several cover sizes.
+        // Allow at most one retry per searched size, capped at six in total;
+        // default and compact-component searches retain one retry.
+        let retry_limit = if comp.len() > 32 && p.max_molecules > 4 {
+            p.max_molecules.min(6)
+        } else { 1 };
+        let mut retries = 0;
         while m <= last {
             let (mut found, mut truncated, mut terminal_truncated) = search_phased_indexed(
                 g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, thread_ends.as_ref(),
@@ -1957,13 +1984,18 @@ pub fn run_phased(
             // Explicit --max-steps remains authoritative.
             let compact_retry = comp.len() <= 32 && found.len() <= 1_000_000;
             let bounded_retry = comp.len() > 32 && comp.len() <= 64 && found.len() <= 1_000_000;
-            if (truncated || terminal_truncated) && p.adaptive_steps && !rep.adaptive_retry
+            if (truncated || terminal_truncated) && p.adaptive_steps && retries < retry_limit
                 && ((compact_retry && br.len() <= 128) || (bounded_retry && br.len() <= 256))
             {
                 rep.adaptive_retry = true;
+                retries += 1;
                 drop(found);
-                let factor = if bounded_retry { 4 } else { 2 };
-                let cap = bounded_retry.then_some(1_000_000);
+                let factor = if bounded_retry && p.max_molecules > 5 && m >= 6 { 20 }
+                    else if bounded_retry && p.max_molecules > 4 && m >= 5 { 10 }
+                    else if bounded_retry { 4 } else { 2 };
+                let cap = bounded_retry.then_some(if p.max_molecules > 5 && m >= 6 {
+                    2_000_000
+                } else { 1_000_000 });
                 (found, truncated, terminal_truncated) = search_phased_indexed_bounded(
                     g.names.len(), &comp, &optional, &br, m,
                     p.max_steps.saturating_mul(factor), &phases, &search_out_of, thread_ends.as_ref(),
@@ -2026,7 +2058,7 @@ pub fn run_phased(
             }
         }
         if let Some(model)=&component_model {
-            let mut budget=crate::read_model::WORK_BUDGET;
+            let mut budget=scoring_work_budget(comp.len(), ranked.len());
             for (walks,cover,_) in &mut ranked {
                 let circular:Vec<_>=cover.molecules.iter().map(|m|m.circular).collect();
                 cover.read_support=model.score(walks,&circular,&mut budget);
@@ -2074,7 +2106,7 @@ pub fn run_phased(
         if let Some(model)=&component_model {
             if !ranked.is_empty() && !rep.read_model_budget_exhausted {
                 let fits:Vec<_>=ranked.iter().map(|(_,c,_)|c.read_support.as_ref().unwrap()).collect();
-                let path_cover=model.path_cover(&fits,1_000_000);
+                let path_cover=model.path_cover(&fits,candidate_work_budget(1_000_000,comp.len(),ranked.len()));
                 rep.witness_configurations=path_cover.candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
                 rep.ambiguity_configurations=path_cover.equivalent_candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
                 rep.read_path_cover=Some(path_cover);
@@ -3152,6 +3184,19 @@ mod tests {
         assert!(r.best.as_ref().unwrap().circular);
         assert_eq!(r.molecules, 1);
         assert_eq!(r.repeats_not_placed, names(&["R"]));
+    }
+
+    #[test]
+    fn scoring_budget_scales_only_for_bounded_components() {
+        let base = crate::read_model::WORK_BUDGET;
+        assert_eq!(scoring_work_budget(53, 0), base);
+        assert_eq!(scoring_work_budget(53, 20_000), base);
+        assert_eq!(scoring_work_budget(53, 44_432), base * 3);
+        assert_eq!(scoring_work_budget(53, 100_000), base * 5);
+        assert_eq!(scoring_work_budget(53, 100_001), base);
+        assert_eq!(scoring_work_budget(65, 44_432), base);
+        assert_eq!(candidate_work_budget(1_000_000, 53, 44_432), 3_000_000);
+        assert_eq!(candidate_work_budget(1_000_000, 65, 44_432), 1_000_000);
     }
 
     #[test]
