@@ -126,6 +126,8 @@ pub struct RunConfig {
     pub(crate) seed_source_audits: BTreeMap<String, crate::seed_source::Provenance>,
     /// Explicitly verified original records for the seed recruitment arm.
     pub read_admission_manifest: Option<PathBuf>,
+    /// Source exclusions for the seed recruitment arm.
+    pub read_source_exclusions: Option<PathBuf>,
     /// The built-in library `builtin_seeds` came from (`summary.json` records it).
     pub seed_lineage: crate::seeddb::Lineage,
     pub recruit: RecruitBy,
@@ -875,12 +877,14 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
         .cloned()
         .unwrap_or_default();
     out.remove("output");
-    if let Some(audit) = report.get("read_admission") {
-        let mut audit = audit.clone();
-        if let Some(records) = audit["records"].as_array_mut() {
-            records.retain(|record| record["target"] == organelle);
+    for name in ["read_admission", "read_source_exclusions"] {
+        if let Some(audit) = report.get(name) {
+            let mut audit = audit.clone();
+            if let Some(records) = audit["records"].as_array_mut() {
+                records.retain(|record| record["target"] == organelle);
+            }
+            out.insert(name.into(), audit);
         }
-        out.insert("read_admission".into(), audit);
     }
     out.insert("extend_gate".into(), report["extend_gate"].clone());
     out.insert("bootstrap".into(), report["bootstrap"].clone());
@@ -1098,6 +1102,9 @@ fn recruit_all(
             .each("--reads", &cfg.reads);
         if let Some(path) = &cfg.read_admission_manifest {
             argv = argv.opt("--read-admission-manifest", path);
+        }
+        if let Some(path) = &cfg.read_source_exclusions {
+            argv = argv.opt("--read-source-exclusions", path);
         }
         for (name, paths) in &cfg.seeds {
             for p in paths {
@@ -2035,6 +2042,11 @@ fn component_filter_summary(report: &Value) -> Value {
 }
 
 fn validate(cfg: &RunConfig) -> Result<()> {
+    if cfg.read_source_exclusions.is_some()
+        && (cfg.read_set != ReadSet::WholeGenome || cfg.recruit != RecruitBy::Seeds)
+    {
+        bail!("--read-source-exclusions requires whole-genome recruitment with --recruit seeds");
+    }
     if cfg.recruit_cache.is_some()
         && (cfg.read_set == ReadSet::Target || cfg.recruit == RecruitBy::Discover)
     {
@@ -2696,6 +2708,7 @@ mod tests {
             builtin_seeds: BTreeSet::new(),
             seed_source_audits: BTreeMap::new(),
             read_admission_manifest: None,
+            read_source_exclusions: None,
             seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: RecruitBy::Seeds,
             recruit_depth: None,

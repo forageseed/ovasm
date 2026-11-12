@@ -600,6 +600,9 @@ struct RunArgs {
     /// Admit exact original records with independently supplied source evidence in seed recruitment.
     #[arg(long)]
     read_admission_manifest: Option<PathBuf>,
+    /// SHA-bound original records prohibited from contributing to a named target during seed recruitment.
+    #[arg(long)]
+    read_source_exclusions: Option<PathBuf>,
     /// Lineage: plant (default), animal or fungi; 0/1/2 as PMAT2 -x. Sets seeds, protein panel, genetic code.
     ///
     /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
@@ -831,6 +834,11 @@ fn run(args: RunArgs) -> Result<()> {
     {
         bail!("--read-admission-manifest requires whole-genome seed recruitment");
     }
+    if args.read_source_exclusions.is_some()
+        && (args.read_set != pipeline::ReadSet::WholeGenome || args.recruit != pipeline::RecruitBy::Seeds)
+    {
+        bail!("--read-source-exclusions requires whole-genome recruitment with --recruit seeds");
+    }
     if !args.seed_source_audits.is_empty()
         && (args.read_set != pipeline::ReadSet::WholeGenome
             || args.recruit == pipeline::RecruitBy::Discover)
@@ -1037,6 +1045,7 @@ fn run(args: RunArgs) -> Result<()> {
         builtin_seeds,
         seed_source_audits,
         read_admission_manifest: args.read_admission_manifest,
+        read_source_exclusions: args.read_source_exclusions,
         seed_lineage: args.lineage,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
@@ -2206,6 +2215,9 @@ struct RecruitArgs {
     /// Admit exact original records with independently supplied source evidence after baiting.
     #[arg(long)]
     read_admission_manifest: Option<PathBuf>,
+    /// SHA-bound original records prohibited from contributing to a named target during seed recruitment.
+    #[arg(long)]
+    read_source_exclusions: Option<PathBuf>,
     /// Read files (FASTQ/FASTA, optionally .gz); repeat for several libraries.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -2530,6 +2542,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
         },
         args.frontier_audit,
         args.read_admission_manifest.as_deref(),
+        args.read_source_exclusions.as_deref(),
     )?;
     for o in &report.outputs {
         let depth = match (o.read_depth, o.implied_size) {

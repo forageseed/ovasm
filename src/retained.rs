@@ -238,6 +238,7 @@ pub(crate) fn recruitment(
     bait: &BaitSet,
     params: &ClassifyParams,
     mut frontier: Option<&mut FrontierAudit>,
+    exclusions: Option<&crate::read_admission::Exclusions>,
 ) -> Result<Value> {
     let start = Instant::now();
     let dir = out.join("source_candidates");
@@ -312,7 +313,8 @@ pub(crate) fn recruitment(
                 return;
             }
             if let Call::Organelle(mask) = classify(&rec.seq, bait, params).0 {
-                if mask & (1 << mt) != 0 && mask & (1 << pt) != 0 {
+                let allowed = mask & !exclusions.map_or(0, |plan| plan.mask(&rec.id));
+                if allowed & (1 << mt) != 0 && allowed & (1 << pt) != 0 {
                     failure = write_rec(&mut shared, &rec);
                     shared_count += 1;
                 }
@@ -565,7 +567,7 @@ mod tests {
             numt_min_block: 15,
             block_gap: 0,
         };
-        let report = recruitment(&dir, &pool, &bait, &params, None).unwrap();
+        let report = recruitment(&dir, &pool, &bait, &params, None, None).unwrap();
         assert_eq!(report["target_files"][0]["reads"], 1);
         assert_eq!(
             fs::read_to_string(dir.join("source_candidates/plastid.fastq")).unwrap(),

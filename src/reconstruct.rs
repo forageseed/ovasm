@@ -2059,6 +2059,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             builtin_seeds: BTreeSet::new(),
             seed_source_audits: Default::default(),
             read_admission_manifest: None,
+            read_source_exclusions: None,
             seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: pipeline::RecruitBy::Seeds,
             recruit_depth: None,

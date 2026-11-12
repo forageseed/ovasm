@@ -671,6 +671,12 @@ struct Writes<'a> {
     keep: Option<&'a [Keep]>,
 }
 
+struct ScanPolicies<'a> {
+    admission: Option<&'a mut crate::read_admission::Admission>,
+    exclusions: Option<&'a mut crate::read_admission::Exclusions>,
+    pass: Option<usize>,
+}
+
 /// One pass over the inputs. Recruited reads are written, in input order, to each target's
 /// pass file and NUMT candidates to `numt_path`, not kept: a plastid at 20,000x recruits
 /// gigabases (Col-0 HiFi: 3.2 Gb, 14 GB of memory when held), more than a laptop has.
@@ -684,11 +690,14 @@ fn scan(
     final_outputs: bool,
     gate_sketch: Option<&mut crate::seedfree::GateSketch>,
     gpu: Option<&mut crate::gpu::Gpu>,
-    mut admission: Option<&mut crate::read_admission::Admission>,
+    mut policies: ScanPolicies<'_>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
-    if let Some(plan) = &mut admission {
+    if let Some(plan) = &mut policies.admission {
+        plan.begin_scan();
+    }
+    if let Some(plan) = &mut policies.exclusions {
         plan.begin_scan();
     }
     // the change check of a replay pass, on the GPU while it works (else on the CPU, same answer)
@@ -883,8 +892,23 @@ fn scan(
                     cache.cover_bounds.push(bound);
                 }
             }
-            if let Some(plan) = &mut admission {
-                plan.observe(&entry.rec, call, !replaying || final_outputs);
+            // Cache the ordinary classifier result. Apply the source constraint
+            // before any target counts, samples, output or extension input.
+            let original_input = !replaying || final_outputs;
+            let excluded = if let Some(plan) = &mut policies.exclusions {
+                plan.observe(&entry.rec, call, original_input, policies.pass)?
+            } else {
+                0
+            };
+            let call = match call {
+                Call::Organelle(mask) => {
+                    let allowed = mask & !excluded;
+                    if allowed == 0 { Call::Other } else { Call::Organelle(allowed) }
+                }
+                call => call,
+            };
+            if let Some(plan) = &mut policies.admission {
+                plan.observe(&entry.rec, call, original_input);
             }
             if call == Call::Other {
                 continue;
@@ -930,9 +954,11 @@ fn scan(
                     }
                     out.numt.reads += 1;
                     out.numt.bases += len;
-                    out.partial_candidates[t] = true;
-                    if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
-                        out.frontier[t].offer(name_key(&rec.id), &rec.seq);
+                    if excluded & (1 << t) == 0 {
+                        out.partial_candidates[t] = true;
+                        if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
+                            out.frontier[t].offer(name_key(&rec.id), &rec.seq);
+                        }
                     }
                 }
                 Call::Other => {}
@@ -965,7 +991,10 @@ fn scan(
         w.flush()?;
     }
     numt_w.flush()?;
-    if let Some(plan) = admission {
+    if let Some(plan) = policies.admission {
+        plan.finish_scan()?;
+    }
+    if let Some(plan) = policies.exclusions {
         plan.finish_scan()?;
     }
     if profiling() { eprintln!(
@@ -1114,6 +1143,8 @@ pub struct RecruitReport {
     pub outputs: Vec<TargetOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) read_admission: Option<crate::read_admission::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_source_exclusions: Option<crate::read_admission::ExclusionReport>,
     pub numt_candidates: u64,
     pub numt_output: String,
     pub source_candidates: serde_json::Value,
@@ -1599,10 +1630,14 @@ fn bootstrap_candidates(
     gate: &DepthGate,
     used: &FxHashSet<u64>,
     deep: Option<f64>,
+    exclusions: Option<&crate::read_admission::Exclusions>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
     let n = bait.targets.len();
     let (mut picked, mut keys) = (Vec::new(), Vec::new());
     for_each_rec(numt_path, |r| {
+        if exclusions.is_some_and(|plan| plan.mask(&r.id) & (1 << t) != 0) {
+            return;
+        }
         let key = name_key(&r.id);
         if used.contains(&key) {
             return;
@@ -1841,12 +1876,13 @@ fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
 }
 
 pub fn run(bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
-    run_with_options(bait, cfg, false, None)
+    run_with_options(bait, cfg, false, None, None)
 }
 
 pub(crate) fn run_with_options(
     mut bait: BaitSet, cfg: RecruitConfig, audit_frontier: bool,
     admission_manifest: Option<&Path>,
+    exclusion_manifest: Option<&Path>,
 ) -> Result<RecruitReport> {
     use crate::retained::{FrontierAudit, FrontierReason};
 
@@ -1854,6 +1890,12 @@ pub(crate) fn run_with_options(
     let mut admission = admission_manifest
         .map(|path| crate::read_admission::Admission::load(path, &bait))
         .transpose()?;
+    let mut exclusions = exclusion_manifest
+        .map(|path| crate::read_admission::Exclusions::load(path, &bait))
+        .transpose()?;
+    if let (Some(positive), Some(negative)) = (&admission, &exclusions) {
+        positive.check_exclusions(negative)?;
+    }
     std::fs::create_dir_all(&cfg.out_dir)?;
     let mut iterations = Vec::new();
     let mut replay = cfg
@@ -1983,7 +2025,7 @@ pub(crate) fn run_with_options(
             // only the first pass: without a cache every pass reads the inputs
             if it == 0 { gate_sketch.as_mut() } else { None },
             gpu.as_mut(),
-            admission.as_mut(),
+            ScanPolicies { admission: admission.as_mut(), exclusions: exclusions.as_mut(), pass: Some(it + 1) },
         )?;
         if crate::recruit::profiling() {
             eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
@@ -2024,6 +2066,12 @@ pub(crate) fn run_with_options(
         // 20 bp before it, 39 at it, none across) until it counted as saturated.
         if let Some(table) = kmer_table.as_ref().filter(|_| !last) {
             for t in 0..n_targets {
+                // Whole-library counts do not preserve the source of a word.
+                // Keep depth estimation, but no autonomous walk for a target
+                // whose new bait must respect per-original exclusions.
+                if exclusions.as_ref().is_some_and(|plan| plan.protects(t)) {
+                    continue;
+                }
                 let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t] && !walk_stopped[t]) else {
                     continue;
                 };
@@ -2401,6 +2449,7 @@ pub(crate) fn run_with_options(
                     g,
                     &boot_used[t],
                     None,
+                    exclusions.as_ref(),
                 )?;
                 // A seed that failed is bootstrapped from all of them. One that recruits more
                 // reads than are left as deep partial candidates has its genome already, and its
@@ -2438,7 +2487,7 @@ pub(crate) fn run_with_options(
                     {
                         bootstrap_candidates(
                             &numt_path, floor, t, &bait, &cfg.params, g,
-                            &boot_used[t], Some(deep),
+                            &boot_used[t], Some(deep), exclusions.as_ref(),
                         )?
                     } else {
                         (picked, keys)
@@ -2640,7 +2689,7 @@ pub(crate) fn run_with_options(
             true,
             None,
             None,
-            admission.as_mut(),
+            ScanPolicies { admission: admission.as_mut(), exclusions: exclusions.as_mut(), pass: None },
         )?;
         anyhow::ensure!(
             final_res.reads == res.reads && final_res.bases == res.bases,
@@ -2651,7 +2700,7 @@ pub(crate) fn run_with_options(
 
     let mut source_candidates =
         crate::retained::recruitment(
-            &cfg.out_dir, &numt_path, &bait, &cfg.params, frontier_audit.as_mut(),
+            &cfg.out_dir, &numt_path, &bait, &cfg.params, frontier_audit.as_mut(), exclusions.as_ref(),
         )?;
     // This is a bounded audit, not evidence of nuclear origin. The existing candidate pool
     // excludes reads shorter than numt_min_block, including all ordinary short reads.
@@ -2818,6 +2867,7 @@ pub(crate) fn run_with_options(
         iterations,
         outputs,
         read_admission: admission.map(|plan| plan.report()),
+        read_source_exclusions: exclusions.map(|plan| plan.report(&bait, cfg.kmer_gate)),
         numt_candidates: res.numt.reads,
         numt_output: numt_path.display().to_string(),
         source_candidates,
@@ -2860,6 +2910,77 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_exclusion_stops_read_bait_before_recruiting_dependent_reads() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!("ovasm-source-extension-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fq");
+        let evidence = dir.join("proof.json");
+        std::fs::write(&evidence, b"independent source test").unwrap();
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let core = pseudo_random(300, 97);
+        let tail = pseudo_random(55, 19);
+        let bridge = [&core[25..], &tail].concat();
+        let dependent = [&core[90..], &tail, &pseudo_random(20, 35)].concat();
+        let raw = |id: &[u8], seq: &[u8]| Rec {
+            id: id.to_vec(), seq: seq.to_vec(), qual: Some(vec![b'I'; seq.len()]),
+        };
+        let bridges = [raw(b"known-1/1 source", &bridge), raw(b"known-2 source", &bridge), raw(b"known-3 source", &bridge)];
+        let mut input = Vec::new();
+        write_rec(&mut input, &raw(b"known-1/2", &core)).unwrap();
+        for read in &bridges {
+            write_rec(&mut input, read).unwrap();
+        }
+        write_rec(&mut input, &raw(b"dependent", &dependent)).unwrap();
+        std::fs::write(&reads, input).unwrap();
+        let records: Vec<_> = bridges.iter().map(|read| serde_json::json!({
+            "target":"mito","read_id_hex":read.id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+            "sequence_sha256":digest(&read.seq),"quality_sha256":digest(read.qual.as_ref().unwrap()),
+            "provenance":{"path":"proof.json","sha256":digest(b"independent source test")},
+        })).collect();
+        let mut decl = serde_json::json!({"schema":"ovasm.read-source-exclusions.v1",
+            "scope":"exclude bridge but preserve its distinct mate","records":records});
+        let manifest = dir.join("exclusions.json");
+        std::fs::write(&manifest, serde_json::to_vec(&decl).unwrap()).unwrap();
+        let config = |name: &str| {
+            let mut cfg = test_config(&reads, dir.join(name), 4, false);
+            cfg.mates_together = true;
+            cfg.params.numt_min_block = 40;
+            cfg
+        };
+        let bait = bait_from(&core, 21);
+        let normal = run(bait.clone(), config("normal")).unwrap();
+        assert!(normal.iterations_run > 1);
+        assert_eq!(normal.outputs[0].kept_reads, 5);
+        let mut guarded = Vec::new();
+        for (label, cache) in [("guarded", false), ("guarded-replay", true)] {
+            let mut cfg = config(label);
+            if cache {
+                cfg.replay_dir = Some(dir.join("cache"));
+            }
+            let report = run_with_options(bait.clone(), cfg, false, None, Some(&manifest)).unwrap();
+            assert_eq!(report.outputs[0].kept_reads, 1);
+            assert_eq!(report.iterations[0].bait_kmers_added, vec![0]);
+            let audit = serde_json::to_value(report.read_source_exclusions.unwrap()).unwrap();
+            assert_eq!(audit["records"][0]["organelle_match_passes"], serde_json::json!([1]));
+            guarded.push(std::fs::read(&report.outputs[0].output).unwrap());
+        }
+        assert_eq!(guarded[0], guarded[1]);
+        assert!(guarded[0].starts_with(b"@known-1/2\n"));
+
+        // Admission must not override a same-record, same-target exclusion.
+        decl["schema"] = serde_json::json!("ovasm.read-admission.v1");
+        let admission = dir.join("admission.json");
+        std::fs::write(&admission, serde_json::to_vec(&decl).unwrap()).unwrap();
+        let error = run_with_options(bait, config("contradiction"), false, Some(&admission), Some(&manifest))
+            .err().unwrap();
+        assert!(error.to_string().contains("conflicting admission and source exclusion"));
+        assert!(!dir.join("contradiction").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn exact_read_admission_preserves_bait_and_original_quality_across_replay() {
@@ -2922,7 +3043,7 @@ mod tests {
             if label == "cached" {
                 cfg.replay_dir = Some(dir.join("replay"));
             }
-            let report = run_with_options(bait.clone(), cfg, false, Some(&manifest)).unwrap();
+            let report = run_with_options(bait.clone(), cfg, false, Some(&manifest), None).unwrap();
             assert_eq!(report.iterations_run, baseline.iterations_run);
             assert_eq!(report.outputs[0].recruitment_state, baseline.outputs[0].recruitment_state);
             assert_eq!(report.outputs[0].kept_reads, baseline.outputs[0].kept_reads + 1);
@@ -2957,7 +3078,7 @@ mod tests {
             cfg
         };
         let standard = run(bait.clone(), config("standard")).unwrap();
-        let audited = run_with_options(bait, config("audited"), true, None).unwrap();
+        let audited = run_with_options(bait, config("audited"), true, None, None).unwrap();
         let relative = Path::new("source_candidates/frontier-evidence.jsonl");
         assert!(!dir.join("standard").join(relative).exists());
         assert_eq!(standard.outputs[0].recruitment_state, audited.outputs[0].recruitment_state);

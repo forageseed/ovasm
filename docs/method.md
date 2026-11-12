@@ -426,6 +426,29 @@ written. The remaining outcomes are `competing_target`, `downsampled` and `base_
 Final output counts include admitted records. Iteration counts, bait closure and
 sketch-based depth describe the ordinary bait search.
 
+### Exclude exact source-bound originals during seed recruitment
+
+`--read-source-exclusions MANIFEST.json` applies to `find recruit` and
+whole-genome `run` with `--recruit seeds`. The
+`ovasm.read-source-exclusions.v1` manifest uses the same original identity
+and provenance fields as read admission. Its target names the prohibited
+destination. One original can exclude several targets. A positive admission
+for the same original and destination conflicts with the exclusion.
+
+The exclusion removes that target assignment before pass files, sampling
+and read-derived bait growth. Partial reads can still be inspected in the
+diagnostic files. A prohibited original cannot feed within-pass extension
+or either leftover bootstrap for that target. Replay validates the same
+identities and restores and checks original qualities for the final outputs.
+Other target assignments remain eligible. No alternate target is inferred
+from exclusion alone.
+
+The starting seed files are supplied independently. The whole-library
+k-mer walk cannot track an original's source, so it is skipped for protected
+targets while read-level depth gates remain available. The recruitment
+report records match passes, bindings and targets whose library walk was
+skipped. Exclusion claims have the scope of the supplied evidence.
+
 ### 3.8 Screen original reads at registered junctions
 
 Run `python3 scripts/prepare_read_admission.py PLAN.json --out SCREEN_DIR` to prepare
