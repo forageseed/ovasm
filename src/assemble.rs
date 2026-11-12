@@ -2339,12 +2339,11 @@ fn run_backbone_layout_guard(
                 at.len(),
                 path.display()
             );
-            // The seeds lower the depth, never raise it: they stand where the organelle's genes
-            // are, which can be deeper than the rest of it (Pseudognaphalium luteoalbum
-            // mitochondrion: seed nodes at 131, all nodes at 10; at 131 min count 13 dropped
-            // 11 kb the reads hold at k 1001), while all the nodes can stand at another organelle's
-            // depth, the case the seeds are for.
-            node_depth = own.min(node_depth);
+            // The seeds' own depth, not the lower of the two: all the nodes of a deep read set
+            // stand at its recurring errors (Acer campestre mitochondrion: all nodes 13, seed
+            // nodes 124; at 13 min count 3, 10,769 nodes, 292 unitigs, 11.6 GB; Rubus caesius
+            // 15 against 143, coverage 0.9999 to 0.9986).
+            node_depth = own;
         }
     }
     // Use read-record support to lower an occurrence-based cutoff inflated by repeats. A
