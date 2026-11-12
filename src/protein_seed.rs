@@ -1162,26 +1162,15 @@ impl WholeReadAudit {
     }
 }
 
-/// Whole reads as seeds for `organelles`, from a scan of every read: a read is a seed when its
-/// stretches make it of the organelle's class (`read_class`) and cover at least
-/// `WHOLE_READ_MIN_GENES` distinct genes. For reads where the organelle is not deeper than the
-/// nucleus (the PMAT2 benchmark's read amounts: Orcinus orca 19 mitochondrial reads in 1 Gb, about
-/// 6x; Sterechinus neumayeri 9 in 2.5 Gb), which the depth gate cannot set apart.
-fn whole_read_seeds(
+/// Scan each read with the existing fallback qualifier, then handle eligible crops in input order.
+fn scan_whole_read_hits(
     inputs: &[PathBuf],
     panel: &Panel,
     p: &ProteinSeedParams,
     organelles: &[&'static str],
-    out_dir: &Path,
-    gate: &DepthGate,
     audit_gene_sets: bool,
-) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
-    let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
-    let t0 = Instant::now();
-    let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
-        FxHashMap::default();
-    let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
-        Default::default();
+    mut visit: impl FnMut(&crate::recruit::Rec, WholeReadHit) -> Result<()>,
+) -> Result<(u64, u64, Option<WholeReadGeneEvidence>)> {
     let (mut reads, mut bases) = (0u64, 0u64);
     let mut audit = audit_gene_sets.then(|| WholeReadAudit::new(panel.gene_count()));
     let strict = PanelParams {
@@ -1220,35 +1209,72 @@ fn whole_read_seeds(
             if let (Some(audit), Some(evidence)) = (&mut audit, evidence) {
                 audit.add(panel, evidence);
             }
-            let Some(WholeReadHit { class, lo, hi }) = forward else { continue };
-            let c = n.entry(class).or_insert(0);
-            if *c >= WHOLE_READ_MAX_SEEDS {
-                continue;
-            }
-            if !writers.contains_key(class) {
-                let path = out_dir.join(format!("protein_seeds.{class}.fasta"));
-                writers.insert(class, std::io::BufWriter::new(std::fs::File::create(&path)?));
-            }
-            let w = writers.get_mut(class).expect("just inserted");
-            let r = &batch[i];
-            w.write_all(b">")?;
-            w.write_all(r.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&r.id))?;
-            writeln!(w, " whole_read_scan span={lo}-{hi}")?;
-            w.write_all(&r.seq[lo..hi])?;
-            w.write_all(b"\n")?;
-            *c += 1;
-            *b.entry(class).or_insert(0) += (hi - lo) as u64;
-            if seed_above_gate(gate, &r.seq, lo, hi) {
-                *above.entry(class).or_insert(0) += 1;
+            if let Some(hit) = forward {
+                visit(&batch[i], hit)?;
             }
         }
     }
     reader.join().expect("reader thread panicked")?;
-    for (_, mut w) in writers {
-        w.flush()?;
+    let evidence = audit.map(|a| a.report(panel, organelles, p.panel.min_gene_segments));
+    Ok((reads, bases, evidence))
+}
+
+fn write_whole_read_crop(
+    writer: &mut impl Write,
+    read: &crate::recruit::Rec,
+    tag: &str,
+    lo: usize,
+    hi: usize,
+) -> Result<()> {
+    writer.write_all(b">")?;
+    writer.write_all(read.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&read.id))?;
+    writeln!(writer, " {tag} span={lo}-{hi}")?;
+    writer.write_all(&read.seq[lo..hi])?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Whole reads as seeds for roles without a called depth cluster.
+fn whole_read_seeds(
+    inputs: &[PathBuf],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    organelles: &[&'static str],
+    out_dir: &Path,
+    gate: &DepthGate,
+    audit_gene_sets: bool,
+) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
+    let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
+    let t0 = Instant::now();
+    let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> = FxHashMap::default();
+    let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
+        Default::default();
+    let (reads, bases, paired_gene_evidence) = scan_whole_read_hits(
+        inputs, panel, p, organelles, audit_gene_sets,
+        |read, WholeReadHit { class, lo, hi }| {
+            let count = n.entry(class).or_insert(0);
+            if *count >= WHOLE_READ_MAX_SEEDS {
+                return Ok(());
+            }
+            if !writers.contains_key(class) {
+                let path = out_dir.join(format!("protein_seeds.{class}.fasta"));
+                writers.insert(class, std::io::BufWriter::new(std::fs::File::create(path)?));
+            }
+            let writer = writers.get_mut(class).expect("seed writer is present");
+            write_whole_read_crop(writer, read, "whole_read_scan", lo, hi)?;
+            *count += 1;
+            *b.entry(class).or_insert(0) += (hi - lo) as u64;
+            if seed_above_gate(gate, &read.seq, lo, hi) {
+                *above.entry(class).or_insert(0) += 1;
+            }
+            Ok(())
+        },
+    )?;
+    for (_, mut writer) in writers {
+        writer.flush()?;
     }
-    for &o in organelles {
-        n.entry(o).or_insert(0);
+    for &organelle in organelles {
+        n.entry(organelle).or_insert(0);
     }
     Ok((
         WholeReadScan {
@@ -1259,12 +1285,157 @@ fn whole_read_seeds(
             seed_reads_above_gate: above,
             gate_without_nucleus: gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME,
             seconds: t0.elapsed().as_secs_f64(),
-            paired_gene_evidence: audit.map(|audit| {
-                audit.report(panel, organelles, p.panel.min_gene_segments)
-            }),
+            paired_gene_evidence,
         },
         b,
     ))
+}
+
+const WHOLE_READ_CANDIDATE_FILE: &str = "protein_whole_read_candidates";
+
+#[derive(Default, Serialize)]
+struct WholeReadCandidateRole {
+    indexed_families: usize,
+    eligible_records: u64,
+    exported_records: usize,
+    exported_bases: u64,
+    omitted_by_cap: u64,
+    truncated: bool,
+    candidate_fasta: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+pub struct WholeReadCandidateReport {
+    schema: &'static str,
+    source_qualification: &'static str,
+    scan_state: &'static str,
+    inputs: Vec<PathBuf>,
+    reads: u64,
+    bases: u64,
+    record_unit: &'static str,
+    export_order: &'static str,
+    min_stretch_hits: u32,
+    min_distinct_families: usize,
+    min_read_stretches: usize,
+    flank: usize,
+    export_cap_per_organelle: usize,
+    organelles: std::collections::BTreeMap<&'static str, WholeReadCandidateRole>,
+    panel_gene_sets: Vec<PanelGeneSet>,
+    paired_gene_evidence: Option<WholeReadGeneEvidence>,
+    elapsed_seconds: f64,
+    peak_rss_mb: Option<f64>,
+}
+
+impl WholeReadCandidateReport {
+    pub fn summary(&self) -> String {
+        let roles = self.organelles.iter()
+            .map(|(name, role)| format!("{name} {}/{}", role.exported_records, role.eligible_records))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "[ovasm] whole-read protein candidates: {roles} exported/eligible; source qualification pending ({:.1} s)",
+            self.elapsed_seconds
+        )
+    }
+}
+
+/// Independent source-pending candidates. This result is never consumed by normal seed recruitment.
+pub fn run_whole_read_candidates(
+    inputs: &[PathBuf],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    want: &[&'static str],
+    out_dir: &Path,
+    cap: usize,
+) -> Result<WholeReadCandidateReport> {
+    anyhow::ensure!(cap > 0, "--whole-read-candidate-cap must be at least 1");
+    if let Some(parent) = out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(out_dir)?;
+    let staging = out_dir.join(".staging");
+    std::fs::create_dir(&staging)?;
+    let mut published = Vec::new();
+    let result = (|| -> Result<_> {
+        let t0 = Instant::now();
+        let gene_sets = panel_gene_sets(panel);
+        let mut roles: std::collections::BTreeMap<_, _> = want.iter().copied().map(|role| {
+            let indexed_families = gene_sets.iter()
+                .find(|row| row.organelle == role)
+                .map_or(0, |row| row.family_count);
+            (role, WholeReadCandidateRole { indexed_families, ..WholeReadCandidateRole::default() })
+        }).collect();
+        let mut writers = FxHashMap::default();
+        let (reads, bases, paired_gene_evidence) = scan_whole_read_hits(
+            inputs, panel, p, want, true,
+            |read, WholeReadHit { class, lo, hi }| {
+                let role = roles.get_mut(class).expect("candidate role was requested");
+                role.eligible_records += 1;
+                if role.exported_records == cap {
+                    role.omitted_by_cap += 1;
+                    role.truncated = true;
+                    return Ok(());
+                }
+                if !writers.contains_key(class) {
+                    let filename = format!("{WHOLE_READ_CANDIDATE_FILE}.{class}.fasta");
+                    let file = std::fs::File::create_new(staging.join(&filename))?;
+                    writers.insert(class, std::io::BufWriter::new(file));
+                    role.candidate_fasta = Some(out_dir.join(filename));
+                }
+                let writer = writers.get_mut(class).expect("candidate writer is present");
+                write_whole_read_crop(writer, read, "whole_read_candidates", lo, hi)?;
+                role.exported_records += 1;
+                role.exported_bases += (hi - lo) as u64;
+                Ok(())
+            },
+        )?;
+        for (_, mut writer) in writers {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        let report = WholeReadCandidateReport {
+            schema: "ovasm.whole-read-protein-candidates.v1",
+            source_qualification: "pending",
+            scan_state: "complete",
+            inputs: inputs.to_vec(),
+            reads,
+            bases,
+            record_unit: "input_fastx_record",
+            export_order: "merged_input_batch_order",
+            min_stretch_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
+            min_distinct_families: WHOLE_READ_MIN_GENES,
+            min_read_stretches: p.min_read_stretches,
+            flank: p.flank,
+            export_cap_per_organelle: cap,
+            organelles: roles,
+            panel_gene_sets: gene_sets,
+            paired_gene_evidence,
+            elapsed_seconds: t0.elapsed().as_secs_f64(),
+            peak_rss_mb: peak_rss_mb(),
+        };
+        let report_name = format!("{WHOLE_READ_CANDIDATE_FILE}.json");
+        let staged_report = staging.join(&report_name);
+        let mut json = std::fs::File::create_new(&staged_report)?;
+        serde_json::to_writer_pretty(&mut json, &report)?;
+        json.sync_all()?;
+        for role in report.organelles.values() {
+            if let Some(path) = &role.candidate_fasta {
+                let name = path.file_name().expect("candidate has a file name");
+                std::fs::hard_link(staging.join(name), path)?;
+                published.push(path.clone());
+            }
+        }
+        let final_report = out_dir.join(report_name);
+        std::fs::hard_link(staged_report, &final_report)?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        for path in published {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let _ = std::fs::remove_dir_all(staging);
+    result
 }
 
 #[cfg(test)]

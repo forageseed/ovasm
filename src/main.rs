@@ -2058,11 +2058,17 @@ struct ProteinSeedArgs {
     /// Report density-independent gene sets with paired fallback orientation evidence.
     #[arg(long)]
     gene_set_audit: bool,
+    /// Scan all input reads for source-pending protein candidates independently of depth.
+    #[arg(long, conflicts_with_all = ["paired_gene_candidates", "gene_set_audit"])]
+    whole_read_candidates: bool,
+    /// Maximum FASTX record crops exported for each organelle in the diagnostic.
+    #[arg(long, requires = "whole_read_candidates")]
+    whole_read_candidate_cap: Option<usize>,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
-    /// Output directory for protein_seeds FASTAs and report. Paired candidates use a new
-    /// directory containing protein_candidates FASTAs and report.
+    /// Output directory for protein_seeds FASTAs and report. Candidate diagnostics use a new
+    /// directory containing their own candidate FASTAs and report.
     #[arg(long)]
     out: PathBuf,
     /// Which built-in protein panel and genetic code: landplants (mitochondrion and plastid
@@ -2201,6 +2207,14 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         .copied()
         .filter(|o| args.lineage.fasta(o).is_some())
         .collect();
+    if args.whole_read_candidates {
+        let cap = args.whole_read_candidate_cap.unwrap_or(protein_seed::WHOLE_READ_MAX_SEEDS);
+        let report = protein_seed::run_whole_read_candidates(
+            &args.reads, &panel, &p, &want, &args.out, cap,
+        )?;
+        eprintln!("{}", report.summary());
+        return Ok(());
+    }
     let mode = if args.paired_gene_candidates {
         protein_seed::SeedMode::PairedCandidates
     } else if args.gene_set_audit {

@@ -251,6 +251,22 @@ a copy of the verified bytes in the run directory and records the audit in
 `summary.json` under `seed_database.seed_source_audit`. The audit describes the source
 comparison that produced the seed view. The run may use a different reads file.
 
+#### Inspect protein candidates outside the depth gate
+
+Use `ovasm find protein-seeds --whole-read-candidates` to scan all input reads for candidate crops with the same per-read
+protein criteria as the ordinary fallback. This mode can recover candidates even
+when a depth cluster would already supply a seed file. It writes `protein_whole_read_candidates.json` and
+a candidate FASTA for each organelle with exported crops in a new output directory.
+Source qualification is pending. The JSON records complete scan counts and
+paired orientation evidence before the export cap.
+
+The cap defaults to 3,000 input FASTX records per organelle. Set `--whole-read-candidate-cap N` to
+change the number of crops exported. The report gives eligible, exported and
+omitted counts independently for each role, and marks truncation only where the
+cap omitted a crop. Export is in merged input batch order. Candidate crops can
+include nuclear homologs and shared sequence. Use source-specific evidence on
+the original reads to qualify any crops before using them as seeds.
+
 #### Recover original records from candidate crops
 
 Run `python3 scripts/extract_seed_crop_originals.py PLAN.json --out AUDIT.json --out-reads ORIGINALS.fastq`
