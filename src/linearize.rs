@@ -527,6 +527,42 @@ fn search_phased_indexed(
     search_phased_indexed_impl(n_seg, anchors, optional, br, m, max_steps, phases, out_of, thread_ends, true)
 }
 
+/// Conservative directed reachability on the anchor endpoints. If the component
+/// cannot be represented exactly or exceeds its bounds, disable this shortcut.
+fn component_reachability(
+    anchors: &[usize], br: &[Bridge], out_of: &FxHashMap<Oriented, Vec<usize>>,
+) -> Option<(FxHashMap<Oriented, usize>, Vec<Vec<bool>>)> {
+    if anchors.is_empty() || anchors.len() > 256 { return None; }
+    let mut index = FxHashMap::default();
+    for &a in anchors { for side in [false, true] {
+        let next = index.len();
+        if index.insert((a, side), next).is_some() { return None; }
+    }}
+    let n = index.len();
+    let mut adj = vec![Vec::new(); n];
+    let mut edges = 0usize;
+    for (&node, &i) in &index {
+        for &j in out_of.get(&node).map(Vec::as_slice).unwrap_or(&[]) {
+            let b = br.get(j)?;
+            if b.walk.first().copied() != Some(node) { return None; }
+            let end = *b.walk.last()?;
+            let dst = *index.get(&end)?;
+            adj[i].push(dst);
+            edges = edges.checked_add(1)?;
+            if edges > 65_536 { return None; }
+        }
+    }
+    if n.checked_mul(n.checked_add(edges)?)? > 8_000_000 { return None; }
+    let mut reach = vec![vec![false; n]; n];
+    for src in 0..n {
+        let mut stack = vec![src]; reach[src][src] = true;
+        while let Some(x) = stack.pop() { for &y in &adj[x] {
+            if !reach[src][y] { reach[src][y] = true; stack.push(y); }
+        }}
+    }
+    Some((index, reach))
+}
+
 fn search_phased_indexed_impl(
     n_seg: usize,
     anchors: &[usize],
@@ -550,6 +586,7 @@ fn search_phased_indexed_impl(
         max_steps: u64,
         topology_neutral: bool,
         optimize: bool,
+        reach: Option<&'a (FxHashMap<Oriented, usize>, Vec<Vec<bool>>)>,
     }
     struct State {
         used: Vec<bool>,
@@ -579,6 +616,15 @@ fn search_phased_indexed_impl(
         // Once too few remain, no continuation of this partial cover can succeed.
         if c.optimize && c.want.saturating_sub(s.covered) < c.m.saturating_sub(s.done.len() + 1) {
             return;
+        }
+        // Ignore used vertices and phase restrictions in this upper-bound graph:
+        // only provably unreachable mandatory anchors are pruned.
+        if !s.used[s.must] {
+            if let Some((index, reach)) = c.reach {
+                if let (Some(&from), Some(&p), Some(&q)) = (index.get(&at), index.get(&(s.must, false)), index.get(&(s.must, true))) {
+                    if !reach[from][p] && !reach[from][q] { return; }
+                }
+            }
         }
         if s.covered < c.want {
             for &i in c.out_of.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
@@ -820,6 +866,7 @@ fn search_phased_indexed_impl(
         Some(())
     }
 
+    let reach = optimize.then(|| component_reachability(anchors, br, out_of)).flatten();
     let ctx = Ctx {
         phases,
         out_of,
@@ -831,6 +878,7 @@ fn search_phased_indexed_impl(
         max_steps,
         topology_neutral: thread_ends.is_some(),
         optimize,
+        reach: reach.as_ref(),
     };
     let mut st = State {
         used: vec![false; n_seg],
@@ -2964,6 +3012,20 @@ mod tests {
         assert!(r.components[0].tails_cut.is_empty());
         assert_eq!(r.molecules, 1);
         assert_eq!(r.best.as_ref().unwrap().length, 1200);
+    }
+
+    #[test]
+    fn component_reachability_is_directed_and_fails_closed_on_external_endpoints() {
+        let make = |walk| Bridge { walk, reads: 3, topological: false, weak: false };
+        let br = vec![make(vec![(0, true), (1, true)]), make(vec![(1, true), (2, false)])];
+        let mut out = FxHashMap::default();
+        for (i, b) in br.iter().enumerate() { out.entry(b.walk[0]).or_insert_with(Vec::new).push(i); }
+        let (idx, r) = component_reachability(&[0, 1, 2], &br, &out).unwrap();
+        assert!(r[idx[&(0, true)]][idx[&(2, false)]]);
+        assert!(!r[idx[&(2, false)]][idx[&(0, true)]]);
+        assert!(!r[idx[&(0, false)]][idx[&(2, false)]]);
+        assert!(component_reachability(&[0, 1], &br, &out).is_none());
+        assert!(component_reachability(&(0..257).collect::<Vec<_>>(), &br, &out).is_none());
     }
 
     #[test]
