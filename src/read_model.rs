@@ -1,6 +1,7 @@
 //! Bounded, topology-neutral fit of candidate covers to graph-bound record evidence.
 //! The lexicographic objective is explicit, not a calibrated likelihood or abundance.
 use std::cmp::Ordering;
+use std::sync::OnceLock;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context, Result};
@@ -54,6 +55,14 @@ pub struct ReadModel {
     paths: Vec<(Vec<Oriented>,u64,bool)>,
     links: BTreeMap<Edge,u64>,
     min_reads: u64,
+    index: OnceLock<ScoreIndex>,
+}
+
+struct ScoreIndex {
+    successors: BTreeMap<Oriented,BTreeSet<Oriented>>,
+    pairings: BTreeMap<[Oriented;3],u64>,
+    supported: BTreeMap<Edge,(usize,u64)>,
+    total: u64,
 }
 
 /// Index of positions where a supported thread can extend a required anchor.
@@ -191,6 +200,23 @@ fn contains(path: &[Oriented], circular: bool, query: &[Oriented], budget: &mut 
     Some(false)
 }
 
+fn contains_indexed(path:&[Oriented], circular:bool, query:&[Oriented], positions:&BTreeMap<Oriented,Vec<usize>>, budget:&mut u64)->Option<bool> {
+    if path.is_empty() || query.is_empty() || (!circular && query.len()>path.len()) {return Some(false);}
+    let rc:Vec<_>=query.iter().rev().map(|&x|flip(x)).collect();
+    for q in [query,rc.as_slice()] {
+        for &start in positions.get(&q[0]).into_iter().flatten() {
+            if !circular && start+q.len()>path.len() {continue;}
+            let mut matches=true;
+            for (i,&o) in q.iter().enumerate() {
+                if !spend(budget,1) {return None;}
+                if path[(start+i)%path.len()]!=o {matches=false;break;}
+            }
+            if matches {return Some(true);}
+        }
+    }
+    Some(false)
+}
+
 impl ReadModel {
     pub fn load(g: &Graph, report: &Value, repeats: &[bool], min_reads: u64) -> Result<Option<Self>> {
         let Some(v)=report.get("thread_evidence") else { return Ok(None); };
@@ -228,7 +254,7 @@ impl ReadModel {
             paths.push((w,n,joint));
         }
         if Some(total)!=v["accepted_records"].as_u64() {bail!("single-record thread totals disagree")}
-        Ok(Some(Self{paths,links,min_reads:min_reads.max(1)}))
+        Ok(Some(Self{paths,links,min_reads:min_reads.max(1),index:OnceLock::new()}))
     }
 
     pub fn for_anchors(&self, anchors: &[usize], repeats: &[bool]) -> Self {
@@ -244,7 +270,7 @@ impl ReadModel {
         }
         Self {paths:self.paths.iter().filter(|(w,_,_)|
             w.iter().any(|o|!repeats[o.0] && belongs.contains(&o.0))).cloned().collect(),
-            links:self.links.iter().filter(|((a,b),_)|nodes.contains(&a.0)&&nodes.contains(&b.0)).map(|(&e,&n)|(e,n)).collect(),min_reads:self.min_reads}
+            links:self.links.iter().filter(|((a,b),_)|nodes.contains(&a.0)&&nodes.contains(&b.0)).map(|(&e,&n)|(e,n)).collect(),min_reads:self.min_reads,index:OnceLock::new()}
     }
 
     pub(crate) fn thread_ends(&self, anchors: &[usize], optional: &[bool]) -> ThreadEnds {
@@ -343,6 +369,86 @@ impl ReadModel {
             else if n<self.min_reads {fit.weak_junctions+=1;}
             else {fit.adjacency_record_occurrences_explained+=n;}
         }
+        let canonical_triple=|t:[Oriented;3]|t.min([flip(t[2]),flip(t[1]),flip(t[0])]);
+        if self.index.get().is_none() {
+            let cost=self.links.len()+self.paths.iter().map(|(w,_,_)|w.len()).sum::<usize>();
+            if !spend(budget,cost) { return None; }
+        }
+        let index=self.index.get_or_init(|| {
+            let mut successors:BTreeMap<Oriented,BTreeSet<Oriented>>=BTreeMap::new();
+            let mut supported=BTreeMap::new(); let mut total=0u64;
+            for (i,(&(a,b),&n)) in self.links.iter().enumerate() {
+                if n<self.min_reads {continue;}
+                successors.entry(a).or_default().insert(b);
+                successors.entry(flip(b)).or_default().insert(flip(a));
+                supported.insert(edge(a,b),(i,n)); total+=n;
+            }
+            let mut pairings:BTreeMap<[Oriented;3],u64>=BTreeMap::new();
+            for (w,n,_) in &self.paths {
+                let distinct:BTreeSet<_>=w.windows(3).map(|t|canonical_triple([t[0],t[1],t[2]])).collect();
+                for t in distinct {*pairings.entry(t).or_default()+=n;}
+            }
+            ScoreIndex{successors,pairings,supported,total}
+        });
+        fit.unexplained_adjacency_record_occurrences=index.total;
+        for e in &used {
+            if !spend(budget,1) {return None;}
+            if let Some(&(i,n))=index.supported.get(e) {
+                fit.matched_adjacencies.push(i);fit.unexplained_adjacency_record_occurrences-=n;
+            }
+        }
+        fit.matched_adjacencies.sort_unstable();
+        let successors=&index.successors; let pairings=&index.pairings;
+        let mut unresolved=BTreeSet::new();
+        for (p,&closed) in walks.iter().zip(circular) {
+            let starts=if closed {p.len()}else{p.len().saturating_sub(2)};
+            for i in 0..starts {
+                if !spend(budget,1){return None;}
+                let t=[p[i],p[(i+1)%p.len()],p[(i+2)%p.len()]];
+                if successors.get(&t[1]).map_or(0,BTreeSet::len)>1
+                    && successors.get(&flip(t[1])).map_or(0,BTreeSet::len)>1
+                    && pairings.get(&canonical_triple(t)).copied().unwrap_or(0)<self.min_reads {
+                    unresolved.insert(canonical_triple(t));
+                }
+            }
+        }
+        fit.unphased_branch_visits=unresolved.len();
+        let mut starts=Vec::new();
+        for p in walks {
+            if !spend(budget,p.len()) {return None;}
+            let mut pos:BTreeMap<Oriented,Vec<usize>>=BTreeMap::new();
+            for (i,&o) in p.iter().enumerate() {pos.entry(o).or_default().push(i);}
+            starts.push(pos);
+        }
+        for (index,(w,n,joint)) in self.paths.iter().enumerate() {
+            let mut matched=false;
+            for ((p,&c),positions) in walks.iter().zip(circular).zip(&starts) {
+                if contains_indexed(p,c,w,positions,budget)? {matched=true;break;}
+            }
+            if !matched {fit.unexplained_thread_records+=n;}
+            else if *n>=self.min_reads {
+                fit.matched_paths.push(index);
+                fit.thread_records_explained+=n;
+                if *joint {fit.joint_records_explained+=n;}
+            }
+        }
+        Some(fit)
+    }
+    #[cfg(test)]
+    fn score_oracle(&self, walks: &[Vec<Oriented>], circular: &[bool], budget: &mut u64) -> Option<ReadFit> {
+        let mut fit=ReadFit::default();
+        let mut used=BTreeSet::new();
+        for (path,&closed) in walks.iter().zip(circular) {
+            if !spend(budget,path.len()) {return None;}
+            for pair in path.windows(2) {used.insert(edge(pair[0],pair[1]));}
+            if closed && !path.is_empty() {used.insert(edge(*path.last().unwrap(),path[0]));}
+        }
+        for &e in &used {
+            let n=self.links.get(&e).copied().unwrap_or(0);
+            if n==0 {fit.unobserved_junctions+=1;}
+            else if n<self.min_reads {fit.weak_junctions+=1;}
+            else {fit.adjacency_record_occurrences_explained+=n;}
+        }
         let mut successors:BTreeMap<Oriented,BTreeSet<Oriented>>=BTreeMap::new();
         for (index,(&(a,b),&n)) in self.links.iter().enumerate() {
             if !spend(budget,1){return None;}
@@ -394,6 +500,47 @@ mod tests {
     use super::*;
     fn w(ns:&[usize])->Vec<Oriented>{ns.iter().map(|&n|(n,true)).collect()}
     #[test]
+    fn indexed_score_matches_exhaustive_oracle() {
+        let model=ReadModel { paths:vec![(w(&[0,1,2]),5,true),(w(&[2,0,1,2,0]),3,true),(w(&[3,2,1]),1,false)], links:[(edge((0,true),(1,true)),6),(edge((1,true),(2,true)),4),(edge((2,true),(0,true)),1)].into_iter().collect(), min_reads:2,index:OnceLock::new() };
+        for paths in [vec![w(&[0,1,2])],vec![w(&[2,1,0]),w(&[0,1,2,0])],vec![w(&[0,1,2,0,1])]] {
+            for closed in [false,true] {
+                let flags=vec![closed;paths.len()]; let mut a=1_000_000;let mut b=1_000_000;
+                let fast=model.score(&paths,&flags,&mut a).unwrap();let old=model.score_oracle(&paths,&flags,&mut b).unwrap();
+                assert_eq!(serde_json::to_value(&fast).unwrap(),serde_json::to_value(&old).unwrap());
+                assert_eq!(fast.matched_paths,old.matched_paths);assert_eq!(fast.matched_adjacencies,old.matched_adjacencies);
+            }
+        }
+    }
+    #[test]
+    fn indexed_contains_matches_oracle_on_many_deterministic_paths() {
+        let mut state=42u64;
+        for _ in 0..500 {
+            let mut next=||{state=state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);state};
+            let n=(next()%8) as usize; let m=(next()%14) as usize;
+            let p:Vec<Oriented>=(0..n).map(|_|{let x=next();((x%5) as usize, x&8!=0)}).collect();
+            let q:Vec<Oriented>=(0..m).map(|_|{let x=next();((x%5) as usize, x&8!=0)}).collect();
+            let mut idx:BTreeMap<Oriented,Vec<usize>>=BTreeMap::new();for (i,&o) in p.iter().enumerate(){idx.entry(o).or_default().push(i);}
+            for closed in [false,true] {let mut a=100_000;let mut b=100_000;assert_eq!(contains(&p,closed,&q,&mut a),contains_indexed(&p,closed,&q,&idx,&mut b));}
+        }
+    }
+    #[test]
+    fn indexed_contains_matches_oracle_on_empty_repeats_and_long_wrapping_queries() {
+        let paths=vec![vec![],w(&[0]),w(&[0,1,0]),w(&[0,1,2,0])];
+        let queries=vec![vec![],w(&[0]),w(&[0,1,0,1,0]),w(&[2,0,1]),vec![(2,false),(1,false),(0,false)]];
+        for p in &paths { let mut idx:BTreeMap<Oriented,Vec<usize>>=BTreeMap::new(); for (i,&v) in p.iter().enumerate(){idx.entry(v).or_default().push(i);}
+            for q in &queries { for circular in [false,true] {let mut a=10000;let mut b=10000;
+                assert_eq!(contains(p,circular,q,&mut a),contains_indexed(p,circular,q,&idx,&mut b));
+            }}
+        }
+    }
+    #[test]
+    fn indexed_score_respects_empty_budget_and_caches_only_complete_index() {
+        let model=ReadModel{paths:vec![(w(&[0,1,2]),1,false)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
+        let mut b=0;assert!(model.score(&[w(&[0,1,2])],&[false],&mut b).is_none());assert!(model.index.get().is_none());
+        let mut b=100;assert!(model.score(&[w(&[0,1,2])],&[false],&mut b).is_some());
+        let mut b=0;assert!(model.score(&[w(&[0,1,2])],&[false],&mut b).is_none());
+    }
+    #[test]
     fn wrapping_requires_closed_path_and_works_on_both_strands() {
         let p=w(&[0,1,2]);let q=w(&[2,0,1]);let mut b=100;
         assert_eq!(contains(&p,false,&q,&mut b),Some(false));
@@ -403,7 +550,7 @@ mod tests {
     }
     #[test]
     fn equal_local_marginals_do_not_substitute_for_joint_linkage() {
-        let model=ReadModel{paths:vec![(w(&[0,1,2,3,4]),10,true),(w(&[5,1,2,3,6]),10,true)],links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0,1,2,3,4]),10,true),(w(&[5,1,2,3,6]),10,true)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let mut budget=10000;
         let yes=model.score(&[w(&[0,1,2,3,4]),w(&[5,1,2,3,6])],&[false,false],&mut budget).unwrap();
         let no=model.score(&[w(&[0,1,2,3,6]),w(&[5,1,2,3,4])],&[false,false],&mut budget).unwrap();
@@ -412,7 +559,7 @@ mod tests {
     }
     #[test]
     fn coexisting_configurations_are_not_forced_apart() {
-        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,true),(w(&[0,1,3]),10,true)],links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,true),(w(&[0,1,3]),10,true)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let mut budget=1000;
         let a=model.score(&[w(&[0,1,2])],&[false],&mut budget).unwrap();
         let b=model.score(&[w(&[0,1,3])],&[false],&mut budget).unwrap();
@@ -420,7 +567,7 @@ mod tests {
     }
     #[test]
     fn closure_has_no_bonus_without_observed_connection() {
-        let model=ReadModel{paths:vec![],links:[(edge((0,true),(1,true)),10),(edge((1,true),(2,true)),10)].into_iter().collect(),min_reads:2};
+        let model=ReadModel{paths:vec![],links:[(edge((0,true),(1,true)),10),(edge((1,true),(2,true)),10)].into_iter().collect(),min_reads:2,index:OnceLock::new()};
         let mut budget=1000;
         let open=model.score(&[w(&[0,1,2])],&[false],&mut budget).unwrap();
         let closed=model.score(&[w(&[0,1,2])],&[true],&mut budget).unwrap();
@@ -429,7 +576,7 @@ mod tests {
     #[test]
     fn closing_evidence_supplies_an_actual_gain() {
         let links=[(edge((0,true),(1,true)),10),(edge((1,true),(2,true)),10),(edge((2,true),(0,true)),10)].into_iter().collect();
-        let model=ReadModel{paths:vec![],links,min_reads:2};let mut b=1000;
+        let model=ReadModel{paths:vec![],links,min_reads:2,index:OnceLock::new()};let mut b=1000;
         let open=model.score(&[w(&[0,1,2])],&[false],&mut b).unwrap();
         let closed=model.score(&[w(&[0,1,2])],&[true],&mut b).unwrap();
         assert_eq!(closed.order(&open),Ordering::Less);
@@ -438,7 +585,7 @@ mod tests {
     fn local_edges_cannot_phase_a_long_branching_segment() {
         let links=[(edge((0,true),(1,true)),20),(edge((1,true),(0,true)),25),
             (edge((0,true),(2,true)),24),(edge((2,true),(0,true)),28)].into_iter().collect();
-        let model=ReadModel{paths:vec![],links,min_reads:2};let mut b=10000;
+        let model=ReadModel{paths:vec![],links,min_reads:2,index:OnceLock::new()};let mut b=10000;
         let a=model.score(&[w(&[0,1]),w(&[2])],&[true,false],&mut b).unwrap();
         let z=model.score(&[w(&[0,2]),w(&[1])],&[true,false],&mut b).unwrap();
         assert!(a.unphased_branch_visits>0 && a.unexplained_adjacency_record_occurrences>0);
@@ -449,7 +596,7 @@ mod tests {
     }
     #[test]
     fn repeat_loops_do_not_recount_the_same_edge_or_record() {
-        let model=ReadModel{paths:vec![(w(&[0,1,0]),10,false)],links:[(edge((0,true),(1,true)),10),(edge((1,true),(0,true)),10)].into_iter().collect(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0,1,0]),10,false)],links:[(edge((0,true),(1,true)),10),(edge((1,true),(0,true)),10)].into_iter().collect(),min_reads:2,index:OnceLock::new()};
         let mut b=1000;
         let a=model.score(&[w(&[0,1,0])],&[false],&mut b).unwrap();
         let z=model.score(&[w(&[0,1,0,1,0])],&[false],&mut b).unwrap();
@@ -457,13 +604,13 @@ mod tests {
     }
     #[test]
     fn one_record_cannot_become_supported_joint_structure() {
-        let model=ReadModel{paths:vec![(w(&[0,1,2]),1,true)],links:BTreeMap::new(),min_reads:2};let mut b=1000;
+        let model=ReadModel{paths:vec![(w(&[0,1,2]),1,true)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};let mut b=1000;
         let a=model.score(&[w(&[0,1,2])],&[false],&mut b).unwrap();
         assert_eq!((a.joint_records_explained,a.thread_records_explained),(0,0));
     }
     #[test]
     fn exhausted_budget_never_returns_a_partial_score() {
-        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,false)],links:BTreeMap::new(),min_reads:2};let mut b=1;
+        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,false)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};let mut b=1;
         assert!(model.score(&[w(&[0,1,2])],&[false],&mut b).is_none());
     }
     #[test]
@@ -474,14 +621,14 @@ mod tests {
     }
     #[test]
     fn another_components_records_are_not_unexplained_evidence() {
-        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,false),(w(&[3,4,5]),20,false)],links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0,1,2]),10,false),(w(&[3,4,5]),20,false)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let scoped=model.for_anchors(&[0,1,2],&[false;6]);let mut b=1000;
         let fit=scoped.score(&[w(&[0,1,2])],&[false],&mut b).unwrap();
         assert_eq!(fit.thread_records_explained,10);assert_eq!(fit.unexplained_thread_records,0);
     }
     #[test]
     fn explanatory_family_uses_exact_search_when_greedy_is_suboptimal() {
-        let model=ReadModel{paths:(0..6).map(|i|(w(&[i]),10,false)).collect(),links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:(0..6).map(|i|(w(&[i]),10,false)).collect(),links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let f=|xs:&[usize]|ReadFit{matched_paths:xs.to_vec(),..ReadFit::default()};
         let fits=[f(&[0,1,2,3]),f(&[0,1,4]),f(&[2,3,5]),f(&[4]),f(&[5])];
         let cover=model.path_cover(&fits.iter().collect::<Vec<_>>(),10000);
@@ -490,19 +637,19 @@ mod tests {
     }
     #[test]
     fn explanatory_family_preserves_unrepresentable_and_weak_records() {
-        let model=ReadModel{paths:vec![(w(&[0]),10,false),(w(&[1]),5,false),(w(&[2]),1,false)],links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0]),10,false),(w(&[1]),5,false),(w(&[2]),1,false)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let fit=ReadFit{matched_paths:vec![0],..ReadFit::default()};let c=model.path_cover(&[&fit],1000);
         assert_eq!((c.supported_thread_records,c.represented_thread_records,c.unrepresentable_thread_records,c.low_support_thread_records),(15,10,5,1));
     }
     #[test]
     fn explanatory_family_budget_does_not_manufacture_optimality() {
-        let model=ReadModel{paths:vec![(w(&[0]),10,false)],links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:vec![(w(&[0]),10,false)],links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let fit=ReadFit{matched_paths:vec![0],..ReadFit::default()};let c=model.path_cover(&[&fit],0);
         assert!(c.budget_exhausted);assert!(!c.minimum_family_size_proven);assert_eq!(c.represented_thread_records,0);
     }
     #[test]
     fn equivalent_minimum_families_preserve_their_entire_ambiguity_envelope() {
-        let model=ReadModel{paths:(0..4).map(|i|(w(&[i]),10,false)).collect(),links:BTreeMap::new(),min_reads:2};
+        let model=ReadModel{paths:(0..4).map(|i|(w(&[i]),10,false)).collect(),links:BTreeMap::new(),min_reads:2,index:OnceLock::new()};
         let f=|xs:&[usize]|ReadFit{matched_paths:xs.to_vec(),..ReadFit::default()};
         let fits=[f(&[0,1]),f(&[2,3]),f(&[0,2]),f(&[1,3])];
         let cover=model.path_cover(&fits.iter().collect::<Vec<_>>(),10000);
