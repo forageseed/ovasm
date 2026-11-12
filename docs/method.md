@@ -235,6 +235,15 @@ ambiguous, mixed or competing evidence leaves the crop out of the strict view.
 An empty strict view is reportable. OVASM requires at least one qualifying crop
 for that organelle before starting recruitment.
 
+For a stricter panel-scope check, add `--require-reference-roles` with
+`--retention-policy target-supported-only`. The manifest must declare a
+`required_reference_roles` list containing the target and `nuclear`; a plastid
+target also requires `mitochondrion`. Assign each reference a `source_role`
+(`mitochondrion`, `plastid`, `nuclear`, or `unplaced`) consistent with its
+existing `target` or `competing` role. Missing required roles leave every crop
+unresolved and retain none. These roles are user-declared: their presence does
+not establish reference completeness or prove physical origin.
+
 For an audited view prepared with a manifest target of `mitochondrion` or `plastid`, pass
 the retained FASTA to normal seed recruitment. Supply the audit with the same organelle.
 
@@ -263,7 +272,10 @@ paired orientation evidence before the export cap.
 The cap defaults to 3,000 input FASTX records per organelle. Set `--whole-read-candidate-cap N` to
 change the number of crops exported. The report gives eligible, exported and
 omitted counts independently for each role, and marks truncation only where the
-cap omitted a crop. Export is in merged input batch order. Candidate crops can
+cap omitted a crop. Export is in merged input batch order by default. Use
+`--whole-read-export-order stable-record` for order-stable capped export; see
+[protein candidate export](protein-candidate-export.md) for its temporary disk
+use and duplicate-record semantics. Candidate crops can
 include nuclear homologs and shared sequence. Use source-specific evidence on
 the original reads to qualify any crops before using them as seeds.
 
