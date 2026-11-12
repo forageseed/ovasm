@@ -243,6 +243,23 @@ a copy of the verified bytes in the run directory and records the audit in
 `summary.json` under `seed_database.seed_source_audit`. The audit describes the source
 comparison that produced the seed view. The run may use a different reads file.
 
+#### Recover original records from candidate crops
+
+Run `python3 scripts/extract_seed_crop_originals.py PLAN.json --out AUDIT.json --out-reads ORIGINALS.fastq`
+before repeated source comparisons on the same crops. Use schema
+`ovasm.seed-crop-originals-plan.v1` with `scope`, a `candidate_sets` list of
+FASTA file bindings with an `id` per set, and a `raw_reads` list of original
+plain or gzip FASTQ file bindings. Each binding has `path` and `sha256`.
+An original input can also set its one-based `id_field`.
+
+The extractor verifies the archive SHA-256 while scanning the entire file
+and joins each crop by identifier, exact interval and literal sequence bytes.
+It records missing, mismatched and ambiguous matches. The output includes each
+uniquely bound original once, with its full FASTQ title, sequence and qualities.
+The report ties each crop to an input record ordinal and an output record index.
+Use these bindings when assigning mapper names. Source qualification requires
+separate reference and read evidence.
+
 ### 2.7 Audit protein gene sets
 
 Use `ovasm find protein-seeds --gene-set-audit` or add `--protein-gene-set-audit`
