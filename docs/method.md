@@ -238,7 +238,9 @@ for that organelle before starting recruitment.
 For a stricter panel-scope check, add `--require-reference-roles` with
 `--retention-policy target-supported-only`. The manifest must declare a
 `required_reference_roles` list containing the target and `nuclear`; a plastid
-target also requires `mitochondrion`. Assign each reference a `source_role`
+target also requires `mitochondrion`. To require plastid competition for a
+plant mitochondrial target, explicitly include `plastid` in that list; the
+check does not infer biological lineage. Assign each reference a `source_role`
 (`mitochondrion`, `plastid`, `nuclear`, or `unplaced`) consistent with its
 existing `target` or `competing` role. Missing required roles leave every crop
 unresolved and retain none. These roles are user-declared: their presence does
