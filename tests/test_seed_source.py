@@ -1,6 +1,7 @@
 import gzip
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import random
 import runpy
@@ -185,6 +186,91 @@ class SeedSourceAudit(unittest.TestCase):
         report, retained = TOOL["audit"](path)
         self.assertEqual(report["records"][0]["reason"], "original_identifier_repeated")
         self.assertEqual(retained, [seed])
+
+
+    def test_requested_batch_failure_leaves_no_outputs(self):
+        path = self.assemble([(b"seen", self.target)], [self.crop(b"seen", self.target)])
+        prefix = b"OVXPOS1\tpanel\n"
+        hit = b"H\t0\t0\t0\n"
+        terminal = b"E\t2\t4\n"
+        cases = (
+            (b"invalid\n", 0, False),
+            (prefix + hit, 0, False),
+            (prefix + b"E\t2\t5\n", 0, False),
+            (prefix + hit * 2 + terminal, 0, False),
+            (prefix + b"H\t2\t0\t0\n" + terminal, 0, False),
+            (prefix + b"H\t0\t4\t0\n" + terminal, 0, False),
+            (prefix + b"H\t0\t0\t99999999999999999999999999\n" + terminal, 0, False),
+            (prefix + b"H\t0\t2\t0\n" + terminal, 0, False),
+            (prefix + hit + terminal + b"unexpected\n", 0, False),
+            (prefix + hit + terminal, 7, False),
+            (b"OVXPOS1\trecords\nH\t0\t0\t0\n", 0, True),
+        )
+        out, view = self.root / "bad.json", self.root / "bad.fa"
+        for index, (response, status, originals_only) in enumerate(cases):
+            with self.subTest(index=index):
+                source = (
+                    f"#!{sys.executable}\n"
+                    "import sys\n"
+                    "sys.stdin.buffer.read()\n"
+                    f"if {originals_only!r} and sys.argv[-1] == 'panel':\n"
+                    f"    sys.stdout.buffer.write({(prefix + hit + terminal)!r})\n"
+                    "    raise SystemExit(0)\n"
+                    f"sys.stdout.buffer.write({response!r})\n"
+                    f"raise SystemExit({status})\n"
+                ).encode()
+                binary = self.write(f"bad-backend-{index}", source)
+                binary.chmod(0o700)
+                result = subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
+                                         "--out", str(out), "--out-fasta", str(view),
+                                         "--exact-placement-bin", str(binary)],
+                                        capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"exact placement", result.stderr)
+                self.assertFalse(out.exists())
+                self.assertFalse(view.exists())
+
+    @unittest.skipUnless(os.environ.get("OVASM_EXACT_PLACEMENT_BIN"), "requires built OVASM exact-placement binary")
+    def test_native_batch_preserves_capped_orientation_and_record_order(self):
+        binary = Path(os.environ["OVASM_EXACT_PLACEMENT_BIN"]).resolve(strict=True)
+        rng = random.Random(742)
+        words = [b"A", b"AA", b"AAA", b"ACGT", b"AACC", b"GGTT", b"TA", b"AT"]
+        words += [bytes(rng.choices(b"ACGT", k=rng.randrange(3, 9))) for _ in range(31)]
+        records = [b"GGTTNGAACCAAACGT", b"AACCNGGTTACGT", b"", b"N" * 65534 + b"ACGT"]
+        records += [bytes(rng.choices(b"ACGTN", k=370)) for _ in range(170)]
+        batch = TOOL["batch_placement_lookup"]
+        panel = batch(binary, "panel", records, words)
+        by_record = batch(binary, "records", records, words)
+        for word in words:
+            expected = []
+            for index, seq in enumerate(records):
+                single = [(index, *match) for match in TOOL["placements"](seq, word)]
+                self.assertEqual(by_record(word, index), single)
+                expected.extend(single)
+            self.assertEqual(panel(word), expected[:2])
+        self.assertEqual(panel(b"AACC"), [(0, 6, 10, "+"), (0, 0, 4, "-")])
+        self.assertEqual(by_record(b"ACGT", 3), [(3, 65534, 65538, "+"), (3, 65534, 65538, "-")])
+
+    @unittest.skipUnless(os.environ.get("OVASM_EXACT_PLACEMENT_BIN"), "requires built OVASM exact-placement binary")
+    def test_native_batch_cli_outputs_match_both_python_policies(self):
+        binary = Path(os.environ["OVASM_EXACT_PLACEMENT_BIN"]).resolve(strict=True)
+        reverse = self.competing.translate(TOOL["COMPLEMENT"])[::-1]
+        originals = [(b"target", self.target), (b"shared", self.target), (b"shared", reverse),
+                     (b"inside", self.novel + self.target), (b"outside", self.target + self.novel),
+                     (b"mixed", self.competing + self.target)]
+        crops = [self.crop(name, seq) for name, seq in originals[:3]]
+        crops += [self.crop(b"inside", self.target, start=64),
+                  self.crop(b"outside", self.novel, start=64), self.crop(b"mixed", self.target, start=64),
+                  self.crop(b"missing", self.novel)]
+        path = self.assemble(originals, crops, as_gzip=True)
+        for policy in (TOOL["EXCLUDE_COMPETING"], TOOL["TARGET_ONLY"]):
+            published = []
+            for label, extra in (("python", []), ("batch", ["--exact-placement-bin", str(binary)])):
+                out, view = [self.root / f"{policy}-{label}.{suffix}" for suffix in ("json", "fa")]
+                subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path), "--retention-policy", policy,
+                                "--out", str(out), "--out-fasta", str(view), *extra], check=True, timeout=5)
+                published.append((out.read_bytes(), view.read_bytes()))
+            self.assertEqual(*published)
 
 
 if __name__ == "__main__":

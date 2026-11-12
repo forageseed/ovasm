@@ -9,7 +9,10 @@ import gzip
 import json
 import os
 import re
+import struct
+import subprocess
 import tempfile
+from threading import Thread
 
 
 MANIFEST = "ovasm.seed-source-audit.v1"
@@ -18,6 +21,9 @@ SPAN = re.compile(rb"span=(\d+)-(\d+)")
 ROLES = {"target", "competing"}
 EXCLUDE_COMPETING = "exclude-competing"
 TARGET_ONLY = "target-supported-only"
+PLACEMENT_MAGIC = b"OVXPOS1"
+PLACEMENT_END = 0xffffffff
+PLACEMENT_HIT = re.compile(rb"H\t([0-9]+)\t([0-9]+)\t([0-9]+)\n")
 
 
 def require(condition, message):
@@ -102,6 +108,95 @@ def placements(sequence, window):
     return found
 
 
+def write_placement_records(stream, sequences, errors):
+    try:
+        with stream:
+            stream.write(PLACEMENT_MAGIC + b"\n")
+            for sequence in sequences:
+                require(len(sequence) < PLACEMENT_END, "exact placement record exceeds the frame limit")
+                stream.write(struct.pack("<I", len(sequence)))
+                stream.write(sequence)
+            stream.write(struct.pack("<I", PLACEMENT_END))
+    except (OSError, ValueError) as error:
+        errors.append(error)
+
+
+def read_placement_hits(stream, sequences, patterns, scope):
+    header = PLACEMENT_MAGIC + b"\t" + scope.encode("ascii") + b"\n"
+    require(stream.readline(128) == header, "invalid exact placement response header")
+    terminal = f"E\t{len(sequences)}\t{len(patterns)}\n".encode("ascii")
+    hits = defaultdict(list)
+    previous_record = -1
+    while line := stream.readline(128):
+        if line == terminal:
+            require(not stream.read(1), "trailing exact placement response")
+            return hits
+        match = PLACEMENT_HIT.fullmatch(line)
+        require(match is not None, "invalid exact placement hit or terminal summary")
+        record, pattern, start = map(int, match.groups())
+        require(previous_record <= record < len(sequences) and pattern < len(patterns),
+                "invalid exact placement record or pattern index")
+        sequence, literal = sequences[record], patterns[pattern]
+        require(start + len(literal) <= len(sequence) and sequence.startswith(literal, start),
+                "invalid exact placement coordinates or literal")
+        previous_record = record
+        key = (None if scope == "panel" else record, pattern)
+        positions = hits[key]
+        require(len(positions) < 2 and (not positions or positions[-1] < (record, start)),
+                "duplicate, unordered or excess exact placement hits")
+        positions.append((record, start))
+    raise ValueError("missing exact placement terminal summary")
+
+
+def batch_placement_lookup(binary, scope, sequences, words):
+    def oriented(word):
+        return (("+", word), ("-", word.translate(COMPLEMENT)[::-1]))
+
+    oriented_words = {word: oriented(word) for word in words}
+    patterns = tuple(dict.fromkeys(literal for pair in oriented_words.values() for _, literal in pair))
+    pattern_ids = {literal: index for index, literal in enumerate(patterns)}
+    with tempfile.TemporaryDirectory(prefix="ovasm-exact-placements-") as tmp:
+        path = Path(tmp) / "patterns.txt"
+        with path.open("wb") as output:
+            for literal in patterns:
+                output.write(literal + b"\n")
+        with subprocess.Popen(
+            [binary, "find", "exact-placements", "--patterns", path, "--scope", scope],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        ) as process:
+            errors = []
+            writer = Thread(target=write_placement_records, args=(process.stdin, sequences, errors))
+            writer.start()
+            try:
+                hits = read_placement_hits(process.stdout, sequences, patterns, scope)
+                require(process.wait() == 0, "exact placement backend exited unsuccessfully")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                writer.join()
+            require(not errors, f"cannot deliver exact placement input: {errors}")
+
+    def lookup(word, record=None):
+        matches = [(record_index, start, start + len(word), strand)
+                   for strand, literal in oriented_words[word]
+                   for record_index, start in hits.get((record, pattern_ids[literal]), ())]
+        # Reference order takes precedence across records; the legacy search
+        # emits all forward positions before reverse positions in each record.
+        return sorted(matches, key=lambda hit: (hit[0], hit[3] == "-", hit[1]))[:2]
+
+    return lookup
+
+
+def legacy_panel_placements(panel, word):
+    matches = []
+    for ref, (_, records) in panel.items():
+        for contig, sequence in records.items():
+            matches.extend((ref, contig, *position) for position in placements(sequence, word))
+            if len(matches) >= 2:
+                return matches[:2]
+    return matches
+
+
 def load_panel(manifest, base):
     panel = {}
     for entry in manifest["references"]:
@@ -122,7 +217,7 @@ def load_panel(manifest, base):
     return panel
 
 
-def load_windows(manifest, panel, base):
+def load_windows(manifest, panel, base, placement_binary=None):
     windows = {}
     for window in manifest["windows"]:
         name, reference, record = window["id"], window["reference"], window["record"]
@@ -137,22 +232,25 @@ def load_windows(manifest, panel, base):
         require(not set(word).difference(b"ACGT"), f"ambiguous bases in source window: {name}")
         with locked_file(window["provenance"], base):
             pass
-        matches = []
-        for ref, (_, ref_records) in panel.items():
-            for contig, sequence in ref_records.items():
-                matches.extend((ref, contig, *position) for position in placements(sequence, word))
-                if len(matches) >= 2:
-                    break
-            if len(matches) >= 2:
-                break
-        unique = matches == [(reference, record, start, end, "+")]
         windows[name] = (role, word, {
             "reference": reference, "record": record, "interval": [start, end],
             "boundary": boundary, "role": role, "sequence_sha256": sha256(word).hexdigest(),
             "provenance_sha256": window["provenance"]["sha256"],
-            "unique_in_named_panel": unique, "observed_placements": matches[:2],
         })
     require(windows, "provide at least one source window")
+    if placement_binary is not None:
+        entries = [(ref, record, sequence) for ref, (_, records) in panel.items() for record, sequence in records.items()]
+        locate = batch_placement_lookup(placement_binary, "panel", [entry[2] for entry in entries],
+                                        (word for _, word, _ in windows.values()))
+    for _, word, report in windows.values():
+        if placement_binary is None:
+            matches = legacy_panel_placements(panel, word)
+        else:
+            matches = [(entries[i][0], entries[i][1], start, end, strand)
+                       for i, start, end, strand in locate(word)]
+        start, end = report["interval"]
+        report["unique_in_named_panel"] = matches == [(report["reference"], report["record"], start, end, "+")]
+        report["observed_placements"] = matches
     return windows
 
 
@@ -213,7 +311,19 @@ def load_strict_originals(references, base, seeds):
     return originals, observed_names
 
 
-def assess_seed(name, span, seed, originals, windows, strict_names=None):
+def original_placement_lookup(binary, originals, windows):
+    sequences = {id(binding[-1]): binding[-1] for binding in originals.values() if binding is not None}
+    indices = {identity: index for index, identity in enumerate(sequences)}
+    locate = batch_placement_lookup(binary, "records", list(sequences.values()),
+                                    (word for _, word, _ in windows.values()))
+
+    def lookup(sequence, word):
+        return [(start, end, strand) for _, start, end, strand in locate(word, indices[id(sequence)])]
+
+    return lookup
+
+
+def assess_seed(name, span, seed, originals, windows, strict_names=None, locate=placements):
     row = {
         "read_id": name.decode("ascii", errors="backslashreplace"),
         "read_id_hex": name.hex(), "crop": span, "seed_sha256": sha256(seed).hexdigest(),
@@ -248,7 +358,7 @@ def assess_seed(name, span, seed, originals, windows, strict_names=None):
 
     observed_roles, crop_roles = set(), set()
     for window, (role, word, reference) in windows.items():
-        positions = placements(original, word)
+        positions = locate(original, word)
         if not positions:
             continue
         observed_roles.add(role)
@@ -272,7 +382,7 @@ def assess_seed(name, span, seed, originals, windows, strict_names=None):
     return row
 
 
-def audit(path, retention_policy=EXCLUDE_COMPETING):
+def audit(path, retention_policy=EXCLUDE_COMPETING, placement_binary=None):
     data = path.read_bytes()
     manifest = json.loads(data)
     scope = manifest.get("scope")
@@ -284,19 +394,20 @@ def audit(path, retention_policy=EXCLUDE_COMPETING):
     strict = retention_policy == TARGET_ONLY
     require(not strict or target is not None, "target-supported-only requires a named organelle target")
     base = path.parent
-    windows = load_windows(manifest, load_panel(manifest, base), base)
+    windows = load_windows(manifest, load_panel(manifest, base), base, placement_binary)
     seeds = load_seeds(manifest["seeds"], base)
     strict_names = None
     if strict:
         originals, strict_names = load_strict_originals(manifest["raw_reads"], base, seeds)
     else:
         originals = load_originals(manifest["raw_reads"], base, {seed[0] for seed in seeds})
+    locate = placements if placement_binary is None else original_placement_lookup(placement_binary, originals, windows)
     rows = []
     kept = []
     counts = {"target_supported": 0, "competing_supported": 0, "unresolved": 0}
     retained_sha = sha256()
     for name, span, sequence, fasta in seeds:
-        row = assess_seed(name, span, sequence, originals, windows, strict_names)
+        row = assess_seed(name, span, sequence, originals, windows, strict_names, locate)
         rows.append(row)
         counts[row["state"]] += 1
         allowed = row["state"] == "target_supported" if strict else row["state"] != "competing_supported"
@@ -349,13 +460,18 @@ def main():
     parser.add_argument("--out-fasta", type=Path, help="new FASTA containing crops admitted by the retention policy")
     parser.add_argument("--retention-policy", choices=(EXCLUDE_COMPETING, TARGET_ONLY), default=EXCLUDE_COMPETING,
                         help="retain target-supported and unresolved crops, or require positive target evidence")
+    parser.add_argument("--exact-placement-bin", type=Path,
+                        help="use this OVASM binary for exact batch placement; errors abort the audit")
     args = parser.parse_args()
     try:
         paths = [args.out] + ([args.out_fasta] if args.out_fasta else [])
         require(len({path.resolve() for path in paths}) == len(paths), "output paths must differ")
         for path in paths:
             require(not (path.exists() or path.is_symlink()), f"output already exists: {path}")
-        report, retained = audit(args.manifest, args.retention_policy)
+        binary = args.exact_placement_bin
+        if binary is not None:
+            binary = binary.resolve(strict=True)
+        report, retained = audit(args.manifest, args.retention_policy, binary)
         outputs = [(args.out, [json.dumps(report, indent=2, sort_keys=True).encode() + b"\n"])]
         if args.out_fasta:
             outputs.append((args.out_fasta, retained))

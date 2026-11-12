@@ -211,6 +211,12 @@ Every registered `windows` entry provides an ID, reference ID, record ID, half-o
 reference interval, interior boundary coordinate, and a locked `provenance` file.
 Select intervals that cross source-informative boundaries before evaluating crops.
 
+Pass the path to an OVASM binary with the batch scanner as
+`--exact-placement-bin /path/to/ovasm`. The audit streams the same locked reference and
+original sequences to the scanner and preserves the placement order, two-hit limit,
+JSON report and retained FASTA. An invalid or incomplete scanner response aborts
+publication. Without this option the audit uses Python substring searches.
+
 `--out-fasta RETAINED.fa` writes a separate FASTA that omits crops with a supported competing
 context. It preserves target-supported and unresolved records byte for byte. The audit
 records exact placements in the named panel, both strands, and uncertainty from repeated
