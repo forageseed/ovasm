@@ -138,6 +138,105 @@ class SeedSourceAudit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "repeats an original input file"):
             TOOL["audit"](path, TOOL["TARGET_ONLY"])
 
+    def declare_roles(self, competing="nuclear", *, required=None):
+        self.manifest["required_reference_roles"] = (
+            ["mitochondrion", "nuclear"] if required is None else required
+        )
+        self.manifest["references"][0]["source_role"] = "mitochondrion"
+        self.manifest["references"][1]["source_role"] = competing
+
+    def test_declared_roles_hold_target_when_only_plastid_or_unplaced_competes(self):
+        crop = self.crop(b"target", self.target)
+        for other in ("plastid", "unplaced"):
+            with self.subTest(other=other):
+                self.declare_roles(other)
+                manifest = self.assemble([(b"target", self.target)], [crop])
+                previous, legacy = TOOL["audit"](manifest, TOOL["TARGET_ONLY"])
+                self.assertEqual(legacy, [crop])
+                self.assertNotIn("reference_panel_scope", previous)
+                report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+                self.assertEqual(retained, [])
+                self.assertEqual(report["retained_fasta_sha256"], sha256(b"").hexdigest())
+                self.assertEqual(report["retained_records"], 0)
+                self.assertEqual(report["counts"], {"target_supported": 0, "competing_supported": 0,
+                                                    "unresolved": 1})
+                self.assertEqual(report["records"][0]["reason"], "missing_required_reference_roles")
+                scope = report["reference_panel_scope"]
+                self.assertEqual(scope["missing_required_roles"], ["nuclear"])
+                self.assertFalse(scope["source_windows_evaluated"])
+                self.assertEqual(scope["physical_origin"], "unresolved")
+
+    def test_missing_reference_role_reports_without_opening_originals_or_references(self):
+        self.declare_roles("plastid")
+        crop = self.crop(b"target", self.target)
+        self.target_ref.unlink()
+        self.competing_ref.unlink()
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        (self.root / "raw.fa").unlink()
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["windows"], {})
+        self.assertFalse(report["reference_panel_scope"]["raw_records_evaluated"])
+
+    def test_declared_roles_accept_named_panel_with_nuclear_and_report_scope_limit(self):
+        self.declare_roles()
+        crop = self.crop(b"target", self.target)
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [crop])
+        scope = report["reference_panel_scope"]
+        self.assertEqual(scope["missing_required_roles"], [])
+        self.assertTrue(scope["source_windows_evaluated"])
+        self.assertEqual(scope["reference_role_authority"], "user_declared")
+        self.assertEqual(scope["scope"], "supplied_named_reference_records")
+        self.assertEqual(scope["physical_origin"], "unresolved")
+        self.assertIn("does not establish panel completeness or physical origin", report["source_limit"])
+
+    def test_declared_roles_report_missing_target_or_other_required_organelle(self):
+        self.declare_roles(required=["mitochondrion", "nuclear", "plastid"])
+        crop = self.crop(b"target", self.target)
+        originals = [(b"target", self.target)]
+        manifest = self.assemble(originals, [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["reference_panel_scope"]["missing_required_roles"], ["plastid"])
+        self.manifest["references"].pop(0)
+        manifest = self.assemble(originals, [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["reference_panel_scope"]["missing_required_roles"], ["mitochondrion", "plastid"])
+
+    def test_declared_roles_reject_invalid_policy_and_untyped_or_conflicting_roles(self):
+        self.declare_roles(required=["mitochondrion"])
+        originals = [(b"target", self.target)]
+        crops = [self.crop(b"target", self.target)]
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "include the target and nuclear"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.declare_roles()
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "require the target-supported-only"):
+            TOOL["audit"](manifest, require_reference_roles=True)
+        self.manifest["references"][1].pop("source_role")
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "each reference requires"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.manifest["references"][1]["source_role"] = "mitochondrion"
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+
+    def test_declared_roles_cli_missing_nuclear_produces_empty_native_input(self):
+        self.declare_roles("plastid")
+        crop = self.crop(b"target", self.target)
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        out, view = self.root / "audit.json", self.root / "retained.fa"
+        subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(manifest), "--out", str(out),
+                        "--out-fasta", str(view), "--python-placements", "--retention-policy",
+                        TOOL["TARGET_ONLY"], "--require-reference-roles"], check=True)
+        self.assertEqual(view.read_bytes(), b"")
+        self.assertEqual(json.loads(out.read_text())["retained_records"], 0)
+
     def test_explicit_original_identifier_field_supports_archive_prefix(self):
         path = self.assemble([(b"SRR123.1 movie/1", self.competing)],
                              [self.crop(b"movie/1", self.competing)])

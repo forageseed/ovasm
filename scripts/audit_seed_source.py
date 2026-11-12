@@ -20,6 +20,8 @@ MANIFEST = "ovasm.seed-source-audit.v1"
 COMPLEMENT = bytes.maketrans(b"ACGT", b"TGCA")
 SPAN = re.compile(rb"span=(\d+)-(\d+)")
 ROLES = {"target", "competing"}
+REQUIRED_SOURCE_ROLES = {"mitochondrion", "plastid", "nuclear"}
+REFERENCE_SOURCE_ROLES = REQUIRED_SOURCE_ROLES | {"unplaced"}
 EXCLUDE_COMPETING = "exclude-competing"
 TARGET_ONLY = "target-supported-only"
 PLACEMENT_MAGIC = b"OVXPOS1"
@@ -202,6 +204,48 @@ def legacy_panel_placements(panel, word):
     return matches
 
 
+def declared_reference_scope(manifest, target):
+    required = manifest.get("required_reference_roles")
+    require(isinstance(required, list) and
+            all(isinstance(role, str) and role in REQUIRED_SOURCE_ROLES for role in required)
+            and len(set(required)) == len(required),
+            "required_reference_roles must list distinct mitochondrion, plastid or nuclear roles")
+    require({target, "nuclear"} <= set(required),
+            "required_reference_roles must include the target and nuclear roles")
+    require(target != "plastid" or "mitochondrion" in required,
+            "a plastid target also requires the mitochondrial reference role")
+    references = manifest.get("references")
+    require(isinstance(references, list), "references must be a list")
+    declared = []
+    reference_ids = set()
+    for entry in references:
+        require(isinstance(entry, dict), "invalid reference entry")
+        reference_id = entry.get("id")
+        require(isinstance(reference_id, str) and reference_id and reference_id not in reference_ids,
+                "invalid or repeated reference identifier")
+        reference_ids.add(reference_id)
+        source_role = entry.get("source_role")
+        require(isinstance(source_role, str) and source_role in REFERENCE_SOURCE_ROLES,
+                "each reference requires a declared mitochondrion, plastid, nuclear or unplaced source_role")
+        legacy_role = "target" if source_role == target else "competing"
+        require(entry.get("role") == legacy_role, "reference source_role disagrees with target/competing role")
+        declared.append({"id": reference_id, "source_role": source_role})
+    provided = {entry["source_role"] for entry in declared}
+    missing = sorted(set(required) - provided)
+    return {
+        "policy": "require_declared_reference_roles",
+        "reference_role_authority": "user_declared",
+        "scope": "supplied_named_reference_records",
+        "required_roles": sorted(required),
+        "provided_roles": sorted(provided),
+        "missing_required_roles": missing,
+        "declared_references": declared,
+        "source_windows_evaluated": not missing,
+        "raw_records_evaluated": not missing,
+        "physical_origin": "unresolved",
+    }
+
+
 def load_panel(manifest, base):
     panel = {}
     for entry in manifest["references"]:
@@ -328,12 +372,16 @@ def original_placement_lookup(binary, originals, windows):
     return lookup
 
 
-def assess_seed(name, span, seed, originals, windows, strict_names=None, locate=placements):
-    row = {
+def unresolved_seed(name, span, seed, reason):
+    return {
         "read_id": name.decode("ascii", errors="backslashreplace"),
         "read_id_hex": name.hex(), "crop": span, "seed_sha256": sha256(seed).hexdigest(),
-        "state": "unresolved", "reason": "original_missing", "observations": [],
+        "state": "unresolved", "reason": reason, "observations": [],
     }
+
+
+def assess_seed(name, span, seed, originals, windows, strict_names=None, locate=placements):
+    row = unresolved_seed(name, span, seed, "original_missing")
     if strict_names is None:
         if name not in originals:
             return row
@@ -387,7 +435,7 @@ def assess_seed(name, span, seed, originals, windows, strict_names=None, locate=
     return row
 
 
-def audit(path, retention_policy=EXCLUDE_COMPETING, placement_binary=None):
+def audit(path, retention_policy=EXCLUDE_COMPETING, placement_binary=None, *, require_reference_roles=False):
     data = path.read_bytes()
     manifest = json.loads(data)
     scope = manifest.get("scope")
@@ -398,21 +446,29 @@ def audit(path, retention_policy=EXCLUDE_COMPETING, placement_binary=None):
     require(retention_policy in (EXCLUDE_COMPETING, TARGET_ONLY), "unknown retention policy")
     strict = retention_policy == TARGET_ONLY
     require(not strict or target is not None, "target-supported-only requires a named organelle target")
+    require(not require_reference_roles or strict,
+            "required reference roles require the target-supported-only retention policy")
+    reference_scope = declared_reference_scope(manifest, target) if require_reference_roles else None
+    missing_roles = reference_scope is not None and bool(reference_scope["missing_required_roles"])
     base = path.parent
-    windows = load_windows(manifest, load_panel(manifest, base), base, placement_binary)
+    windows = {} if missing_roles else load_windows(manifest, load_panel(manifest, base), base, placement_binary)
     seeds = load_seeds(manifest["seeds"], base)
     strict_names = None
-    if strict:
-        originals, strict_names = load_strict_originals(manifest["raw_reads"], base, seeds)
-    else:
-        originals = load_originals(manifest["raw_reads"], base, {seed[0] for seed in seeds})
-    locate = placements if placement_binary is None else original_placement_lookup(placement_binary, originals, windows)
+    if not missing_roles:
+        if strict:
+            originals, strict_names = load_strict_originals(manifest["raw_reads"], base, seeds)
+        else:
+            originals = load_originals(manifest["raw_reads"], base, {seed[0] for seed in seeds})
+        locate = placements if placement_binary is None else original_placement_lookup(placement_binary, originals, windows)
     rows = []
     kept = []
     counts = {"target_supported": 0, "competing_supported": 0, "unresolved": 0}
     retained_sha = sha256()
     for name, span, sequence, fasta in seeds:
-        row = assess_seed(name, span, sequence, originals, windows, strict_names, locate)
+        if missing_roles:
+            row = unresolved_seed(name, span, sequence, "missing_required_reference_roles")
+        else:
+            row = assess_seed(name, span, sequence, originals, windows, strict_names, locate)
         rows.append(row)
         counts[row["state"]] += 1
         allowed = row["state"] == "target_supported" if strict else row["state"] != "competing_supported"
@@ -433,6 +489,13 @@ def audit(path, retention_policy=EXCLUDE_COMPETING, placement_binary=None):
         report["target"] = target
     if strict:
         report["retention_policy"] = "target_supported_only"
+    if reference_scope is not None:
+        report["reference_panel_scope"] = reference_scope
+        report["source_limit"] = (
+            "support is restricted to supplied named reference records and unique exact windows. "
+            "Reference roles are user declared. Role presence does not establish panel "
+            "completeness or physical origin."
+        )
     return report, kept
 
 
@@ -479,6 +542,8 @@ def main():
     parser.add_argument("--out-fasta", type=Path, help="new FASTA containing crops admitted by the retention policy")
     parser.add_argument("--retention-policy", choices=(EXCLUDE_COMPETING, TARGET_ONLY), default=EXCLUDE_COMPETING,
                         help="retain target-supported and unresolved crops, or require positive target evidence")
+    parser.add_argument("--require-reference-roles", action="store_true",
+                        help="require explicitly declared target and nuclear reference roles before retaining crops")
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--exact-placement-bin", type=Path,
                          help="OVASM executable for exact batch placement (default: ovasm on PATH)")
@@ -491,7 +556,8 @@ def main():
         for path in paths:
             require(not (path.exists() or path.is_symlink()), f"output already exists: {path}")
         binary = None if args.python_placements else resolve_placement_binary(args.exact_placement_bin)
-        report, retained = audit(args.manifest, args.retention_policy, binary)
+        report, retained = audit(args.manifest, args.retention_policy, binary,
+                                 require_reference_roles=args.require_reference_roles)
         outputs = [(args.out, [json.dumps(report, indent=2, sort_keys=True).encode() + b"\n"])]
         if args.out_fasta:
             outputs.append((args.out_fasta, retained))
