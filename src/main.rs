@@ -9,6 +9,7 @@ mod close;
 mod components;
 mod correct;
 mod evidence;
+mod exact_placements;
 mod frontier;
 mod gpu;
 mod genotype;
@@ -137,6 +138,9 @@ enum FindCommand {
     /// clusters, a cluster called mitochondrion or plastid by its conserved proteins, its
     /// gene-bearing reads cropped to their genes; for species far from every seed library.
     ProteinSeeds(ProteinSeedArgs),
+    /// Exact literal placement protocol for the source-audit adapter.
+    #[command(hide = true)]
+    ExactPlacements(ExactPlacementArgs),
     /// Assemble each read cluster and label unitigs mitochondrion or plastid by gene content;
     /// write the labelled unitigs as the sample's own seeds.
     Label(LabelArgs),
@@ -2016,6 +2020,30 @@ struct DiscoverArgs {
 }
 
 #[derive(clap::Args)]
+struct ExactPlacementArgs {
+    /// File with one uppercase ACGT literal per line, in pattern index order.
+    #[arg(long)]
+    patterns: PathBuf,
+    /// Placement cap scope. Each literal emits at most two hits within this scope.
+    #[arg(long, value_parser = ["panel", "records"])]
+    scope: String,
+}
+
+fn find_exact_placements(args: ExactPlacementArgs) -> Result<()> {
+    use std::io::{self, BufReader, BufWriter};
+
+    let words = std::fs::File::open(&args.patterns)
+        .with_context(|| format!("opening {}", args.patterns.display()))?;
+    exact_placements::run(
+        BufReader::new(words),
+        io::stdin().lock(),
+        BufWriter::new(io::stdout().lock()),
+        args.scope.parse()?,
+    )
+    .context("scanning exact placements")
+}
+
+#[derive(clap::Args)]
 struct ProteinSeedArgs {
     /// Export depth-cluster crops nominated by paired family evidence for source qualification.
     #[arg(long, conflicts_with = "gene_set_audit")]
@@ -2597,6 +2625,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Find(FindCommand::Discover(args)) => discover(args),
         Command::Find(FindCommand::Classify(args)) => panel(args),
         Command::Find(FindCommand::ProteinSeeds(args)) => protein_seeds(args),
+        Command::Find(FindCommand::ExactPlacements(args)) => find_exact_placements(args),
         Command::Find(FindCommand::Label(args)) => label(args),
         Command::Assemble(AssembleCommand::Correct(args)) => correct(args),
         Command::Assemble(AssembleCommand::Graph(args)) => assemble(args),
