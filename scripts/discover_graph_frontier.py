@@ -237,12 +237,17 @@ def events(sequence, words, sequences, adjacency, k):
     return found, represented, unique, observable, word_count - observable
 
 
-def fastx(stream):
+def fastx(stream, *, preserve_original=False):
+    def without_line_ending(line):
+        if preserve_original:
+            return line.removesuffix(b"\n").removesuffix(b"\r")
+        return line.rstrip(b"\r\n")
+
     marker = stream.peek(1)[:1]
     if marker == b"@":
         for header in stream:
-            sequence, plus, quality = (stream.readline().rstrip(b"\r\n") for _ in range(3))
-            identifier = header[1:].rstrip(b"\r\n")
+            sequence, plus, quality = (without_line_ending(stream.readline()) for _ in range(3))
+            identifier = without_line_ending(header[1:])
             require(header.startswith(b"@") and identifier.strip() and sequence and plus.startswith(b"+")
                     and len(quality) == len(sequence), "invalid four-line FASTQ record")
             yield identifier, sequence, quality
@@ -254,12 +259,14 @@ def fastx(stream):
                 if identifier is not None:
                     require(pieces, "empty FASTA sequence")
                     yield identifier, b"".join(pieces), None
-                identifier = line[1:].rstrip(b"\r\n")
+                identifier = without_line_ending(line[1:])
                 require(identifier.strip(), "empty FASTA identifier")
                 pieces = []
             else:
                 require(identifier is not None, "FASTA sequence before first identifier")
-                if piece := line.strip():
+                # Native FASTA records remove CR/LF and keep other bytes.
+                piece = line.translate(None, b"\r\n") if preserve_original else line.strip()
+                if piece:
                     pieces.append(piece)
         if identifier is not None:
             require(pieces, "empty FASTA sequence")

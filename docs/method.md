@@ -449,6 +449,34 @@ targets while read-level depth gates remain available. The recruitment
 report records match passes, bindings and targets whose library walk was
 skipped. Exclusion claims have the scope of the supplied evidence.
 
+Generate this manifest from registered source junctions with:
+
+```sh
+python3 scripts/prepare_read_source_exclusions.py PLAN.json --out AUDIT.json \
+  --out-exclusions EXCLUSIONS.json
+```
+
+The plan schema is `ovasm.read-source-exclusion-plan.v1`. Set `scope` and
+`target`, list the original FASTA or four-line FASTQ inputs in `raw_reads`,
+and provide `references` with an `id` and a physical `role` for each FASTA.
+Inputs and provenance objects carry `path` and `sha256`. Each registered
+window in `windows` gives its `id`, panel `reference` ID, FASTA `record`
+ID, zero-based half-open `interval`, interior `boundary`, and `provenance`.
+For a competing role, `exterior_side` marks the `left` or `right` side
+of the boundary that identifies the competing physical source. Target windows
+are veto contexts.
+
+The exporter requires the competing window to occur exactly once in the
+supplied linear reference records and its exterior sequence to be absent
+from all other supplied roles. In the original reads, it accepts either
+orientation. It abstains for mixed roles, ambiguous competing windows,
+repeated matches of a competing window, and duplicate full read headers.
+The audit records the checks and positions. The manifest binds every
+exported record to that audit and preserves the original sequence and
+quality hashes. A run with zero qualifying originals produces only the
+audit. Establish the physical role and boundary independently of the
+recruitment outcome. Use the same original inputs for recruitment.
+
 ### 3.8 Screen original reads at registered junctions
 
 Run `python3 scripts/prepare_read_admission.py PLAN.json --out SCREEN_DIR` to prepare
