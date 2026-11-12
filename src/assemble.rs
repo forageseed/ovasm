@@ -2262,9 +2262,9 @@ fn run_backbone_layout_guard(
             // and the median falls in that tail (Buddleja davidii plastid, 2,532 reads at k
             // 1001: median 4 at 1,065 seed nodes where the sequence stood at 11, min count 1,
             // 39,158 nodes, 343 unitigs for a 154 kb circle)
-            let own = sequence_depth(&at);
+            let own = seed_node_depth(&at);
             eprintln!(
-                "[ovasm] node depth {own:.0} at the {} nodes of {} (count-weighted median of all nodes {node_depth:.0})",
+                "[ovasm] node depth {own:.0} at the {} nodes of {} (all nodes {node_depth:.0})",
                 at.len(),
                 path.display()
             );
@@ -2529,6 +2529,20 @@ const DEPTH_INTEGER_BINS: u32 = 20;
 /// 118, and 15 kb of a ~490 kb molecule. Falls back to the count-weighted median when the
 /// histogram has no valley.
 pub(crate) fn sequence_depth(counts: &[u32]) -> f64 {
+    depth_peak(counts, false)
+}
+
+/// `sequence_depth` for a few hundred nodes (those of the seed reads): past the valley the peak
+/// is the bin with the most nodes for its relative width, not for its width in counts. A depth
+/// of d spreads its nodes over about sqrt(d) counts, so by count a handful of recurring errors
+/// in one integer bin is denser than a few hundred true nodes at 150 (Carex sylvatica
+/// mitochondrion: 5 at its 288 seed nodes where all the nodes stood at 152, min count 1,
+/// 52.9 GB; 19 of 59 DToL plants had the seed depth a quarter of the nodes' or less).
+pub(crate) fn seed_node_depth(counts: &[u32]) -> f64 {
+    depth_peak(counts, true)
+}
+
+fn depth_peak(counts: &[u32], relative: bool) -> f64 {
     if counts.is_empty() {
         return 0.0;
     }
@@ -2560,8 +2574,16 @@ pub(crate) fn sequence_depth(counts: &[u32]) -> f64 {
     let first = bin(counts[0]);
     let valley = (first + 1..density.len() - 1)
         .find(|&i| density[i] <= density[i - 1] && density[i] < density[i + 1]);
+    // nodes per relative width: h / ln(upper / lower), bin 0 (count 0) never holds a node
+    let height = |i: usize| {
+        if relative && i > 0 {
+            hist[i] as f64 / (lower(i + 1) / lower(i)).ln()
+        } else {
+            density[i]
+        }
+    };
     let peak = valley.and_then(|v| {
-        (v..hist.len()).max_by(|&x, &y| density[x].total_cmp(&density[y]).then(y.cmp(&x)))
+        (v..hist.len()).max_by(|&x, &y| height(x).total_cmp(&height(y)).then(y.cmp(&x)))
     });
     match peak {
         Some(i) if hist[i] > 0 => {
@@ -2627,6 +2649,28 @@ mod tests {
         let d = sequence_depth(&one);
         assert!((260.0..=340.0).contains(&d), "{d}");
         assert_eq!(sequence_depth(&[]), 0.0);
+    }
+
+    #[test]
+    fn a_few_hundred_seed_nodes_stand_at_their_depth_not_at_recurring_errors() {
+        // 188 true nodes spread over 125..175, 100 nodes of recurring errors at 3..9 that do not
+        // fall off evenly (a dip at 4): by count the bin of 5 is the densest past that dip
+        let mut counts: Vec<u32> = (0..188).map(|i| 125 + (i * 50 / 188) as u32).collect();
+        for (c, n) in [(3u32, 22usize), (4, 12), (5, 30), (6, 14), (7, 10), (8, 7), (9, 5)] {
+            counts.extend(std::iter::repeat(c).take(n));
+        }
+        counts.sort_unstable();
+        assert_eq!(super::sequence_depth(&counts), 5.0);
+        let d = super::seed_node_depth(&counts);
+        assert!((125.0..=175.0).contains(&d), "{d}");
+        // errors the majority, the sequence at 11 (Buddleja davidii plastid seeds)
+        let mut low: Vec<u32> = Vec::new();
+        for (c, n) in [(3u32, 300usize), (4, 200), (5, 120), (6, 60), (7, 40), (8, 45), (9, 70), (10, 85), (11, 90), (12, 80), (13, 55), (14, 30)] {
+            low.extend(std::iter::repeat(c).take(n));
+        }
+        low.sort_unstable();
+        let d = super::seed_node_depth(&low);
+        assert!((10.0..=12.0).contains(&d), "{d}");
     }
 
     use super::*;
