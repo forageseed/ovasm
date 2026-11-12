@@ -724,6 +724,23 @@ $\hat p$, take the 2.5% and 97.5% quantiles). Every read is also recorded as a s
 5. A component below `SHALLOW` = 0.5 of the main one's depth, with fewer than `MIN_SEED_BP` = 300 bp of the organelle's seed 21-mer blocks, is possibly nuclear or contamination and is not counted.
 6. Any other unjoined component at `SOURCE_FOLD` = 2 times the main depth or more, or at its reciprocal or less, is "source pending": not counted, only in the range's maximum.
 
+#### Audit read length for a repeat route
+
+`python3 scripts/audit_repeat_span_opportunity.py PLAN.json --out AUDIT.json`
+counts original reads long enough to contain the literal spelling of a
+declared repeat route. Use schema `ovasm.repeat-span-opportunity-plan.v1`
+with `scope`, one `graph`, a list of `raw_reads`, and a list of `routes`.
+The graph and each FASTA or FASTQ input use `path` and `sha256`. Each route
+has an `id` and a `path` of oriented GFA segment names, with a flanking
+segment at each end and at least one interior segment.
+
+The minimum length is the spelled interior plus one base from each
+exterior overhang. Internal overlaps are counted once and repeated visits
+are spelled separately. The graph must supply unambiguous exact overlaps.
+The report gives the number of original records meeting the minimum per
+route. This length condition is necessary for a literal, gap-free span.
+Read alignment and physical pairing require separate evidence.
+
 ### 6.5 Assessment (`assess.rs`)
 
 Derived from the run's own files; the reads are not re-read.
