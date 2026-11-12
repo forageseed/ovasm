@@ -473,6 +473,111 @@ class GeometryCliTests(unittest.TestCase):
                 self.assertIn("frontier", result.stderr)
                 self.assertFalse(out.exists() or admission.exists())
 
+    def competing_source_plan(self, *, partial=False, close_mitochondrion=False):
+        self.plan(graph_contains_original=False)
+        path = self.root / "plan.json"
+        plan = json.loads(path.read_bytes())
+        oriented = self.mutate(self.nuclear[10:110], [5, 90])
+        query = reverse(oriented)
+        plan["original_fastqs"] = [self.file("reads.fastq", fastq("original", "m123456/17", query))]
+        plan["mapper_queries"] = self.file("queries.fa", fasta("original", query))
+        query_start, ref_end = (1, 109) if partial else (0, 110)
+        aligned = ref_end - 10
+        paf = (f"original\t100\t{query_start}\t100\t-\tchr\t130\t10\t{ref_end}\t"
+               f"{aligned - 2}\t{aligned}\t60\tcg:Z:{aligned}M\n")
+        plan["paf"]["data"] = self.file("reads.paf", paf.encode("ascii"))
+        plan["windows"][0].update(reference="chr", graph_required=False, require_full_query=False)
+        if close_mitochondrion:
+            mt = self.mt + self.mutate(oriented, [30, 75])
+            plan["panel"]["records"]["mt"]["source"] = self.file("mt.fa", fasta("mt_orig", mt))
+            with (self.root / "panel.fa").open("rb") as original_panel:
+                other_references = original_panel.read().split(b"\n", 2)[2]
+            plan["panel"]["fasta"] = self.file("panel.fa", fasta("mt", mt) + other_references)
+        path.write_text(json.dumps(plan))
+
+    def run_source_exclusions(self, *args):
+        out = self.root / "full.geometry.json"
+        exclusion = self.root / "source-exclusions.json"
+        command = [sys.executable, "-B", str(SCRIPT), str(self.root / "plan.json"),
+                   "--out", str(out), "--full-edit-competition", "--exclude-target", "mitochondrion",
+                   "--out-exclusions", str(exclusion), *args]
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        return json.loads(out.read_bytes()), json.loads(exclusion.read_bytes()) if exclusion.exists() else None
+
+    def test_full_competing_source_excludes_only_the_named_destination(self):
+        self.competing_source_plan()
+        report, manifest = self.run_source_exclusions()
+        row, = report["records"]
+        decision = row["full_edit_source_exclusion"]
+        self.assertEqual(decision["status"], "qualified_within_edit_model")
+        self.assertEqual(decision["source_role"], "nuclear")
+        self.assertEqual(decision["radius"], 2)
+        witness = decision["verified_source_upper_bound"]["witness"]
+        self.assertEqual(witness["scope"]["interval"], [0, 100])
+        self.assertEqual(witness["placement"]["strand"], "-")
+        self.assertEqual(set(decision["competing_roles"]), {"mitochondrion", "plastid"})
+        self.assertTrue(report["native_exclusions_created"])
+        self.assertFalse(report["native_admission_created"])
+        self.assertEqual(manifest["schema"], "ovasm.read-source-exclusions.v1")
+        original, = manifest["records"]
+        self.assertEqual(original["target"], "mitochondrion")
+        for key in ("read_id_hex", "sequence_sha256", "quality_sha256"):
+            self.assertEqual(original[key], row[key])
+        out = self.root / "full.geometry.json"
+        self.assertEqual(original["provenance"],
+                         {"path": str(out), "sha256": sha256(out.read_bytes()).hexdigest()})
+
+    def test_partial_competing_witness_remains_unresolved(self):
+        self.competing_source_plan(partial=True)
+        report, manifest = self.run_source_exclusions()
+        row, = report["records"]
+        self.assertTrue(row["windows"]["window"]["witnesses"])
+        self.assertEqual(row["full_edit_source_exclusion"]["status"], "unresolved_no_full_competing_geometry")
+        self.assertIsNone(manifest)
+
+    def test_unreported_equal_destination_placement_withholds_exclusion(self):
+        self.competing_source_plan(close_mitochondrion=True)
+        report, manifest = self.run_source_exclusions()
+        row, = report["records"]
+        decision = row["full_edit_source_exclusion"]
+        self.assertEqual(decision["status"], "competing_within_edit_bound")
+        self.assertEqual(decision["competing_roles"]["mitochondrion"]["best_hit"]["edit_distance"], 2)
+        self.assertIsNone(manifest)
+
+    def test_registered_partial_other_role_withholds_exclusion(self):
+        self.competing_source_plan()
+        path = self.root / "plan.json"
+        plan = json.loads(path.read_bytes())
+        oriented = self.mutate(self.nuclear[10:110], [5, 14, 23, 90])
+        query = reverse(oriented)
+        plan["original_fastqs"] = [self.file("reads.fastq", fastq("original", "m123456/17", query))]
+        plan["mapper_queries"] = self.file("queries.fa", fasta("original", query))
+        mt = self.mt + oriented[:30]
+        plan["panel"]["records"]["mt"]["source"] = self.file("mt.fa", fasta("mt_orig", mt))
+        other_references = (self.root / "panel.fa").read_bytes().split(b"\n", 2)[2]
+        plan["panel"]["fasta"] = self.file("panel.fa", fasta("mt", mt) + other_references)
+        plan["windows"].append(dict(id="mt_diagnostic", reference="mt", interval=[140, 148], anchor_bp=8,
+                                    mode="exact_context", exclusive_sides=["left", "right"],
+                                    graph_required=True, physical_boundaries=[], require_full_query=True))
+        paf = (b"original\t100\t0\t100\t-\tchr\t130\t10\t110\t96\t100\t60\tcg:Z:100M\n"
+               b"original\t100\t70\t100\t-\tmt\t158\t128\t158\t30\t30\t60\tcg:Z:30M\n")
+        plan["paf"]["data"] = self.file("reads.paf", paf)
+        path.write_text(json.dumps(plan))
+        report, manifest = self.run_source_exclusions()
+        row, = report["records"]
+        self.assertEqual(row["full_edit_source_exclusion"]["status"], "unresolved_conflicting_geometry")
+        self.assertFalse(row["windows"]["mt_diagnostic"]["witnesses"])
+        self.assertTrue(row["windows"]["mt_diagnostic"]["partial_witnesses_for_source_exclusion"])
+        self.assertIsNone(manifest)
+
+    def test_competition_budget_exhaustion_withholds_exclusion(self):
+        self.competing_source_plan(close_mitochondrion=True)
+        report, manifest = self.run_source_exclusions("--max-edit-text-bases", "1")
+        row, = report["records"]
+        self.assertEqual(row["full_edit_source_exclusion"]["status"], "unresolved_edit_budget")
+        self.assertIsNone(manifest)
+
     def run_full_edit(self):
         out = self.root / "full.geometry.json"
         admission = self.root / "read-admission.json"

@@ -92,3 +92,24 @@ This comparison uses a linear named reference panel and unit edit costs.
 Missing reference sequence, unrepresented arrangements, correlated errors and
 source mixing are outside the search scope. Keep the model decision with its
 reference bindings and graph provenance.
+
+## Exclude a verified competing source
+
+Use `--full-edit-competition --exclude-target mitochondrion --out-exclusions EXCLUSIONS.json`
+to prepare a source exclusion for that recruitment destination. `plastid`
+is also supported. The physical source comes from a registered window in
+a different role. A single alignment must span the entire original read,
+cover both role-exclusive exterior anchors and verify the registered
+context or both exact junctions. The decision uses the literal edit count
+of that alignment and searches every other supplied role at the same bound.
+A verified witness in another role withholds exclusion, including a partial
+witness at a registered window. A continuous equal or better placement or
+an incomplete search also withholds exclusion.
+
+A window marked `graph_required` also needs a unique route and an independent
+original donor in that graph. An independently registered competing reference
+window can omit that requirement. Exclusion applies only to the named
+recruitment destination. The native manifest binds each exact original
+to the audit, and an empty decision set produces only the audit. The result
+describes the named source role and panel, with possible additional
+placements within the same role.
