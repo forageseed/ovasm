@@ -1364,9 +1364,35 @@ pub struct ComponentReport {
     pub alternatives: Vec<CoverReport>,
 }
 
+/// Summarize only ranked components; unplaced/skipped fragments have no ranking.
+fn effective_ranking_model<'a>(models: impl Iterator<Item = &'a str>) -> &'static str {
+    let mut native = false;
+    let mut legacy = false;
+    let mut fallback = false;
+    for model in models {
+        match model {
+            "legacy_after_read_budget_exhaustion" => fallback = true,
+            "legacy_bridge_copy" => legacy = true,
+            _ => native = true,
+        }
+    }
+    match (native, legacy, fallback) {
+        (false, false, false) => "no_ranked_components",
+        (true, false, false) => crate::read_model::MODEL,
+        (false, true, false) => "legacy_bridge_copy",
+        (false, false, true) => "legacy_after_read_budget_exhaustion",
+        _ => "mixed_component_models",
+    }
+}
+
 #[derive(Serialize)]
 pub struct LinearizeReport {
+    /// Requested/available model; see effective_ranking_model for actual component use.
     pub ranking_model: &'static str,
+    /// Actual ranking used across non-skipped components with ranked candidates.
+    pub effective_ranking_model: &'static str,
+    /// True if any component abandoned read-based scoring because its budget ran out.
+    pub read_model_budget_exhausted: bool,
     pub physical_topology_identified: bool,
     pub configurations_fasta: Option<String>,
     /// Requested FASTA of ranked component covers.
@@ -2139,6 +2165,8 @@ pub fn run_phased(
     }
     let out = LinearizeReport {
         ranking_model: if read_model.is_some() {crate::read_model::MODEL} else {"legacy_bridge_copy"},
+        effective_ranking_model: effective_ranking_model(comps.iter().filter(|c| !c.skipped && c.candidates > 0).map(|c| c.ranking_model)),
+        read_model_budget_exhausted: comps.iter().any(|c| c.read_model_budget_exhausted),
         physical_topology_identified: false,
         configurations_fasta: has_configurations.then(||configuration_path.display().to_string()),
         candidate_fasta: out_candidate.map(|path| path.display().to_string()),
@@ -3624,6 +3652,15 @@ mod tests {
             .filter(|m| m.circular).map(|m| m.path.clone()).collect::<BTreeSet<_>>();
         assert_eq!(circles(&baseline), circles(&extended));
         assert!(!extended.physical_topology_identified);
+    }
+
+    #[test]
+    fn effective_model_distinguishes_fallback_mixed_and_no_candidates() {
+        assert_eq!(super::effective_ranking_model([].into_iter()), "no_ranked_components");
+        assert_eq!(super::effective_ranking_model(["legacy_after_read_budget_exhaustion"].into_iter()), "legacy_after_read_budget_exhaustion");
+        assert_eq!(super::effective_ranking_model([crate::read_model::MODEL, "legacy_after_read_budget_exhaustion"].into_iter()), "mixed_component_models");
+        assert_eq!(super::effective_ranking_model([crate::read_model::MODEL].into_iter()), crate::read_model::MODEL);
+        assert_eq!(super::effective_ranking_model(["legacy_bridge_copy"].into_iter()), "legacy_bridge_copy");
     }
 
     #[test]
