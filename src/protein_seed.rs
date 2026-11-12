@@ -46,6 +46,13 @@ use crate::seedfree::{depth_peaks, DepthGate, GateReport};
 
 pub const ORGANELLES: [&str; 2] = ["mitochondrion", "plastid"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SeedMode {
+    Legacy,
+    GeneSetAudit,
+    PairedCandidates,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProteinSeedParams {
     /// Reads scanned per depth cluster at most (evenly spread over the cluster).
@@ -141,6 +148,32 @@ fn gene_set_evidence(
     }).collect()
 }
 
+fn nominated_organelle_sets(
+    evidence: &[GeneSetEvidence],
+    want: &[&'static str],
+    min_genes: usize,
+) -> Vec<&'static str> {
+    evidence.iter()
+        .filter(|row| want.contains(&row.organelle) && row.supported_families.len() >= min_genes)
+        .map(|row| row.organelle)
+        .collect()
+}
+
+#[derive(Serialize)]
+struct PairedClusterSelection {
+    organelles: Vec<&'static str>,
+    legacy_organelle_calls: Vec<&'static str>,
+    crop_records: usize,
+}
+
+#[derive(Serialize)]
+struct CandidateCrops {
+    source_qualification: &'static str,
+    records: FxHashMap<&'static str, usize>,
+    bases: FxHashMap<&'static str, u64>,
+    files: FxHashMap<&'static str, PathBuf>,
+}
+
 #[derive(Serialize)]
 pub struct ClusterCall {
     /// Centre of the depth peak (sketch depth).
@@ -170,6 +203,8 @@ pub struct ClusterCall {
     pub gene_evidence: Vec<ClusterGeneCount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gene_set_evidence: Option<Vec<GeneSetEvidence>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_candidate_selection: Option<PairedClusterSelection>,
     /// Seed reads this cluster gave.
     pub seed_reads: usize,
 }
@@ -199,6 +234,8 @@ pub struct ProteinSeedReport {
     pub seed_reads: FxHashMap<&'static str, usize>,
     pub seed_bases: FxHashMap<&'static str, u64>,
     pub seeds: FxHashMap<&'static str, PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_crops: Option<CandidateCrops>,
     /// The scan of every read for the organelles no depth cluster seeded (`whole_read_seeds`).
     pub whole_read_scan: Option<WholeReadScan>,
     pub elapsed_seconds: f64,
@@ -282,6 +319,14 @@ impl ProteinSeedReport {
 
     /// One line for the terminal.
     pub fn summary(&self) -> String {
+        if let Some(candidates) = &self.candidate_crops {
+            return format!(
+                "[ovasm] paired protein candidates: {} mitochondrial and {} plastid crops; source qualification pending ({:.0} s)",
+                candidates.records.get("mitochondrion").copied().unwrap_or(0),
+                candidates.records.get("plastid").copied().unwrap_or(0),
+                self.elapsed_seconds
+            );
+        }
         let calls: Vec<String> = self
             .clusters
             .iter()
@@ -381,7 +426,7 @@ fn crop(
         .iter()
         .filter(|&&(g, _, _)| panel.gene_organelle(g) == organelle);
     let (lo, hi) = mine.fold((usize::MAX, 0), |(lo, hi), &(_, a, b)| (lo.min(a), hi.max(b)));
-    (lo < hi).then(|| (lo.saturating_sub(flank), (hi + flank).min(len)))
+    (lo < hi).then(|| (lo.saturating_sub(flank), hi.saturating_add(flank).min(len)))
 }
 
 /// Fewest bases a depth cluster must stand for (its reads' bases over its depth) to seed: a deep
@@ -523,10 +568,22 @@ pub fn run(
     p: &ProteinSeedParams,
     want: &[&'static str],
     out_dir: &Path,
-    audit_gene_sets: bool,
+    mode: SeedMode,
 ) -> Result<ProteinSeedReport> {
     let t0 = Instant::now();
-    std::fs::create_dir_all(out_dir)?;
+    let audit_gene_sets = mode != SeedMode::Legacy;
+    let paired_candidates = mode == SeedMode::PairedCandidates;
+    anyhow::ensure!(!paired_candidates || p.panel.min_genes > 0,
+        "paired candidates require a positive --min-genes");
+    let file_prefix = if paired_candidates { "protein_candidates" } else { "protein_seeds" };
+    if paired_candidates {
+        if let Some(parent) = out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(out_dir)?;
+    } else {
+        std::fs::create_dir_all(out_dir)?;
+    }
     // passes 1-2: the depth sketch and the nuclear peak
     let mut gate = DepthGate::long_reads(inputs)?;
     match (p.nuclear_depth, p.genome_size) {
@@ -663,16 +720,19 @@ pub fn run(
         // reversed control seeds from its reads, also where both count (a cluster holding parts of
         // both genomes at one depth)
         let span = cluster_bases[c] as f64 / 2f64.powf(peak);
-        let seeded: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd)), ((&plastid, pd), (&cp, cpd))]
+        let legacy_calls: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd)), ((&plastid, pd), (&cp, cpd))]
             .iter()
             .zip(ORGANELLES)
             .filter(|((fwd, rev), _)| class_seeds(*fwd, *rev, span, &p.panel))
             .map(|(_, o)| o)
             .collect();
+        let nominated = gene_set_evidence.as_deref().filter(|_| paired_candidates)
+            .map(|rows| nominated_organelle_sets(rows, want, p.panel.min_genes));
+        let selected = nominated.as_ref().unwrap_or(&legacy_calls);
         let mut given = 0;
         for (s, class) in mine.iter().zip(&classes) {
             let Some(organelle) = *class else { continue };
-            if !seeded.contains(&organelle) {
+            if !selected.contains(&organelle) {
                 continue;
             }
             {
@@ -682,11 +742,13 @@ pub fn run(
                     continue;
                 };
                 if !fasta.contains_key(organelle) {
-                    let path = out_dir.join(format!("protein_seeds.{organelle}.fasta"));
-                    fasta.insert(
-                        organelle,
-                        std::io::BufWriter::new(std::fs::File::create(&path)?),
-                    );
+                    let path = out_dir.join(format!("{file_prefix}.{organelle}.fasta"));
+                    let file = if paired_candidates {
+                        std::fs::File::create_new(&path)?
+                    } else {
+                        std::fs::File::create(&path)?
+                    };
+                    fasta.insert(organelle, std::io::BufWriter::new(file));
                     seeds.insert(organelle, path);
                 }
                 let w = fasta.get_mut(organelle).expect("just inserted");
@@ -700,6 +762,15 @@ pub fn run(
                 *seed_bases.entry(organelle).or_insert(0u64) += (b - a) as u64;
             }
         }
+        let (seeded, paired_candidate_selection) = if let Some(organelles) = nominated {
+            (Vec::new(), Some(PairedClusterSelection {
+                organelles,
+                legacy_organelle_calls: legacy_calls,
+                crop_records: given,
+            }))
+        } else {
+            (legacy_calls, None)
+        };
         clusters.push(ClusterCall {
             depth: 2f64.powf(peak),
             reads: cluster_reads[c],
@@ -716,7 +787,8 @@ pub fn run(
             reversed_control_segments: cm.gene_segments.iter().chain(&cp.gene_segments).cloned().collect(),
             gene_evidence,
             gene_set_evidence,
-            seed_reads: given,
+            paired_candidate_selection,
+            seed_reads: if paired_candidates { 0 } else { given },
         });
     }
     for (_, mut w) in fasta {
@@ -728,7 +800,7 @@ pub fn run(
         .copied()
         .filter(|o| !seeds.contains_key(o))
         .collect();
-    let whole_read_scan = if missing.is_empty() {
+    let whole_read_scan = if missing.is_empty() || paired_candidates {
         None
     } else {
         let w = whole_read_seeds(inputs, panel, p, &missing, out_dir, &gate, audit_gene_sets)?;
@@ -741,6 +813,12 @@ pub fn run(
         }
         Some(w.0)
     };
+    let candidate_crops = paired_candidates.then(|| CandidateCrops {
+        source_qualification: "pending",
+        records: std::mem::take(&mut seed_reads),
+        bases: std::mem::take(&mut seed_bases),
+        files: std::mem::take(&mut seeds),
+    });
     let (panel_proteins, panel_genes) = panel.sizes();
     let report = ProteinSeedReport {
         tool: "ovasm find protein-seeds",
@@ -750,7 +828,7 @@ pub fn run(
         panel_genes,
         panel_gene_sets: panel_gene_sets(panel),
         gene_evidence_record_unit: "input_fastx_record",
-        gene_evidence_scope: if audit_gene_sets {
+        gene_evidence_scope: if mode == SeedMode::GeneSetAudit {
             "depth_cluster_records_and_whole_read_fallback_after_orientation_specific_read_qualification"
         } else {
             "depth_cluster_records_after_read_classification"
@@ -764,14 +842,24 @@ pub fn run(
         seed_reads,
         seed_bases,
         seeds,
+        candidate_crops,
         whole_read_scan,
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
     };
-    std::fs::write(
-        out_dir.join("protein_seeds.json"),
-        serde_json::to_string_pretty(&report)?,
-    )?;
+    let report_path = out_dir.join(format!("{file_prefix}.json"));
+    let text = serde_json::to_string_pretty(&report)?;
+    if paired_candidates {
+        // Publish the completed report only after all candidate files have been written.
+        let staging = out_dir.join(".protein_candidates.json.partial");
+        let mut file = std::fs::File::create_new(&staging)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&staging, report_path)?;
+        std::fs::remove_file(staging)?;
+    } else {
+        std::fs::write(report_path, text)?;
+    }
     Ok(report)
 }
 
@@ -1030,6 +1118,7 @@ mod tests {
             crop(1000, &stretches, "plastid", &panel, 2000),
             Some((0, 1000))
         );
+        assert_eq!(crop(1000, &stretches, "plastid", &panel, usize::MAX), Some((0, 1000)));
         assert_eq!(crop(1000, &[(pltd, 1, 2)], "mitochondrion", &panel, 10), None);
     }
 
@@ -1039,6 +1128,32 @@ mod tests {
             segments,
             gene_segments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn paired_nomination_needs_distinct_supported_families_of_the_requested_organelle() {
+        let family = |organelle, name: &str, forward_records, reversed_records, both| ClusterGeneCount {
+            organelle,
+            family: name.to_owned(),
+            forward_stretches: 20,
+            reversed_stretches: 4,
+            forward_records,
+            reversed_records,
+            both_orientation_records: both,
+        };
+        let counts = [
+            family("mitochondrion", "cox1", 8, 4, 3),
+            family("mitochondrion", "cob", 3, 3, 3),
+            family("plastid", "rbcL", 5, 2, 1),
+        ];
+        let evidence = gene_set_evidence(&counts, &ORGANELLES, 2);
+        assert_eq!(evidence[0].supported_families, ["cox1"]);
+        assert_eq!(evidence[0].support_fraction, Some(0.5));
+        assert_eq!(
+            nominated_organelle_sets(&evidence, &["mitochondrion"], 1),
+            ["mitochondrion"]
+        );
+        assert!(nominated_organelle_sets(&evidence, &ORGANELLES, 2).is_empty());
     }
 
     #[test]

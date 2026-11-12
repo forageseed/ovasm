@@ -944,7 +944,11 @@ fn run(args: RunArgs) -> Result<()> {
                 &p,
                 &searched,
                 &args.out.join("protein-seeds"),
-                args.protein_gene_set_audit,
+                if args.protein_gene_set_audit {
+                    protein_seed::SeedMode::GeneSetAudit
+                } else {
+                    protein_seed::SeedMode::Legacy
+                },
             )?;
             eprintln!("{}", report.summary());
             for &o in &searched {
@@ -2013,14 +2017,17 @@ struct DiscoverArgs {
 
 #[derive(clap::Args)]
 struct ProteinSeedArgs {
+    /// Export depth-cluster crops nominated by paired family evidence for source qualification.
+    #[arg(long, conflicts_with = "gene_set_audit")]
+    paired_gene_candidates: bool,
     /// Report density-independent gene sets with paired fallback orientation evidence.
     #[arg(long)]
     gene_set_audit: bool,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
-    /// Output directory: protein_seeds.{mitochondrion,plastid}.fasta (for each organelle with a
-    /// called cluster) and protein_seeds.json.
+    /// Output directory for protein_seeds FASTAs and report. Paired candidates use a new
+    /// directory containing protein_candidates FASTAs and report.
     #[arg(long)]
     out: PathBuf,
     /// Which built-in protein panel and genetic code: landplants (mitochondrion and plastid
@@ -2155,7 +2162,14 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         .copied()
         .filter(|o| args.lineage.fasta(o).is_some())
         .collect();
-    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out, args.gene_set_audit)?;
+    let mode = if args.paired_gene_candidates {
+        protein_seed::SeedMode::PairedCandidates
+    } else if args.gene_set_audit {
+        protein_seed::SeedMode::GeneSetAudit
+    } else {
+        protein_seed::SeedMode::Legacy
+    };
+    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out, mode)?;
     eprintln!("{}", report.summary());
     Ok(())
 }

@@ -167,6 +167,23 @@ subtraction and minimum-stretch filtering. It also counts records with the same 
 These are input records. Physical molecule identity and source require separate evidence. The whole-read
 fallback is outside this paired report because it scans forward only.
 
+#### Export candidates from paired gene sets
+
+`ovasm find protein-seeds --paired-gene-candidates` exports nominated depth-cluster
+crops in `protein_candidates.<organelle>.fasta` under a new output directory.
+Each panel family needs more
+forward than reversed input records and at least `min_gene_segments` net forward
+stretches. A cluster nominates the requested organelle when its supported family
+count reaches `--min-genes`. The report `protein_candidates.json` includes the
+effective family denominator, the paired evidence, and the legacy cluster calls
+for comparison on the same sampled records. Density and estimated cluster span
+are recorded for comparison.
+
+These crops have pending source qualification. Use the original reads and the
+registered source windows with `audit_seed_source.py` and
+`--retention-policy target-supported-only` before passing the qualified FASTA and
+its audit into recruitment. The ordinary seed path includes whole-read fallback.
+
 ### 2.5 Whole-read scan (`protein_seed::whole_read_seeds`)
 
 For organelles no cluster seeded, every read is scanned with $\text{min\_hits}' = \max(\text{min\_hits}, 12)$
