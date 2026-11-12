@@ -42,8 +42,8 @@ ovasm run hifi -i sample.hifi.fastq.gz -x fungi -t 8 -o result   # fungal mitoch
 
 Short options follow PMAT2 where they overlap: `-G mt|pt|all`, `-x 0|1|2` (plant, animal, fungi),
 `-g` nuclear genome size, `-T` as well as `-t` for threads. `ovasm run hifi -h` lists the everyday
-options, `--help` all of them. For animals and fungi the seeds come from the sample's own reads
-(mitochondrial protein genes found in the reads); `--no-protein-seeds` uses the built-in seed
+options, `--help` all of them. For HiFi whole-genome reads of every lineage the seeds come from the sample's own reads
+(organelle protein genes found in the reads); `--no-protein-seeds` uses the built-in seed
 library only.
 
 Illumina paired reads:

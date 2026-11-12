@@ -599,17 +599,16 @@ struct RunArgs {
     /// --organelle mitochondrion).
     #[arg(short = 'x', short_alias = 'l', long, value_enum, default_value_t = seeddb::Lineage::Landplants)]
     lineage: seeddb::Lineage,
-    /// Protein seeds from the sample's own reads (default for animal and fungi).
+    /// Protein seeds from the sample's own reads (the default for HiFi whole-genome reads).
     ///
     /// HiFi whole-genome reads: seed each organelle without --seeds from the sample's own reads
     /// first (`ovasm find protein-seeds`, written to <out>/protein-seeds/): depth clusters called
     /// by their conserved proteins (the --lineage protein panel and genetic code), under the same
     /// depth-gate options. An organelle without a called cluster falls back to the --lineage
-    /// seed library. For species far from every library genome.
+    /// seed library. The default for every lineage; --no-protein-seeds turns it off.
     #[arg(short = 'P', long)]
     protein_seeds: bool,
-    /// No protein seeds where they are the default (animals and fungi): seed from the --lineage
-    /// seed library only.
+    /// No protein seeds: seed from the --lineage seed library only.
     #[arg(long, conflicts_with = "protein_seeds", hide_short_help = true)]
     no_protein_seeds: bool,
     /// Protein panel for the protein seeds; default: the built-in panel of --lineage.
@@ -869,11 +868,12 @@ fn run(mut args: RunArgs) -> Result<()> {
     }
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
-    // protein seeds: asked for, or the default for animals and fungi (HiFi whole-genome reads
-    // recruited with seeds), whose seed libraries are far from most species
+    // protein seeds: asked for, or the default for HiFi whole-genome reads recruited with seeds,
+    // in every lineage: the seed libraries are far from most animals and fungi, and of 26 DToL
+    // land plants the protein seeds did better than the library in 8 (Acer campestre
+    // mitochondrion 0.02 to 0.9985 of Oatk's, Buxus 0.86 to 0.998), the same in 15, worse in 3
     let protein_seeds = args.protein_seeds
         || (!args.no_protein_seeds
-            && args.lineage != seeddb::Lineage::Landplants
             && args.read_type == pipeline::ReadType::Hifi
             && args.read_set == pipeline::ReadSet::WholeGenome
             && args.recruit != pipeline::RecruitBy::Discover);

@@ -46,7 +46,7 @@ Source: `main.rs` (`RunArgs`), `pipeline.rs` (`ReadType`, `ReadSet`, `RecruitBy`
 ## 2. Depth gate and protein seeds
 
 Protein seeds replace the seed library when the sample may be far from every library genome. They are the default for
-animals and fungi on HiFi whole-genome reads, opt-in (`-P`) for land plants, and never used with `--recruit discover` or
+every lineage on HiFi whole-genome reads (`--no-protein-seeds` turns them off), and never used with `--recruit discover` or
 `--read-set target` (`main.rs::run`). An organelle without a called cluster falls back to the library
 (`seeddb::fill_missing`).
 
