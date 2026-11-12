@@ -524,6 +524,21 @@ fn search_phased_indexed(
     out_of: &FxHashMap<Oriented, Vec<usize>>,
     thread_ends: Option<&crate::read_model::ThreadEnds>,
 ) -> (Vec<Vec<Found>>, bool, bool) {
+    search_phased_indexed_impl(n_seg, anchors, optional, br, m, max_steps, phases, out_of, thread_ends, true)
+}
+
+fn search_phased_indexed_impl(
+    n_seg: usize,
+    anchors: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    m: usize,
+    max_steps: u64,
+    phases: &crate::phase::Constraints,
+    out_of: &FxHashMap<Oriented, Vec<usize>>,
+    thread_ends: Option<&crate::read_model::ThreadEnds>,
+    optimize: bool,
+) -> (Vec<Vec<Found>>, bool, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
         out_of: &'a FxHashMap<Oriented, Vec<usize>>,
@@ -534,6 +549,7 @@ fn search_phased_indexed(
         m: usize,
         max_steps: u64,
         topology_neutral: bool,
+        optimize: bool,
     }
     struct State {
         used: Vec<bool>,
@@ -557,6 +573,11 @@ fn search_phased_indexed(
         s.steps += 1;
         if s.steps > c.max_steps {
             s.truncated = true;
+            return;
+        }
+        // Every later molecule must consume a distinct unused required anchor.
+        // Once too few remain, no continuation of this partial cover can succeed.
+        if c.optimize && c.want.saturating_sub(s.covered) < c.m.saturating_sub(s.done.len() + 1) {
             return;
         }
         if s.covered < c.want {
@@ -589,9 +610,11 @@ fn search_phased_indexed(
             }
         }
         // End the molecule here.
-        if !visits(c, start, &s.path, s.must) {
-            return;
-        }
+        // `must` was unused when this molecule began; only this molecule can
+        // have set its bit. Keep the original scan as an oracle for tests.
+        let visited_must = if c.optimize { s.used[s.must] } else { visits(c, start, &s.path, s.must) };
+        debug_assert_eq!(visited_must, visits(c, start, &s.path, s.must));
+        if !visited_must { return; }
         let mut closings: Vec<usize> = c.out_of.get(&at).map(|v| {
             v.iter()
                 .copied()
@@ -807,6 +830,7 @@ fn search_phased_indexed(
         m,
         max_steps,
         topology_neutral: thread_ends.is_some(),
+        optimize,
     };
     let mut st = State {
         used: vec![false; n_seg],
@@ -3043,6 +3067,75 @@ mod tests {
         assert!(r.best.as_ref().unwrap().circular);
         assert_eq!(r.molecules, 1);
         assert_eq!(r.repeats_not_placed, names(&["R"]));
+    }
+
+    #[test]
+    fn optimized_cover_search_matches_unpruned_oracle() {
+        // Deterministic directed four-anchor graphs, including self closures,
+        // optional anchors, both orientations, and active phase checks.
+        let anchors = [0usize, 1, 2, 3];
+        let mut seed = 0x1234_5678u64;
+        for case in 0..64 {
+            let mut br = Vec::new();
+            for a in 0..4 { for b in 0..4 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if seed >> 62 == 0 {
+                    for forward in [true, false] {
+                        br.push(Bridge { walk: vec![(a, forward), (b, forward)], reads: (case % 7 + 1) as u64, weak: false, topological: false });
+                    }
+                }
+            }}
+            let mut out = FxHashMap::default();
+            for (i, b) in br.iter().enumerate() { out.entry(b.walk[0]).or_insert_with(Vec::new).push(i); }
+            let mut phase = crate::phase::Constraints::default();
+            if case % 2 == 0 { phase.active_nodes = 1; }
+            for mask in 0..16 {
+                let optional: Vec<bool> = (0..4).map(|i| mask & (1 << i) != 0).collect();
+                for m in 1..=4 {
+                    let a = search_phased_indexed_impl(4, &anchors, &optional, &br, m, 2_000_000, &phase, &out, None, true);
+                    let b = search_phased_indexed_impl(4, &anchors, &optional, &br, m, 2_000_000, &phase, &out, None, false);
+                    let repr = |c: &[Vec<Found>]| c.iter().map(|p| p.iter().map(|x| (x.start, x.bridges.clone(), x.circular)).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    assert!(!a.1 && !b.1, "fixture budget case={case} mask={mask} m={m}");
+                    assert_eq!(repr(&a.0), repr(&b.0), "case={case} mask={mask} m={m}");
+                    assert_eq!(a.2, b.2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_cover_search_matches_phase_and_terminal_oracle() {
+        let gfa = gfa_text(&[("A",100),("C",100),("R",100),("B",100),("D",100)],
+            &[("A+","R+"),("C+","R+"),("R+","B+"),("R+","D+")]);
+        let dir = std::env::temp_dir().join(format!("ovasm-dfs-phase-oracle-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gp = dir.join("graph.gfa"); std::fs::write(&gp,&gfa).unwrap();
+        let graph = parse_gfa(&gp).unwrap();
+        let report = json!({"graph_fingerprint":crate::unzip::graph_fingerprint(&graph), "min_count":80, "unique_records":400,
+            "repeat_nodes":[{"segment":"R","classification":"resolved",
+            "entries":[{"segment":"A+","adjacency_reads":200},{"segment":"C+","adjacency_reads":200}],
+            "exits":[{"segment":"B+","adjacency_reads":200},{"segment":"D+","adjacency_reads":200}],
+            "phases":[{"entry":"A+","exit":"B+","reads":80,"supported":true},{"entry":"C+","exit":"D+","reads":80,"supported":true}]}]});
+        let pp=dir.join("phase.json"); std::fs::write(&pp,report.to_string()).unwrap();
+        let phases=crate::phase::Constraints::load(&graph,&pp).unwrap();
+        assert!(!phases.allows((0,true),(2,true),(4,true)));
+        assert!(!phases.allows((4,false),(2,false),(0,false)));
+        let links=[("A+","R+",2),("C+","R+",2),("R+","B+",2),("R+","D+",2)];
+        let ev=terminal_evidence(&gfa,&links,&[("A+ R+ B+",2),("C+ R+ D+",2)]);
+        let anchors: Vec<_>=(0..5).collect();let optional=vec![false,false,false,true,true];let repeats=vec![false;5];
+        let threads=crate::read_model::ReadModel::load(&graph,&ev,&repeats,2).unwrap().unwrap().thread_ends(&anchors,&optional);
+        assert!(!threads.is_empty());
+        let (br,_)=bridges(&graph,&ev,&repeats,2).unwrap();let mut out=FxHashMap::default();
+        for (i,b) in br.iter().enumerate(){out.entry(b.walk[0]).or_insert_with(Vec::new).push(i);}
+        for m in 1..=3 { for with_threads in [false,true] {
+            let t=with_threads.then_some(&threads);
+            let a=search_phased_indexed_impl(5,&anchors,&optional,&br,m,2_000_000,&phases,&out,t,true);
+            let b=search_phased_indexed_impl(5,&anchors,&optional,&br,m,2_000_000,&phases,&out,t,false);
+            let repr=|c:&[Vec<Found>]| c.iter().map(|p|p.iter().map(|f|(f.start,f.bridges.clone(),f.circular)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            assert!(!a.1 && !b.1 && !a.2 && !b.2);
+            assert_eq!(repr(&a.0),repr(&b.0),"m={m} threads={with_threads}");
+        }}
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
