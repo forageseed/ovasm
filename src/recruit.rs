@@ -409,6 +409,8 @@ struct ScanResult {
     /// Each extending target's NUMT candidates that this pass classified anew: the partial reads
     /// at the edges its bait last grew to (`FRONTIER_STEPS`).
     frontier: Vec<Sample<FRONTIER_READS>>,
+    /// A partial target candidate was observed, including unchanged cached calls.
+    partial_candidates: Vec<bool>,
     /// Accepted short reads partially explained by gap-bridged bait, per target.
     accepted_partial: Vec<AcceptedPartialAudit>,
     numt: TargetCounts,
@@ -776,6 +778,12 @@ struct Writes<'a> {
     keep: Option<&'a [Keep]>,
 }
 
+struct ScanPolicies<'a> {
+    admission: Option<&'a mut crate::read_admission::Admission>,
+    exclusions: Option<&'a mut crate::read_admission::Exclusions>,
+    pass: Option<usize>,
+}
+
 /// One pass over the inputs. Recruited reads are written, in input order, to each target's
 /// pass file and NUMT candidates to `numt_path`, not kept: a plastid at 20,000x recruits
 /// gigabases (Col-0 HiFi: 3.2 Gb, 14 GB of memory when held), more than a laptop has.
@@ -790,9 +798,16 @@ fn scan(
     gate_sketch: Option<&mut crate::seedfree::GateSketch>,
     gpu: Option<&mut crate::gpu::Gpu>,
     tandem: Option<&TandemCheck>,
+    mut policies: ScanPolicies<'_>,
 ) -> Result<ScanResult> {
     let (out_dir, numt_path) = (w.out_dir, w.numt_path);
     let replaying = replay.as_ref().is_some_and(|r| r.ready);
+    if let Some(plan) = &mut policies.admission {
+        plan.begin_scan();
+    }
+    if let Some(plan) = &mut policies.exclusions {
+        plan.begin_scan();
+    }
     // the change check of a replay pass, on the GPU while it works (else on the CPU, same answer)
     let mut gpu = gpu.filter(|_| replaying && !final_outputs);
     if let Some(d) = delta {
@@ -843,6 +858,7 @@ fn scan(
         all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         frontier: (0..n_targets).map(|_| Sample::default()).collect(),
+        partial_candidates: vec![false; n_targets],
         accepted_partial: (0..n_targets).map(|_| AcceptedPartialAudit::default()).collect(),
         numt: TargetCounts::default(),
         reads: 0,
@@ -1002,6 +1018,30 @@ fn scan(
                     cache.cover_bounds.push(bound);
                 }
             }
+            // Cache the ordinary classifier result. Apply the source constraint
+            // before any target counts, samples, output or extension input.
+            let original_input = !replaying || final_outputs;
+            let excluded = if let Some(plan) = &mut policies.exclusions {
+                plan.observe(&entry.rec, call, original_input, policies.pass)?
+            } else {
+                0
+            };
+            // a tandem read its target admits is recruited like an organelle read: the same
+            // source constraint holds for it
+            let call = match call {
+                Call::Organelle(mask) => {
+                    let allowed = mask & !excluded;
+                    if allowed == 0 { Call::Other } else { Call::Organelle(allowed) }
+                }
+                Call::TandemArray(mask) => {
+                    let allowed = mask & !excluded;
+                    if allowed == 0 { Call::Other } else { Call::TandemArray(allowed) }
+                }
+                call => call,
+            };
+            if let Some(plan) = &mut policies.admission {
+                plan.observe(&entry.rec, call, original_input);
+            }
             if matches!(call, Call::Other | Call::Tandem) {
                 continue;
             }
@@ -1046,8 +1086,11 @@ fn scan(
                     }
                     out.numt.reads += 1;
                     out.numt.bases += len;
-                    if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
-                        out.frontier[t].offer(name_key(&rec.id), &rec.seq);
+                    if excluded & (1 << t) == 0 {
+                        out.partial_candidates[t] = true;
+                        if changed && w.keep.map_or(true, |k| k[t] != Keep::Nothing) {
+                            out.frontier[t].offer(name_key(&rec.id), &rec.seq);
+                        }
                     }
                 }
                 Call::Other | Call::Tandem => {}
@@ -1080,6 +1123,12 @@ fn scan(
         w.flush()?;
     }
     numt_w.flush()?;
+    if let Some(plan) = policies.admission {
+        plan.finish_scan()?;
+    }
+    if let Some(plan) = policies.exclusions {
+        plan.finish_scan()?;
+    }
     if profiling() { eprintln!(
         "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s gpu={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
         if final_outputs { "final" } else if replaying { "replay" } else { "source" },
@@ -1105,10 +1154,15 @@ fn name_key(id: &[u8]) -> u64 {
 /// Salt of the subsample used for bait extension (independent of the output downsampling).
 const EXTEND_SALT: u64 = 0xB417_E87E;
 
-/// What a read is downsampled by: its whole name, or with `mates_together` the name's first word.
+/// Downsample mates by the first name token without an optional terminal /1 or /2.
 fn sample_name(id: &[u8], mates_together: bool) -> &[u8] {
     if mates_together {
-        id.split(|b| b.is_ascii_whitespace()).next().unwrap_or(id)
+        let name = id.split(|b| b.is_ascii_whitespace()).next().unwrap_or(id);
+        if name.len() > 2 {
+            name.strip_suffix(b"/1").or_else(|| name.strip_suffix(b"/2")).unwrap_or(name)
+        } else {
+            name
+        }
     } else {
         id
     }
@@ -1140,6 +1194,31 @@ pub(crate) fn write_rec(w: &mut impl Write, r: &Rec) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecruitmentState {
+    Converged,
+    Unresolved,
+    Truncated,
+}
+
+impl RecruitmentState {
+    fn from_stop(
+        reason: &str,
+        pass_budget_exhausted: bool,
+        closure_observed: bool,
+        bootstrap_budget_exhausted: bool,
+    ) -> Self {
+        match reason {
+            "iteration_limit" | "single_pass" | "size_cap" => Self::Truncated,
+            "bootstrap_limit" if bootstrap_budget_exhausted => Self::Truncated,
+            "bait_complete" if pass_budget_exhausted => Self::Truncated,
+            "bait_complete" if closure_observed => Self::Converged,
+            _ => Self::Unresolved,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetOutput {
     pub name: String,
@@ -1157,7 +1236,10 @@ pub struct TargetOutput {
     /// --saturation), bait_complete (extension added nothing), size_cap (stood for more than
     /// `size_cap`), iteration_limit (still growing when the passes ran out) or single_pass.
     pub stop_reason: &'static str,
-    /// False for iteration_limit, size_cap, growing and bootstrap_limit: reads may be incomplete or hold others.
+    /// Closure of the observed bait under the configured eligibility rules, before FASTQ
+    /// downsampling. Unresolved or truncated runs have no such closure evidence.
+    pub recruitment_state: RecruitmentState,
+    /// True exactly when recruitment_state is converged.
     pub converged: bool,
     pub sampling_fraction: f64,
     /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
@@ -1191,6 +1273,10 @@ pub struct RecruitReport {
     pub targets: Vec<crate::bait::Target>,
     pub iterations: Vec<IterationStats>,
     pub outputs: Vec<TargetOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_admission: Option<crate::read_admission::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_source_exclusions: Option<crate::read_admission::ExclusionReport>,
     pub numt_candidates: u64,
     pub numt_output: String,
     pub source_candidates: serde_json::Value,
@@ -1567,6 +1653,16 @@ enum Gauge {
     Deep,
 }
 
+fn frontier_reason(gauge: Gauge) -> Option<crate::retained::FrontierReason> {
+    use crate::retained::FrontierReason;
+    match gauge {
+        Gauge::Extends => None,
+        Gauge::Gated => Some(FrontierReason::ReadDepthProfile),
+        Gauge::Shallow => Some(FrontierReason::BelowTargetDepth),
+        Gauge::Deep => Some(FrontierReason::AboveTargetDepth),
+    }
+}
+
 fn gauge(d: Option<ReadDepth>, floor: Option<f64>, ceiling: Option<f64>) -> Gauge {
     match d {
         Some(d) if d.organelle_like => {
@@ -1710,10 +1806,14 @@ fn bootstrap_candidates(
     gate: &DepthGate,
     used: &FxHashSet<u64>,
     deep: Option<f64>,
+    exclusions: Option<&crate::read_admission::Exclusions>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
     let n = bait.targets.len();
     let (mut picked, mut keys) = (Vec::new(), Vec::new());
     for_each_rec(numt_path, |r| {
+        if exclusions.is_some_and(|plan| plan.mask(&r.id) & (1 << t) != 0) {
+            return;
+        }
         let key = name_key(&r.id);
         if used.contains(&key) {
             return;
@@ -1957,8 +2057,32 @@ fn runaway_growth(previous: Option<usize>, gain: usize, closing: bool) -> bool {
     !closing && runaway_bait_gain(previous, gain)
 }
 
-pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
+fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
+    let bit = 1u8 << target;
+    CanonicalKmers::new(seq, bait.k).any(|(_, km)| bait.get(km) & bit == 0)
+}
+
+pub fn run(bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
+    run_with_options(bait, cfg, false, None, None)
+}
+
+pub(crate) fn run_with_options(
+    mut bait: BaitSet, cfg: RecruitConfig, audit_frontier: bool,
+    admission_manifest: Option<&Path>,
+    exclusion_manifest: Option<&Path>,
+) -> Result<RecruitReport> {
+    use crate::retained::{FrontierAudit, FrontierReason};
+
     let start = Instant::now();
+    let mut admission = admission_manifest
+        .map(|path| crate::read_admission::Admission::load(path, &bait))
+        .transpose()?;
+    let mut exclusions = exclusion_manifest
+        .map(|path| crate::read_admission::Exclusions::load(path, &bait))
+        .transpose()?;
+    if let (Some(positive), Some(negative)) = (&admission, &exclusions) {
+        positive.check_exclusions(negative)?;
+    }
     std::fs::create_dir_all(&cfg.out_dir)?;
     let mut iterations = Vec::new();
     let mut replay = cfg
@@ -1982,6 +2106,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         Vec::new()
     };
     let n_targets = bait.targets.len();
+    let mut frontier_audit = audit_frontier.then(|| FrontierAudit::new(n_targets));
     let numt_path = cfg.out_dir.join("numt_candidates.fastq");
     // Reads already used to extend each target's bait: later passes count only new reads, so a
     // deep, already complete target (a plastid at 20,000x) is not re-counted every pass.
@@ -2052,6 +2177,10 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     // (`KMER_FRONTIER_MAX_END_GROWTH`)
     let mut walk_ends: Vec<Option<usize>> = vec![None; n_targets];
     let mut walk_stopped = vec![false; n_targets];
+    // Extension remembers processed names, so a withheld read may not be tested again.
+    let mut extension_subsampled = vec![false; n_targets];
+    let mut frontier_withheld = vec![false; n_targets];
+    let mut bootstrap_budget_exhausted = vec![false; n_targets];
     for it in 0..cfg.iterations.max(1) {
         let t0 = Instant::now();
         let bait_kmers = bait.len();
@@ -2094,6 +2223,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             if it == 0 { gate_sketch.as_mut() } else { None },
             gpu.as_mut(),
             tandem.as_ref(),
+            ScanPolicies { admission: admission.as_mut(), exclusions: exclusions.as_mut(), pass: Some(it + 1) },
         )?;
         if crate::recruit::profiling() {
             eprintln!("[ovasm] profile iteration {} pre-scan+scan {:.1}s", it + 1, t0.elapsed().as_secs_f64());
@@ -2136,6 +2266,12 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         // 20 bp before it, 39 at it, none across) until it counted as saturated.
         if let Some(table) = kmer_table.as_ref().filter(|_| !last) {
             for t in 0..n_targets {
+                // Whole-library counts do not preserve the source of a word.
+                // Keep depth estimation, but no autonomous walk for a target
+                // whose new bait must respect per-original exclusions.
+                if exclusions.as_ref().is_some_and(|plan| plan.protects(t)) {
+                    continue;
+                }
                 let Some(d) = kmer_target_depth[t].filter(|_| !saturated[t] && !walk_stopped[t]) else {
                     continue;
                 };
@@ -2300,11 +2436,23 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     }
                     fresh.push(key);
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
+                        extension_subsampled[t] = true;
+                        if let Some(audit) = &mut frontier_audit {
+                            audit.record(t, it + 1, FrontierReason::ExtensionSubsampled, key, &r);
+                        }
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
                         if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d)) {
                             gated_out[t] += 1;
+                            if (!frontier_withheld[t] || frontier_audit.is_some())
+                                && has_unbaited_kmer(&bait, t, &r.seq)
+                            {
+                                frontier_withheld[t] = true;
+                                if let Some(audit) = &mut frontier_audit {
+                                    audit.record(t, it + 1, FrontierReason::KmerDepthGate, key, &r);
+                                }
+                            }
                             return;
                         }
                     }
@@ -2312,7 +2460,19 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         picked.push(r.seq);
                         return;
                     };
-                    match extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds) {
+                    let (verdict, by_new) =
+                        extends(g, &bait, t, &r.seq, extension_deep(g, core_depth[t]), bounds);
+                    if let Some(reason) = frontier_reason(verdict) {
+                        if (!frontier_withheld[t] || frontier_audit.is_some())
+                            && has_unbaited_kmer(&bait, t, &r.seq)
+                        {
+                            frontier_withheld[t] = true;
+                            if let Some(audit) = &mut frontier_audit {
+                                audit.record(t, it + 1, reason, key, &r);
+                            }
+                        }
+                    }
+                    match (verdict, by_new) {
                         (Gauge::Extends, by_new) => {
                             new_part[t] += u64::from(by_new);
                             picked.push(r.seq);
@@ -2333,7 +2493,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         new.sort_unstable();
                         new.dedup();
                     }
+                    let before = new.len();
                     keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
+                    frontier_withheld[t] |= new.len() < before;
                     let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
                     if runaway_growth(previous, added[t] + new.len(), closing[t]) {
                         saturated[t] = true;
@@ -2353,6 +2515,13 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         picked.iter().map(Vec::as_slice),
                         cfg.extend_min_count,
                     );
+                }
+                if !frontier_withheld[t] {
+                    frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
+                }
+                if let Some(audit) = &mut frontier_audit {
+                    let records = picked.iter().filter(|seq| has_unbaited_kmer(&bait, t, seq)).count();
+                    audit.count(t, FrontierReason::UnbaitedAfterCommit, false, records as u64);
                 }
                 used[t].extend(fresh);
                 // Within-pass extension from the partial reads at its edges (`FRONTIER_STEPS`),
@@ -2380,15 +2549,27 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         }
                     }
                     pending = rest;
-                    let judged: Vec<(&[u8], bool)> = ready
+                    let judged: Vec<(&[u8], Gauge, bool)> = ready
                         .into_par_iter()
-                        .filter_map(|s| match extends(g, &bait, t, s, deep, bounds) {
-                            (Gauge::Extends, by_new) => Some((s, by_new)),
-                            _ => None,
+                        .map(|s| {
+                            let (verdict, by_new) = extends(g, &bait, t, s, deep, bounds);
+                            (s, verdict, by_new)
                         })
                         .collect();
-                    new_part[t] += judged.iter().filter(|j| j.1).count() as u64;
-                    let picked: Vec<&[u8]> = judged.into_iter().map(|j| j.0).collect();
+                    let mut picked = Vec::new();
+                    for (seq, verdict, by_new) in judged {
+                        if verdict == Gauge::Extends {
+                            new_part[t] += u64::from(by_new);
+                            picked.push(seq);
+                        } else if (!frontier_withheld[t] || frontier_audit.is_some())
+                            && has_unbaited_kmer(&bait, t, seq)
+                        {
+                            frontier_withheld[t] = true;
+                            if let (Some(audit), Some(reason)) = (&mut frontier_audit, frontier_reason(verdict)) {
+                                audit.count(t, reason, true, 1);
+                            }
+                        }
+                    }
                     if picked.is_empty() {
                         break;
                     }
@@ -2415,8 +2596,15 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                         }
                         bait.add_kmers(t, &new)
                     } else {
-                        bait.extend_from_reads(t, picked, cfg.extend_min_count)
+                        bait.extend_from_reads(t, picked.iter().copied(), cfg.extend_min_count)
                     };
+                    if !frontier_withheld[t] {
+                        frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
+                    }
+                    if let Some(audit) = &mut frontier_audit {
+                        let records = picked.iter().filter(|seq| has_unbaited_kmer(&bait, t, seq)).count();
+                        audit.count(t, FrontierReason::UnbaitedAfterCommit, true, records as u64);
+                    }
                     added[t] += more;
                     if more == 0 {
                         break;
@@ -2465,6 +2653,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     g,
                     &boot_used[t],
                     None,
+                    exclusions.as_ref(),
                 )?;
                 // A seed that failed is bootstrapped from all of them. One that recruits more
                 // reads than are left as deep partial candidates has its genome already, and its
@@ -2502,7 +2691,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     {
                         bootstrap_candidates(
                             &numt_path, floor, t, &bait, &cfg.params, g,
-                            &boot_used[t], Some(deep),
+                            &boot_used[t], Some(deep), exclusions.as_ref(),
                         )?
                     } else {
                         (picked, keys)
@@ -2541,6 +2730,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if picked.len() > leftover_boot_count[t] || picked_bases > leftover_boot_bases[t] {
                         saturated[t] = true;
                         stopped[t] = Some("bootstrap_limit");
+                        bootstrap_budget_exhausted[t] = true;
                         warnings.push(format!("{}: third leftover retry held by candidate count or base budget; candidate origins remain unresolved", bait.targets[t].name));
                         continue;
                     }
@@ -2549,6 +2739,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
                     if runaway_bait_gain(Some(leftover_boot_gain[t]), kmers.len()) {
                         saturated[t] = true;
                         stopped[t] = Some("bootstrap_limit");
+                        bootstrap_budget_exhausted[t] = true;
                         warnings.push(format!("{}: third leftover retry held by bait growth budget; candidate origins remain unresolved", bait.targets[t].name));
                         continue;
                     }
@@ -2771,6 +2962,7 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
             None,
             None,
             final_tandem.as_ref(),
+            ScanPolicies { admission: admission.as_mut(), exclusions: exclusions.as_mut(), pass: None },
         )?;
         anyhow::ensure!(
             final_res.reads == res.reads && final_res.bases == res.bases,
@@ -2780,7 +2972,9 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
     }
 
     let mut source_candidates =
-        crate::retained::recruitment(&cfg.out_dir, &numt_path, &bait, &cfg.params)?;
+        crate::retained::recruitment(
+            &cfg.out_dir, &numt_path, &bait, &cfg.params, frontier_audit.as_mut(), exclusions.as_ref(),
+        )?;
     // This is a bounded audit, not evidence of nuclear origin. The existing candidate pool
     // excludes reads shorter than numt_min_block, including all ordinary short reads.
     if cfg.params.numt_min_block == usize::MAX {
@@ -2858,28 +3052,56 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         let pass = pass_path(&cfg.out_dir, &target.name);
         let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
         let (mut kept_reads, mut kept_bases) = (0u64, 0u64);
+        let eligible = |r: &Rec| fraction >= 1.0
+            || unit_hash(sample_name(&r.id, cfg.mates_together), cfg.salt) < fraction;
         let mut failed = Ok(());
         for_each_rec(&pass, |r| {
-            if failed.is_ok() && (fraction >= 1.0 || unit_hash(sample_name(&r.id, cfg.mates_together), cfg.salt) < fraction) {
+            if failed.is_ok() && eligible(&r) {
                 kept_reads += 1;
                 kept_bases += r.seq.len() as u64;
                 failed = write_rec(&mut w, &r);
             }
         })?;
         failed?;
+        let added = if let Some(plan) = &mut admission {
+            let available = cfg.max_bases.unwrap_or(u64::MAX).saturating_sub(kept_bases);
+            plan.append(t, &mut w, eligible, available)?
+        } else {
+            TargetCounts::default()
+        };
+        kept_reads += added.reads;
+        kept_bases += added.bases;
         w.flush()?;
         std::fs::remove_file(&pass)?;
         let stop_reason = stopped[t].unwrap_or("bait_complete");
+        // The last permitted scan skips extension. A budget stop with no previous bait gain
+        // can still have the legacy bait_complete reason without observing a fixed point.
+        let checked_walk = !cfg.kmer_gate
+            || (!walk_stopped[t] && kmer_walks[t].last().is_some_and(|walk| {
+                walk.skipped.is_none() && !walk.budget_reached
+                    && walk.capped_ends == 0 && walk.tips_removed == 0
+            }));
+        let closure_observed = !ran_out && cfg.iterations > 1 && counts.reads > 0
+            && !res.partial_candidates[t] && !extension_subsampled[t] && !frontier_withheld[t]
+            && checked_walk;
+        let recruitment_state = RecruitmentState::from_stop(
+            stop_reason, ran_out, closure_observed, bootstrap_budget_exhausted[t],
+        );
         outputs.push(TargetOutput {
             name: target.name.clone(),
-            recruited_reads: counts.reads,
-            recruited_bases: counts.bases,
+            recruited_reads: counts.reads + added.reads,
+            recruited_bases: counts.bases + added.bases,
             seed_length: target.seed_length,
-            estimated_depth: depth,
+            estimated_depth: if target.seed_length > 0 {
+                (counts.bases + added.bases) as f64 / target.seed_length as f64
+            } else {
+                0.0
+            },
             read_depth: final_depths.read[t],
             implied_size: final_depths.implied_size[t],
             stop_reason,
-            converged: !matches!(stop_reason, "iteration_limit" | "size_cap" | "growing" | "bootstrap_limit"),
+            recruitment_state,
+            converged: recruitment_state == RecruitmentState::Converged,
             sampling_fraction: fraction,
             sampled_by,
             kept_reads,
@@ -2917,6 +3139,8 @@ pub fn run(mut bait: BaitSet, cfg: RecruitConfig) -> Result<RecruitReport> {
         targets: bait.targets.clone(),
         iterations,
         outputs,
+        read_admission: admission.map(|plan| plan.report()),
+        read_source_exclusions: exclusions.map(|plan| plan.report(&bait, cfg.kmer_gate)),
         numt_candidates: res.numt.reads,
         numt_output: numt_path.display().to_string(),
         source_candidates,
@@ -2959,6 +3183,308 @@ pub fn peak_rss_mb() -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_exclusion_stops_read_bait_before_recruiting_dependent_reads() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!("ovasm-source-extension-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fq");
+        let evidence = dir.join("proof.json");
+        std::fs::write(&evidence, b"independent source test").unwrap();
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let core = pseudo_random(300, 97);
+        let tail = pseudo_random(55, 19);
+        let bridge = [&core[25..], &tail].concat();
+        let dependent = [&core[90..], &tail, &pseudo_random(20, 35)].concat();
+        let raw = |id: &[u8], seq: &[u8]| Rec {
+            id: id.to_vec(), seq: seq.to_vec(), qual: Some(vec![b'I'; seq.len()]),
+        };
+        let bridges = [raw(b"known-1/1 source", &bridge), raw(b"known-2 source", &bridge), raw(b"known-3 source", &bridge)];
+        let mut input = Vec::new();
+        write_rec(&mut input, &raw(b"known-1/2", &core)).unwrap();
+        for read in &bridges {
+            write_rec(&mut input, read).unwrap();
+        }
+        write_rec(&mut input, &raw(b"dependent", &dependent)).unwrap();
+        std::fs::write(&reads, input).unwrap();
+        let records: Vec<_> = bridges.iter().map(|read| serde_json::json!({
+            "target":"mito","read_id_hex":read.id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+            "sequence_sha256":digest(&read.seq),"quality_sha256":digest(read.qual.as_ref().unwrap()),
+            "provenance":{"path":"proof.json","sha256":digest(b"independent source test")},
+        })).collect();
+        let mut decl = serde_json::json!({"schema":"ovasm.read-source-exclusions.v1",
+            "scope":"exclude bridge but preserve its distinct mate","records":records});
+        let manifest = dir.join("exclusions.json");
+        std::fs::write(&manifest, serde_json::to_vec(&decl).unwrap()).unwrap();
+        let config = |name: &str| {
+            let mut cfg = test_config(&reads, dir.join(name), 4, false);
+            cfg.mates_together = true;
+            cfg.params.numt_min_block = 40;
+            cfg
+        };
+        let bait = bait_from(&core, 21);
+        let normal = run(bait.clone(), config("normal")).unwrap();
+        assert!(normal.iterations_run > 1);
+        assert_eq!(normal.outputs[0].kept_reads, 5);
+        let mut guarded = Vec::new();
+        for (label, cache) in [("guarded", false), ("guarded-replay", true)] {
+            let mut cfg = config(label);
+            if cache {
+                cfg.replay_dir = Some(dir.join("cache"));
+            }
+            let report = run_with_options(bait.clone(), cfg, false, None, Some(&manifest)).unwrap();
+            assert_eq!(report.outputs[0].kept_reads, 1);
+            assert_eq!(report.iterations[0].bait_kmers_added, vec![0]);
+            let audit = serde_json::to_value(report.read_source_exclusions.unwrap()).unwrap();
+            assert_eq!(audit["records"][0]["organelle_match_passes"], serde_json::json!([1]));
+            guarded.push(std::fs::read(&report.outputs[0].output).unwrap());
+        }
+        assert_eq!(guarded[0], guarded[1]);
+        assert!(guarded[0].starts_with(b"@known-1/2\n"));
+
+        // Admission must not override a same-record, same-target exclusion.
+        decl["schema"] = serde_json::json!("ovasm.read-admission.v1");
+        let admission = dir.join("admission.json");
+        std::fs::write(&admission, serde_json::to_vec(&decl).unwrap()).unwrap();
+        let error = run_with_options(bait, config("contradiction"), false, Some(&admission), Some(&manifest))
+            .err().unwrap();
+        assert!(error.to_string().contains("conflicting admission and source exclusion"));
+        assert!(!dir.join("contradiction").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_read_admission_preserves_bait_and_original_quality_across_replay() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!("ovasm-read-admission-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fq");
+        let proof = dir.join("proof.json");
+        let manifest = dir.join("manifest.json");
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let core = pseudo_random(150, 97);
+        let extension = [&core[..135], &pseudo_random(15, 19)].concat();
+        let partial = Rec {
+            id: b"partial/2 source metadata".to_vec(),
+            seq: [&core[..75], &pseudo_random(75, 83)].concat(),
+            qual: Some([b'!'; 75].into_iter().chain([b'I'; 75]).collect()),
+        };
+        let mut data = Vec::new();
+        write_rec(&mut data, &partial).unwrap();
+        let mut admitted = data.clone();
+        for i in 0..3 {
+            write_rec(&mut data, &Rec {
+                id: format!("known-{i}").into_bytes(),
+                seq: extension.clone(),
+                qual: Some(vec![b'J'; 150]),
+            }).unwrap();
+        }
+        std::fs::write(&reads, data).unwrap();
+        let evidence = br#"{"fixture":"exact partial original"}"#;
+        std::fs::write(&proof, evidence).unwrap();
+        let hex: String = partial.id.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
+            "schema": "ovasm.read-admission.v1",
+            "scope": "synthetic original record",
+            "records": [{
+                "target": "mito",
+                "read_id_hex": hex,
+                "sequence_sha256": digest(&partial.seq),
+                "quality_sha256": digest(partial.qual.as_ref().unwrap()),
+                "provenance": {"path": "proof.json", "sha256": digest(evidence)}
+            }]
+        })).unwrap()).unwrap();
+
+        let config = |label: &str| {
+            let mut cfg = test_config(&reads, dir.join(label), 3, false);
+            cfg.params.numt_min_block = 40;
+            cfg
+        };
+        let bait = bait_from(&core, 21);
+        let baseline = run(bait.clone(), config("baseline")).unwrap();
+        let baseline_reads = std::fs::read(dir.join("baseline/mito.fastq")).unwrap();
+        assert!(baseline.iterations_run > 1);
+        assert!(baseline.read_admission.is_none());
+        assert_eq!(std::fs::read(dir.join("baseline/numt_candidates.fastq")).unwrap(), admitted);
+        let mut expected = baseline_reads;
+        expected.append(&mut admitted);
+        for label in ["uncached", "cached"] {
+            let mut cfg = config(label);
+            if label == "cached" {
+                cfg.replay_dir = Some(dir.join("replay"));
+            }
+            let report = run_with_options(bait.clone(), cfg, false, Some(&manifest), None).unwrap();
+            assert_eq!(report.iterations_run, baseline.iterations_run);
+            assert_eq!(report.outputs[0].recruitment_state, baseline.outputs[0].recruitment_state);
+            assert_eq!(report.outputs[0].kept_reads, baseline.outputs[0].kept_reads + 1);
+            assert_eq!(std::fs::read(dir.join(label).join("mito.fastq")).unwrap(), expected);
+            assert_eq!(std::fs::read(dir.join(label).join("numt_candidates.fastq")).unwrap(),
+                std::fs::read(dir.join("baseline/numt_candidates.fastq")).unwrap());
+            let audit = serde_json::to_value(report.read_admission.unwrap()).unwrap();
+            assert_eq!(audit["records"][0]["baseline"], "partial");
+            assert_eq!(audit["records"][0]["status"], "admitted");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn optional_frontier_evidence_keeps_recruitment_and_source_outputs() {
+        let dir = std::env::temp_dir().join(format!("ovasm-frontier-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fa");
+        let target = pseudo_random(150, 97);
+        let background = pseudo_random(150, 83);
+        let bait = bait_from(&target, 21);
+        let known = std::str::from_utf8(&target).unwrap();
+        let partial = [&target[..75], &background[75..]].concat();
+        let partial = std::str::from_utf8(&partial).unwrap();
+        let data = format!(">partial\n{partial}\n")
+            + &(0..5200).map(|i| format!(">r{i}\n{known}\n")).collect::<String>();
+        std::fs::write(&reads, data).unwrap();
+        let config = |label: &str| {
+            let mut cfg = test_config(&reads, dir.join(label), 3, false);
+            cfg.params.numt_min_block = 40;
+            cfg.extend_depth = 1.0;
+            cfg
+        };
+        let standard = run(bait.clone(), config("standard")).unwrap();
+        let audited = run_with_options(bait, config("audited"), true, None, None).unwrap();
+        let relative = Path::new("source_candidates/frontier-evidence.jsonl");
+        assert!(!dir.join("standard").join(relative).exists());
+        assert_eq!(standard.outputs[0].recruitment_state, audited.outputs[0].recruitment_state);
+        assert_eq!(standard.iterations[0].extended_from_reads, audited.iterations[0].extended_from_reads);
+        for file in ["mito.fastq", "numt_candidates.fastq", "source_candidates/nuclear-insertion-candidates.jsonl"] {
+            assert_eq!(std::fs::read(dir.join("standard").join(file)).unwrap(),
+                       std::fs::read(dir.join("audited").join(file)).unwrap());
+        }
+        let evidence = &audited.source_candidates["frontier_evidence"];
+        let subsampled = &evidence["targets"][0]["reasons"][0];
+        assert_eq!(subsampled["reason"], "extension_subsampled");
+        assert_eq!(subsampled["extension_records"],
+            audited.outputs[0].recruited_reads - audited.iterations[0].extended_from_reads[0]);
+        assert_eq!(subsampled["sampled"], 8);
+        let rows = std::fs::read_to_string(dir.join("audited").join(relative)).unwrap();
+        assert_eq!(rows.lines().count(), 8);
+        for line in rows.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["reason"], "extension_subsampled");
+            assert_eq!(row["in_final_partial_pool"], false);
+            assert_eq!(row["flank_origin"], "unknown");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+
+    #[test]
+    fn recruitment_state_requires_an_observed_closure() {
+        let dir = std::env::temp_dir().join(format!("ovasm-recruit-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("reads.fa");
+        let target = pseudo_random(150, 97);
+        let background = pseudo_random(150, 83);
+        let bait = bait_from(&target, 21);
+        let data = format!(">target\n{}\n", std::str::from_utf8(&target).unwrap());
+        std::fs::write(&reads, &data).unwrap();
+        let config = |label, passes| test_config(&reads, dir.join(label), passes, false);
+
+        let full = run(bait.clone(), config("full", 3)).unwrap();
+        let exact = &full.outputs[0];
+        assert_eq!(full.iterations_run, 1);
+        assert_eq!(exact.stop_reason, "bait_complete");
+        assert_eq!(exact.recruitment_state, RecruitmentState::Converged);
+        assert!(exact.converged);
+        let json = serde_json::to_value(exact).unwrap();
+        assert_eq!(json["recruitment_state"], "converged");
+        assert_eq!(json["converged"], true);
+
+        let one = run(bait.clone(), config("one", 1)).unwrap();
+        let one = &one.outputs[0];
+        assert_eq!(one.stop_reason, "single_pass");
+        assert_eq!(one.recruitment_state, RecruitmentState::Truncated);
+        assert!(!one.converged);
+        assert_eq!(std::fs::read(&one.output).unwrap(), std::fs::read(&exact.output).unwrap());
+
+        let mut capped = config("output-capped", 3);
+        capped.max_bases = Some(1);
+        let capped = run(bait.clone(), capped).unwrap();
+        assert!(capped.outputs[0].sampling_fraction < 1.0);
+        assert_eq!(capped.outputs[0].recruitment_state, RecruitmentState::Converged);
+
+        let partial = [&target[..75], &background[75..]].concat();
+        std::fs::write(&reads, format!("{data}>partial\n{}\n",
+            std::str::from_utf8(&partial).unwrap())).unwrap();
+        let mut with_partial = config("partial", 3);
+        with_partial.params.numt_min_block = 40;
+        let partial = run(bait.clone(), with_partial).unwrap();
+        assert_eq!(partial.numt_candidates, 1);
+        assert_eq!(partial.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(partial.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+        assert_eq!(std::fs::read(&partial.outputs[0].output).unwrap(), std::fs::read(&exact.output).unwrap());
+
+        let novel = [&target[..130], &background[130..]].concat();
+        std::fs::write(&reads, format!("{data}>below-support\n{}\n",
+            std::str::from_utf8(&novel).unwrap())).unwrap();
+        let below_support = run(bait.clone(), config("below-support", 3)).unwrap();
+        assert_eq!(below_support.outputs[0].recruited_reads, 2);
+        assert_eq!(below_support.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(below_support.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+
+        let common = [&target[..], &background[..10]].concat();
+        let rare = [&common[..], &background[10..30]].concat();
+        let common = std::str::from_utf8(&common).unwrap();
+        let rare = std::str::from_utf8(&rare).unwrap();
+        std::fs::write(&reads, format!(
+            "{data}>common1\n{common}\n>common2\n{common}\n>common3\n{common}\n>rare\n{rare}\n"
+        )).unwrap();
+        let unsupported_tail = run(bait.clone(), config("gain-and-unsupported-tail", 3)).unwrap();
+        assert_eq!(unsupported_tail.iterations_run, 2);
+        assert!(unsupported_tail.iterations[0].bait_kmers_added[0] > 0);
+        assert_eq!(unsupported_tail.iterations[1].extended_from_reads[0], 0);
+        assert_eq!(unsupported_tail.numt_candidates, 0);
+        assert_eq!(unsupported_tail.outputs[0].recruited_reads, 5);
+        assert_eq!(unsupported_tail.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(unsupported_tail.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+
+        let mut multi_bait = bait.clone();
+        let growing = multi_bait.target("growing").unwrap();
+        multi_bait.add_sequence(growing, &background[..130]);
+        let second = std::str::from_utf8(&background).unwrap();
+        std::fs::write(&reads, format!("{data}>grow1\n{second}\n>grow2\n{second}\n>grow3\n{second}\n")).unwrap();
+        let mixed = run(multi_bait, config("mixed", 2)).unwrap();
+        assert_eq!(mixed.iterations_run, 2);
+        assert_eq!(mixed.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(mixed.outputs[growing].stop_reason, "iteration_limit");
+        assert!(mixed.outputs.iter().all(|o| o.recruitment_state == RecruitmentState::Truncated));
+
+        let text: String = (0..5200).map(|i| format!(">r{i}\n{}\n",
+            std::str::from_utf8(&target).unwrap())).collect();
+        std::fs::write(&reads, text).unwrap();
+        let mut sampled = config("extension-sampled", 3);
+        sampled.extend_depth = 1.0;
+        let sampled = run(bait, sampled).unwrap();
+        assert_eq!(sampled.outputs[0].recruited_reads, 5200);
+        assert_eq!(sampled.outputs[0].kept_reads, 5200);
+        assert!(sampled.iterations[0].extended_from_reads[0] < 5200);
+        assert_eq!(sampled.outputs[0].stop_reason, "bait_complete");
+        assert_eq!(sampled.outputs[0].recruitment_state, RecruitmentState::Unresolved);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recruitment_guard_states_distinguish_budget_from_insufficient_evidence() {
+        use RecruitmentState::{Converged, Truncated, Unresolved};
+        let state = RecruitmentState::from_stop;
+        assert_eq!(state("bootstrap_limit", false, false, true), Truncated);
+        assert_eq!(state("bootstrap_limit", false, false, false), Unresolved);
+        assert_eq!(state("size_cap", false, false, false), Truncated);
+        assert_eq!(state("saturated", false, false, false), Unresolved);
+        assert_eq!(state("growing", false, false, false), Unresolved);
+        assert_eq!(state("seeded_from_reads", false, false, false), Unresolved);
+        assert_eq!(state("bait_complete", false, true, false), Converged);
+    }
 
     #[test]
     fn accepted_short_partial_reads_are_audited_without_source_claims() {
@@ -3075,6 +3601,28 @@ mod tests {
         assert_eq!(unit_hash(sample_name(a, true), 3), unit_hash(sample_name(b, true), 3));
         assert_eq!(sample_name(a, false), a);
         assert_ne!(unit_hash(sample_name(a, false), 3), unit_hash(sample_name(b, false), 3));
+    }
+
+    #[test]
+    fn slash_mates_share_sampling_decisions_without_changing_other_names() {
+        let a = b"instrument/read/1";
+        let b = b"instrument/read/2";
+        assert_eq!(sample_name(a, true), b"instrument/read");
+        assert_eq!(sample_name(b, true), b"instrument/read");
+        for salt in [0, 3, u64::MAX] {
+            let ha = unit_hash(sample_name(a, true), salt);
+            let hb = unit_hash(sample_name(b, true), salt);
+            assert_eq!(ha, hb);
+            for fraction in [0.1, 0.5, 0.9] { assert_eq!(ha < fraction, hb < fraction); }
+        }
+        assert_eq!(sample_name(b"instrument/read/12", true), b"instrument/read/12");
+        assert_eq!(sample_name(b"instrument/1/read", true), b"instrument/1/read");
+        assert_eq!(sample_name(b"plain", true), b"plain");
+        assert_eq!(sample_name(b"/1", true), b"/1");
+        assert_eq!(sample_name(b"/2", true), b"/2");
+        assert_eq!(sample_name(b"x/1 comment", true), b"x");
+        assert_eq!(sample_name(a, false), a);
+        assert_eq!(sample_name(b, false), b);
     }
 
     #[test]
@@ -4335,7 +4883,7 @@ mod tests {
         let first = &gated.iterations[0];
         assert_eq!(first.extension_gated_out[0], 0, "organelle-like by depth");
         assert_eq!(first.extension_shallow_out[0], stray as u64);
-        assert!(gated.outputs[0].converged);
+        assert_eq!(gated.outputs[0].recruitment_state, RecruitmentState::Unresolved);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4559,9 +5107,10 @@ mod tests {
         let gated = run(bait, config("gated", true)).unwrap();
         let mito_reads = |r: &RecruitReport| count_reads(&r.outputs[0].output, b'm');
         assert_eq!(plain.outputs[0].stop_reason, "saturated");
+        assert_eq!(plain.outputs[0].recruitment_state, RecruitmentState::Unresolved);
         assert!(mito_reads(&plain) < 480, "{}", mito_reads(&plain));
         assert_eq!(mito_reads(&gated), 960);
-        assert!(gated.outputs[0].converged);
+        assert_ne!(gated.outputs[0].recruitment_state, RecruitmentState::Truncated);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -4644,7 +5193,7 @@ mod tests {
         assert!(!cfg.kmer_gate);
         let result = run(bait, cfg).unwrap();
         assert_eq!(count_reads(&result.outputs[0].output, b'm'), 1200);
-        assert!(result.outputs[0].converged);
+        assert_ne!(result.outputs[0].recruitment_state, RecruitmentState::Truncated);
         assert!(result.depth_gate.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4670,7 +5219,9 @@ mod tests {
         assert_eq!(mito_reads(&plain), 1200);
         assert_eq!(mito_reads(&gated), 1200);
         assert_eq!(count_reads(&gated.outputs[0].output, b'n'), 0);
-        assert!(gated.outputs[0].converged && plain.outputs[0].converged);
+        for report in [&gated, &plain] {
+            assert_ne!(report.outputs[0].recruitment_state, RecruitmentState::Truncated);
+        }
         let frontier: u64 = gated.iterations.iter().map(|it| it.frontier_reads[0]).sum();
         assert!(frontier > 0);
         assert!(

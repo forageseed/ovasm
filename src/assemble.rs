@@ -216,8 +216,11 @@ pub struct AssembleReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub junction_rescue: Option<crate::junctions::JunctionReport>,
     pub k: usize,
-    /// Automatic k: each k tried, largest first, with its node depth (see `run_auto_k`).
+    /// Automatic k attempts in order, with their occurrence-based node depths.
     pub k_tried: Vec<(usize, f64)>,
+    /// Read-record filter depth for each matching attempt in k_tried. Null uses its occurrence depth.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub k_filter_depths: Vec<Option<f64>>,
     /// Automatic k found no k deep enough on the reads given, so it self-corrected them and
     /// assembled these (see `run_auto_k`); `k_tried` then lists both ladders.
     pub corrected_reads: Option<String>,
@@ -228,8 +231,13 @@ pub struct AssembleReport {
     pub distinct_nodes: usize,
     pub min_count: u32,
     pub min_count_auto: bool,
-    /// Typical node depth (count-weighted median of nodes seen at least 3 times).
+    /// Typical node depth in k-mer occurrences, used by graph cleaning.
     pub node_depth: f64,
+    /// Read-record support depth used by automatic k and automatic min_count when applicable
+    /// in the sparse base-coordinate graph. This is capped at occurrence depth. Each record counts
+    /// separately, including records with the same molecule identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_depth: Option<f64>,
     pub nodes_kept: usize,
     pub edges_kept: usize,
     pub cleaning: CleanStats,
@@ -257,6 +265,12 @@ pub struct AssembleReport {
     pub longest: usize,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
+}
+
+impl AssembleReport {
+    fn auto_k_depth(&self) -> f64 {
+        self.filter_depth.unwrap_or(self.node_depth)
+    }
 }
 
 struct Unitig {
@@ -867,12 +881,15 @@ pub const ARC_FRACTION: f64 = 0.35;
 /// The relative rule never keeps an edge fewer reads show than the automatic min_count's floor.
 pub const ARC_MIN_READS: u32 = 3;
 
+// Node occurrence count, canonical sequence, and supporting read-record count.
+type GraphNode = (u32, Vec<u8>, u32);
+
 /// Graph over the kept k-mers: edges between kept nodes seen `min_count` times or
 /// `ARC_FRACTION` of the shallower node's count, plus `extra`.
 /// Returns the node hashes (index = node id), adjacency and the number of edges kept.
 fn build_graph(
     keep: &FxHashSet<u64>,
-    nodes: &FxHashMap<u64, (u32, Vec<u8>)>,
+    nodes: &FxHashMap<u64, GraphNode>,
     edges: &FxHashMap<EdgeKey, u32>,
     extra: &[EdgeKey],
     min_count: u32,
@@ -1545,7 +1562,7 @@ const OPEN_END_MIN_COUNT: u32 = 3;
 fn ladder_choice(scored: &[(LadderScore, usize)], last: &AssembleReport, target: f64) -> Option<usize> {
     let last_score = scored.iter().find(|x| x.1 == last.k).map(|x| x.0);
     let small_and_open = last.unitigs <= OPEN_END_MAX_UNITIGS && last_score.is_some_and(|x| x.0 > 0);
-    if last.node_depth >= target && !small_and_open {
+    if last.auto_k_depth() >= target && !small_and_open {
         let longest = scored.iter().map(|x| x.0 .2 .0).max().unwrap_or(0) as f64;
         return scored
             .iter()
@@ -1670,8 +1687,13 @@ fn run_auto_k_cleaning(
     nuclear_share: Option<f64>,
     depth_reference: Option<&'static Path>,
 ) -> Result<AssembleReport> {
-    let ladder = |reads: &[PathBuf], tried: &mut Vec<(usize, f64)>| -> Result<AssembleReport> {
+    let ladder = |reads: &[PathBuf],
+                  tried: &mut Vec<(usize, f64, Option<f64>)>|
+     -> Result<AssembleReport> {
         let mut last = None;
+        // Depth depends on the read set and k, even when the internal rescue fixes min_count.
+        // Each raw or corrected ladder owns its own measurements.
+        let mut filter_depth_by_k = FxHashMap::default();
         // every k tried, by (open ends, unitigs, longer, larger k): the choice when the node depth
         // does not make it (see `ladder_choice`)
         let mut scored: Vec<(LadderScore, usize)> = Vec::new();
@@ -1689,7 +1711,8 @@ fn run_auto_k_cleaning(
                 out_gfa,
                 out_json,
             )?;
-            tried.push((k, r.node_depth));
+            tried.push((k, r.node_depth, r.filter_depth));
+            filter_depth_by_k.insert(k, r.filter_depth);
             let open = open_ends(out_gfa);
             if r.unitigs > 0 {
                 scored.push((
@@ -1702,7 +1725,7 @@ fn run_auto_k_cleaning(
                     k,
                 ));
             }
-            let deep = r.node_depth >= target;
+            let deep = r.auto_k_depth() >= target;
             // a deep graph that is closed is done; a small deep graph with open ends goes on down
             // the ladder (a stretch under the threshold at this k breaks the circle)
             let done = (deep && (open == 0 || r.unitigs > OPEN_END_MAX_UNITIGS))
@@ -1713,6 +1736,12 @@ fn run_auto_k_cleaning(
             }
         }
         let last = last.expect("the ladder is not empty");
+        let initial_filter_depth = |k| {
+            filter_depth_by_k
+                .get(&k)
+                .copied()
+                .context("internal rescue needs depth from the initial attempt at this k")
+        };
         let mut choice = ladder_choice(&scored, &last, target).map(|k| (k, min_count));
         let mut ran_low = false;
         // a small graph still open at the automatic threshold: a stretch of the organelle sits
@@ -1738,7 +1767,7 @@ fn run_auto_k_cleaning(
                         out_gfa,
                         out_json,
                     )?;
-                    tried.push((k, r.node_depth));
+                    tried.push((k, r.node_depth, initial_filter_depth(k)?));
                     let open = open_ends(out_gfa);
                     let score = (
                         open,
@@ -1761,7 +1790,7 @@ fn run_auto_k_cleaning(
                     "[ovasm] k {k}{} gives the fewest open ends and unitigs of the k tried; assembling at it",
                     mc.map_or(String::new(), |m| format!(" (node threshold {m})"))
                 );
-                let r = run_backbone(
+                let mut r = run_backbone(
                     reads.to_vec(),
                     AssembleParams {
                         cleaning_audit_only,
@@ -1774,7 +1803,10 @@ fn run_auto_k_cleaning(
                     out_gfa,
                     out_json,
                 )?;
-                tried.push((k, r.node_depth));
+                if ran_low && mc.is_some() {
+                    r.filter_depth = initial_filter_depth(k)?;
+                }
+                tried.push((k, r.node_depth, r.filter_depth));
                 Ok(r)
             }
             _ => Ok(last),
@@ -1782,9 +1814,9 @@ fn run_auto_k_cleaning(
     };
     let mut tried = Vec::new();
     let mut r = ladder(&inputs, &mut tried)?;
-    if r.node_depth < target {
+    if r.auto_k_depth() < target {
         let corrected = out_gfa.with_extension("corrected.fa");
-        crate::correct::run(
+        let correction = crate::correct::run(
             inputs.clone(),
             Vec::new(),
             &[17, 25],
@@ -1807,19 +1839,20 @@ fn run_auto_k_cleaning(
         // (PMAT2 benchmark, Limnoperna fortunei ERR9713993, its 0.13 Gbp random draw: 5
         // mitochondrial reads at ~2x, "solid >= 11 (1 k-mers)" at k 25 trimmed 99.5%, and the
         // run stopped on "cannot read assembly.corrected.fa: Failed to read the first two
-        // bytes"): the same case as keeping under half of the bases.
-        let kept_some = fs::metadata(&corrected).is_ok_and(|m| m.len() > 0);
-        let rc = if kept_some {
+        // bytes"). The original ladder has already written its graph.
+        let kept_some = fs::metadata(&corrected).is_ok_and(|m| m.len() > 0)
+            && correction.rounds.last().is_some_and(|round| round.reads_out > 0);
+        let corrected_graph = if kept_some {
             Some(ladder(std::slice::from_ref(&corrected), &mut tried)?)
         } else {
             None
         };
-        match rc {
+        match corrected_graph {
             Some(mut rc) if 2 * rc.bases >= before => {
                 rc.corrected_reads = Some(corrected.display().to_string());
                 r = rc;
             }
-            _ => {
+            Some(_) => {
                 // Correction needs depth for its solid k-mers: at about 5x it trimmed away what the
                 // reads held (Canis lupus mitochondrion from 10 Mb of HiFi reads, the PMAT2 benchmark's
                 // lowest-depth test: 11 reads, 75 kb -> 5 reads, 1.4 kb, no unitig). The uncorrected
@@ -1829,10 +1862,16 @@ fn run_auto_k_cleaning(
                 );
                 r = ladder(&inputs, &mut tried)?;
             }
+            None => {
+                eprintln!("[ovasm] correction kept no reads; retaining the original read graph");
+            }
         }
     }
     add_junctions(&mut r, &inputs, out_gfa, context)?;
-    r.k_tried = tried;
+    if tried.iter().any(|&(_, _, filter)| filter.is_some()) {
+        r.k_filter_depths = tried.iter().map(|&(_, _, filter)| filter).collect();
+    }
+    r.k_tried = tried.into_iter().map(|(k, depth, _)| (k, depth)).collect();
     if cleaning_audit_only {
         bind_cleaning_audit(out_gfa, &out_gfa.with_extension("cleaning.json"))?;
     }
@@ -2156,8 +2195,8 @@ fn run_backbone_layout_guard(
     }
     let t0 = Instant::now();
     let (rx, reader) = read_batches(&inputs);
-    // canonical hash -> (count, canonical sequence)
-    let mut nodes: FxHashMap<u64, (u32, Vec<u8>)> = FxHashMap::default();
+    // canonical hash -> occurrence count, canonical sequence, read-record count
+    let mut nodes: FxHashMap<u64, GraphNode> = FxHashMap::default();
     // canonical ((a, fwd), (b, fwd), distance) -> count
     let mut edges: FxHashMap<EdgeKey, u32> = FxHashMap::default();
     let (mut reads, mut bases, mut sampled) = (0u64, 0u64, 0u64);
@@ -2169,6 +2208,9 @@ fn run_backbone_layout_guard(
     // keeping every read's k-mers would take gigabytes.
     let mut seen_nodes = dense.then(|| crate::correct::Bloom::new(30));
     let mut seen_edges = dense.then(|| crate::correct::Bloom::new(30));
+    let mut seen_in_read = (!dense && coordinates == Coordinates::Bases && p.min_count.is_none())
+        .then(FxHashSet::default);
+    let mut repeated_in_read = false;
     for mut batch in rx {
         for r in &mut batch {
             r.seq.make_ascii_uppercase();
@@ -2185,6 +2227,9 @@ fn run_backbone_layout_guard(
             reads += 1;
             bases += r.seq.len() as u64;
             sampled += samples.len() as u64;
+            if let Some(seen) = seen_in_read.as_mut() {
+                seen.clear();
+            }
             for &(h, fwd, pos) in &samples {
                 if let Some(b) = seen_nodes.as_mut() {
                     if !b.insert(h) {
@@ -2193,9 +2238,16 @@ fn run_backbone_layout_guard(
                 }
                 let e = nodes.entry(h).or_insert_with(|| {
                     let km = &r.seq[pos as usize..pos as usize + p.k];
-                    (0, if fwd { km.to_vec() } else { revcomp(km) })
+                    (0, if fwd { km.to_vec() } else { revcomp(km) }, 0)
                 });
                 e.0 += 1;
+                if let Some(seen) = seen_in_read.as_mut() {
+                    if seen.insert(h) {
+                        e.2 += 1;
+                    } else {
+                        repeated_in_read = true;
+                    }
+                }
             }
             for w in samples.windows(2) {
                 let d = w[1].2 - w[0].2;
@@ -2226,11 +2278,20 @@ fn run_backbone_layout_guard(
     let mut counts: Vec<u32> = nodes.values().map(|v| v.0).filter(|&c| c >= 3).collect();
     counts.sort_unstable();
     let mut node_depth = sequence_depth(&counts);
+    // When no read contains a node twice, both distributions are identical. Otherwise reuse the
+    // count buffer to estimate support without retaining a second whole-graph histogram input.
+    let mut support_depth = repeated_in_read.then(|| {
+        counts.clear();
+        counts.extend(nodes.values().map(|v| v.2).filter(|&c| c >= 3));
+        counts.sort_unstable();
+        sequence_depth(&counts)
+    });
     if let Some(path) = p.depth_reference.filter(|_| matches!(coordinates, Coordinates::Bases)) {
         let text = fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         let mut at: Vec<u32> = Vec::new();
+        let mut anchor_support: Vec<u32> = Vec::new();
         for rec in text.split('>').skip(1) {
             let seq: Vec<u8> = rec
                 .lines()
@@ -2251,9 +2312,16 @@ fn run_backbone_layout_guard(
                 if seen.insert(h) {
                     if let Some(v) = nodes.get(&h).filter(|v| v.0 >= 3 && u64::from(v.0) <= reads) {
                         at.push(v.0);
+                        if repeated_in_read && v.2 >= 3 {
+                            anchor_support.push(v.2);
+                        }
                     }
                 }
             }
+        }
+        if anchor_support.len() >= DEPTH_REFERENCE_MIN_NODES {
+            anchor_support.sort_unstable();
+            support_depth = Some(f64::from(anchor_support[anchor_support.len() / 2]));
         }
         if at.len() >= DEPTH_REFERENCE_MIN_NODES {
             at.sort_unstable();
@@ -2271,20 +2339,31 @@ fn run_backbone_layout_guard(
             node_depth = own;
         }
     }
+    // Use read-record support to lower an occurrence-based cutoff inflated by repeats. A
+    // different histogram peak or anchor set cannot make the cutoff stricter.
+    let filter_depth = seen_in_read
+        .is_some()
+        .then_some(support_depth.unwrap_or(node_depth).min(node_depth));
+    let threshold_depth = filter_depth.unwrap_or(node_depth);
+    if threshold_depth != node_depth {
+        eprintln!(
+            "[ovasm] automatic filter depth {threshold_depth:.0} from read-record support (occurrence depth {node_depth:.0})"
+        );
+    }
     // The automatic threshold is at least 3, 2 under LOW_DEPTH_NODES and 1 under
     // VERY_LOW_DEPTH_NODES: at about 5x a count of 3
     // drops every stretch where coverage dips to two reads (Canis lupus mitochondrion from 10 Mb of
     // HiFi reads, the PMAT2 benchmark's lowest-depth test: 2 unitigs, 14.2 of 16.7 kb).
-    let floor = if node_depth < VERY_LOW_DEPTH_NODES {
+    let floor = if threshold_depth < VERY_LOW_DEPTH_NODES {
         1
-    } else if node_depth < LOW_DEPTH_NODES {
+    } else if threshold_depth < LOW_DEPTH_NODES {
         2
     } else {
         3
     };
     let min_count = p.min_count.unwrap_or_else(|| match p.min_count_fraction {
-        Some(f) => ((node_depth * f + 1e-9) as u32).max(floor),
-        None => ((node_depth / 10.0) as u32).max(floor),
+        Some(f) => ((threshold_depth * f + 1e-9) as u32).max(floor),
+        None => ((threshold_depth / 10.0) as u32).max(floor),
     });
 
     // Keep nodes and edges seen at least min_count times, plus whatever gap rescue adds.
@@ -2486,6 +2565,7 @@ fn run_backbone_layout_guard(
         min_count,
         min_count_auto: p.min_count.is_none(),
         node_depth,
+        filter_depth,
         nodes_kept: ids.len(),
         edges_kept,
         cleaning,
@@ -2504,6 +2584,7 @@ fn run_backbone_layout_guard(
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
         k_tried: Vec::new(),
+        k_filter_depths: Vec::new(),
         corrected_reads: None,
     };
     fs::create_dir_all(out_json.parent().unwrap_or(Path::new(".")))?;
@@ -2689,10 +2770,10 @@ mod tests {
 
     #[test]
     fn an_edge_under_min_count_survives_when_it_holds_a_share_of_its_nodes() {
-        let nodes: FxHashMap<u64, (u32, Vec<u8>)> =
+        let nodes: FxHashMap<u64, GraphNode> =
             [(1, 100), (2, 100), (3, 100), (4, 5), (5, 5), (9, 1)]
                 .into_iter()
-                .map(|(h, c)| (h, (c, Vec::new())))
+                .map(|(h, c)| (h, (c, Vec::new(), 0)))
                 .collect();
         let keep: FxHashSet<u64> = [1, 2, 3, 4, 5].into_iter().collect();
         let mut edges = FxHashMap::default();
@@ -2753,6 +2834,31 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn automatic_k_keeps_the_raw_graph_when_correction_drops_every_read() {
+        let dir = tmpdir("empty-correction");
+        let gfa = dir.join("raw.gfa");
+        let json = dir.join("raw.json");
+        let report = run_auto_k(
+            vec![fastq(&dir, &[seq(1_400, 163)])],
+            31,
+            None,
+            None,
+            AUTO_K_NODE_DEPTH,
+            &gfa,
+            &json,
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(gfa.with_extension("corrected.fa")).unwrap().len(), 0);
+        assert!(report.corrected_reads.is_none());
+        assert_eq!(report.reads, 1);
+        assert_eq!(report.bases, 1_400);
+        assert!(report.unitigs > 0);
+        assert!(gfa.is_file());
+        assert!(json.is_file());
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Tile reads over a circular genome, both strands, at the given depth.
@@ -3387,6 +3493,7 @@ mod tests {
         .unwrap();
         assert_eq!(rep.k, 1001);
         assert_eq!(rep.k_tried.len(), 1);
+        assert_eq!(rep.k_filter_depths, vec![Some(rep.k_tried[0].1)]);
         // shallow: a read every 600 bp (5x) -> no k reaches the target; every k is tried,
         // largest first, and the one with the fewest unitigs is assembled again and kept
         // (LOW_DEPTH_NODES)
@@ -3419,6 +3526,65 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(dir.join("a.json")).unwrap()).unwrap();
         assert_eq!(json["k_tried"].as_array().unwrap().len(), ks.len());
         assert_eq!(json["corrected_reads"].as_str(), Some(corrected.as_str()));
+    }
+
+    #[test]
+    fn the_k_ladder_does_not_treat_occurrences_as_read_support() {
+        use std::cmp::Reverse;
+        let scored = [
+            ((0, 5, Reverse(12_000), Reverse(501)), 501),
+            ((1, 5, Reverse(10_000), Reverse(351)), 351),
+        ];
+        let mut last = AssembleReport {
+            k: 351,
+            unitigs: 5,
+            node_depth: 90.0,
+            filter_depth: Some(4.0),
+            ..Default::default()
+        };
+        assert_eq!(ladder_choice(&scored, &last, AUTO_K_NODE_DEPTH), Some(501));
+        last.filter_depth = None;
+        assert_eq!(ladder_choice(&scored, &last, AUTO_K_NODE_DEPTH), None);
+    }
+
+    #[test]
+    fn within_read_repeats_do_not_inflate_the_automatic_filter_depth() {
+        let dir = tmpdir("repeat-filter-depth");
+        let unit = seq(2_500, 77);
+        let input = fastq(&dir, &vec![unit.repeat(40); 4]);
+        let anchor = dir.join("anchor.fa");
+        fs::write(&anchor, format!(">repeat\n{}\n", std::str::from_utf8(&unit).unwrap())).unwrap();
+        let anchor: &'static Path = Box::leak(anchor.into_boxed_path());
+        let at = |name: &str, depth_reference, min_count| {
+            run(
+                vec![input.clone()],
+                AssembleParams {
+                    cleaning_audit_only: false,
+                    k: 101,
+                    s: 15,
+                    min_count,
+                    min_count_fraction: None,
+                    nuclear_share: None,
+                    depth_reference,
+                },
+                &dir.join(format!("{name}.gfa")),
+                &dir.join(format!("{name}.json")),
+            )
+            .unwrap()
+        };
+        let anchored = at("anchored", Some(anchor), None);
+        let global = at("global", None, None);
+        for report in [&anchored, &global] {
+            assert_eq!(report.reads, 4);
+            assert!(report.node_depth >= 150.0, "{}", report.node_depth);
+            assert_eq!(report.filter_depth, Some(4.0));
+            assert_eq!(report.min_count, 1);
+        }
+        let explicit = at("explicit", Some(anchor), Some(12));
+        assert_eq!(explicit.node_depth, anchored.node_depth);
+        assert_eq!(explicit.filter_depth, None);
+        assert_eq!(explicit.min_count, 12);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

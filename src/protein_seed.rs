@@ -46,6 +46,13 @@ use crate::seedfree::{depth_peaks, DepthGate, GateReport};
 
 pub const ORGANELLES: [&str; 2] = ["mitochondrion", "plastid"];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SeedMode {
+    Legacy,
+    GeneSetAudit,
+    PairedCandidates,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProteinSeedParams {
     /// Reads scanned per depth cluster at most (evenly spread over the cluster).
@@ -84,6 +91,90 @@ impl Default for ProteinSeedParams {
 }
 
 #[derive(Serialize)]
+pub struct PanelGeneSet {
+    pub organelle: &'static str,
+    pub family_count: usize,
+    pub families: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ClusterGeneCount {
+    pub organelle: &'static str,
+    pub family: String,
+    pub forward_stretches: u64,
+    pub reversed_stretches: u64,
+    pub forward_records: u64,
+    pub reversed_records: u64,
+    /// Input records contributing this family in both orientations.
+    pub both_orientation_records: u64,
+}
+
+/// Search-panel coverage and directionality, before any physical-source assessment.
+#[derive(Debug, PartialEq, Serialize)]
+struct GeneSetEvidence {
+    organelle: &'static str,
+    panel_families: usize,
+    observed_forward_families: Vec<String>,
+    supported_families: Vec<String>,
+    support_fraction: Option<f64>,
+}
+
+fn gene_set_evidence(
+    counts: &[ClusterGeneCount],
+    organelles: &[&'static str],
+    min_gene_segments: u64,
+) -> Vec<GeneSetEvidence> {
+    organelles.iter().map(|&organelle| {
+        let families: Vec<_> = counts.iter().filter(|c| c.organelle == organelle).collect();
+        let observed_forward_families = families.iter()
+            .filter(|c| c.forward_stretches >= min_gene_segments && c.forward_records > 0)
+            .map(|c| c.family.clone())
+            .collect();
+        // Compare discordant records within each family. The intersection cancels in the
+        // difference, even when forward and reversed hits are on the same original record.
+        let supported_families: Vec<_> = families.iter().filter(|c| {
+            c.forward_records > c.reversed_records
+                && c.forward_stretches.saturating_sub(c.reversed_stretches) >= min_gene_segments
+        }).map(|c| c.family.clone()).collect();
+        let panel_families = families.len();
+        GeneSetEvidence {
+            organelle,
+            panel_families,
+            observed_forward_families,
+            support_fraction: (panel_families != 0)
+                .then(|| supported_families.len() as f64 / panel_families as f64),
+            supported_families,
+        }
+    }).collect()
+}
+
+fn nominated_organelle_sets(
+    evidence: &[GeneSetEvidence],
+    want: &[&'static str],
+    min_genes: usize,
+) -> Vec<&'static str> {
+    evidence.iter()
+        .filter(|row| want.contains(&row.organelle) && row.supported_families.len() >= min_genes)
+        .map(|row| row.organelle)
+        .collect()
+}
+
+#[derive(Serialize)]
+struct PairedClusterSelection {
+    organelles: Vec<&'static str>,
+    legacy_organelle_calls: Vec<&'static str>,
+    crop_records: usize,
+}
+
+#[derive(Serialize)]
+struct CandidateCrops {
+    source_qualification: &'static str,
+    records: FxHashMap<&'static str, usize>,
+    bases: FxHashMap<&'static str, u64>,
+    files: FxHashMap<&'static str, PathBuf>,
+}
+
+#[derive(Serialize)]
 pub struct ClusterCall {
     /// Centre of the depth peak (sketch depth).
     pub depth: f64,
@@ -108,6 +199,12 @@ pub struct ClusterCall {
     pub reversed_control_genes: (usize, usize),
     /// The reversed control's stretches per gene (both classes, most first).
     pub reversed_control_segments: Vec<(String, u64)>,
+    /// Per-family counts after assigning each record a class, before subtraction or filtering.
+    pub gene_evidence: Vec<ClusterGeneCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gene_set_evidence: Option<Vec<GeneSetEvidence>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_candidate_selection: Option<PairedClusterSelection>,
     /// Seed reads this cluster gave.
     pub seed_reads: usize,
 }
@@ -119,6 +216,13 @@ pub struct ProteinSeedReport {
     pub params: ProteinSeedParams,
     pub panel_proteins: usize,
     pub panel_genes: usize,
+    /// Effective family identities after panel exclusions, separated by organelle.
+    pub panel_gene_sets: Vec<PanelGeneSet>,
+    /// Records are FASTX input records, with no claim of original-molecule deduplication.
+    pub gene_evidence_record_unit: &'static str,
+    /// Scan scope for paired evidence, including the optional whole-read fallback audit.
+    pub gene_evidence_scope: &'static str,
+    pub reverse_control: &'static str,
     /// The alignment E-value a gene stretch needs (`panel::Panel::max_evalue`); null: shared
     /// k-mers alone decide.
     pub panel_max_evalue: Option<f64>,
@@ -130,6 +234,8 @@ pub struct ProteinSeedReport {
     pub seed_reads: FxHashMap<&'static str, usize>,
     pub seed_bases: FxHashMap<&'static str, u64>,
     pub seeds: FxHashMap<&'static str, PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_crops: Option<CandidateCrops>,
     /// The scan of every read for the organelles no depth cluster seeded (`whole_read_seeds`).
     pub whole_read_scan: Option<WholeReadScan>,
     pub elapsed_seconds: f64,
@@ -157,6 +263,14 @@ pub struct WholeReadScan {
     /// threshold, a multiple of that peak, sets nothing apart.
     pub gate_without_nucleus: bool,
     pub seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_gene_evidence: Option<WholeReadGeneEvidence>,
+}
+
+#[derive(Serialize)]
+struct WholeReadGeneEvidence {
+    counts: Vec<ClusterGeneCount>,
+    gene_set_evidence: Vec<GeneSetEvidence>,
 }
 
 impl WholeReadScan {
@@ -205,6 +319,14 @@ impl ProteinSeedReport {
 
     /// One line for the terminal.
     pub fn summary(&self) -> String {
+        if let Some(candidates) = &self.candidate_crops {
+            return format!(
+                "[ovasm] paired protein candidates: {} mitochondrial and {} plastid crops; source qualification pending ({:.0} s)",
+                candidates.records.get("mitochondrion").copied().unwrap_or(0),
+                candidates.records.get("plastid").copied().unwrap_or(0),
+                self.elapsed_seconds
+            );
+        }
         let calls: Vec<String> = self
             .clusters
             .iter()
@@ -304,7 +426,7 @@ fn crop(
         .iter()
         .filter(|&&(g, _, _)| panel.gene_organelle(g) == organelle);
     let (lo, hi) = mine.fold((usize::MAX, 0), |(lo, hi), &(_, a, b)| (lo.min(a), hi.max(b)));
-    (lo < hi).then(|| (lo.saturating_sub(flank), (hi + flank).min(len)))
+    (lo < hi).then(|| (lo.saturating_sub(flank), hi.saturating_add(flank).min(len)))
 }
 
 /// Fewest bases a depth cluster must stand for (its reads' bases over its depth) to seed: a deep
@@ -377,6 +499,89 @@ fn class_seeds(
     (counts(forward) || diluted) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
 }
 
+fn panel_gene_sets(panel: &Panel) -> Vec<PanelGeneSet> {
+    ORGANELLES
+        .iter()
+        .map(|&organelle| {
+            let mut families: Vec<_> = (0..panel.gene_count())
+                .map(|gene| gene as u16)
+                .filter(|&gene| panel.gene_organelle(gene) == organelle)
+                .map(|gene| panel.gene_name(gene).to_owned())
+                .collect();
+            families.sort_unstable();
+            PanelGeneSet {
+                organelle,
+                family_count: families.len(),
+                families,
+            }
+        })
+        .collect()
+}
+
+struct GeneTally {
+    stretches: Vec<u64>,
+    records: Vec<u64>,
+    last_record: Vec<Option<usize>>,
+}
+
+impl GeneTally {
+    fn new(genes: usize) -> Self {
+        Self {
+            stretches: vec![0; genes],
+            records: vec![0; genes],
+            last_record: vec![None; genes],
+        }
+    }
+
+    fn add(
+        &mut self,
+        panel: &Panel,
+        record: usize,
+        class: Option<&str>,
+        genes: impl Iterator<Item = u16>,
+        mut on_first_in_record: impl FnMut(usize),
+    ) {
+        for gene in genes {
+            if Some(panel.gene_organelle(gene)) != class {
+                continue;
+            }
+            let gene = usize::from(gene);
+            self.stretches[gene] += 1;
+            if self.last_record[gene] != Some(record) {
+                self.records[gene] += 1;
+                self.last_record[gene] = Some(record);
+                on_first_in_record(gene);
+            }
+        }
+    }
+}
+
+fn cluster_gene_counts(
+    panel: &Panel,
+    forward: &GeneTally,
+    reversed: &GeneTally,
+    both: &[u64],
+) -> Vec<ClusterGeneCount> {
+    let mut counts: Vec<_> = (0..panel.gene_count())
+        .map(|i| {
+            let gene = i as u16;
+            ClusterGeneCount {
+                organelle: panel.gene_organelle(gene),
+                family: panel.gene_name(gene).to_owned(),
+                forward_stretches: forward.stretches[i],
+                reversed_stretches: reversed.stretches[i],
+                forward_records: forward.records[i],
+                reversed_records: reversed.records[i],
+                both_orientation_records: both[i],
+            }
+        })
+        .collect();
+    counts.sort_unstable_by(|a, b| {
+        a.organelle.cmp(b.organelle).then_with(|| a.family.cmp(&b.family))
+    });
+    counts
+}
+
 /// Protein seeds for the organelles in `want` (the others are not looked for in the whole-read
 /// scan; depth clusters may still seed them).
 pub fn run(
@@ -385,9 +590,22 @@ pub fn run(
     p: &ProteinSeedParams,
     want: &[&'static str],
     out_dir: &Path,
+    mode: SeedMode,
 ) -> Result<ProteinSeedReport> {
     let t0 = Instant::now();
-    std::fs::create_dir_all(out_dir)?;
+    let audit_gene_sets = mode != SeedMode::Legacy;
+    let paired_candidates = mode == SeedMode::PairedCandidates;
+    anyhow::ensure!(!paired_candidates || p.panel.min_genes > 0,
+        "paired candidates require a positive --min-genes");
+    let file_prefix = if paired_candidates { "protein_candidates" } else { "protein_seeds" };
+    if paired_candidates {
+        if let Some(parent) = out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir(out_dir)?;
+    } else {
+        std::fs::create_dir_all(out_dir)?;
+    }
     // passes 1-2: the depth sketch and the nuclear peak
     let mut gate = DepthGate::long_reads(inputs)?;
     match (p.nuclear_depth, p.genome_size) {
@@ -490,7 +708,10 @@ pub fn run(
         let n = mine.len() as u64;
         // only the stretches of each read's own class count, so a homologous gene of the other
         // organelle (or a plastid insertion in a mitochondrial read) does not add to its class
-        let (mut segs, mut ctrl) = (vec![0u64; panel.gene_count()], vec![0u64; panel.gene_count()]);
+        let (mut segs, mut ctrl) = (
+            GeneTally::new(panel.gene_count()),
+            GeneTally::new(panel.gene_count()),
+        );
         let classes: Vec<Option<&'static str>> = mine
             .iter()
             .map(|s| {
@@ -498,27 +719,30 @@ pub fn run(
                 read_class(&genes, panel, p.min_read_stretches)
             })
             .collect();
-        for (s, class) in mine.iter().zip(&classes) {
-            for &(g, _, _) in &s.stretches {
-                if Some(panel.gene_organelle(g)) == *class {
-                    segs[g as usize] += 1;
-                }
-            }
+        let mut both = vec![0u64; panel.gene_count()];
+        for (record, (s, class)) in mine.iter().zip(&classes).enumerate() {
+            segs.add(panel, record, *class, s.stretches.iter().map(|x| x.0), |_| {});
             let cclass = read_class(&s.control, panel, p.min_read_stretches);
-            for &g in &s.control {
-                if Some(panel.gene_organelle(g)) == cclass {
-                    ctrl[g as usize] += 1;
-                }
-            }
+            ctrl.add(panel, record, cclass, s.control.iter().copied(), |gene| {
+                both[gene] += u64::from(segs.last_record[gene] == Some(record));
+            });
         }
-        let (mitochondrion, plastid, md, pd, call) =
-            panel::call_segments(panel, excess_over_control(&segs, &ctrl), n, &p.panel);
-        let (cm, cp, cmd, cpd, ccall) = panel::call_segments(panel, ctrl, n, &p.panel);
+        let gene_evidence = cluster_gene_counts(panel, &segs, &ctrl, &both);
+        let gene_set_evidence = audit_gene_sets.then(|| {
+            gene_set_evidence(&gene_evidence, &ORGANELLES, p.panel.min_gene_segments)
+        });
+        let (mitochondrion, plastid, md, pd, call) = panel::call_segments(
+            panel,
+            excess_over_control(&segs.stretches, &ctrl.stretches),
+            n,
+            &p.panel,
+        );
+        let (cm, cp, cmd, cpd, ccall) = panel::call_segments(panel, ctrl.stretches, n, &p.panel);
         // a class that counts here (enough genes, enough stretches per read) and not in the
         // reversed control seeds from its reads, also where both count (a cluster holding parts of
         // both genomes at one depth)
         let span = cluster_bases[c] as f64 / 2f64.powf(peak);
-        let seeded: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd), pd), ((&plastid, pd), (&cp, cpd), md)]
+        let legacy_calls: Vec<&'static str> = [((&mitochondrion, md), (&cm, cmd), pd), ((&plastid, pd), (&cp, cpd), md)]
             .iter()
             .zip(ORGANELLES)
             .filter(|((fwd, rev, other), o)| {
@@ -526,10 +750,13 @@ pub fn run(
             })
             .map(|(_, o)| o)
             .collect();
+        let nominated = gene_set_evidence.as_deref().filter(|_| paired_candidates)
+            .map(|rows| nominated_organelle_sets(rows, want, p.panel.min_genes));
+        let selected = nominated.as_ref().unwrap_or(&legacy_calls);
         let mut given = 0;
         for (s, class) in mine.iter().zip(&classes) {
             let Some(organelle) = *class else { continue };
-            if !seeded.contains(&organelle) {
+            if !selected.contains(&organelle) {
                 continue;
             }
             {
@@ -539,11 +766,13 @@ pub fn run(
                     continue;
                 };
                 if !fasta.contains_key(organelle) {
-                    let path = out_dir.join(format!("protein_seeds.{organelle}.fasta"));
-                    fasta.insert(
-                        organelle,
-                        std::io::BufWriter::new(std::fs::File::create(&path)?),
-                    );
+                    let path = out_dir.join(format!("{file_prefix}.{organelle}.fasta"));
+                    let file = if paired_candidates {
+                        std::fs::File::create_new(&path)?
+                    } else {
+                        std::fs::File::create(&path)?
+                    };
+                    fasta.insert(organelle, std::io::BufWriter::new(file));
                     seeds.insert(organelle, path);
                 }
                 let w = fasta.get_mut(organelle).expect("just inserted");
@@ -557,6 +786,15 @@ pub fn run(
                 *seed_bases.entry(organelle).or_insert(0u64) += (b - a) as u64;
             }
         }
+        let (seeded, paired_candidate_selection) = if let Some(organelles) = nominated {
+            (Vec::new(), Some(PairedClusterSelection {
+                organelles,
+                legacy_organelle_calls: legacy_calls,
+                crop_records: given,
+            }))
+        } else {
+            (legacy_calls, None)
+        };
         clusters.push(ClusterCall {
             depth: 2f64.powf(peak),
             reads: cluster_reads[c],
@@ -571,7 +809,10 @@ pub fn run(
             reversed_control_call: ccall,
             reversed_control_genes: (cm.genes, cp.genes),
             reversed_control_segments: cm.gene_segments.iter().chain(&cp.gene_segments).cloned().collect(),
-            seed_reads: given,
+            gene_evidence,
+            gene_set_evidence,
+            paired_candidate_selection,
+            seed_reads: if paired_candidates { 0 } else { given },
         });
     }
     for (_, mut w) in fasta {
@@ -583,10 +824,10 @@ pub fn run(
         .copied()
         .filter(|o| !seeds.contains_key(o))
         .collect();
-    let whole_read_scan = if missing.is_empty() {
+    let whole_read_scan = if missing.is_empty() || paired_candidates {
         None
     } else {
-        let w = whole_read_seeds(inputs, panel, p, &missing, out_dir, &gate)?;
+        let w = whole_read_seeds(inputs, panel, p, &missing, out_dir, &gate, audit_gene_sets)?;
         for (&o, &n) in &w.0.seed_reads {
             if n > 0 {
                 seeds.insert(o, out_dir.join(format!("protein_seeds.{o}.fasta")));
@@ -596,6 +837,12 @@ pub fn run(
         }
         Some(w.0)
     };
+    let candidate_crops = paired_candidates.then(|| CandidateCrops {
+        source_qualification: "pending",
+        records: std::mem::take(&mut seed_reads),
+        bases: std::mem::take(&mut seed_bases),
+        files: std::mem::take(&mut seeds),
+    });
     let (panel_proteins, panel_genes) = panel.sizes();
     let report = ProteinSeedReport {
         tool: "ovasm find protein-seeds",
@@ -603,6 +850,14 @@ pub fn run(
         params: p.clone(),
         panel_proteins,
         panel_genes,
+        panel_gene_sets: panel_gene_sets(panel),
+        gene_evidence_record_unit: "input_fastx_record",
+        gene_evidence_scope: if mode == SeedMode::GeneSetAudit {
+            "depth_cluster_records_and_whole_read_fallback_after_orientation_specific_read_qualification"
+        } else {
+            "depth_cluster_records_after_read_classification"
+        },
+        reverse_control: "reverse_sequence_without_complement",
         panel_max_evalue: panel.max_evalue(),
         gate: gate.report.clone(),
         reads,
@@ -611,15 +866,107 @@ pub fn run(
         seed_reads,
         seed_bases,
         seeds,
+        candidate_crops,
         whole_read_scan,
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
     };
-    std::fs::write(
-        out_dir.join("protein_seeds.json"),
-        serde_json::to_string_pretty(&report)?,
-    )?;
+    let report_path = out_dir.join(format!("{file_prefix}.json"));
+    let text = serde_json::to_string_pretty(&report)?;
+    if paired_candidates {
+        // Publish the completed report only after all candidate files have been written.
+        let staging = out_dir.join(".protein_candidates.json.partial");
+        let mut file = std::fs::File::create_new(&staging)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&staging, report_path)?;
+        std::fs::remove_file(staging)?;
+    } else {
+        std::fs::write(report_path, text)?;
+    }
     Ok(report)
+}
+
+#[derive(Clone, Copy)]
+struct WholeReadHit {
+    class: &'static str,
+    lo: usize,
+    hi: usize,
+}
+
+fn whole_read_hit(
+    len: usize,
+    stretches: &[(u16, usize, usize)],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    organelles: &[&'static str],
+) -> Option<WholeReadHit> {
+    let genes: Vec<u16> = stretches.iter().map(|x| x.0).collect();
+    let class = read_class(&genes, panel, p.min_read_stretches)?;
+    if !organelles.contains(&class) {
+        return None;
+    }
+    let mut distinct = genes;
+    distinct.retain(|&g| panel.gene_organelle(g) == class);
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() < WHOLE_READ_MIN_GENES {
+        return None;
+    }
+    // Crop to genes and flanks. Sequence elsewhere in a qualifying read can be nuclear.
+    let (lo, hi) = crop(len, stretches, class, panel, p.flank)?;
+    Some(WholeReadHit { class, lo, hi })
+}
+
+type EligibleGenes = Option<(&'static str, Vec<u16>)>;
+
+struct WholeReadEvidence {
+    forward: EligibleGenes,
+    reversed: EligibleGenes,
+}
+
+impl WholeReadEvidence {
+    fn eligible(hit: Option<WholeReadHit>, stretches: &[(u16, usize, usize)]) -> EligibleGenes {
+        hit.map(|h| (h.class, stretches.iter().map(|s| s.0).collect()))
+    }
+}
+
+struct WholeReadAudit {
+    next_record: usize,
+    forward: GeneTally,
+    reversed: GeneTally,
+    both: Vec<u64>,
+}
+
+impl WholeReadAudit {
+    fn new(genes: usize) -> Self {
+        Self {
+            next_record: 0,
+            forward: GeneTally::new(genes),
+            reversed: GeneTally::new(genes),
+            both: vec![0; genes],
+        }
+    }
+
+    fn add(&mut self, panel: &Panel, evidence: WholeReadEvidence) {
+        let record = self.next_record;
+        self.next_record += 1;
+        if let Some((class, genes)) = evidence.forward {
+            self.forward.add(panel, record, Some(class), genes.into_iter(), |_| {});
+        }
+        if let Some((class, genes)) = evidence.reversed {
+            self.reversed.add(panel, record, Some(class), genes.into_iter(), |gene| {
+                self.both[gene] += u64::from(self.forward.last_record[gene] == Some(record));
+            });
+        }
+    }
+
+    fn report(self, panel: &Panel, organelles: &[&'static str], min_gene_segments: u64) -> WholeReadGeneEvidence {
+        let mut counts = cluster_gene_counts(panel, &self.forward, &self.reversed, &self.both);
+        counts.retain(|count| organelles.contains(&count.organelle));
+        let gene_set_evidence = gene_set_evidence(&counts, organelles, min_gene_segments);
+        WholeReadGeneEvidence { counts, gene_set_evidence }
+    }
 }
 
 /// Whole reads as seeds for `organelles`, from a scan of every read: a read is a seed when its
@@ -634,6 +981,7 @@ fn whole_read_seeds(
     organelles: &[&'static str],
     out_dir: &Path,
     gate: &DepthGate,
+    audit_gene_sets: bool,
 ) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
     let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
     let t0 = Instant::now();
@@ -642,47 +990,44 @@ fn whole_read_seeds(
     let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
         Default::default();
     let (mut reads, mut bases) = (0u64, 0u64);
+    let mut audit = audit_gene_sets.then(|| WholeReadAudit::new(panel.gene_count()));
+    let strict = PanelParams {
+        min_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
+        ..p.panel.clone()
+    };
     let (rx, reader) = read_batches(inputs);
     for batch in rx {
         reads += batch.len() as u64;
         bases += batch.iter().map(|r| r.seq.len() as u64).sum::<u64>();
-        let strict = PanelParams {
-            min_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
-            ..p.panel.clone()
-        };
-        let hits: Vec<(usize, &'static str, usize, usize)> = batch
+        let hits: Vec<_> = batch
             .par_iter()
             .enumerate()
             .map_init(
                 || vec![0u32; panel.gene_count()],
                 |hits, (i, r)| {
-                    let st = panel::gene_stretches(&r.seq, panel, &strict, hits);
-                    let genes: Vec<u16> = st.iter().map(|x| x.0).collect();
-                    let class = read_class(&genes, panel, p.min_read_stretches)?;
-                    if !organelles.contains(&class) {
-                        return None;
-                    }
-                    let mut distinct: Vec<u16> = genes
-                        .iter()
-                        .copied()
-                        .filter(|&g| panel.gene_organelle(g) == class)
-                        .collect();
-                    distinct.sort_unstable();
-                    distinct.dedup();
-                    if distinct.len() < WHOLE_READ_MIN_GENES {
-                        return None;
-                    }
-                    // the read's own genes and flanks, as a cluster seed (`crop`): the rest of a
-                    // read can be nuclear (Gliophorus irrigatus: 18 of 21 seed reads 26-80%
-                    // mitochondrial, the rest a GC-rich nuclear repeat that recruited 125 nuclear
-                    // reads next to 23 mitochondrial ones)
-                    let (a, b) = crop(r.seq.len(), &st, class, panel, p.flank)?;
-                    Some((i, class, a, b))
+                    let stretches = panel::gene_stretches(&r.seq, panel, &strict, hits);
+                    let forward = whole_read_hit(r.seq.len(), &stretches, panel, p, organelles);
+                    let evidence = if audit_gene_sets {
+                        let reversed: Vec<u8> = r.seq.iter().rev().copied().collect();
+                        let control = panel::gene_stretches(&reversed, panel, &strict, hits);
+                        let reverse_hit = whole_read_hit(reversed.len(), &control, panel, p, organelles);
+                        (forward.is_some() || reverse_hit.is_some()).then(|| WholeReadEvidence {
+                            forward: WholeReadEvidence::eligible(forward, &stretches),
+                            reversed: WholeReadEvidence::eligible(reverse_hit, &control),
+                        })
+                    } else {
+                        None
+                    };
+                    (forward.is_some() || evidence.is_some()).then_some((i, forward, evidence))
                 },
             )
             .flatten()
             .collect();
-        for (i, class, lo, hi) in hits {
+        for (i, forward, evidence) in hits {
+            if let (Some(audit), Some(evidence)) = (&mut audit, evidence) {
+                audit.add(panel, evidence);
+            }
+            let Some(WholeReadHit { class, lo, hi }) = forward else { continue };
             let c = n.entry(class).or_insert(0);
             if *c >= WHOLE_READ_MAX_SEEDS {
                 continue;
@@ -721,6 +1066,9 @@ fn whole_read_seeds(
             seed_reads_above_gate: above,
             gate_without_nucleus: gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME,
             seconds: t0.elapsed().as_secs_f64(),
+            paired_gene_evidence: audit.map(|audit| {
+                audit.report(panel, organelles, p.panel.min_gene_segments)
+            }),
         },
         b,
     ))
@@ -794,6 +1142,7 @@ mod tests {
             crop(1000, &stretches, "plastid", &panel, 2000),
             Some((0, 1000))
         );
+        assert_eq!(crop(1000, &stretches, "plastid", &panel, usize::MAX), Some((0, 1000)));
         assert_eq!(crop(1000, &[(pltd, 1, 2)], "mitochondrion", &panel, 10), None);
     }
 
@@ -803,6 +1152,122 @@ mod tests {
             segments,
             gene_segments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn paired_nomination_needs_distinct_supported_families_of_the_requested_organelle() {
+        let family = |organelle, name: &str, forward_records, reversed_records, both| ClusterGeneCount {
+            organelle,
+            family: name.to_owned(),
+            forward_stretches: 20,
+            reversed_stretches: 4,
+            forward_records,
+            reversed_records,
+            both_orientation_records: both,
+        };
+        let counts = [
+            family("mitochondrion", "cox1", 8, 4, 3),
+            family("mitochondrion", "cob", 3, 3, 3),
+            family("plastid", "rbcL", 5, 2, 1),
+        ];
+        let evidence = gene_set_evidence(&counts, &ORGANELLES, 2);
+        assert_eq!(evidence[0].supported_families, ["cox1"]);
+        assert_eq!(evidence[0].support_fraction, Some(0.5));
+        assert_eq!(
+            nominated_organelle_sets(&evidence, &["mitochondrion"], 1),
+            ["mitochondrion"]
+        );
+        assert!(nominated_organelle_sets(&evidence, &ORGANELLES, 2).is_empty());
+    }
+
+    #[test]
+    fn gene_evidence_reports_effective_per_organelle_panel_sizes() {
+        let text = ">mito|cox1|KeepA\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|cox1|KeepB\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|nad1|ExcludeA\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >plastid|cox1|KeepA\nMCCCCCCCCCCCCCCCCCCCCC\n";
+        let panel = Panel::parse(text, 6, &[]).unwrap();
+        let smaller = Panel::parse(text, 6, &["Exclude".to_owned()]).unwrap();
+        let counts = panel_gene_sets(&panel);
+        let filtered = panel_gene_sets(&smaller);
+        assert_eq!(counts[0].organelle, "mitochondrion");
+        assert_eq!(counts[0].family_count, 2);
+        assert_eq!(counts[0].families, ["cox1", "nad1"]);
+        assert_eq!(counts[1].organelle, "plastid");
+        assert_eq!(counts[1].family_count, 1);
+        assert_eq!(counts[1].families, ["cox1"]);
+        assert_eq!(filtered[0].family_count, 1);
+        assert_eq!(filtered[0].families, ["cox1"]);
+        assert_eq!(filtered[1].families, ["cox1"]);
+    }
+
+    #[test]
+    fn gene_evidence_counts_each_orientation_and_record_before_filtering() {
+        let text = ">mito|cox1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|nad1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >plastid|rbcL|Sp\nMCCCCCCCCCCCCCCCCCCCCC\n";
+        let panel = Panel::parse(text, 6, &[]).unwrap();
+        let mut forward = GeneTally::new(panel.gene_count());
+        let mut reversed = GeneTally::new(panel.gene_count());
+        let mut both = vec![0u64; panel.gene_count()];
+        forward.add(&panel, 0, Some("mitochondrion"), [0, 0, 2].into_iter(), |_| {});
+        reversed.add(&panel, 0, Some("mitochondrion"), [0, 0, 1, 1].into_iter(), |gene| {
+            both[gene] += u64::from(forward.last_record[gene] == Some(0));
+        });
+        forward.add(&panel, 1, Some("mitochondrion"), [0, 1].into_iter(), |_| {});
+        reversed.add(&panel, 1, Some("plastid"), [2].into_iter(), |gene| {
+            both[gene] += u64::from(forward.last_record[gene] == Some(1));
+        });
+        let counts = cluster_gene_counts(&panel, &forward, &reversed, &both);
+        assert_eq!(counts[0].family, "cox1");
+        assert_eq!(counts[0].forward_stretches, 3);
+        assert_eq!(counts[0].forward_records, 2);
+        assert_eq!(counts[0].reversed_stretches, 2);
+        assert_eq!(counts[0].reversed_records, 1);
+        assert_eq!(counts[0].both_orientation_records, 1);
+        assert_eq!(counts[1].forward_stretches, 1);
+        assert_eq!(counts[1].reversed_stretches, 2);
+        assert_eq!(counts[1].reversed_records, 1);
+        assert_eq!(counts[1].both_orientation_records, 0);
+        assert_eq!(counts[2].family, "rbcL");
+        assert_eq!(counts[2].forward_records, 0);
+        assert_eq!(counts[2].reversed_records, 1);
+        assert_eq!(counts[2].both_orientation_records, 0);
+        assert_eq!(
+            excess_over_control(&forward.stretches, &reversed.stretches),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn fallback_gene_sets_use_paired_records_and_effective_panel_members() {
+        let text = ">mito|cox1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|nad1|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n\
+                    >mito|cob|Sp\nMAAAAAAAAAAAAAAAAAAAAA\n";
+        let panel = Panel::parse(text, 6, &[]).unwrap();
+        let mut audit = WholeReadAudit::new(panel.gene_count());
+        let mt = "mitochondrion";
+        audit.add(&panel, WholeReadEvidence {
+            forward: Some((mt, vec![0, 0, 1, 1])),
+            reversed: Some((mt, vec![0, 1, 1])),
+        });
+        audit.add(&panel, WholeReadEvidence {
+            forward: Some((mt, vec![0, 0, 0])),
+            reversed: None,
+        });
+        audit.add(&panel, WholeReadEvidence {
+            forward: None,
+            reversed: Some((mt, vec![2, 2])),
+        });
+        let report = audit.report(&panel, &ORGANELLES, 2);
+        let cox1 = report.counts.iter().find(|c| c.family == "cox1").unwrap();
+        assert_eq!((cox1.forward_records, cox1.reversed_records, cox1.both_orientation_records), (2, 1, 1));
+        let mt = &report.gene_set_evidence[0];
+        assert_eq!(mt.panel_families, 3);
+        assert_eq!(mt.observed_forward_families, ["cox1", "nad1"]);
+        assert_eq!(mt.supported_families, ["cox1"]);
+        assert_eq!(mt.support_fraction, Some(1.0 / 3.0));
+        assert_eq!(report.gene_set_evidence[1].support_fraction, None);
     }
 
     #[test]
@@ -862,6 +1327,7 @@ mod tests {
             seed_reads_above_gate: seeds.iter().map(|&(o, _, a)| (o, a)).collect(),
             gate_without_nucleus: false,
             seconds: 0.0,
+            paired_gene_evidence: None,
         }
     }
 

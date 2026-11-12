@@ -9,6 +9,7 @@ mod close;
 mod components;
 mod correct;
 mod evidence;
+mod exact_placements;
 mod frontier;
 mod gpu;
 mod genotype;
@@ -27,6 +28,7 @@ mod phase;
 mod protein_seed;
 mod pipeline;
 mod primary;
+mod read_admission;
 mod read_context;
 mod read_model;
 mod reconstruct;
@@ -34,7 +36,9 @@ mod recruit;
 mod result;
 mod replay;
 mod replicate;
+mod repeat_depth;
 mod retained;
+mod seed_source;
 mod seeddb;
 mod seedfree;
 mod thread_evidence;
@@ -43,7 +47,7 @@ mod uncertain;
 mod unify;
 mod unzip;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -135,6 +139,9 @@ enum FindCommand {
     /// clusters, a cluster called mitochondrion or plastid by its conserved proteins, its
     /// gene-bearing reads cropped to their genes; for species far from every seed library.
     ProteinSeeds(ProteinSeedArgs),
+    /// Exact literal placement protocol for the source-audit adapter.
+    #[command(hide = true)]
+    ExactPlacements(ExactPlacementArgs),
     /// Assemble each read cluster and label unitigs mitochondrion or plastid by gene content;
     /// write the labelled unitigs as the sample's own seeds.
     Label(LabelArgs),
@@ -592,6 +599,15 @@ struct RunArgs {
     /// Both organelles are always seeded unless --single-seed, so that each claims its own reads.
     #[arg(short = 'S', long = "seeds")]
     seeds: Vec<String>,
+    /// Audit JSON as ORGANELLE=PATH for one retained FASTA supplied with --seeds.
+    #[arg(long = "seed-source-audit")]
+    seed_source_audits: Vec<String>,
+    /// Admit exact original records with independently supplied source evidence in seed recruitment.
+    #[arg(long)]
+    read_admission_manifest: Option<PathBuf>,
+    /// SHA-bound original records prohibited from contributing to a named target during seed recruitment.
+    #[arg(long)]
+    read_source_exclusions: Option<PathBuf>,
     /// Lineage: plant (default), animal or fungi; 0/1/2 as PMAT2 -x. Sets seeds, protein panel, genetic code.
     ///
     /// Built-in seed library for organelles without --seeds: landplants (mitochondrion and
@@ -614,6 +630,9 @@ struct RunArgs {
     /// Protein panel for the protein seeds; default: the built-in panel of --lineage.
     #[arg(long, hide_short_help = true)]
     protein_seed_panel: Option<PathBuf>,
+    /// Report paired protein gene sets during the HiFi whole-genome protein seed scan.
+    #[arg(long)]
+    protein_gene_set_audit: bool,
     /// Print result.json (the run's outcome for scripts and agents) on standard output too.
     #[arg(long, hide_short_help = true)]
     json: bool,
@@ -805,6 +824,14 @@ fn prune_gene_free(lineage: seeddb::Lineage, protein_seeds_used: bool) -> bool {
     protein_seeds_used && !matches!(lineage, seeddb::Lineage::Landplants)
 }
 
+fn seed_organelle(name: &str) -> &str {
+    match name {
+        "mt" | "mito" => "mitochondrion",
+        "pt" | "cp" | "chloroplast" => "plastid",
+        other => other,
+    }
+}
+
 fn run(mut args: RunArgs) -> Result<()> {
     let run_started = std::time::Instant::now();
     if let Some(n) = args.threads {
@@ -859,13 +886,43 @@ fn run(mut args: RunArgs) -> Result<()> {
             }
         };
         // the short names of `-g` work here too (mt=PATH, pt=PATH)
-        let name = match name {
-            "mt" | "mito" => "mitochondrion",
-            "pt" | "cp" | "chloroplast" => "plastid",
-            other => other,
-        };
-        seeds.entry(name.to_string()).or_default().push(path.into());
+        seeds.entry(seed_organelle(name).to_string()).or_default().push(path.into());
     }
+    if args.read_admission_manifest.is_some()
+        && (args.read_set != pipeline::ReadSet::WholeGenome
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!("--read-admission-manifest requires whole-genome seed recruitment");
+    }
+    if args.read_source_exclusions.is_some()
+        && (args.read_set != pipeline::ReadSet::WholeGenome || args.recruit != pipeline::RecruitBy::Seeds)
+    {
+        bail!("--read-source-exclusions requires whole-genome recruitment with --recruit seeds");
+    }
+    if !args.seed_source_audits.is_empty()
+        && (args.read_set != pipeline::ReadSet::WholeGenome
+            || args.recruit == pipeline::RecruitBy::Discover)
+    {
+        bail!("--seed-source-audit requires whole-genome seed recruitment");
+    }
+    let mut checked = std::collections::BTreeMap::new();
+    for spec in &args.seed_source_audits {
+        let (name, path) = spec.split_once('=')
+            .with_context(|| format!("--seed-source-audit expects ORGANELLE=PATH, got {spec:?}"))?;
+        let name = seed_organelle(name);
+        if !protein_seed::ORGANELLES.contains(&name) {
+            bail!("--seed-source-audit: invalid organelle {name:?}");
+        }
+        if checked.contains_key(name) {
+            bail!("--seed-source-audit: more than one audit for {name}");
+        }
+        let [view] = seeds.get(name).map(Vec::as_slice).unwrap_or_default() else {
+            bail!("--seed-source-audit requires exactly one --seeds FASTA for {name}");
+        };
+        let verified = seed_source::verify(Path::new(path), view, name)?;
+        checked.insert(name.to_string(), verified);
+    }
+    let mut seed_source_audits = std::collections::BTreeMap::new();
     // Whole-genome reads are recruited with seeds unless discovery does it: an organelle
     // without --seeds takes the built-in library (its other organelle too, unless --single-seed).
     // protein seeds: asked for, or the default for HiFi whole-genome reads recruited with seeds,
@@ -886,6 +943,28 @@ fn run(mut args: RunArgs) -> Result<()> {
             "--protein-seeds seeds the recruitment of HiFi whole-genome reads: run hifi, not with --read-set target or --recruit discover"
         );
     }
+    if args.protein_gene_set_audit && !protein_seeds {
+        bail!("--protein-gene-set-audit requires a protein seed scan");
+    }
+    // the organelles seeded (the asked one and, unless --single-seed, its competitor)
+    // and only those the lineage has (no plastid in metazoa or fungi)
+    let wanted: Vec<&'static str> = match single {
+        Some(o) if args.single_seed => vec![o],
+        _ => protein_seed::ORGANELLES
+            .iter()
+            .copied()
+            .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
+            .collect(),
+    };
+    let scan_proteins = protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o));
+    if args.protein_gene_set_audit && !scan_proteins {
+        bail!("--protein-gene-set-audit requires an organelle without explicitly supplied seeds");
+    }
+    for (name, view) in checked {
+        let (path, provenance) = view.materialize(&args.out)?;
+        seeds.insert(name.clone(), vec![path]);
+        seed_source_audits.insert(name, provenance);
+    }
     let mut builtin_seeds = std::collections::BTreeSet::new();
     // Recruitment passes when every seeded organelle has protein seeds (`protein_seed_passes`): land
     // plants the usual gated passes, animals and fungi up to three, shallow seeds one. Set (Some) only
@@ -899,17 +978,7 @@ fn run(mut args: RunArgs) -> Result<()> {
     if args.read_set == pipeline::ReadSet::WholeGenome
         && args.recruit != pipeline::RecruitBy::Discover
     {
-        // the organelles seeded (the asked one and, unless --single-seed, its competitor)
-        // and only those the lineage has (no plastid in metazoa or fungi)
-        let wanted: Vec<&'static str> = match single {
-            Some(o) if args.single_seed => vec![o],
-            _ => protein_seed::ORGANELLES
-                .iter()
-                .copied()
-                .filter(|o| Some(*o) == single || args.lineage.fasta(o).is_some())
-                .collect(),
-        };
-        if protein_seeds && wanted.iter().any(|o| !seeds.contains_key(*o)) {
+        if scan_proteins {
             let p = protein_seed_params(
                 3000,
                 2000,
@@ -925,15 +994,23 @@ fn run(mut args: RunArgs) -> Result<()> {
                 p.panel.k,
                 &[],
             )?;
+            let searched: Vec<_> = wanted.iter().copied()
+                .filter(|name| !seed_source_audits.contains_key(*name))
+                .collect();
             let report = protein_seed::run(
                 &args.reads,
                 &panel,
                 &p,
-                &wanted,
+                &searched,
                 &args.out.join("protein-seeds"),
+                if args.protein_gene_set_audit {
+                    protein_seed::SeedMode::GeneSetAudit
+                } else {
+                    protein_seed::SeedMode::Legacy
+                },
             )?;
             eprintln!("{}", report.summary());
-            for &o in &wanted {
+            for &o in &searched {
                 // the complete organelle holds its whole gene set; a repeat or an insert array
                 // that a cluster of its own stands for, a part of it
                 let best = report
@@ -1030,6 +1107,9 @@ fn run(mut args: RunArgs) -> Result<()> {
         read_set: args.read_set,
         seeds,
         builtin_seeds,
+        seed_source_audits,
+        read_admission_manifest: args.read_admission_manifest,
+        read_source_exclusions: args.read_source_exclusions,
         seed_lineage: args.lineage,
         recruit: args.recruit,
         recruit_depth: args.recruit_depth,
@@ -1652,6 +1732,11 @@ struct LinearizeArgs {
     /// there are partial paths; a file from an earlier run is removed otherwise.
     #[arg(long)]
     out_partial_fasta: Option<PathBuf>,
+    /// Export the selected and reported alternative covers of each component to a separate
+    /// FASTA, respecting --max-alternatives. Excludes partial paths and read-join fallbacks.
+    /// Records identify their component, cover, and molecule. An empty result writes an empty file.
+    #[arg(long)]
+    out_candidate_fasta: Option<PathBuf>,
     /// Ignore phased paths and links supported by fewer reads.
     #[arg(long, default_value_t = 2)]
     min_reads: u64,
@@ -1688,6 +1773,7 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
         args.out_partial_fasta.as_deref(),
         &args.out_json,
         args.phases.as_deref(),
+        args.out_candidate_fasta.as_deref(),
     )?;
     eprintln!(
         "[ovasm] {} anchors, {} bridges, {} components, {} candidates; {} molecules{}",
@@ -1765,6 +1851,9 @@ fn linearize(args: LinearizeArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct EvidenceArgs {
+    /// Experimentally calibrate repeat labels with distinct, read-supported long-read flanks.
+    #[arg(long, conflicts_with = "short_read_adjacency")]
+    flank_repeat_depth: bool,
     /// Count exact overlap-edge words separately from long-span repeat phasing.
     #[arg(long)]
     short_read_adjacency: bool,
@@ -1916,7 +2005,7 @@ fn evidence(args: EvidenceArgs) -> Result<()> {
     if !(1..=kmer::MAX_K).contains(&args.k) {
         bail!("--k must be between 1 and {}", kmer::MAX_K);
     }
-    let report = evidence::run(
+    let report = evidence::run_with_flank_calibration(
         &args.gfa,
         args.reads,
         evidence::EvidenceParams {
@@ -1932,6 +2021,7 @@ fn evidence(args: EvidenceArgs) -> Result<()> {
             max_repeat_len: args.max_repeat_len,
         },
         &args.out,
+        args.flank_repeat_depth,
     )?;
     eprintln!(
         "[ovasm] links supported {}/{}; branches {}; repeat pairings {}; phased paths {}; {} of {} reads informative; {:.1}s",
@@ -1986,12 +2076,42 @@ struct DiscoverArgs {
 }
 
 #[derive(clap::Args)]
+struct ExactPlacementArgs {
+    /// File with one uppercase ACGT literal per line, in pattern index order.
+    #[arg(long)]
+    patterns: PathBuf,
+    /// Placement cap scope. Each literal emits at most two hits within this scope.
+    #[arg(long, value_parser = ["panel", "records"])]
+    scope: String,
+}
+
+fn find_exact_placements(args: ExactPlacementArgs) -> Result<()> {
+    use std::io::{self, BufReader, BufWriter};
+
+    let words = std::fs::File::open(&args.patterns)
+        .with_context(|| format!("opening {}", args.patterns.display()))?;
+    exact_placements::run(
+        BufReader::new(words),
+        io::stdin().lock(),
+        BufWriter::new(io::stdout().lock()),
+        args.scope.parse()?,
+    )
+    .context("scanning exact placements")
+}
+
+#[derive(clap::Args)]
 struct ProteinSeedArgs {
+    /// Export depth-cluster crops nominated by paired family evidence for source qualification.
+    #[arg(long, conflicts_with = "gene_set_audit")]
+    paired_gene_candidates: bool,
+    /// Report density-independent gene sets with paired fallback orientation evidence.
+    #[arg(long)]
+    gene_set_audit: bool,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
-    /// Output directory: protein_seeds.{mitochondrion,plastid}.fasta (for each organelle with a
-    /// called cluster) and protein_seeds.json.
+    /// Output directory for protein_seeds FASTAs and report. Paired candidates use a new
+    /// directory containing protein_candidates FASTAs and report.
     #[arg(long)]
     out: PathBuf,
     /// Which built-in protein panel and genetic code: landplants (mitochondrion and plastid
@@ -2126,7 +2246,14 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         .copied()
         .filter(|o| args.lineage.fasta(o).is_some())
         .collect();
-    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out)?;
+    let mode = if args.paired_gene_candidates {
+        protein_seed::SeedMode::PairedCandidates
+    } else if args.gene_set_audit {
+        protein_seed::SeedMode::GeneSetAudit
+    } else {
+        protein_seed::SeedMode::Legacy
+    };
+    let report = protein_seed::run(&args.reads, &panel, &p, &want, &args.out, mode)?;
     eprintln!("{}", report.summary());
     Ok(())
 }
@@ -2183,6 +2310,12 @@ fn discover(args: DiscoverArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct RecruitArgs {
+    /// Admit exact original records with independently supplied source evidence after baiting.
+    #[arg(long)]
+    read_admission_manifest: Option<PathBuf>,
+    /// SHA-bound original records prohibited from contributing to a named target during seed recruitment.
+    #[arg(long)]
+    read_source_exclusions: Option<PathBuf>,
     /// Read files (FASTQ/FASTA, optionally .gz); repeat for several libraries.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
@@ -2205,6 +2338,9 @@ struct RecruitArgs {
     /// Output directory (per-target FASTQ, numt_candidates.fastq, recruit.json).
     #[arg(long)]
     out: PathBuf,
+    /// Record bounded diagnostic evidence for reads held out of bait extension.
+    #[arg(long)]
+    frontier_audit: bool,
     /// Read platform preset: sets k, block_gap, min_hit_frac and numt_min_block defaults.
     #[arg(long, value_enum, default_value_t = Preset::Hifi)]
     preset: Preset,
@@ -2465,7 +2601,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
         bait.k,
         bait.targets.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
-    let report = recruit::run(
+    let report = recruit::run_with_options(
         bait,
         recruit::RecruitConfig {
             bait_growth_guard: false,
@@ -2502,6 +2638,9 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             nuclear_depth: args.nuclear_depth,
             genome_size: args.genome_size,
         },
+        args.frontier_audit,
+        args.read_admission_manifest.as_deref(),
+        args.read_source_exclusions.as_deref(),
     )?;
     for o in &report.outputs {
         let depth = match (o.read_depth, o.implied_size) {
@@ -2542,6 +2681,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Find(FindCommand::Discover(args)) => discover(args),
         Command::Find(FindCommand::Classify(args)) => panel(args),
         Command::Find(FindCommand::ProteinSeeds(args)) => protein_seeds(args),
+        Command::Find(FindCommand::ExactPlacements(args)) => find_exact_placements(args),
         Command::Find(FindCommand::Label(args)) => label(args),
         Command::Assemble(AssembleCommand::Correct(args)) => correct(args),
         Command::Assemble(AssembleCommand::Graph(args)) => assemble(args),

@@ -64,6 +64,27 @@ pub(crate) fn acgt_span(seq: &[u8], steps: &[Step]) -> bool {
 }
 
 impl ThreadCounter {
+    pub(crate) fn revisited_segment_records(&self, segment_count: usize) -> Vec<u64> {
+        let mut records = vec![0u64; segment_count];
+        for (walk, &count) in &self.counts {
+            let mut seen = BTreeSet::new();
+            let mut revisited = BTreeSet::new();
+            for &(segment, _) in walk {
+                if !seen.insert(segment) {
+                    revisited.insert(segment);
+                }
+            }
+            for segment in revisited {
+                records[segment] = records[segment].saturating_add(count);
+            }
+        }
+        records
+    }
+
+    pub(crate) fn link_records(&self, (a, b): (Oriented, Oriented)) -> u64 {
+        self.links.get(&(a, b).min((flip(b), flip(a)))).copied().unwrap_or(0)
+    }
+
     pub fn observe(&mut self, id: &[u8], seq: &[u8], steps: &[Step], ambiguous: bool,
                    walks: &[Vec<Oriented>], extra_adjacencies: &[(Oriented, Oriented)],
                    short_reads: bool) -> Result<()> {

@@ -153,23 +153,136 @@ At most `sample` = 3,000 reads per cluster are scanned, every `step`-th in input
 4. `panel::call_from` returns plastid, mitochondrion, mixed or none: a counting class is the call if the other does not count or if it
    has at least twice the other's genes; both counting without that margin is mixed. `ClusterCall.seeded` does not use this call:
    each counting class seeds independently (Ulota crispa: part of the mitochondrion at the plastid's 1,878x).
-5. Reversed control: the same reads reversed (not complemented) are scanned and called. A call other than none means chance or
-   low-complexity sequence fakes genes. It is reported, not used as a filter.
+5. The reversed control scans the same read with its sequence reversed. A gene contributes its forward count minus its
+   reversed count when the forward count is at least twice the reversed count. Otherwise it contributes zero. A class that
+   meets the gene and density thresholds in the reversed scan does not seed from the cluster.
 6. Seed = a read cropped to the span of its class's stretches plus `flank` = 2,000 on each side (**unstated**). Seeds go to
    `protein_seeds.<organelle>.fasta`.
 7. Depth reference: for each organelle, the seeded cluster with the most genes (ties: the deeper) writes
    `protein_seeds.<o>.depth.fasta`, used for assembly node depth (section 4.3).
 
+The `protein_seeds.json` report includes the loaded panel families per organelle in `panel_gene_sets`. Gene labels
+are the exact panel labels. Each depth cluster reports per-family stretch and FASTX record counts before control
+subtraction and minimum-stretch filtering. It also counts records with the same family detected in both scans.
+These are input records. Physical molecule identity and source require separate evidence. The whole-read
+fallback is outside this paired report because it scans forward only.
+
+#### Export candidates from paired gene sets
+
+`ovasm find protein-seeds --paired-gene-candidates` exports nominated depth-cluster
+crops in `protein_candidates.<organelle>.fasta` under a new output directory.
+Each panel family needs more
+forward than reversed input records and at least `min_gene_segments` net forward
+stretches. A cluster nominates the requested organelle when its supported family
+count reaches `--min-genes`. The report `protein_candidates.json` includes the
+effective family denominator, the paired evidence, and the legacy cluster calls
+for comparison on the same sampled records. Density and estimated cluster span
+are recorded for comparison.
+
+These crops have pending source qualification. Use the original reads and the
+registered source windows with `audit_seed_source.py` and
+`--retention-policy target-supported-only` before passing the qualified FASTA and
+its audit into recruitment. The ordinary seed path includes whole-read fallback.
+
 ### 2.5 Whole-read scan (`protein_seed::whole_read_seeds`)
 
 For organelles no cluster seeded, every read is scanned with $\text{min\_hits}' = \max(\text{min\_hits}, 12)$
 (`WHOLE_READ_MIN_HITS`). A read is a seed when its class is that organelle and it holds at least `WHOLE_READ_MIN_GENES` = 3 distinct
-genes of the class; the whole read is kept, at most `WHOLE_READ_MAX_SEEDS` = 3,000. Evidence for 12: chance stretches of nuclear
+genes of the class. The seed is cropped to the gene span with the configured flanks, up to `WHOLE_READ_MAX_SEEDS` = 3,000 seeds. Evidence for 12: chance stretches of nuclear
 reads reach 5-8 hits, mitochondrial genes 13-140 on the best stretch (PMAT2 reference genomes); at 5 hits and 2 genes, 1,514 of
 74,216 Gibbula magus reads passed against 19 mitochondrial (empirical). Cases: organelle about as deep as the nucleus (Orcinus orca,
 19 mitochondrial reads in 1 Gb; Sterechinus neumayeri, 9 in 2.5 Gb). The value 3 rests on a rule of thumb in the constant's doc (a NUMT
 is a few kb of one or two genes; a 10 kb animal HiFi read holds five or more); no distribution is cited. If any whole-read seed is found
 (`ProteinSeedReport::shallow`), recruitment runs without the depth gate and with one pass.
+
+### 2.6 Audit seed source with original read coordinates
+
+`scripts/audit_seed_source.py MANIFEST --out AUDIT.json` checks native protein seed crops
+against predeclared source windows. Each seed header supplies an original read identifier
+and a `span=START-END` interval. The tool requires a unique original record and exact crop
+sequence at those coordinates. It also requires an exact, unambiguous source window
+inside the original read and the crop.
+
+The manifest uses `ovasm.seed-source-audit.v1` and names the comparison scope. Its `seeds`
+and `raw_reads` entries lock the seed FASTA and each original FASTX file by path and SHA-256.
+A `raw_reads` entry can select a one-based `id_field` when an archive prefixes its own ID.
+The `references` entries add an ID and either a `target` or `competing` role to a locked FASTA.
+Every registered `windows` entry provides an ID, reference ID, record ID, half-open
+reference interval, interior boundary coordinate, and a locked `provenance` file.
+Select intervals that cross source-informative boundaries before evaluating crops.
+
+`--out-fasta RETAINED.fa` writes a separate FASTA that omits crops with a supported competing
+context. It preserves target-supported and unresolved records byte for byte. The audit
+records exact placements in the named panel, both strands, and uncertainty from repeated
+IDs, repeated windows, mixed source observations, or missing crop evidence. Source claims
+are scoped to the supplied references and provenance. Use an independent evidence set
+when validating the windows or measuring the source filter.
+
+For positive-only release, add `--retention-policy target-supported-only`.
+The producer retains only crops that spell a unique target window completely
+within their audited original span. If original IDs repeat, strict mode
+requires the ID, span and literal crop to match exactly one original record.
+The audit records its file index, record ordinal and sequence digest. Missing,
+ambiguous, mixed or competing evidence leaves the crop out of the strict view.
+An empty strict view is reportable. OVASM requires at least one qualifying crop
+for that organelle before starting recruitment.
+
+For an audited view prepared with a manifest target of `mitochondrion` or `plastid`, pass
+the retained FASTA to normal seed recruitment. Supply the audit with the same organelle.
+
+~~~sh
+ovasm run hifi --reads sample.fastq.gz --out assembly \
+  --seeds mt=RETAINED.fa --seed-source-audit mt=AUDIT.json
+~~~
+
+OVASM checks the digest, target, and complete ordered list of retained records.
+For a strict view it also checks original-coordinate spans and the literal
+target window spelling within each crop. This check uses the source evidence
+in the named audit panel and applies to the organelle named on the command. It uses
+a copy of the verified bytes in the run directory and records the audit in
+`summary.json` under `seed_database.seed_source_audit`. The audit describes the source
+comparison that produced the seed view. The run may use a different reads file.
+
+#### Recover original records from candidate crops
+
+Run `python3 scripts/extract_seed_crop_originals.py PLAN.json --out AUDIT.json --out-reads ORIGINALS.fastq`
+before repeated source comparisons on the same crops. Use schema
+`ovasm.seed-crop-originals-plan.v1` with `scope`, a `candidate_sets` list of
+FASTA file bindings with an `id` per set, and a `raw_reads` list of original
+plain or gzip FASTQ file bindings. Each binding has `path` and `sha256`.
+An original input can also set its one-based `id_field`.
+
+The extractor verifies the archive SHA-256 while scanning the entire file
+and joins each crop by identifier, exact interval and literal sequence bytes.
+It records missing, mismatched and ambiguous matches. The output includes each
+uniquely bound original once, with its full FASTQ title, sequence and qualities.
+The report ties each crop to an input record ordinal and an output record index.
+Use these bindings when assigning mapper names. Source qualification requires
+separate reference and read evidence.
+
+### 2.7 Audit protein gene sets
+
+Use `ovasm find protein-seeds --gene-set-audit` or add `--protein-gene-set-audit`
+to an active protein seed scan in `ovasm run hifi`. The report records gene sets for
+each sampled depth cluster. If the whole-read fallback runs, it also scans every
+fallback input in reverse sequence order, using the same translation, gene
+assignment, read qualification, and crop rules in both orientations. The fallback
+counts qualifying records before the seed output cap and depth check.
+
+Each gene set lists observed forward families and families with both more forward
+than reversed records and at least `min_gene_segments` excess forward stretches.
+The shared record count is provided for each family. `support_fraction` is the
+supported family count divided by the indexed panel families for that organelle,
+or null if none are indexed. A family present in the loaded panel with no amino
+acid k-mer is reported in `unindexed_families`.
+
+The depth-cluster and fallback scans qualify reads differently. Interpret their
+fractions within each scan. Counts refer to input records, and multiple families
+can share a record. The reversal control measures directional signal under these
+rules. True homologues in nuclear and plastid copies can also produce that signal,
+so assigning physical source requires independent original-read evidence. This
+audit leaves seed selection and FASTA output unchanged.
+
 
 ## 3. Seed recruitment
 
@@ -281,8 +394,9 @@ When protein-seed passes exceed one, the mitochondrial component filter also run
 
 ### 3.5 NUMT flags and competing targets
 
-- `NumtCandidate`: a partial read (cover below `min_cover`) with a contiguous organelle-like block of at least `numt_min_block`: an organelle
-  segment with nuclear flanks. Written to `numt_candidates.fastq` and used by bootstrap and frontier extension.
+- `NumtCandidate` describes a partial read (cover below `min_cover`) with a contiguous organelle-like block of at least `numt_min_block`.
+  The unexplained sequence may reflect a nuclear insertion or sequence missing from the target bait. OVASM writes these reads to
+  `numt_candidates.fastq` and uses them in bootstrap and frontier extension.
 - Both organelles are seeded unless `--single-seed`: a mitochondrion seeded alone extended into the plastid genome through plastid-derived
   stretches (Ajuga and Alisma "mitochondria" were plastids; plastid reads are 10-30x deeper).
 
@@ -295,6 +409,164 @@ $d_{read}$ = median sketch depth of the target's reads) and `max_bases/bases` (`
 polymorpha plastid reads took 2.5 GB, 8.5 Gb of Carex echinata "plastid" reads 309 GB). The 250x and $10^9$ are empirical bounds. The input
 cache (`recruit/input-cache`, a quarter byte per base plus names) is used when the output disk has room for twice the need
 (`default_recruit_cache`).
+
+### Recruitment status in the report
+
+Each target in `recruit.json` has a `recruitment_state`.
+
+- `converged` requires an evaluated pass with no bait gain and no unresolved evidence within the configured search. The check covers recruited reads and the partial candidates assigned to that target by the classifier.
+- `unresolved` covers heuristic saturation, seeds supplied as reads, or evidence withheld during extension. For example, a read can contain a new k-mer that lacks independent support. The run retains this uncertainty when a later pass has no new evidence for that read.
+- `truncated` covers stops due to the scan budget, the target size cap, or explicit bootstrap limits. A single scan classifies reads without extending the bait. The last allowed scan also skips extension, so a target can have the historical `bait_complete` reason and still be truncated.
+
+The `stop_reason` field retains the historical stop label. The `converged` boolean is true only for the `converged` state. The state describes the observed bait search under the run's rules. Final FASTQ sampling is reported separately, and the state cannot establish physical genome completeness.
+
+For a diagnostic run, add `--frontier-audit` to `ovasm find recruit`. The report links
+to `source_candidates/frontier-evidence.jsonl`, with up to eight read examples per
+target and reason. The report counts events, including repeated observations of the
+same record. It reports some stages only as counts. Example coordinates refer to
+the final bait and matching uses the read identifier and sequence. A match does not
+establish the read's physical source. This option uses the existing scans and keeps
+the recruitment and FASTQ rules.
+
+### 3.7 Admit original reads with external source evidence
+
+Use `--read-admission-manifest MANIFEST.json` with `ovasm find recruit` or with the
+seed recruitment arm of `ovasm run hifi` and `ovasm run short`. Prepare the manifest
+from independent source evidence for the input sample. The manifest has schema
+`ovasm.read-admission.v1`, a nonempty `scope` and a `records` array. Each record has
+the following fields.
+
+| Field | Value |
+| --- | --- |
+| `target` | Exact seed target name, such as `mitochondrion` |
+| `read_id_hex` | Lowercase hexadecimal bytes of the complete FASTA or FASTQ header after its initial marker |
+| `sequence_sha256` | Lowercase SHA-256 of the parsed sequence bytes, preserving case and removing line breaks |
+| `quality_sha256` | Lowercase SHA-256 of the FASTQ quality bytes, or JSON null for FASTA |
+| `provenance` | Object with `path` and lowercase SHA-256 `sha256` for the evidence file. Relative paths resolve beside the canonical manifest. |
+
+Each declared identifier must occur once in the manifest and once across the original
+inputs. OVASM validates the evidence file and exact original record digests. The source
+assessment itself comes from the evidence author. Record bytes come from the original
+input stream. Existing passes establish the final bait call. New admissions are
+appended in manifest order after ordinary downsampling, without extending the bait
+or adding the other mate. An ordinary call for the requested target keeps its usual
+sampling behavior. An ordinary call exclusively for another target takes precedence.
+A partial record keeps its diagnostic entry even when it is explicitly admitted.
+The same sampling hash applies to added records, and an addition must fit within
+the remaining configured base cap.
+
+The optional `read_admission` section of `recruit.json` records manifest and evidence
+digests, the baseline classification and each record's outcome. `already_recruited`
+describes the baseline call before sampling. `admitted` confirms the record was
+written. The remaining outcomes are `competing_target`, `downsampled` and `base_cap`.
+Final output counts include admitted records. Iteration counts, bait closure and
+sketch-based depth describe the ordinary bait search.
+
+### Exclude exact source-bound originals during seed recruitment
+
+`--read-source-exclusions MANIFEST.json` applies to `find recruit` and
+whole-genome `run` with `--recruit seeds`. The
+`ovasm.read-source-exclusions.v1` manifest uses the same original identity
+and provenance fields as read admission. Its target names the prohibited
+destination. One original can exclude several targets. A positive admission
+for the same original and destination conflicts with the exclusion.
+
+The exclusion removes that target assignment before pass files, sampling
+and read-derived bait growth. Partial reads can still be inspected in the
+diagnostic files. A prohibited original cannot feed within-pass extension
+or either leftover bootstrap for that target. Replay validates the same
+identities and restores and checks original qualities for the final outputs.
+Other target assignments remain eligible. No alternate target is inferred
+from exclusion alone.
+
+The starting seed files are supplied independently. The whole-library
+k-mer walk cannot track an original's source, so it is skipped for protected
+targets while read-level depth gates remain available. The recruitment
+report records match passes, bindings and targets whose library walk was
+skipped. Exclusion claims have the scope of the supplied evidence.
+
+Generate this manifest from registered source junctions with:
+
+```sh
+python3 scripts/prepare_read_source_exclusions.py PLAN.json --out AUDIT.json \
+  --out-exclusions EXCLUSIONS.json
+```
+
+The plan schema is `ovasm.read-source-exclusion-plan.v1`. Set `scope` and
+`target`, list the original FASTA or four-line FASTQ inputs in `raw_reads`,
+and provide `references` with an `id` and a physical `role` for each FASTA.
+Inputs and provenance objects carry `path` and `sha256`. Each registered
+window in `windows` gives its `id`, panel `reference` ID, FASTA `record`
+ID, zero-based half-open `interval`, interior `boundary`, and `provenance`.
+For a competing role, `exterior_side` marks the `left` or `right` side
+of the boundary that identifies the competing physical source. Target windows
+are veto contexts.
+
+The exporter requires the competing window to occur exactly once in the
+supplied linear reference records and its exterior sequence to be absent
+from all other supplied roles. In the original reads, it accepts either
+orientation. It abstains for mixed roles, ambiguous competing windows,
+repeated matches of a competing window, and duplicate full read headers.
+The audit records the checks and positions. The manifest binds every
+exported record to that audit and preserves the original sequence and
+quality hashes. A run with zero qualifying originals produces only the
+audit. Establish the physical role and boundary independently of the
+recruitment outcome. Use the same original inputs for recruitment.
+
+### 3.8 Screen original reads at registered junctions
+
+Run `python3 scripts/prepare_read_admission.py PLAN.json --out SCREEN_DIR` to prepare
+a native read admission manifest. Use the same original four-line FASTQ inputs for
+screening and recruitment. Plain and gzip inputs are supported. The plan uses schema
+`ovasm.read-source-screen.v1`, a nonempty `scope`, and a `target` of `mitochondrion`
+or `plastid`.
+
+- `reads` lists original FASTQs. `panel` gives one FASTA for each of
+  `mitochondrion`, `plastid`, and `nuclear`. A FASTA can contain several reference records.
+  Each file uses an object with `path` and lowercase `sha256`.
+- `windows` lists registered target junctions. Each object has an `id`, target FASTA
+  `reference` identifier, and integers `start0`, `boundary0`, and `end0`. Coordinates
+  are zero-based and half-open. Supply at least one base on either side of the boundary.
+- Optional `qualification` binds an independent comparison file with schema
+  `ovasm.read-source-qualification.v1`. That file declares `scope`, `target`,
+  `panel_sha256` keyed by the same three roles, a `provenance` file binding, and
+  `records`. Each record has `read_id_hex`, `sequence_sha256`, `quality_sha256`, the
+  complete registered `window` object, and a `verdict` of `target_supported`,
+  `competing`, or `unresolved`. The evidence author supplies the verdict using
+  independent evidence for the same original record and interval.
+
+Relative paths resolve beside the JSON file that declares them. The screen searches
+all input reads for registered windows in either orientation, then compares the
+complete exact read end and exact window against the named panel. Only a unique
+target placement for both, at the registered coordinates and with an independently
+qualified original record, is eligible. Exact comparison applies to literal panel
+bases. Assembly gaps, unrepresented sequence and approximate matches remain outside
+that comparison. A matching competing or unresolved declaration also withholds the
+record. The report keeps up to two placements per role, enough to establish
+ambiguity. Multiple windows on the same record yield at most one native declaration.
+
+`source-screen.json` records the frozen inputs, exact placements and individual
+decisions. If screening finishes with eligible records, `read-admission.json` is
+ready for `--read-admission-manifest`. Reaching the candidate cap before all reads
+are checked produces a truncated report and no admission manifest. This route
+currently handles exact complete reads at registered windows.
+
+For an additional short-read competition check, set `--phred-error-quantile Q`
+with a probability strictly between zero and one. The script calculates each
+read end's error-count quantile from its Phred+33 qualities, conditional on
+independent calibrated errors. It searches both strands for equal-length placements
+within that number of substitutions. Splitting the read into one more block than
+the allowed substitutions guarantees that every such placement has an exact seed.
+The search confirms each candidate by comparing the full read end.
+
+A competing role, another position or orientation in the target, or an exhausted
+search budget withholds an otherwise eligible record. The report records up to
+two placements per role. `saturated` means at least two were found.
+`--max-substitution-starts` sets the work budget per original read and role, with
+500,000 starts by default. The independent qualification remains part of the
+admission rule. This comparison covers literal equal-length sequence. Indels,
+assembly omissions, sequence changes between individuals, and correlated quality
+errors are outside its model.
 
 ## 4. Assembly (`assemble.rs`, `pipeline.rs::GraphAttempts::attempt`, `k_ladder`)
 
@@ -456,6 +728,9 @@ $\hat p$, take the 2.5% and 97.5% quantiles). Every read is also recorded as a s
   topologically (`TOPO_READS` = 1, at most `TOPO_MAX_REPEATS` = 8 repeats) at an anchor end that fewer than `ABSENCE_READS` = 10 reads cross. Topological and weak bridges make a molecule non-decisive.
 - Connected components of the anchor graph are solved separately. Within one, a cover is a set of molecules visiting each anchor once through bridges (one molecule is a Hamiltonian path in the small
   anchor graph); repeats are laid down as often as the chosen bridges cross them; a molecule is circular when a bridge returns from its last anchor to its first. Covers of every size compete together.
+- Once the required-anchor covers have been enumerated, the remaining search budget can extend an open cover to an observed record end. The entire inbound thread must match the existing oriented
+  path. Its tail must follow existing bridges to unused optional anchors and respect phase constraints. These additional open candidates carry the same representation and topology limits as the original
+  covers. On exhaustion, the original covers remain available and the search is marked incomplete.
 - Ranking when thread evidence is present (always, since `check evidence` writes it): `read_model::ReadFit::order`, lexicographic and not a likelihood: more joint records explained, then more
   thread records, then more adjacency-record occurrences, then fewer unobserved junctions, then fewer weak junctions; then fewer copy-number deviations, then fewer molecules (a representation
   tie-break). Search work is bounded by `WORK_BUDGET` = $10^7$; on exhaustion `ranking_model = "legacy_after_read_budget_exhaustion"`.
@@ -484,6 +759,23 @@ $\hat p$, take the 2.5% and 97.5% quantiles). Every read is also recorded as a s
 4. A repeat no read crosses, or too few, leaves a range of counts.
 5. A component below `SHALLOW` = 0.5 of the main one's depth, with fewer than `MIN_SEED_BP` = 300 bp of the organelle's seed 21-mer blocks, is possibly nuclear or contamination and is not counted.
 6. Any other unjoined component at `SOURCE_FOLD` = 2 times the main depth or more, or at its reciprocal or less, is "source pending": not counted, only in the range's maximum.
+
+#### Audit read length for a repeat route
+
+`python3 scripts/audit_repeat_span_opportunity.py PLAN.json --out AUDIT.json`
+counts original reads long enough to contain the literal spelling of a
+declared repeat route. Use schema `ovasm.repeat-span-opportunity-plan.v1`
+with `scope`, one `graph`, a list of `raw_reads`, and a list of `routes`.
+The graph and each FASTA or FASTQ input use `path` and `sha256`. Each route
+has an `id` and a `path` of oriented GFA segment names, with a flanking
+segment at each end and at least one interior segment.
+
+The minimum length is the spelled interior plus one base from each
+exterior overhang. Internal overlaps are counted once and repeated visits
+are spelled separately. The graph must supply unambiguous exact overlaps.
+The report gives the number of original records meeting the minimum per
+route. This length condition is necessary for a literal, gap-free span.
+Read alignment and physical pairing require separate evidence.
 
 ### 6.5 Assessment (`assess.rs`)
 

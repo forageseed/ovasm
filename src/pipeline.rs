@@ -122,6 +122,12 @@ pub struct RunConfig {
     pub seeds: BTreeMap<String, Vec<PathBuf>>,
     /// The organelles whose `seeds` are the built-in library (`summary.json` says `builtin`).
     pub builtin_seeds: BTreeSet<String>,
+    /// Provenance of each explicitly audited retained seed FASTA.
+    pub(crate) seed_source_audits: BTreeMap<String, crate::seed_source::Provenance>,
+    /// Explicitly verified original records for the seed recruitment arm.
+    pub read_admission_manifest: Option<PathBuf>,
+    /// Source exclusions for the seed recruitment arm.
+    pub read_source_exclusions: Option<PathBuf>,
     /// The built-in library `builtin_seeds` came from (`summary.json` records it).
     pub seed_lineage: crate::seeddb::Lineage,
     pub recruit: RecruitBy,
@@ -874,6 +880,15 @@ fn recruitment_summary(report: &Value, index: usize, organelle: &str, gated: boo
         .cloned()
         .unwrap_or_default();
     out.remove("output");
+    for name in ["read_admission", "read_source_exclusions"] {
+        if let Some(audit) = report.get(name) {
+            let mut audit = audit.clone();
+            if let Some(records) = audit["records"].as_array_mut() {
+                records.retain(|record| record["target"] == organelle);
+            }
+            out.insert(name.into(), audit);
+        }
+    }
     out.insert("extend_gate".into(), report["extend_gate"].clone());
     out.insert("bootstrap".into(), report["bootstrap"].clone());
     out.insert("gated_by_default".into(), gated.into());
@@ -1090,6 +1105,12 @@ fn recruit_all(
             )
             .opt("--salt", cfg.salt.to_string())
             .each("--reads", &cfg.reads);
+        if let Some(path) = &cfg.read_admission_manifest {
+            argv = argv.opt("--read-admission-manifest", path);
+        }
+        if let Some(path) = &cfg.read_source_exclusions {
+            argv = argv.opt("--read-source-exclusions", path);
+        }
         for (name, paths) in &cfg.seeds {
             for p in paths {
                 let mut spec = OsString::from(format!("{name}="));
@@ -1200,13 +1221,18 @@ fn recruit_all(
                 let own = seed_files(organelle);
                 source = own.join(", ");
                 let seed_source = |o: &str| {
-                    if cfg.builtin_seeds.contains(o) {
+                    if cfg.seed_source_audits.contains_key(o) {
+                        "audited_source_view"
+                    } else if cfg.builtin_seeds.contains(o) {
                         "builtin"
                     } else {
                         "custom"
                     }
                 };
                 seed_info.insert("source".into(), seed_source(organelle).into());
+                if let Some(audit) = cfg.seed_source_audits.get(organelle) {
+                    seed_info.insert("seed_source_audit".into(), json!(audit));
+                }
                 if cfg.builtin_seeds.contains(organelle) {
                     seed_info.insert("version".into(), cfg.seed_lineage.version().into());
                     seed_info.insert("lineage".into(), cfg.seed_lineage.name().into());
@@ -1222,11 +1248,15 @@ fn recruit_all(
                 seed_info.insert(
                     "competing_seed".into(),
                     if cfg.seeds.contains_key(other) {
-                        json!({
+                        let mut competitor = json!({
                             "organelle": other,
                             "source": seed_source(other),
                             "files": seed_files(other),
-                        })
+                        });
+                        if let Some(audit) = cfg.seed_source_audits.get(other) {
+                            competitor["seed_source_audit"] = json!(audit);
+                        }
+                        competitor
                     } else {
                         Value::Null
                     },
@@ -2092,6 +2122,11 @@ fn component_filter_summary(report: &Value) -> Value {
 }
 
 fn validate(cfg: &RunConfig) -> Result<()> {
+    if cfg.read_source_exclusions.is_some()
+        && (cfg.read_set != ReadSet::WholeGenome || cfg.recruit != RecruitBy::Seeds)
+    {
+        bail!("--read-source-exclusions requires whole-genome recruitment with --recruit seeds");
+    }
     if cfg.recruit_cache.is_some()
         && (cfg.read_set == ReadSet::Target || cfg.recruit == RecruitBy::Discover)
     {
@@ -2760,6 +2795,9 @@ mod tests {
             read_set: ReadSet::Target,
             seeds: BTreeMap::new(),
             builtin_seeds: BTreeSet::new(),
+            seed_source_audits: BTreeMap::new(),
+            read_admission_manifest: None,
+            read_source_exclusions: None,
             seed_lineage: crate::seeddb::Lineage::Landplants,
             recruit: RecruitBy::Seeds,
             recruit_depth: None,
@@ -2877,7 +2915,9 @@ mod tests {
             let r = &s["recruitment"];
             assert_eq!(r["extend_gate"], json!(true), "{organelle}");
             assert_eq!(r["bootstrap"], json!(true), "{organelle}");
-            assert_eq!(r["converged"], json!(true), "{organelle}");
+            assert_eq!(r["stop_reason"], "saturated", "{organelle}");
+            assert_eq!(r["recruitment_state"], "unresolved", "{organelle}");
+            assert_eq!(r["converged"], json!(false), "{organelle}");
             assert_eq!(r["sampled_by"], Value::Null, "{organelle}");
             assert!(r["read_depth"].as_f64().unwrap() < 250.0, "{organelle}");
         }

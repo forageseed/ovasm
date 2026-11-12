@@ -2,12 +2,13 @@
 use crate::bait::BaitSet;
 use crate::evidence::{parse_gfa, revcomp, Graph};
 use crate::kmer::CanonicalKmers;
-use crate::recruit::{classify, for_each_rec, write_rec, Call, ClassifyParams};
+use crate::recruit::{classify, for_each_rec, write_rec, Call, ClassifyParams, Rec};
 use anyhow::Result;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::hash::Hasher;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -38,11 +39,206 @@ pub(crate) fn blocks(seq: &[u8], bait: &BaitSet, gap: usize) -> Vec<Vec<(usize, 
     result
 }
 
-pub fn recruitment(
+const FRONTIER_AUDIT_EXAMPLES: usize = 8;
+const FRONTIER_AUDIT_ID_BYTES: usize = 1024;
+const FRONTIER_AUDIT_SEQUENCE_BYTES: usize = 65536;
+const FRONTIER_AUDIT_INTERVALS: usize = 16;
+
+#[derive(Clone, Copy)]
+pub(crate) enum FrontierReason {
+    ExtensionSubsampled,
+    KmerDepthGate,
+    ReadDepthProfile,
+    BelowTargetDepth,
+    AboveTargetDepth,
+    UnbaitedAfterCommit,
+}
+
+impl FrontierReason {
+    const ALL: [Self; 6] = [
+        Self::ExtensionSubsampled,
+        Self::KmerDepthGate,
+        Self::ReadDepthProfile,
+        Self::BelowTargetDepth,
+        Self::AboveTargetDepth,
+        Self::UnbaitedAfterCommit,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExtensionSubsampled => "extension_subsampled",
+            Self::KmerDepthGate => "kmer_depth_gate",
+            Self::ReadDepthProfile => "read_depth_profile",
+            Self::BelowTargetDepth => "below_target_depth",
+            Self::AboveTargetDepth => "above_target_depth",
+            Self::UnbaitedAfterCommit => "unbaited_after_commit",
+        }
+    }
+}
+
+struct FrontierWitness {
+    key: u64,
+    id: Vec<u8>,
+    sequence: Vec<u8>,
+    pass: usize,
+    in_final_partial_pool: bool,
+}
+
+#[derive(Default)]
+struct FrontierEvents {
+    extension_records: u64,
+    within_pass_records: u64,
+    oversized_records: u64,
+    witnesses: Vec<FrontierWitness>,
+}
+
+pub(crate) struct FrontierAudit {
+    events: Vec<[FrontierEvents; FrontierReason::ALL.len()]>,
+    witness_index: FxHashMap<Vec<u8>, Vec<(usize, usize, usize)>>,
+}
+
+impl FrontierAudit {
+    pub(crate) fn new(targets: usize) -> Self {
+        Self {
+            events: (0..targets).map(|_| Default::default()).collect(),
+            witness_index: FxHashMap::default(),
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        target: usize,
+        pass: usize,
+        reason: FrontierReason,
+        name_key: u64,
+        read: &Rec,
+    ) {
+        let events = &mut self.events[target][reason as usize];
+        events.extension_records += 1;
+        if read.id.len() > FRONTIER_AUDIT_ID_BYTES
+            || read.seq.len() > FRONTIER_AUDIT_SEQUENCE_BYTES
+        {
+            events.oversized_records += 1;
+            return;
+        }
+        let rank = (name_key, read.id.as_slice(), read.seq.as_slice());
+        let position = events.witnesses.binary_search_by(|witness| {
+            (witness.key, witness.id.as_slice(), witness.sequence.as_slice()).cmp(&rank)
+        });
+        let Err(position) = position else { return };
+        if position >= FRONTIER_AUDIT_EXAMPLES {
+            return;
+        }
+        if events.witnesses.len() == FRONTIER_AUDIT_EXAMPLES {
+            events.witnesses.pop();
+        }
+        events.witnesses.insert(position, FrontierWitness {
+            key: name_key,
+            id: read.id.clone(),
+            sequence: read.seq.clone(),
+            pass,
+            in_final_partial_pool: false,
+        });
+    }
+
+    pub(crate) fn count(
+        &mut self, target: usize, reason: FrontierReason, within_pass: bool, records: u64,
+    ) {
+        let events = &mut self.events[target][reason as usize];
+        if within_pass {
+            events.within_pass_records += records;
+        } else {
+            events.extension_records += records;
+        }
+    }
+
+    fn prepare_pool_membership(&mut self) {
+        for (t, reasons) in self.events.iter().enumerate() {
+            for (r, events) in reasons.iter().enumerate() {
+                for (w, witness) in events.witnesses.iter().enumerate() {
+                    self.witness_index.entry(witness.id.clone()).or_default().push((t, r, w));
+                }
+            }
+        }
+    }
+
+    fn match_pool_record(&mut self, read: &Rec) {
+        if let Some(indices) = self.witness_index.get(&read.id) {
+            for &(t, r, w) in indices {
+                let witness = &mut self.events[t][r].witnesses[w];
+                if witness.sequence == read.seq {
+                    witness.in_final_partial_pool = true;
+                }
+            }
+        }
+    }
+
+    fn write(&self, dir: &Path, bait: &BaitSet, gap: usize) -> Result<Value> {
+        let path = dir.join("frontier-evidence.jsonl");
+        let mut rows = BufWriter::new(File::create(&path)?);
+        let mut targets = Vec::new();
+        for (t, reasons) in self.events.iter().enumerate() {
+            let name = &bait.targets[t].name;
+            let mut summary = Vec::new();
+            for (reason, events) in FrontierReason::ALL.into_iter().zip(reasons) {
+                for w in &events.witnesses {
+                    let compatible = blocks(&w.sequence, bait, gap);
+                    let intervals = &compatible[t];
+                    let shown = intervals.len().min(FRONTIER_AUDIT_INTERVALS);
+                    let id = String::from_utf8_lossy(&w.id);
+                    let exact_id = std::str::from_utf8(&w.id).is_err().then(|| {
+                        w.id.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                    });
+                    let mut fingerprint = FxHasher::default();
+                    for &base in &w.sequence {
+                        fingerprint.write_u8(base);
+                    }
+                    writeln!(rows, "{}", json!({
+                        "target": name, "reason": reason.name(), "pass": w.pass,
+                        "read_id": id, "read_id_hex_if_non_utf8": exact_id,
+                        "read_length": w.sequence.len(),
+                        "read_sequence_fxhash64": format!("{:016x}", fingerprint.finish()),
+                        "in_final_partial_pool": w.in_final_partial_pool,
+                        "final_bait_compatible_blocks": &intervals[..shown],
+                        "final_bait_intervals_omitted": intervals.len() - shown,
+                        "flank_origin": "unknown"
+                    }))?;
+                }
+                summary.push(json!({
+                    "reason": reason.name(), "extension_records": events.extension_records,
+                    "within_pass_records": events.within_pass_records,
+                    "oversized_extension_records": events.oversized_records,
+                    "sampled": events.witnesses.len()
+                }));
+            }
+            targets.push(json!({"target": name, "reasons": summary}));
+        }
+        rows.flush()?;
+        Ok(json!({
+            "schema": "ovasm.recruitment-frontier-evidence.v1",
+            "read_evidence": path,
+            "scope": "held or unevaluated records in configured extension; source origin is unknown",
+            "counting": "record events by stage and reason, possibly repeated across passes",
+            "sampling": "bounded main-extension examples by name hash, raw ID and exact sequence; within-pass and post-commit records are aggregate only",
+            "extension_subsampled": "not evaluated for extension",
+            "pool_matching": "full read ID and sequence, not an independent molecule identity",
+            "coordinates": "0-based half-open intervals of final-bait compatibility, not alignments",
+            "max_examples_per_target_reason": FRONTIER_AUDIT_EXAMPLES,
+            "max_sample_id_bytes": FRONTIER_AUDIT_ID_BYTES,
+            "max_sample_sequence_bytes": FRONTIER_AUDIT_SEQUENCE_BYTES,
+            "max_intervals_per_example": FRONTIER_AUDIT_INTERVALS,
+            "targets": targets
+        }))
+    }
+}
+
+pub(crate) fn recruitment(
     out: &Path,
     pool: &Path,
     bait: &BaitSet,
     params: &ClassifyParams,
+    mut frontier: Option<&mut FrontierAudit>,
+    exclusions: Option<&crate::read_admission::Exclusions>,
 ) -> Result<Value> {
     let start = Instant::now();
     let dir = out.join("source_candidates");
@@ -60,12 +256,18 @@ pub fn recruitment(
     let mut rows = BufWriter::new(File::create(
         dir.join("nuclear-insertion-candidates.jsonl"),
     )?);
+    if let Some(audit) = frontier.as_deref_mut() {
+        audit.prepare_pool_membership();
+    }
     let mut failure = Ok(());
     for_each_rec(pool, |rec| {
         if failure.is_err() {
             return;
         }
         failure = (|| -> Result<()> {
+            if let Some(audit) = frontier.as_deref_mut() {
+                audit.match_pool_record(&rec);
+            }
             let (call, score) = classify(&rec.seq, bait, params);
             let compatible = blocks(&rec.seq, bait, params.block_gap);
             let mut targets = Vec::new();
@@ -111,7 +313,8 @@ pub fn recruitment(
                 return;
             }
             if let Call::Organelle(mask) = classify(&rec.seq, bait, params).0 {
-                if mask & (1 << mt) != 0 && mask & (1 << pt) != 0 {
+                let allowed = mask & !exclusions.map_or(0, |plan| plan.mask(&rec.id));
+                if allowed & (1 << mt) != 0 && allowed & (1 << pt) != 0 {
                     failure = write_rec(&mut shared, &rec);
                     shared_count += 1;
                 }
@@ -120,7 +323,7 @@ pub fn recruitment(
         failure?;
     }
     shared.flush()?;
-    let report = json!({"scope": "partial bait matches and competing-target ties; no nuclear-reference or insertion-junction certification",
+    let mut report = json!({"scope": "partial bait matches and competing-target ties; no nuclear-reference or insertion-junction certification",
         "coordinates": "0-based half-open read intervals; gap-bridged bait-compatible blocks, not alignments",
         "original_merged_pool": pool, "original_pool_preserved": true, "classification_parameters": params,
         "short_read_limit": "reads shorter than numt_min_block cannot enter this candidate pool; an empty pool does not exclude NUMTs/NUPTs",
@@ -129,6 +332,9 @@ pub fn recruitment(
         "read_evidence": dir.join("nuclear-insertion-candidates.jsonl"),
         "mt_pt_shared_reads": shared_count, "mt_pt_shared_fastq": dir.join("mt-pt-shared-reads.fastq"),
         "transfer_direction": Value::Null, "elapsed_seconds": start.elapsed().as_secs_f64()});
+    if let Some(audit) = frontier {
+        report["frontier_evidence"] = audit.write(&dir, bait, params.block_gap)?;
+    }
     save(&dir.join("summary.json"), &report)?;
     Ok(report)
 }
@@ -293,6 +499,36 @@ pub fn cross_organelle(assembly: &Path, out: &Path, k: usize) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontier_samples_are_bounded_and_match_exact_records() {
+        let mut audit = FrontierAudit::new(1);
+        let record = |id: &[u8], seq: &[u8]| Rec { id: id.to_vec(), seq: seq.to_vec(), qual: None };
+        let reason = FrontierReason::ReadDepthProfile;
+        for key in (0..20).rev() {
+            let name = format!("read-{key}");
+            audit.record(0, 1, reason, key, &record(name.as_bytes(), b"AAAA"));
+        }
+        audit.record(0, 2, reason, 0, &record(b"read-0", b"AAAA"));
+        audit.record(0, 2, reason, 0, &record(b"read-0", b"CCCC"));
+        audit.record(0, 2, reason, 0, &record(&vec![b'x'; FRONTIER_AUDIT_ID_BYTES + 1], b"A"));
+        audit.count(0, reason, true, 3);
+        audit.prepare_pool_membership();
+        audit.match_pool_record(&record(b"read-0", b"CCCC"));
+        audit.match_pool_record(&record(b"read-1", b"GGGG"));
+
+        let events = &audit.events[0][reason as usize];
+        assert_eq!(events.extension_records, 23);
+        assert_eq!(events.within_pass_records, 3);
+        assert_eq!(events.oversized_records, 1);
+        assert_eq!(events.witnesses.len(), FRONTIER_AUDIT_EXAMPLES);
+        let first: Vec<_> = events.witnesses.iter().take(3).map(|w| {
+            (w.key, w.sequence.as_slice(), w.in_final_partial_pool)
+        }).collect();
+        assert_eq!(first, vec![(0, b"AAAA".as_slice(), false), (0, b"CCCC".as_slice(), true),
+                              (1, b"AAAA".as_slice(), false)]);
+    }
+
     #[test]
     fn shared_words_keep_repeat_coordinates_and_reverse_orientation() {
         let seq = b"ACGTTGCAAGGCTTACGATCTAGCGGA".to_vec();
@@ -331,7 +567,7 @@ mod tests {
             numt_min_block: 15,
             block_gap: 0,
         };
-        let report = recruitment(&dir, &pool, &bait, &params).unwrap();
+        let report = recruitment(&dir, &pool, &bait, &params, None, None).unwrap();
         assert_eq!(report["target_files"][0]["reads"], 1);
         assert_eq!(
             fs::read_to_string(dir.join("source_candidates/plastid.fastq")).unwrap(),

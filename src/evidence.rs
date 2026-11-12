@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use crate::kmer::CanonicalKmers;
 use crate::recruit::{peak_rss_mb, read_batches};
+use crate::repeat_depth::{FlankCalibration, Measure};
 
 /// Oriented segment: (segment index, forward?).
 pub type Oriented = (usize, bool);
@@ -939,6 +940,65 @@ fn median_depth(g: &Graph, depth: &[f64]) -> f64 {
         .map_or(0.0, |x| x.0)
 }
 
+// Unresolved local depth keeps the legacy operational role. A new repeat role
+// requires bilateral depth and directly observed repeated visits. A demotion
+// requires a reciprocal comparator and no repeated-visit witness.
+struct RepeatDepth<'a> {
+    values: Option<&'a [f64]>,
+    median: f64,
+    flanks: Option<&'a [Measure]>,
+}
+
+impl<'a> RepeatDepth<'a> {
+    #[cfg(test)]
+    fn legacy(g: &Graph, values: Option<&'a [f64]>) -> Self {
+        Self::new(g, values, None)
+    }
+
+    fn new(g: &Graph, values: Option<&'a [f64]>, flanks: Option<&'a [Measure]>) -> Self {
+        Self { values, median: values.map_or(0.0, |d| median_depth(g, d)), flanks }
+    }
+
+    fn local(&self, segment: usize) -> Option<(f64, crate::repeat_depth::Bounds, Measure)> {
+        let measurement = self.flanks?[segment];
+        Some((measurement.segment_depth?, measurement.anchor_range?, measurement))
+    }
+
+    fn at_least(&self, segment: usize, fold: f64) -> bool {
+        self.at_least_or(segment, fold, false)
+    }
+
+    fn at_least_or(&self, segment: usize, fold: f64, without_depth: bool) -> bool {
+        if let Some((d, range, measurement)) = self.local(segment) {
+            if measurement.can_promote() && d >= fold * range.maximum {
+                return true;
+            }
+            if measurement.can_demote() && d < fold * range.minimum {
+                return false;
+            }
+        }
+        self.values.map_or(without_depth, |d| d[segment] >= fold * self.median)
+    }
+
+    fn at_most(&self, segment: usize, fold: f64) -> bool {
+        if let Some((d, range, measurement)) = self.local(segment) {
+            if measurement.can_demote() && d <= fold * range.minimum {
+                return true;
+            }
+            if measurement.can_promote() && d > fold * range.maximum {
+                return false;
+            }
+        }
+        self.median > 0.0 && self.values.is_some_and(|d| d[segment] <= fold * self.median)
+    }
+
+    fn has_depth_evidence(&self) -> bool {
+        self.values.is_some() || self.flanks.is_some_and(|values| {
+            values.iter().any(|m| m.segment_depth.is_some() && m.anchor_range.is_some())
+        })
+    }
+}
+
 /// Repeat segments: a branching end (two or more distinct read-supported links) and, when the
 /// GFA records depth, at least `REPEAT_FOLD` times the median depth. Without depth the inference
 /// is limited to segments short enough for reads to span. A depth-backed repeat remains a
@@ -981,13 +1041,9 @@ fn crossroads(g: &Graph, link_reads: &[u64]) -> Vec<bool> {
 }
 
 /// Segments that depth says are single-copy even at a crossroad (`CROSSROAD_ONE_COPY`).
-fn single_copy_crossroads(g: &Graph, depth: Option<&[f64]>) -> Vec<bool> {
-    let Some(d) = depth else {
-        return vec![false; g.seqs.len()];
-    };
-    let median = median_depth(g, d);
+fn single_copy_crossroads(g: &Graph, depth: &RepeatDepth<'_>) -> Vec<bool> {
     (0..g.seqs.len())
-        .map(|s| median > 0.0 && g.seqs[s].len() >= CROSSROAD_LONG && d[s] <= CROSSROAD_ONE_COPY * median)
+        .map(|s| g.seqs[s].len() >= CROSSROAD_LONG && depth.at_most(s, CROSSROAD_ONE_COPY))
         .collect()
 }
 
@@ -995,7 +1051,7 @@ fn repeat_segments(
     g: &Graph,
     max_len: usize,
     supported: &[bool],
-    depth: Option<&[f64]>,
+    depth: &RepeatDepth<'_>,
 ) -> Vec<bool> {
     // (segment, right end?) -> distinct links touching that end
     let mut degree: FxHashMap<(usize, bool), usize> = FxHashMap::default();
@@ -1012,16 +1068,11 @@ fn repeat_segments(
         *degree.entry((a.0, a.1)).or_default() += 1; // leaves a's right end if a is forward
         *degree.entry((b.0, !b.1)).or_default() += 1; // enters b's left end if b is forward
     }
-    let median = depth.map_or(0.0, |d| median_depth(g, d));
-    let deep = |s: usize| match depth {
-        Some(d) => d[s] >= REPEAT_FOLD * median,
-        None => true,
-    };
     let mut repeat: Vec<bool> = (0..g.seqs.len())
         .map(|s| {
             let branching = degree.get(&(s, true)).copied().unwrap_or(0) >= 2
                 || degree.get(&(s, false)).copied().unwrap_or(0) >= 2;
-            branching && (depth.is_some() || g.seqs[s].len() <= max_len) && deep(s)
+            branching && depth.at_least_or(s, REPEAT_FOLD, g.seqs[s].len() <= max_len)
         })
         .collect();
     // A deep segment inside a chain of repeats branches at neither end (its neighbours do):
@@ -1029,7 +1080,7 @@ fn repeat_segments(
     // reads: a 4.4 kb two-copy segment between two repeats). Graph links count here, since
     // short reads cannot test every link; the depth keeps a deep unique segment out (an MTPT
     // at 3.75x between unique neighbours stays an anchor).
-    if depth.is_some() {
+    if depth.has_depth_evidence() {
         let mut side: FxHashMap<(usize, bool), Vec<usize>> = FxHashMap::default();
         for &(a, b) in &g.links {
             side.entry((a.0, a.1)).or_default().push(b.0);
@@ -1037,7 +1088,7 @@ fn repeat_segments(
         }
         loop {
             let add: Vec<usize> = (0..g.seqs.len())
-                .filter(|&s| !repeat[s] && deep(s))
+                .filter(|&s| !repeat[s] && depth.at_least(s, REPEAT_FOLD))
                 .filter(|&s| {
                     [true, false].iter().all(|&end| {
                         side.get(&(s, end))
@@ -1070,13 +1121,12 @@ fn ambiguous_repeats(
     repeat: &[bool],
     link_reads: &[u64],
     link_ambiguous: &[u64],
-    depth: Option<&[f64]>,
+    depth: &RepeatDepth<'_>,
     max_len: usize,
 ) -> Vec<usize> {
-    let Some(d) = depth else {
+    if !depth.has_depth_evidence() {
         return Vec::new();
-    };
-    let median = median_depth(g, d);
+    }
     let mut ends: FxHashMap<(usize, bool), std::collections::BTreeSet<(Oriented, Oriented)>> =
         FxHashMap::default();
     let mut touches = vec![false; g.seqs.len()];
@@ -1098,7 +1148,7 @@ fn ambiguous_repeats(
         .filter(|&s| {
             !repeat[s]
                 && touches[s]
-                && d[s] >= AMBIGUOUS_FOLD * median
+                && depth.at_least(s, AMBIGUOUS_FOLD)
                 && g.seqs[s].len() <= max_len
                 && branching(s, true)
                 && branching(s, false)
@@ -1344,6 +1394,9 @@ pub struct EvidenceReport {
     pub segment_depths: Option<BTreeMap<String, f64>>,
     /// Length-weighted median of `segment_depths`.
     pub median_depth: Option<f64>,
+    /// Candidate-flank tag ranges, only when explicitly requested. Missing ranges are unresolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_depth_calibration: Option<FlankCalibration>,
     /// Unique -> repeat(s) -> unique paths observed in single reads, most supported first.
     pub phased_paths: Vec<Traversal>,
     /// Maximal consecutive junction chains observed within individual reads. Each path is
@@ -1408,6 +1461,19 @@ pub fn run(
     p: EvidenceParams,
     out: &Path,
 ) -> Result<EvidenceReport> {
+    run_with_flank_calibration(gfa, inputs, p, out, false)
+}
+
+pub(crate) fn run_with_flank_calibration(
+    gfa: &Path,
+    inputs: Vec<PathBuf>,
+    p: EvidenceParams,
+    out: &Path,
+    flank_repeat_depth: bool,
+) -> Result<EvidenceReport> {
+    if flank_repeat_depth && p.short_read_adjacency {
+        bail!("flank repeat depth requires long-read crossings without short-read adjacency");
+    }
     let t0 = Instant::now();
     let g = parse_gfa(gfa)?;
     let gfa_text = fs::read_to_string(gfa)?;
@@ -1526,8 +1592,15 @@ pub fn run(
         .zip(&adjacency_reads)
         .map(|(&crossing, &adjacency)| crossing > 0 || adjacency > 0)
         .collect();
-    let mut repeat = repeat_segments(&g, p.max_repeat_len, &supported_links, rdepths.as_deref());
-    let one_copy = single_copy_crossroads(&g, rdepths.as_deref());
+    let calibration = flank_repeat_depth.then(|| {
+        FlankCalibration::new(&g, &gfa_text, &thread_counter, REPEAT_FOLD)
+    });
+    let repeat_depth = RepeatDepth::new(&g, rdepths.as_deref(),
+        calibration.as_ref().map(|(_, _, median)| median.as_slice()));
+    let mean_depth = RepeatDepth::new(&g, depths.as_deref(),
+        calibration.as_ref().map(|(_, mean, _)| mean.as_slice()));
+    let mut repeat = repeat_segments(&g, p.max_repeat_len, &supported_links, &repeat_depth);
+    let one_copy = single_copy_crossroads(&g, &repeat_depth);
     for ((r, c), one) in repeat.iter_mut().zip(crossroads(&g, &link_reads)).zip(one_copy) {
         *r |= c && !one;
     }
@@ -1536,7 +1609,7 @@ pub fn run(
         &repeat,
         &link_reads,
         &link_ambiguous,
-        depths.as_deref(),
+        &mean_depth,
         p.max_repeat_len,
     );
     for &s in &ambiguous {
@@ -1709,6 +1782,7 @@ pub fn run(
             .as_ref()
             .map(|d| g.names.iter().cloned().zip(d.iter().copied()).collect()),
         median_depth: depths.as_deref().map(|d| median_depth(&g, d)),
+        repeat_depth_calibration: calibration.map(|(report, _, _)| report),
         repeat_segments: (0..g.seqs.len())
             .filter(|&s| repeat[s])
             .map(|s| g.names[s].clone())
@@ -2064,13 +2138,13 @@ mod tests {
     fn repeats_are_branching_segments_within_the_length_limit() {
         let (g, _) = repeat_chain();
         assert_eq!(
-            repeat_segments(&g, 20_000, &[true; 5], None),
+            repeat_segments(&g, 20_000, &[true; 5], &RepeatDepth::legacy(&g, None)),
             vec![false, true, true, false, false, false]
         );
-        assert_eq!(repeat_segments(&g, 1000, &[true; 5], None), vec![false; 6]);
+        assert_eq!(repeat_segments(&g, 1000, &[true; 5], &RepeatDepth::legacy(&g, None)), vec![false; 6]);
         // Without reads on Z -> R1, R1 no longer branches.
         assert_eq!(
-            repeat_segments(&g, 20_000, &[true, false, true, true, true], None),
+            repeat_segments(&g, 20_000, &[true, false, true, true, true], &RepeatDepth::legacy(&g, None)),
             vec![false, false, true, false, false, false]
         );
     }
@@ -2081,7 +2155,7 @@ mod tests {
         // R1 at 2x depth stays a repeat; R2 branches too but sits at unique-segment depth.
         let depth = [100.0, 200.0, 105.0, 100.0, 95.0, 100.0];
         assert_eq!(
-            repeat_segments(&g, 20_000, &[true; 5], Some(&depth)),
+            repeat_segments(&g, 20_000, &[true; 5], &RepeatDepth::legacy(&g, Some(&depth))),
             vec![false, true, false, false, false, false]
         );
         let text = "S\tX\tACGT\tdp:f:10\nS\tR1\tACGT\tKC:i:80\nS\tR2\tACGT\n";
@@ -2107,7 +2181,7 @@ mod tests {
         // Both repeat segments exceed the topology-only limit. Their copy-depth evidence
         // still excludes them from the single-copy anchors used for representative paths.
         assert_eq!(
-            repeat_segments(&g, 1000, &[true; 5], Some(&depth)),
+            repeat_segments(&g, 1000, &[true; 5], &RepeatDepth::legacy(&g, Some(&depth))),
             vec![false, true, true, false, false, false]
         );
     }
@@ -2116,7 +2190,7 @@ mod tests {
     fn a_read_across_two_repeats_gives_one_phased_path() {
         let (g, [x, r1, r2, y, ..]) = repeat_chain();
         let idx = build_index(&g, &params());
-        let repeat = repeat_segments(&g, 20_000, &[true; 5], None);
+        let repeat = repeat_segments(&g, 20_000, &[true; 5], &RepeatDepth::legacy(&g, None));
         let read = cat(&[&x[1200..], &r1, &r2, &y[..900]]);
         for read in [read.clone(), revcomp(&read)] {
             let (cs, _) = assign(&g, crossings(&read, &idx, &params()), 0.05);
@@ -2531,7 +2605,44 @@ mod tests {
         };
         // X single-copy; S short (its depth is noise); R at 1.37x, a two-copy repeat (Geg-14)
         let depth = [110.0, 101.0, 95.0, 151.0];
-        assert_eq!(single_copy_crossroads(&g, Some(&depth)), vec![true, true, false, false]);
-        assert_eq!(single_copy_crossroads(&g, None), vec![false; 4]);
+        assert_eq!(single_copy_crossroads(&g, &RepeatDepth::legacy(&g, Some(&depth))), vec![true, true, false, false]);
+        assert_eq!(single_copy_crossroads(&g, &RepeatDepth::legacy(&g, None)), vec![false; 4]);
+    }
+}
+
+#[cfg(test)]
+mod flank_depth_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn an_inconclusive_flank_range_preserves_the_topology_only_fallback() {
+        let candidate = [Measure {
+            segment_depth: Some(80.0),
+            anchor_range: Some(crate::repeat_depth::Bounds { minimum: 80.0, maximum: 80.0 }),
+            direct_comparator: true,
+            reciprocal_comparator: false,
+            repeated_visit_records: 0,
+        }];
+        let depth = RepeatDepth { values: None, median: 0.0, flanks: Some(&candidate) };
+        assert!(depth.at_least_or(0, REPEAT_FOLD, true));
+        assert!(!depth.at_least(0, REPEAT_FOLD));
+    }
+
+    #[test]
+    fn repeat_promotion_needs_bilateral_depth_and_multiple_revisited_records() {
+        let range = crate::repeat_depth::Bounds { minimum: 9.0, maximum: 10.0 };
+        for (direct, visits, expected) in [(false, 0, false), (false, 2, false),
+                                          (true, 0, false), (true, 1, false), (true, 2, true)] {
+            let candidate = [Measure {
+                segment_depth: Some(22.0),
+                anchor_range: Some(range),
+                direct_comparator: direct,
+                reciprocal_comparator: !direct,
+                repeated_visit_records: visits,
+            }];
+            let depth = RepeatDepth { values: Some(&[22.0]), median: 22.0, flanks: Some(&candidate) };
+            assert_eq!(depth.at_least(0, REPEAT_FOLD), expected);
+            assert_eq!(depth.at_most(0, CROSSROAD_ONE_COPY), !expected);
+        }
     }
 }
