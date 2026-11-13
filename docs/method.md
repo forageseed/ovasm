@@ -211,6 +211,14 @@ Every registered `windows` entry provides an ID, reference ID, record ID, half-o
 reference interval, interior boundary coordinate, and a locked `provenance` file.
 Select intervals that cross source-informative boundaries before evaluating crops.
 
+The audit uses the Rust exact batch scanner in the OVASM executable found on PATH.
+Supply `--exact-placement-bin /path/to/ovasm` to select a particular build that
+includes the scanner. The scanner streams the locked sequences and preserves
+placement order, the two-hit limit, the JSON report, and the retained FASTA.
+The audit fails before publication if the executable cannot run or the response is
+invalid or incomplete. To run the Python comparison backend explicitly, pass
+`--python-placements`.
+
 `--out-fasta RETAINED.fa` writes a separate FASTA that omits crops with a supported competing
 context. It preserves target-supported and unresolved records byte for byte. The audit
 records exact placements in the named panel, both strands, and uncertainty from repeated
@@ -227,6 +235,17 @@ ambiguous, mixed or competing evidence leaves the crop out of the strict view.
 An empty strict view is reportable. OVASM requires at least one qualifying crop
 for that organelle before starting recruitment.
 
+For a stricter panel-scope check, add `--require-reference-roles` with
+`--retention-policy target-supported-only`. The manifest must declare a
+`required_reference_roles` list containing the target and `nuclear`; a plastid
+target also requires `mitochondrion`. To require plastid competition for a
+plant mitochondrial target, explicitly include `plastid` in that list; the
+check does not infer biological lineage. Assign each reference a `source_role`
+(`mitochondrion`, `plastid`, `nuclear`, or `unplaced`) consistent with its
+existing `target` or `competing` role. Missing required roles leave every crop
+unresolved and retain none. These roles are user-declared: their presence does
+not establish reference completeness or prove physical origin.
+
 For an audited view prepared with a manifest target of `mitochondrion` or `plastid`, pass
 the retained FASTA to normal seed recruitment. Supply the audit with the same organelle.
 
@@ -242,6 +261,25 @@ in the named audit panel and applies to the organelle named on the command. It u
 a copy of the verified bytes in the run directory and records the audit in
 `summary.json` under `seed_database.seed_source_audit`. The audit describes the source
 comparison that produced the seed view. The run may use a different reads file.
+
+#### Inspect protein candidates outside the depth gate
+
+Use `ovasm find protein-seeds --whole-read-candidates` to scan all input reads for candidate crops with the same per-read
+protein criteria as the ordinary fallback. This mode can recover candidates even
+when a depth cluster would already supply a seed file. It writes `protein_whole_read_candidates.json` and
+a candidate FASTA for each organelle with exported crops in a new output directory.
+Source qualification is pending. The JSON records complete scan counts and
+paired orientation evidence before the export cap.
+
+The cap defaults to 3,000 input FASTX records per organelle. Set `--whole-read-candidate-cap N` to
+change the number of crops exported. The report gives eligible, exported and
+omitted counts independently for each role, and marks truncation only where the
+cap omitted a crop. Export is in merged input batch order by default. Use
+`--whole-read-export-order stable-record` for order-stable capped export; see
+[protein candidate export](protein-candidate-export.md) for its temporary disk
+use and duplicate-record semantics. Candidate crops can
+include nuclear homologs and shared sequence. Use source-specific evidence on
+the original reads to qualify any crops before using them as seeds.
 
 #### Recover original records from candidate crops
 

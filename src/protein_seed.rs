@@ -8,11 +8,10 @@
 //! organelle proteins were found at once (leave-out test, 2026-11-05). Protein sequence stays
 //! recognisable far beyond nucleotide k-mers, so the seeds are taken from the reads themselves:
 //!
-//! 1. Depth: only organelle-like reads (`DepthGate`: deep and uniformly deep along the read, the
-//!    test of `find discover`) are looked at, so nuclear copies of organelle genes (NUMTs and
-//!    NUPTs, at nuclear depth) never start a seed.
-//! 2. Clusters: those reads are split by their median depth into depth peaks (`find discover`'s
-//!    clusters; a plastid and a mitochondrion form separate peaks).
+//! 1. Depth: the cluster scan starts from reads with deep and uniform sampled k-mer counts
+//!    (`DepthGate`, the test of `find discover`). Equal-depth or high-copy nuclear homologs
+//!    can pass this gate. The whole-read fallback also scans reads outside the gate.
+//! 2. Clusters: those reads are grouped by median depth. Sources can share a depth cluster.
 //! 3. Proteins: up to `sample` reads of each cluster are translated in six frames and their
 //!    stop-free stretches assigned to the protein panel's genes (`ovasm find classify`).
 //! 4. Reads: a read is of a class when at least `min_read_stretches` of its gene stretches are of
@@ -31,7 +30,9 @@
 //! counts in the control seeds nothing there (`class_seeds`). An organelle
 //! without a called cluster gets no protein seeds; `run` then seeds it from the library.
 
-use std::io::Write;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -39,9 +40,10 @@ use anyhow::Result;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::panel::{self, ClassReport, Panel, PanelParams};
-use crate::recruit::{peak_rss_mb, read_batches};
+use crate::recruit::{peak_rss_mb, read_batches, Rec};
 use crate::seedfree::{depth_peaks, DepthGate, GateReport};
 
 pub const ORGANELLES: [&str; 2] = ["mitochondrion", "plastid"];
@@ -53,10 +55,26 @@ pub enum SeedMode {
     PairedCandidates,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleOrder {
+    #[default]
+    Legacy,
+    StableRecord,
+}
+
+impl SampleOrder {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProteinSeedParams {
-    /// Reads scanned per depth cluster at most (evenly spread over the cluster).
+    /// Maximum input-record occurrences scanned per depth cluster.
     pub sample: usize,
+    #[serde(skip_serializing_if = "SampleOrder::is_legacy")]
+    pub sample_order: SampleOrder,
     /// Bases kept on each side of a seed read's gene stretches.
     pub flank: usize,
     /// Reads a depth peak needs to become a cluster.
@@ -79,6 +97,7 @@ impl Default for ProteinSeedParams {
     fn default() -> Self {
         Self {
             sample: 3000,
+            sample_order: SampleOrder::Legacy,
             flank: 2000,
             min_cluster_reads: 20,
             min_read_stretches: 2,
@@ -183,6 +202,8 @@ pub struct ClusterCall {
     /// The sequence those reads stand for: their bases over the depth (`MIN_CLUSTER_SPAN`).
     pub span_bp: u64,
     pub scanned: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stable_sample: Option<StableSampleReport>,
     /// Each class's genes by their stretches in excess of the reversed control's
     /// (`excess_over_control`); the densities and the call are of these.
     pub mitochondrion: ClassReport,
@@ -373,8 +394,7 @@ fn nearest(peaks: &[f64], median: f64) -> usize {
         .expect("peaks is not empty")
 }
 
-/// Which organelle-like reads are scanned: for each cluster, every `step`-th of its reads (in
-/// input order) up to `sample`, `step` spreading the sample over the whole cluster.
+/// Legacy selection: every `step`-th record in cluster input order, up to `sample`.
 fn sample_reads(
     candidates: &[(u64, usize)],
     clusters: usize,
@@ -411,6 +431,219 @@ fn read_class(genes: &[u16], panel: &Panel, min: usize) -> Option<&'static str> 
     } else {
         None
     }
+}
+
+const RECORD_PRIORITY_VERSION: &str = "sha256_raw_fastx_record_v1";
+
+struct RankedRecord {
+    digest: [u8; 32],
+    raw: Rec,
+}
+
+impl RankedRecord {
+    fn new(raw: Rec) -> Self {
+        Self { digest: raw_record_priority(&raw), raw }
+    }
+}
+
+fn raw_record_priority(raw: &Rec) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"ovasm.protein-cluster-sample.v1\0");
+    for field in [&raw.id, &raw.seq] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    match &raw.qual {
+        None => hash.update([0]),
+        Some(quality) => {
+            hash.update([1]);
+            hash.update((quality.len() as u64).to_be_bytes());
+            hash.update(quality);
+        }
+    }
+    hash.finalize().into()
+}
+
+impl Ord for RankedRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.digest.cmp(&other.digest)
+            .then_with(|| self.raw.id.cmp(&other.raw.id))
+            .then_with(|| self.raw.seq.cmp(&other.raw.seq))
+            .then_with(|| self.raw.qual.cmp(&other.raw.qual))
+    }
+}
+
+impl PartialOrd for RankedRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedRecord {}
+
+struct Multiplicity {
+    selected: usize,
+    observed: usize,
+}
+
+#[derive(Serialize)]
+struct StableSampleReport {
+    priority: &'static str,
+    eligible_record_occurrences: usize,
+    selected_record_occurrences: usize,
+    selected_distinct_exact_records: usize,
+    selected_repeated_exact_records: usize,
+    selected_occurrences_of_repeated_records: usize,
+    observed_occurrences_of_selected_repeated_records: usize,
+    exact_records_split_at_cutoff: usize,
+    selected_ids_with_distinct_exact_records: usize,
+    selected_sequences_with_distinct_ids: usize,
+}
+
+/// Keep the lowest-priority record occurrences. Identical records share storage while each
+/// occurrence still counts against the limit and is scanned if selected.
+#[derive(Default)]
+struct StableSample {
+    picked: BTreeMap<RankedRecord, Multiplicity>,
+    selected: usize,
+    eligible: usize,
+}
+
+impl StableSample {
+    fn offer(&mut self, record: RankedRecord, cap: usize) {
+        self.eligible += 1;
+        if cap == 0 {
+            return;
+        }
+        // The worst selected priority can only improve. An identity still selected at the
+        // end could never have been discarded entirely, so its observed count is exact.
+        if let Some(counts) = self.picked.get_mut(&record) {
+            counts.observed += 1;
+        }
+        if self.selected == cap {
+            let mut worst = self.picked.last_entry().expect("the full sample has a record");
+            if &record >= worst.key() {
+                return;
+            }
+            worst.get_mut().selected -= 1;
+            if worst.get().selected == 0 {
+                worst.remove_entry();
+            }
+        } else {
+            self.selected += 1;
+        }
+        self.picked.entry(record)
+            .and_modify(|counts| counts.selected += 1)
+            .or_insert(Multiplicity { selected: 1, observed: 1 });
+    }
+
+    fn finish(self) -> (Vec<Rec>, StableSampleReport) {
+        let mut ids = FxHashMap::default();
+        let mut sequences = FxHashMap::default();
+        let mut report = StableSampleReport {
+            priority: RECORD_PRIORITY_VERSION,
+            eligible_record_occurrences: self.eligible,
+            selected_record_occurrences: self.selected,
+            selected_distinct_exact_records: self.picked.len(),
+            selected_repeated_exact_records: 0,
+            selected_occurrences_of_repeated_records: 0,
+            observed_occurrences_of_selected_repeated_records: 0,
+            exact_records_split_at_cutoff: 0,
+            selected_ids_with_distinct_exact_records: 0,
+            selected_sequences_with_distinct_ids: 0,
+        };
+        for (record, counts) in &self.picked {
+            let id = record.raw.id.as_slice();
+            *ids.entry(id).or_insert(0usize) += 1;
+            let (first_id, multiple_ids) = sequences.entry(record.raw.seq.as_slice()).or_insert((id, false));
+            *multiple_ids |= *first_id != id;
+            if counts.observed > 1 {
+                report.selected_repeated_exact_records += 1;
+                report.selected_occurrences_of_repeated_records += counts.selected;
+                report.observed_occurrences_of_selected_repeated_records += counts.observed;
+                report.exact_records_split_at_cutoff += usize::from(counts.selected < counts.observed);
+            }
+        }
+        report.selected_ids_with_distinct_exact_records = ids.values().filter(|&&n| n > 1).count();
+        report.selected_sequences_with_distinct_ids = sequences.values().filter(|(_, multiple)| *multiple).count();
+        let mut reads = Vec::with_capacity(self.selected);
+        for (record, counts) in self.picked {
+            let mut raw = record.raw;
+            raw.qual = None; // Quality binds the ranking key; translation uses only sequence.
+            reads.extend(std::iter::repeat_with(|| raw.clone()).take(counts.selected - 1));
+            reads.push(raw);
+        }
+        (reads, report)
+    }
+}
+
+/// Visit the eligible ordinals in the existing FASTX pass. The ordinal locates an observation
+/// in this pass; it never ranks it or resolves different exact records with equal hashes.
+fn stable_cluster_samples(
+    inputs: &[PathBuf],
+    candidates: Vec<(u64, usize)>,
+    expected_reads: u64,
+    clusters: usize,
+    cap: usize,
+) -> Result<Vec<StableSample>> {
+    let mut samples: Vec<_> = (0..clusters).map(|_| StableSample::default()).collect();
+    if candidates.is_empty() {
+        return Ok(samples);
+    }
+    let mut candidates = candidates.into_iter().peekable();
+    let (rx, reader) = read_batches(inputs);
+    let mut ordinal = 0u64;
+    for batch in rx {
+        let first = ordinal;
+        ordinal += batch.len() as u64;
+        let eligible: Vec<_> = batch.into_iter().enumerate().filter_map(|(i, record)| {
+            if candidates.peek().is_some_and(|&(o, _)| o == first + i as u64) {
+                let (_, cluster) = candidates.next().expect("matched eligible ordinal");
+                Some((cluster, record))
+            } else {
+                None
+            }
+        }).collect();
+        let ranked: Vec<_> = eligible.into_par_iter()
+            .map(|(cluster, record)| (cluster, RankedRecord::new(record))).collect();
+        for (cluster, record) in ranked {
+            samples[cluster].offer(record, cap);
+        }
+    }
+    reader.join().expect("reader thread panicked")?;
+    anyhow::ensure!(
+        ordinal == expected_reads && candidates.next().is_none(),
+        "protein seed input record count changed between depth and sampling passes"
+    );
+    Ok(samples)
+}
+
+fn scan_records(
+    mine: Vec<(usize, Rec)>,
+    panel: &Panel,
+    p: &ProteinSeedParams,
+) -> Vec<Scanned> {
+    mine.into_par_iter()
+        .map_init(
+            || vec![0u32; panel.gene_count()],
+            |hits, (cluster, r)| {
+                let stretches = panel::gene_stretches(&r.seq, panel, &p.panel, hits);
+                let reversed: Vec<u8> = r.seq.iter().rev().copied().collect();
+                let control = panel::gene_stretches(&reversed, panel, &p.panel, hits)
+                    .into_iter()
+                    .map(|x| x.0)
+                    .collect();
+                let read = (!stretches.is_empty()).then(|| (r.id, r.seq));
+                Scanned { cluster, stretches, control, read }
+            },
+        )
+        .collect()
 }
 
 /// The seed of a read: the span of its stretches of `organelle`'s genes plus `flank` bases each
@@ -655,47 +888,34 @@ pub fn run(
         cluster_reads[c] += 1;
         cluster_bases[c] += len;
     }
-    let picked = sample_reads(&candidates, peaks.len(), p.sample);
-    drop(candidates);
-
-    // pass 4: the sampled reads' gene stretches
+    // Pass 4: sample eligible records and scan their gene stretches.
     let mut scanned: Vec<Scanned> = Vec::new();
-    if !picked.is_empty() {
-        let (rx, reader) = read_batches(inputs);
-        let mut ordinal = 0u64;
-        for batch in rx {
-            let first = ordinal;
-            ordinal += batch.len() as u64;
-            let mine: Vec<(usize, crate::recruit::Rec)> = batch
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| picked.get(&(first + i as u64)).map(|&c| (c, r)))
-                .collect();
-            let done: Vec<Scanned> = mine
-                .into_par_iter()
-                .map_init(
-                    || vec![0u32; panel.gene_count()],
-                    |hits, (cluster, r)| {
-                        let stretches = panel::gene_stretches(&r.seq, panel, &p.panel, hits);
-                        let reversed: Vec<u8> = r.seq.iter().rev().copied().collect();
-                        let control = panel::gene_stretches(&reversed, panel, &p.panel, hits)
-                            .into_iter()
-                            .map(|x| x.0)
-                            .collect();
-                        let read = (!stretches.is_empty()).then(|| (r.id, r.seq));
-                        Scanned {
-                            cluster,
-                            stretches,
-                            control,
-                            read,
-                        }
-                    },
-                )
-                .collect();
-            scanned.extend(done);
+    let mut stable_reports = Vec::new();
+    if p.sample_order == SampleOrder::StableRecord {
+        let samples = stable_cluster_samples(inputs, candidates, reads, peaks.len(), p.sample)?;
+        for (cluster, sample) in samples.into_iter().enumerate() {
+            let (reads, report) = sample.finish();
+            scanned.extend(scan_records(reads.into_iter().map(|r| (cluster, r)).collect(), panel, p));
+            stable_reports.push(report);
         }
-        reader.join().expect("reader thread panicked")?;
+    } else {
+        let picked = sample_reads(&candidates, peaks.len(), p.sample);
+        drop(candidates);
+        if !picked.is_empty() {
+            let (rx, reader) = read_batches(inputs);
+            let mut ordinal = 0u64;
+            for batch in rx {
+                let first = ordinal;
+                ordinal += batch.len() as u64;
+                let mine = batch.into_iter().enumerate()
+                    .filter_map(|(i, r)| picked.get(&(first + i as u64)).map(|&c| (c, r)))
+                    .collect();
+                scanned.extend(scan_records(mine, panel, p));
+            }
+            reader.join().expect("reader thread panicked")?;
+        }
     }
+    let mut stable_reports = stable_reports.into_iter();
 
     // calls and seeds
     let mut fasta: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
@@ -800,6 +1020,7 @@ pub fn run(
             reads: cluster_reads[c],
             span_bp: span.round() as u64,
             scanned: n,
+            stable_sample: stable_reports.next(),
             mitochondrion,
             plastid,
             mitochondrion_density: md,
@@ -969,26 +1190,15 @@ impl WholeReadAudit {
     }
 }
 
-/// Whole reads as seeds for `organelles`, from a scan of every read: a read is a seed when its
-/// stretches make it of the organelle's class (`read_class`) and cover at least
-/// `WHOLE_READ_MIN_GENES` distinct genes. For reads where the organelle is not deeper than the
-/// nucleus (the PMAT2 benchmark's read amounts: Orcinus orca 19 mitochondrial reads in 1 Gb, about
-/// 6x; Sterechinus neumayeri 9 in 2.5 Gb), which the depth gate cannot set apart.
-fn whole_read_seeds(
+/// Scan each read with the existing fallback qualifier, then handle eligible crops in input order.
+fn scan_whole_read_hits(
     inputs: &[PathBuf],
     panel: &Panel,
     p: &ProteinSeedParams,
     organelles: &[&'static str],
-    out_dir: &Path,
-    gate: &DepthGate,
     audit_gene_sets: bool,
-) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
-    let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
-    let t0 = Instant::now();
-    let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> =
-        FxHashMap::default();
-    let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
-        Default::default();
+    mut visit: impl FnMut(&crate::recruit::Rec, WholeReadHit) -> Result<()>,
+) -> Result<(u64, u64, Option<WholeReadGeneEvidence>)> {
     let (mut reads, mut bases) = (0u64, 0u64);
     let mut audit = audit_gene_sets.then(|| WholeReadAudit::new(panel.gene_count()));
     let strict = PanelParams {
@@ -1027,35 +1237,72 @@ fn whole_read_seeds(
             if let (Some(audit), Some(evidence)) = (&mut audit, evidence) {
                 audit.add(panel, evidence);
             }
-            let Some(WholeReadHit { class, lo, hi }) = forward else { continue };
-            let c = n.entry(class).or_insert(0);
-            if *c >= WHOLE_READ_MAX_SEEDS {
-                continue;
-            }
-            if !writers.contains_key(class) {
-                let path = out_dir.join(format!("protein_seeds.{class}.fasta"));
-                writers.insert(class, std::io::BufWriter::new(std::fs::File::create(&path)?));
-            }
-            let w = writers.get_mut(class).expect("just inserted");
-            let r = &batch[i];
-            w.write_all(b">")?;
-            w.write_all(r.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&r.id))?;
-            writeln!(w, " whole_read_scan span={lo}-{hi}")?;
-            w.write_all(&r.seq[lo..hi])?;
-            w.write_all(b"\n")?;
-            *c += 1;
-            *b.entry(class).or_insert(0) += (hi - lo) as u64;
-            if seed_above_gate(gate, &r.seq, lo, hi) {
-                *above.entry(class).or_insert(0) += 1;
+            if let Some(hit) = forward {
+                visit(&batch[i], hit)?;
             }
         }
     }
     reader.join().expect("reader thread panicked")?;
-    for (_, mut w) in writers {
-        w.flush()?;
+    let evidence = audit.map(|a| a.report(panel, organelles, p.panel.min_gene_segments));
+    Ok((reads, bases, evidence))
+}
+
+fn write_whole_read_crop(
+    writer: &mut impl Write,
+    read: &crate::recruit::Rec,
+    tag: &str,
+    lo: usize,
+    hi: usize,
+) -> Result<()> {
+    writer.write_all(b">")?;
+    writer.write_all(read.id.split(|&x| x == b' ' || x == b'\t').next().unwrap_or(&read.id))?;
+    writeln!(writer, " {tag} span={lo}-{hi}")?;
+    writer.write_all(&read.seq[lo..hi])?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+/// Whole reads as seeds for roles without a called depth cluster.
+fn whole_read_seeds(
+    inputs: &[PathBuf],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    organelles: &[&'static str],
+    out_dir: &Path,
+    gate: &DepthGate,
+    audit_gene_sets: bool,
+) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
+    let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
+    let t0 = Instant::now();
+    let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> = FxHashMap::default();
+    let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
+        Default::default();
+    let (reads, bases, paired_gene_evidence) = scan_whole_read_hits(
+        inputs, panel, p, organelles, audit_gene_sets,
+        |read, WholeReadHit { class, lo, hi }| {
+            let count = n.entry(class).or_insert(0);
+            if *count >= WHOLE_READ_MAX_SEEDS {
+                return Ok(());
+            }
+            if !writers.contains_key(class) {
+                let path = out_dir.join(format!("protein_seeds.{class}.fasta"));
+                writers.insert(class, std::io::BufWriter::new(std::fs::File::create(path)?));
+            }
+            let writer = writers.get_mut(class).expect("seed writer is present");
+            write_whole_read_crop(writer, read, "whole_read_scan", lo, hi)?;
+            *count += 1;
+            *b.entry(class).or_insert(0) += (hi - lo) as u64;
+            if seed_above_gate(gate, &read.seq, lo, hi) {
+                *above.entry(class).or_insert(0) += 1;
+            }
+            Ok(())
+        },
+    )?;
+    for (_, mut writer) in writers {
+        writer.flush()?;
     }
-    for &o in organelles {
-        n.entry(o).or_insert(0);
+    for &organelle in organelles {
+        n.entry(organelle).or_insert(0);
     }
     Ok((
         WholeReadScan {
@@ -1066,17 +1313,368 @@ fn whole_read_seeds(
             seed_reads_above_gate: above,
             gate_without_nucleus: gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME,
             seconds: t0.elapsed().as_secs_f64(),
-            paired_gene_evidence: audit.map(|audit| {
-                audit.report(panel, organelles, p.panel.min_gene_segments)
-            }),
+            paired_gene_evidence,
         },
         b,
     ))
 }
 
+const WHOLE_READ_CANDIDATE_FILE: &str = "protein_whole_read_candidates";
+
+/// Order canonical FASTA records by bytes without retaining long crops in memory.
+fn compare_spooled_crops(left: &Path, right: &Path) -> Result<Ordering> {
+    let mut left = BufReader::new(std::fs::File::open(left)?);
+    let mut right = BufReader::new(std::fs::File::open(right)?);
+    loop {
+        let a = left.fill_buf()?;
+        let b = right.fill_buf()?;
+        let length = a.len().min(b.len());
+        if length == 0 {
+            return Ok(a.len().cmp(&b.len()));
+        }
+        let order = a[..length].cmp(&b[..length]);
+        if order != Ordering::Equal {
+            return Ok(order);
+        }
+        left.consume(length);
+        right.consume(length);
+    }
+}
+
+struct SpooledCrop {
+    slot: u64,
+    bytes: u64,
+    bases: usize,
+    occurrences: usize,
+}
+
+#[derive(Serialize)]
+struct StableCropExportReport {
+    retained_distinct_priority_crops: usize,
+    spool_writes: u64,
+    peak_spooled_payload_bytes: u64,
+}
+
+/// Hold only the lowest-priority occurrences for a role. Payloads stay in the staging
+/// directory. Identical priority and output bytes share one spool file and occupy
+/// one slot per occurrence.
+struct StableCropExport {
+    root: PathBuf,
+    cap: usize,
+    picked: BTreeMap<[u8; 32], Vec<SpooledCrop>>,
+    count: usize,
+    writes: u64,
+    payload_bytes: u64,
+    peak_bytes: u64,
+}
+
+impl StableCropExport {
+    fn new(root: PathBuf, cap: usize) -> Result<Self> {
+        std::fs::create_dir(&root)?;
+        Ok(Self {
+            root,
+            cap,
+            picked: BTreeMap::new(),
+            count: 0,
+            writes: 0,
+            payload_bytes: 0,
+            peak_bytes: 0,
+        })
+    }
+
+    fn offer(&mut self, read: &Rec, lo: usize, hi: usize) -> Result<()> {
+        self.offer_ranked(raw_record_priority(read), read, lo, hi)
+    }
+
+    fn offer_ranked(&mut self, key: [u8; 32], read: &Rec, lo: usize, hi: usize) -> Result<()> {
+        let full = self.count == self.cap;
+        if full && key > *self.picked.last_key_value().expect("full candidate sample").0 {
+            return Ok(());
+        }
+        let slot = self.writes;
+        let path = self.root.join(slot.to_string());
+        let file = std::fs::File::create_new(&path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        write_whole_read_crop(&mut writer, read, "whole_read_candidates", lo, hi)?;
+        writer.flush()?;
+        let bytes = writer.get_ref().metadata()?.len();
+        drop(writer);
+        self.writes += 1;
+        self.payload_bytes += bytes;
+        self.peak_bytes = self.peak_bytes.max(self.payload_bytes);
+
+        if full {
+            let mut last = self.picked.last_entry().expect("full candidate sample");
+            let same_rank = key == *last.key();
+            let worst = last.get_mut().last_mut().expect("nonempty rank bucket");
+            if same_rank
+                && compare_spooled_crops(&path, &self.root.join(worst.slot.to_string()))? != Ordering::Less
+            {
+                std::fs::remove_file(&path)?;
+                self.payload_bytes -= bytes;
+                return Ok(());
+            }
+            worst.occurrences -= 1;
+            if worst.occurrences == 0 {
+                std::fs::remove_file(self.root.join(worst.slot.to_string()))?;
+                self.payload_bytes -= worst.bytes;
+                last.get_mut().pop();
+                if last.get().is_empty() {
+                    last.remove_entry();
+                }
+            }
+        } else {
+            self.count += 1;
+        }
+
+        let bucket = self.picked.entry(key).or_default();
+        let mut index = 0;
+        while let Some(existing) = bucket.get_mut(index) {
+            match compare_spooled_crops(&path, &self.root.join(existing.slot.to_string()))? {
+                Ordering::Less => break,
+                Ordering::Equal => {
+                    existing.occurrences += 1;
+                    std::fs::remove_file(&path)?;
+                    self.payload_bytes -= bytes;
+                    return Ok(());
+                }
+                Ordering::Greater => index += 1,
+            }
+        }
+        bucket.insert(index, SpooledCrop { slot, bytes, bases: hi - lo, occurrences: 1 });
+        Ok(())
+    }
+
+    fn finish(self, mut writer: impl Write) -> Result<(usize, u64, StableCropExportReport)> {
+        let report = StableCropExportReport {
+            retained_distinct_priority_crops: self.picked.values().map(Vec::len).sum(),
+            spool_writes: self.writes,
+            peak_spooled_payload_bytes: self.peak_bytes,
+        };
+        let mut bases = 0;
+        for crop in self.picked.into_values().flatten() {
+            let path = self.root.join(crop.slot.to_string());
+            for _ in 0..crop.occurrences {
+                let written = std::io::copy(&mut std::fs::File::open(&path)?, &mut writer)?;
+                anyhow::ensure!(written == crop.bytes, "staged candidate crop size changed");
+                bases += crop.bases as u64;
+            }
+            std::fs::remove_file(path)?;
+        }
+        std::fs::remove_dir(self.root)?;
+        Ok((self.count, bases, report))
+    }
+}
+
+
+#[derive(Default, Serialize)]
+struct WholeReadCandidateRole {
+    indexed_families: usize,
+    eligible_records: u64,
+    exported_records: usize,
+    exported_bases: u64,
+    omitted_by_cap: u64,
+    truncated: bool,
+    candidate_fasta: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stable_export: Option<StableCropExportReport>,
+}
+
+#[derive(Serialize)]
+pub struct WholeReadCandidateReport {
+    schema: &'static str,
+    source_qualification: &'static str,
+    scan_state: &'static str,
+    inputs: Vec<PathBuf>,
+    reads: u64,
+    bases: u64,
+    record_unit: &'static str,
+    export_order: &'static str,
+    min_stretch_hits: u32,
+    min_distinct_families: usize,
+    min_read_stretches: usize,
+    flank: usize,
+    export_cap_per_organelle: usize,
+    organelles: std::collections::BTreeMap<&'static str, WholeReadCandidateRole>,
+    panel_gene_sets: Vec<PanelGeneSet>,
+    paired_gene_evidence: Option<WholeReadGeneEvidence>,
+    elapsed_seconds: f64,
+    peak_rss_mb: Option<f64>,
+}
+
+impl WholeReadCandidateReport {
+    pub fn summary(&self) -> String {
+        let roles = self.organelles.iter()
+            .map(|(name, role)| format!("{name} {}/{}", role.exported_records, role.eligible_records))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "[ovasm] whole-read protein candidates: {roles} exported/eligible; source qualification pending ({:.1} s)",
+            self.elapsed_seconds
+        )
+    }
+}
+
+/// Independent source-pending candidates. This result is never consumed by normal seed recruitment.
+pub fn run_whole_read_candidates(
+    inputs: &[PathBuf],
+    panel: &Panel,
+    p: &ProteinSeedParams,
+    want: &[&'static str],
+    out_dir: &Path,
+    cap: usize,
+    export_order: SampleOrder,
+) -> Result<WholeReadCandidateReport> {
+    anyhow::ensure!(cap > 0, "--whole-read-candidate-cap must be at least 1");
+    if let Some(parent) = out_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(out_dir)?;
+    let staging = out_dir.join(".staging");
+    std::fs::create_dir(&staging)?;
+    let mut published = Vec::new();
+    let result = (|| -> Result<_> {
+        let t0 = Instant::now();
+        let gene_sets = panel_gene_sets(panel);
+        let mut roles: std::collections::BTreeMap<_, _> = want.iter().copied().map(|role| {
+            let indexed_families = gene_sets.iter()
+                .find(|row| row.organelle == role)
+                .map_or(0, |row| row.family_count);
+            (role, WholeReadCandidateRole { indexed_families, ..WholeReadCandidateRole::default() })
+        }).collect();
+        let mut writers = FxHashMap::default();
+        let mut stable = BTreeMap::new();
+        if export_order == SampleOrder::StableRecord {
+            for &role in want {
+                stable.insert(role, StableCropExport::new(staging.join(format!("{role}.spool")), cap)?);
+            }
+        }
+        let (reads, bases, paired_gene_evidence) = scan_whole_read_hits(
+            inputs, panel, p, want, true,
+            |read, WholeReadHit { class, lo, hi }| {
+                let role = roles.get_mut(class).expect("candidate role was requested");
+                role.eligible_records += 1;
+                if let Some(selected) = stable.get_mut(class) {
+                    return selected.offer(read, lo, hi);
+                }
+                if role.exported_records == cap {
+                    role.omitted_by_cap += 1;
+                    role.truncated = true;
+                    return Ok(());
+                }
+                if !writers.contains_key(class) {
+                    let filename = format!("{WHOLE_READ_CANDIDATE_FILE}.{class}.fasta");
+                    let file = std::fs::File::create_new(staging.join(&filename))?;
+                    writers.insert(class, std::io::BufWriter::new(file));
+                    role.candidate_fasta = Some(out_dir.join(filename));
+                }
+                let writer = writers.get_mut(class).expect("candidate writer is present");
+                write_whole_read_crop(writer, read, "whole_read_candidates", lo, hi)?;
+                role.exported_records += 1;
+                role.exported_bases += (hi - lo) as u64;
+                Ok(())
+            },
+        )?;
+        for (class, selected) in stable {
+            let role = roles.get_mut(class).expect("candidate role was requested");
+            let (records, bases, metrics) = if selected.count == 0 {
+                selected.finish(std::io::sink())?
+            } else {
+                let filename = format!("{WHOLE_READ_CANDIDATE_FILE}.{class}.fasta");
+                let mut writer = std::io::BufWriter::new(std::fs::File::create_new(staging.join(&filename))?);
+                let result = selected.finish(&mut writer)?;
+                role.candidate_fasta = Some(out_dir.join(filename));
+                writers.insert(class, writer);
+                result
+            };
+            role.exported_records = records;
+            role.exported_bases = bases;
+            role.omitted_by_cap = role.eligible_records - records as u64;
+            role.truncated = role.omitted_by_cap != 0;
+            role.stable_export = Some(metrics);
+        }
+        for (_, mut writer) in writers {
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        let report = WholeReadCandidateReport {
+            schema: "ovasm.whole-read-protein-candidates.v1",
+            source_qualification: "pending",
+            scan_state: "complete",
+            inputs: inputs.to_vec(),
+            reads,
+            bases,
+            record_unit: "input_fastx_record",
+            export_order: match export_order {
+                SampleOrder::Legacy => "merged_input_batch_order",
+                SampleOrder::StableRecord => RECORD_PRIORITY_VERSION,
+            },
+            min_stretch_hits: p.panel.min_hits.max(WHOLE_READ_MIN_HITS),
+            min_distinct_families: WHOLE_READ_MIN_GENES,
+            min_read_stretches: p.min_read_stretches,
+            flank: p.flank,
+            export_cap_per_organelle: cap,
+            organelles: roles,
+            panel_gene_sets: gene_sets,
+            paired_gene_evidence,
+            elapsed_seconds: t0.elapsed().as_secs_f64(),
+            peak_rss_mb: peak_rss_mb(),
+        };
+        let report_name = format!("{WHOLE_READ_CANDIDATE_FILE}.json");
+        let staged_report = staging.join(&report_name);
+        let mut json = std::fs::File::create_new(&staged_report)?;
+        serde_json::to_writer_pretty(&mut json, &report)?;
+        json.sync_all()?;
+        for role in report.organelles.values() {
+            if let Some(path) = &role.candidate_fasta {
+                let name = path.file_name().expect("candidate has a file name");
+                std::fs::hard_link(staging.join(name), path)?;
+                published.push(path.clone());
+            }
+        }
+        let final_report = out_dir.join(report_name);
+        std::fs::hard_link(staged_report, &final_report)?;
+        Ok(report)
+    })();
+    if result.is_err() {
+        for path in published {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let _ = std::fs::remove_dir_all(staging);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_candidate_spool_preserves_occurrences_and_breaks_exact_hash_ties() {
+        let root = std::env::temp_dir().join(format!("ovasm-stable-crop-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let names = [b"zeta".as_slice(), b"alpha", b"beta", b"alpha", b"alpha"];
+        let mut observed = Vec::new();
+        for (i, order) in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0]].into_iter().enumerate() {
+            let mut selected = StableCropExport::new(root.join(i.to_string()), 3).unwrap();
+            for n in order {
+                let raw = Rec { id: names[n].to_vec(), seq: b"ACGT".repeat(4097), qual: None };
+                selected.offer_ranked([0; 32], &raw, 0, raw.seq.len()).unwrap();
+                assert!(selected.count <= 3);
+                assert!(selected.picked.values().map(Vec::len).sum::<usize>() <= 3);
+            }
+            let mut output = Vec::new();
+            let (count, bases, report) = selected.finish(&mut output).unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(bases, 3 * 4 * 4097);
+            assert_eq!(report.retained_distinct_priority_crops, 1);
+            assert_eq!(output.split(|&b| b == b'\n').filter(|line| line.starts_with(b">alpha ")).count(), 3);
+            observed.push(output);
+        }
+        assert_eq!(observed[0], observed[1]);
+        std::fs::remove_dir(root).unwrap();
+    }
+
 
     #[test]
     fn reads_go_to_the_nearest_depth_peak() {
@@ -1105,6 +1703,63 @@ mod tests {
         assert_eq!(of(0), vec![0, 2, 5, 8]);
         // cluster 1 (3, 7, 11): fewer than the sample, all of them
         assert_eq!(of(1), vec![3, 7, 11]);
+    }
+
+    #[test]
+    fn stable_sampling_matches_multiset_oracle_in_both_orders_even_on_hash_collision() {
+        let raw = |id: &[u8], seq: &[u8], qual: Option<&[u8]>| Rec {
+            id: id.to_vec(),
+            seq: seq.to_vec(),
+            qual: qual.map(|q| q.to_vec()),
+        };
+        let records = [
+            raw(b"same id", b"AAA", Some(b"IIH")),
+            raw(b"same id", b"AAA", Some(b"III")),
+            raw(b"same id", b"AAC", None),
+            raw(b"other", b"AAA", None),
+            raw(b"same id", b"AAA", Some(b"III")),
+            raw(b"same id", b"AAA", Some(b"III")),
+        ];
+        let rank = |raw: Rec| RankedRecord { digest: [0; 32], raw };
+        for cap in [0, 1, 2, 3, 4, 6, 20] {
+            let mut expected: Vec<_> = records.iter().cloned().map(rank).collect();
+            expected.sort_unstable();
+            expected.truncate(cap);
+            for ordered in [records.to_vec(), records.iter().rev().cloned().collect()] {
+                let mut sample = StableSample::default();
+                for record in ordered {
+                    sample.offer(rank(record), cap);
+                    assert!(sample.selected <= cap && sample.picked.len() <= cap);
+                }
+                let actual: Vec<_> = sample.picked.iter().flat_map(|(key, counts)| {
+                    assert_eq!(counts.observed,
+                        records.iter().cloned().map(rank).filter(|r| r == key).count());
+                    std::iter::repeat(key).take(counts.selected)
+                }).collect();
+                assert!(actual.into_iter().eq(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn stable_sampling_preserves_and_reports_indistinguishable_occurrences() {
+        let record = Rec { id: b"id".to_vec(), seq: b"AAA".to_vec(), qual: None };
+        let mut sample = StableSample::default();
+        for _ in 0..4 {
+            sample.offer(RankedRecord::new(record.clone()), 2);
+        }
+        let (reads, report) = sample.finish();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(report.eligible_record_occurrences, 4);
+        assert_eq!(report.selected_distinct_exact_records, 1);
+        assert_eq!(report.selected_repeated_exact_records, 1);
+        assert_eq!(report.selected_occurrences_of_repeated_records, 2);
+        assert_eq!(report.observed_occurrences_of_selected_repeated_records, 4);
+        assert_eq!(report.exact_records_split_at_cutoff, 1);
+        assert_ne!(
+            RankedRecord::new(record.clone()).digest,
+            RankedRecord::new(Rec { qual: Some(Vec::new()), ..record }).digest,
+        );
     }
 
     #[test]

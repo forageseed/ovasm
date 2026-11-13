@@ -633,6 +633,9 @@ struct RunArgs {
     /// Report paired protein gene sets during the HiFi whole-genome protein seed scan.
     #[arg(long)]
     protein_gene_set_audit: bool,
+    /// How the HiFi protein seed scan samples depth clusters.
+    #[arg(long, value_enum, default_value_t = protein_seed::SampleOrder::Legacy)]
+    protein_sample_order: protein_seed::SampleOrder,
     /// Print result.json (the run's outcome for scripts and agents) on standard output too.
     #[arg(long, hide_short_help = true)]
     json: bool,
@@ -960,6 +963,9 @@ fn run(mut args: RunArgs) -> Result<()> {
     if args.protein_gene_set_audit && !scan_proteins {
         bail!("--protein-gene-set-audit requires an organelle without explicitly supplied seeds");
     }
+    if args.protein_sample_order == protein_seed::SampleOrder::StableRecord && !scan_proteins {
+        bail!("--protein-sample-order stable-record requires a HiFi protein seed scan");
+    }
     for (name, view) in checked {
         let (path, provenance) = view.materialize(&args.out)?;
         seeds.insert(name.clone(), vec![path]);
@@ -979,7 +985,7 @@ fn run(mut args: RunArgs) -> Result<()> {
         && args.recruit != pipeline::RecruitBy::Discover
     {
         if scan_proteins {
-            let p = protein_seed_params(
+            let mut p = protein_seed_params(
                 3000,
                 2000,
                 (args.nuclear_depth, args.genome_size, args.extend_gate_fold),
@@ -987,6 +993,7 @@ fn run(mut args: RunArgs) -> Result<()> {
                 0.3,
                 panel::Panel::lineage_min_hits(args.lineage.name()),
             )?;
+            p.sample_order = args.protein_sample_order;
             let panel = load_panel(
                 args.protein_seed_panel.as_deref(),
                 args.lineage,
@@ -2107,11 +2114,20 @@ struct ProteinSeedArgs {
     /// Report density-independent gene sets with paired fallback orientation evidence.
     #[arg(long)]
     gene_set_audit: bool,
+    /// Scan all input reads for source-pending protein candidates independently of depth.
+    #[arg(long, conflicts_with_all = ["paired_gene_candidates", "gene_set_audit"])]
+    whole_read_candidates: bool,
+    /// Maximum FASTX record crops exported for each organelle in the diagnostic.
+    #[arg(long, requires = "whole_read_candidates")]
+    whole_read_candidate_cap: Option<usize>,
+    /// Rank diagnostic exports by input order or by stable FASTX record content.
+    #[arg(long, value_enum, requires = "whole_read_candidates")]
+    whole_read_export_order: Option<protein_seed::SampleOrder>,
     /// Whole-genome long reads (HiFi; FASTQ/FASTA, optionally .gz); repeat for several files.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
-    /// Output directory for protein_seeds FASTAs and report. Paired candidates use a new
-    /// directory containing protein_candidates FASTAs and report.
+    /// Output directory for protein_seeds FASTAs and report. Candidate diagnostics use a new
+    /// directory containing their own candidate FASTAs and report.
     #[arg(long)]
     out: PathBuf,
     /// Which built-in protein panel and genetic code: landplants (mitochondrion and plastid
@@ -2128,6 +2144,9 @@ struct ProteinSeedArgs {
     /// Leave panel proteins of species starting with this name out (repeatable).
     #[arg(long = "exclude-species")]
     exclude: Vec<String>,
+    /// Rank depth-cluster records by input order or by stable FASTX record content.
+    #[arg(long, value_enum, default_value_t = protein_seed::SampleOrder::Legacy)]
+    sample_order: protein_seed::SampleOrder,
     /// Reads scanned per depth cluster at most.
     #[arg(long, default_value_t = 3000)]
     sample: usize,
@@ -2225,7 +2244,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
             .num_threads(n)
             .build_global()?;
     }
-    let p = protein_seed_params(
+    let mut p = protein_seed_params(
         args.sample,
         args.flank,
         (args.nuclear_depth, args.genome_size, args.gate_fold),
@@ -2234,6 +2253,7 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         args.min_hits
             .unwrap_or_else(|| panel::Panel::lineage_min_hits(args.lineage.name())),
     )?;
+    p.sample_order = args.sample_order;
     let panel = load_panel(
         args.panel.as_deref(),
         args.lineage,
@@ -2246,6 +2266,15 @@ fn protein_seeds(args: ProteinSeedArgs) -> Result<()> {
         .copied()
         .filter(|o| args.lineage.fasta(o).is_some())
         .collect();
+    if args.whole_read_candidates {
+        let cap = args.whole_read_candidate_cap.unwrap_or(protein_seed::WHOLE_READ_MAX_SEEDS);
+        let report = protein_seed::run_whole_read_candidates(
+            &args.reads, &panel, &p, &want, &args.out, cap,
+            args.whole_read_export_order.unwrap_or_default(),
+        )?;
+        eprintln!("{}", report.summary());
+        return Ok(());
+    }
     let mode = if args.paired_gene_candidates {
         protein_seed::SeedMode::PairedCandidates
     } else if args.gene_set_audit {

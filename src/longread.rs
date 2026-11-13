@@ -267,9 +267,9 @@ pub const CORRECT_MAX_DEPTH: f64 = 300.0;
 
 fn read_seqs(path: &Path) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    if !path.is_file() || fs::metadata(path)?.len() == 0 {
-        return Ok(out);
-    }
+    let meta = fs::metadata(path).with_context(|| format!("cannot access {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "not a regular file: {}", path.display());
+    if meta.len() == 0 { return Ok(out); }
     let mut reader = needletail::parse_fastx_file(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     while let Some(record) = reader.next() {
@@ -491,7 +491,9 @@ fn split_partial(
     let path = dir.join("numt_candidates.fastq");
     let mut calls: Vec<(Vec<u8>, Vec<u8>, usize)> = Vec::new();
     let mut bases = vec![0u64; bait.targets.len()];
-    if path.is_file() && fs::metadata(&path)?.len() > 0 {
+    let meta = fs::metadata(&path).with_context(|| format!("cannot access {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "not a regular file: {}", path.display());
+    if meta.len() > 0 {
         let mut reader = needletail::parse_fastx_file(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
         while let Some(record) = reader.next() {
@@ -870,13 +872,18 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                         continue;
                     }
                     let fasta = o.out.join(format!("correct/round{round}/{organelle}.bait.fasta"));
-                    let mut c = correct(&inputs, None, &fasta, o.salt)?;
-                    c["purpose"] = "bait".into();
-                    c["partial_reads"] = partial.get(organelle).map(|x| x.1).into();
-                    let masked = fasta.with_extension("masked.fasta");
-                    c["tandem_masked_bases"] = mask_tandem_fasta(&fasta, &masked)?.into();
-                    r.bait = Some(masked);
-                    r.corrections.push(c);
+                    let result = (|| -> Result<(Value, PathBuf)> {
+                        let mut c = correct(&inputs, None, &fasta, o.salt)?;
+                        c["purpose"] = "bait".into();
+                        c["partial_reads"] = partial.get(organelle).map(|x| x.1).into();
+                        let masked = fasta.with_extension("masked.fasta");
+                        c["tandem_masked_bases"] = mask_tandem_fasta(&fasta, &masked)?.into();
+                        Ok((c, masked))
+                    })();
+                    match result {
+                        Ok((c, masked)) => { r.bait = Some(masked); r.corrections.push(c); }
+                        Err(e) => { reads.insert(organelle, Err(e.context("bait correction"))); }
+                    }
                 }
             }
             for (&organelle, entry) in reads.iter_mut() {
@@ -893,10 +900,10 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 }
                 log(&format!("self-correcting the {organelle} long reads to assemble"));
                 let fasta = o.out.join(format!("correct/{organelle}.fasta"));
-                let mut c = correct(&r.raw, None, &fasta, o.salt)?;
-                c["purpose"] = "assembly".into();
-                r.corrected = fasta;
-                r.corrections.push(c);
+                match correct(&r.raw, None, &fasta, o.salt) {
+                    Ok(mut c) => { c["purpose"] = "assembly".into(); r.corrected = fasta; r.corrections.push(c); }
+                    Err(e) => { *entry = Err(e.context("self correction for assembly")); }
+                }
             }
         }
     }
@@ -915,12 +922,13 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
             argv = argv.opt("--max-bases", s.max_bases.to_string());
         }
         let mut baited = 0;
-        for (name, r) in &reads {
-            if let Ok(r) = r {
+        for (name, entry) in &mut reads {
+            if let Ok(r) = entry {
                 let masked = r.corrected.with_extension("masked.fasta");
-                mask_tandem_fasta(&r.corrected, &masked)?;
-                argv = argv.opt("--seed-reads", seed_spec(name, &masked));
-                baited += 1;
+                match mask_tandem_fasta(&r.corrected, &masked) {
+                    Ok(_) => { argv = argv.opt("--seed-reads", seed_spec(name, &masked)); baited += 1; }
+                    Err(e) => { *entry = Err(e.context("masking corrected reads for short-read bait")); }
+                }
             }
         }
         // an organelle without corrected reads (the competing one) claims its short reads by its seeds
@@ -956,13 +964,17 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 }
                 log(&format!("correcting the {organelle} long reads with its short reads"));
                 let fasta = o.out.join("correct/hybrid").join(format!("{organelle}.fasta"));
-                let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta, o.salt)?;
-                c["purpose"] = "assembly".into();
-                let n = c["reads_out"].as_u64().ok_or_else(|| anyhow::anyhow!("invalid hybrid reads_out"))?;
-                if use_hybrid_correction(n, &fasta, &r.corrected, &mut c)? {
-                    r.corrected = fasta;
+                let result = (|| -> Result<(Value, bool)> {
+                    let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta, o.salt)?;
+                    c["purpose"] = "assembly".into();
+                    let n = c["reads_out"].as_u64().ok_or_else(|| anyhow::anyhow!("invalid hybrid reads_out"))?;
+                    let use_corrected = use_hybrid_correction(n, &fasta, &r.corrected, &mut c)?;
+                    Ok((c, use_corrected))
+                })();
+                match result {
+                    Ok((c, use_corrected)) => { if use_corrected { r.corrected = fasta; } r.corrections.push(c); }
+                    Err(e) => { reads.insert(organelle, Err(e.context("hybrid correction"))); }
                 }
-                r.corrections.push(c);
             }
         }
     }
@@ -1505,6 +1517,99 @@ mod tests {
         assert!(!round_grew(Some(1000), 900));
         assert!(!round_grew(Some(0), 0), "nothing twice");
         assert!(round_grew(Some(0), 1));
+    }
+
+    #[test]
+    fn a_bait_correction_failure_does_not_discard_the_other_organelle() {
+        let dir = tmpdir("bait-isolation");
+        let s = sample(&dir, 0.05);
+        let out = dir.join("out");
+        // A directory at the output FASTA path forces an I/O failure only for MT.
+        fs::create_dir_all(out.join("correct/round1/mitochondrion.bait.fasta")).unwrap();
+        let mt = format!("mitochondrion={}", s.mt_seed.display());
+        let pt = format!("plastid={}", s.pt_seed.display());
+        let o = options(&["--organelle", "both", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt]);
+        let err = run(&[s.long.clone()], None, &o).unwrap_err();
+        assert!(format!("{err:#}").contains("mitochondrion failed"));
+        let summary = read_json(&out.join("summary.json")).unwrap();
+        assert_eq!(summary["failed"], json!(["mitochondrion"]));
+        assert!(summary["organelles"]["mitochondrion"]["error"].as_str().unwrap().contains("bait correction"));
+        assert!(out.join("plastid/summary.json").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn assembly_correction_failure_is_isolated_with_and_without_short_reads() {
+        for hybrid in [false, true] {
+            let dir = tmpdir(if hybrid { "hybrid-isolation" } else { "self-isolation" });
+            let s = sample(&dir, 0.05);
+            let out = dir.join("out");
+            let blocked = if hybrid { "correct/hybrid/mitochondrion.fasta" } else { "correct/mitochondrion.fasta" };
+            fs::create_dir_all(out.join(blocked)).unwrap();
+            let mt = format!("mitochondrion={}", s.mt_seed.display());
+            let pt = format!("plastid={}", s.pt_seed.display());
+            let o = options(&["--organelle", "both", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt]);
+            let (s1, s2) = (dir.join("short_1.fa"), dir.join("short_2.fa"));
+            let mut a = Vec::new(); let mut b = Vec::new();
+            for (tag, genome) in [("m", &s.mito), ("p", &s.plastid)] {
+                let circ = [genome.as_slice(), &genome[..400]].concat();
+                for (i, st) in (0..genome.len()).step_by(20).enumerate() {
+                    let f = &circ[st..st+400];
+                    a.push((format!("{tag}{i}"), f[..150].to_vec()));
+                    b.push((format!("{tag}{i}"), crate::evidence::revcomp(&f[250..])));
+                }
+            }
+            fasta(&s1, &a); fasta(&s2, &b);
+            let short_files = [s1, s2];
+            let short = hybrid.then_some(Short { reads: &short_files, max_bases: 0 });
+            let err = run(&[s.long.clone()], short, &o).unwrap_err();
+            assert!(format!("{err:#}").contains("mitochondrion failed"));
+            let summary = read_json(&out.join("summary.json")).unwrap();
+            assert_eq!(summary["failed"], json!(["mitochondrion"]));
+            let reason = summary["organelles"]["mitochondrion"]["error"].as_str().unwrap();
+            assert!(reason.contains(if hybrid { "hybrid correction" } else { "self correction for assembly" }), "{reason}");
+            assert!(out.join("plastid/summary.json").is_file());
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn missing_and_nonfile_recruit_outputs_are_errors_but_empty_files_are_valid() {
+        let dir = tmpdir("required_recruit_outputs");
+        let p = dir.join("numt_candidates.fastq");
+        let seeds = BTreeMap::new();
+        assert!(read_seqs(&p).is_err());
+        assert!(split_partial(&dir, 21, &seeds, &[], 0, 1).is_err());
+        fs::create_dir(&p).unwrap();
+        assert!(read_seqs(&p).is_err());
+        assert!(split_partial(&dir, 21, &seeds, &[], 0, 1).is_err());
+        fs::remove_dir(&p).unwrap();
+        fs::write(&p, b"").unwrap();
+        assert!(read_seqs(&p).unwrap().is_empty());
+        assert!(split_partial(&dir, 21, &seeds, &[], 0, 1).unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hybrid_masking_failure_is_isolated() {
+        let dir = tmpdir("hybrid_mask_failure");
+        let s = sample(&dir, 0.05);
+        let out = dir.join("out");
+        fs::create_dir_all(out.join("correct/mitochondrion.masked.fasta")).unwrap();
+        let mt = format!("mitochondrion={}", s.mt_seed.display());
+        let pt = format!("plastid={}", s.pt_seed.display());
+        let o = options(&["--organelle", "both", "--out", out.to_str().unwrap(), "--seeds", &mt, "--seeds", &pt]);
+        let s1 = dir.join("short.fa");
+        let short_reads = vec![("s0".to_string(), s.plastid[..150].to_vec())];
+        fasta(&s1, &short_reads);
+        let short_files = [s1];
+        let err = run(&[s.long.clone()], Some(Short { reads: &short_files, max_bases: 0 }), &o).unwrap_err();
+        assert!(format!("{err:#}").contains("mitochondrion failed"));
+        let report = read_json(&out.join("summary.json")).unwrap();
+        assert_eq!(report["failed"], json!(["mitochondrion"]));
+        assert!(report["organelles"]["mitochondrion"]["error"].as_str().unwrap().contains("masking corrected reads"));
+        assert!(out.join("plastid/summary.json").is_file());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

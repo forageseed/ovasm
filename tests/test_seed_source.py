@@ -1,9 +1,11 @@
 import gzip
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import random
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,7 +95,7 @@ class SeedSourceAudit(unittest.TestCase):
         self.assertEqual(rows["missing"]["reason"], "original_missing")
         out, view = self.root / "audit.json", self.root / "retained.fa"
         subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
-                        "--out", str(out), "--out-fasta", str(view)], check=True)
+                        "--out", str(out), "--out-fasta", str(view), "--python-placements"], check=True)
         self.assertEqual(view.read_bytes(), b"".join(retained))
         result = json.loads(out.read_text())
         self.assertEqual(result["target"], "mitochondrion")
@@ -123,7 +125,7 @@ class SeedSourceAudit(unittest.TestCase):
         out, view = self.root / "strict.json", self.root / "strict.fa"
         subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
                         "--retention-policy", "target-supported-only", "--out", str(out),
-                        "--out-fasta", str(view)], check=True)
+                        "--out-fasta", str(view), "--python-placements"], check=True)
         self.assertEqual(view.read_bytes(), crops[0])
 
     def test_strict_empty_is_reportable_and_repeated_input_alias_fails(self):
@@ -135,6 +137,105 @@ class SeedSourceAudit(unittest.TestCase):
         path.write_text(json.dumps(self.manifest))
         with self.assertRaisesRegex(ValueError, "repeats an original input file"):
             TOOL["audit"](path, TOOL["TARGET_ONLY"])
+
+    def declare_roles(self, competing="nuclear", *, required=None):
+        self.manifest["required_reference_roles"] = (
+            ["mitochondrion", "nuclear"] if required is None else required
+        )
+        self.manifest["references"][0]["source_role"] = "mitochondrion"
+        self.manifest["references"][1]["source_role"] = competing
+
+    def test_declared_roles_hold_target_when_only_plastid_or_unplaced_competes(self):
+        crop = self.crop(b"target", self.target)
+        for other in ("plastid", "unplaced"):
+            with self.subTest(other=other):
+                self.declare_roles(other)
+                manifest = self.assemble([(b"target", self.target)], [crop])
+                previous, legacy = TOOL["audit"](manifest, TOOL["TARGET_ONLY"])
+                self.assertEqual(legacy, [crop])
+                self.assertNotIn("reference_panel_scope", previous)
+                report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+                self.assertEqual(retained, [])
+                self.assertEqual(report["retained_fasta_sha256"], sha256(b"").hexdigest())
+                self.assertEqual(report["retained_records"], 0)
+                self.assertEqual(report["counts"], {"target_supported": 0, "competing_supported": 0,
+                                                    "unresolved": 1})
+                self.assertEqual(report["records"][0]["reason"], "missing_required_reference_roles")
+                scope = report["reference_panel_scope"]
+                self.assertEqual(scope["missing_required_roles"], ["nuclear"])
+                self.assertFalse(scope["source_windows_evaluated"])
+                self.assertEqual(scope["physical_origin"], "unresolved")
+
+    def test_missing_reference_role_reports_without_opening_originals_or_references(self):
+        self.declare_roles("plastid")
+        crop = self.crop(b"target", self.target)
+        self.target_ref.unlink()
+        self.competing_ref.unlink()
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        (self.root / "raw.fa").unlink()
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["windows"], {})
+        self.assertFalse(report["reference_panel_scope"]["raw_records_evaluated"])
+
+    def test_declared_roles_accept_named_panel_with_nuclear_and_report_scope_limit(self):
+        self.declare_roles()
+        crop = self.crop(b"target", self.target)
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [crop])
+        scope = report["reference_panel_scope"]
+        self.assertEqual(scope["missing_required_roles"], [])
+        self.assertTrue(scope["source_windows_evaluated"])
+        self.assertEqual(scope["reference_role_authority"], "user_declared")
+        self.assertEqual(scope["scope"], "supplied_named_reference_records")
+        self.assertEqual(scope["physical_origin"], "unresolved")
+        self.assertIn("does not establish panel completeness or physical origin", report["source_limit"])
+
+    def test_declared_roles_report_missing_target_or_other_required_organelle(self):
+        self.declare_roles(required=["mitochondrion", "nuclear", "plastid"])
+        crop = self.crop(b"target", self.target)
+        originals = [(b"target", self.target)]
+        manifest = self.assemble(originals, [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["reference_panel_scope"]["missing_required_roles"], ["plastid"])
+        self.manifest["references"].pop(0)
+        manifest = self.assemble(originals, [crop])
+        report, retained = TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.assertEqual(retained, [])
+        self.assertEqual(report["reference_panel_scope"]["missing_required_roles"], ["mitochondrion", "plastid"])
+
+    def test_declared_roles_reject_invalid_policy_and_untyped_or_conflicting_roles(self):
+        self.declare_roles(required=["mitochondrion"])
+        originals = [(b"target", self.target)]
+        crops = [self.crop(b"target", self.target)]
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "include the target and nuclear"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.declare_roles()
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "require the target-supported-only"):
+            TOOL["audit"](manifest, require_reference_roles=True)
+        self.manifest["references"][1].pop("source_role")
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "each reference requires"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+        self.manifest["references"][1]["source_role"] = "mitochondrion"
+        manifest = self.assemble(originals, crops)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            TOOL["audit"](manifest, TOOL["TARGET_ONLY"], require_reference_roles=True)
+
+    def test_declared_roles_cli_missing_nuclear_produces_empty_native_input(self):
+        self.declare_roles("plastid")
+        crop = self.crop(b"target", self.target)
+        manifest = self.assemble([(b"target", self.target)], [crop])
+        out, view = self.root / "audit.json", self.root / "retained.fa"
+        subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(manifest), "--out", str(out),
+                        "--out-fasta", str(view), "--python-placements", "--retention-policy",
+                        TOOL["TARGET_ONLY"], "--require-reference-roles"], check=True)
+        self.assertEqual(view.read_bytes(), b"")
+        self.assertEqual(json.loads(out.read_text())["retained_records"], 0)
 
     def test_explicit_original_identifier_field_supports_archive_prefix(self):
         path = self.assemble([(b"SRR123.1 movie/1", self.competing)],
@@ -162,7 +263,8 @@ class SeedSourceAudit(unittest.TestCase):
         self.proof.write_bytes(b"modified\n")
         out, view = self.root / "audit.json", self.root / "retained.fa"
         result = subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
-                                 "--out", str(out), "--out-fasta", str(view)], capture_output=True)
+                                 "--out", str(out), "--out-fasta", str(view), "--python-placements"],
+                                capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"SHA-256 mismatch", result.stderr)
         self.assertFalse(out.exists())
@@ -185,6 +287,136 @@ class SeedSourceAudit(unittest.TestCase):
         report, retained = TOOL["audit"](path)
         self.assertEqual(report["records"][0]["reason"], "original_identifier_repeated")
         self.assertEqual(retained, [seed])
+
+
+    def test_default_requires_an_ovasm_executable_and_does_not_fall_back(self):
+        path = self.assemble([(b"seen", self.target)], [self.crop(b"seen", self.target)])
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        out, view = self.root / "audit.json", self.root / "retained.fa"
+        command = [sys.executable, "-B", "-I", str(SCRIPT), str(path), "--out", str(out), "--out-fasta", str(view)]
+        env = {**os.environ, "PATH": str(bin_dir)}
+        cases = (
+            ([], b"OVASM executable not found on PATH"),
+            (["--exact-placement-bin", str(bin_dir / "missing")], b"cannot resolve OVASM executable"),
+            (["--exact-placement-bin", str(bin_dir)], b"not an executable file"),
+            (["--exact-placement-bin", str(bin_dir), "--python-placements"], b"not allowed with argument"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra):
+                failed = subprocess.run([*command, *extra], env=env, capture_output=True, timeout=5)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(message, failed.stderr)
+                self.assertFalse(out.exists())
+                self.assertFalse(view.exists())
+
+        if os.name != "nt":
+            fake = bin_dir / "ovasm"
+            fake.write_text(f"#!{sys.executable}\nraise SystemExit(9)\n")
+            fake.chmod(0o700)
+            failed = subprocess.run(command, env=env, capture_output=True, timeout=5)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn(b"OVASM exact placement backend failed (panel", failed.stderr)
+            self.assertFalse(out.exists())
+            self.assertFalse(view.exists())
+
+        subprocess.run([*command, "--python-placements"], env=env, check=True, timeout=5)
+        self.assertTrue(out.exists())
+        self.assertTrue(view.exists())
+
+    def test_requested_batch_failure_leaves_no_outputs(self):
+        path = self.assemble([(b"seen", self.target)], [self.crop(b"seen", self.target)])
+        prefix = b"OVXPOS1\tpanel\n"
+        hit = b"H\t0\t0\t0\n"
+        terminal = b"E\t2\t4\n"
+        cases = (
+            (b"invalid\n", 0, False),
+            (prefix + hit, 0, False),
+            (prefix + b"E\t2\t5\n", 0, False),
+            (prefix + hit * 2 + terminal, 0, False),
+            (prefix + b"H\t2\t0\t0\n" + terminal, 0, False),
+            (prefix + b"H\t0\t4\t0\n" + terminal, 0, False),
+            (prefix + b"H\t0\t0\t99999999999999999999999999\n" + terminal, 0, False),
+            (prefix + b"H\t0\t2\t0\n" + terminal, 0, False),
+            (prefix + hit + terminal + b"unexpected\n", 0, False),
+            (prefix + hit + terminal, 7, False),
+            (b"OVXPOS1\trecords\nH\t0\t0\t0\n", 0, True),
+        )
+        out, view = self.root / "bad.json", self.root / "bad.fa"
+        for index, (response, status, originals_only) in enumerate(cases):
+            with self.subTest(index=index):
+                source = (
+                    f"#!{sys.executable}\n"
+                    "import sys\n"
+                    "sys.stdin.buffer.read()\n"
+                    f"if {originals_only!r} and sys.argv[-1] == 'panel':\n"
+                    f"    sys.stdout.buffer.write({(prefix + hit + terminal)!r})\n"
+                    "    raise SystemExit(0)\n"
+                    f"sys.stdout.buffer.write({response!r})\n"
+                    f"raise SystemExit({status})\n"
+                ).encode()
+                binary = self.write(f"bad-backend-{index}", source)
+                binary.chmod(0o700)
+                result = subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path),
+                                         "--out", str(out), "--out-fasta", str(view),
+                                         "--exact-placement-bin", str(binary)],
+                                        capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"exact placement", result.stderr)
+                self.assertFalse(out.exists())
+                self.assertFalse(view.exists())
+
+    @unittest.skipUnless(os.environ.get("OVASM_EXACT_PLACEMENT_BIN"), "requires built OVASM exact-placement binary")
+    def test_native_batch_preserves_capped_orientation_and_record_order(self):
+        binary = Path(os.environ["OVASM_EXACT_PLACEMENT_BIN"]).resolve(strict=True)
+        rng = random.Random(742)
+        words = [b"A", b"AA", b"AAA", b"ACGT", b"AACC", b"GGTT", b"TA", b"AT"]
+        words += [bytes(rng.choices(b"ACGT", k=rng.randrange(3, 9))) for _ in range(31)]
+        records = [b"GGTTNGAACCAAACGT", b"AACCNGGTTACGT", b"", b"N" * 65534 + b"ACGT"]
+        records += [bytes(rng.choices(b"ACGTN", k=370)) for _ in range(170)]
+        batch = TOOL["batch_placement_lookup"]
+        panel = batch(binary, "panel", records, words)
+        by_record = batch(binary, "records", records, words)
+        for word in words:
+            expected = []
+            for index, seq in enumerate(records):
+                single = [(index, *match) for match in TOOL["placements"](seq, word)]
+                self.assertEqual(by_record(word, index), single)
+                expected.extend(single)
+            self.assertEqual(panel(word), expected[:2])
+        self.assertEqual(panel(b"AACC"), [(0, 6, 10, "+"), (0, 0, 4, "-")])
+        self.assertEqual(by_record(b"ACGT", 3), [(3, 65534, 65538, "+"), (3, 65534, 65538, "-")])
+
+    @unittest.skipUnless(os.environ.get("OVASM_EXACT_PLACEMENT_BIN"), "requires built OVASM exact-placement binary")
+    def test_native_batch_cli_outputs_match_both_python_policies(self):
+        binary = Path(os.environ["OVASM_EXACT_PLACEMENT_BIN"]).resolve(strict=True)
+        reverse = self.competing.translate(TOOL["COMPLEMENT"])[::-1]
+        originals = [(b"target", self.target), (b"shared", self.target), (b"shared", reverse),
+                     (b"inside", self.novel + self.target), (b"outside", self.target + self.novel),
+                     (b"mixed", self.competing + self.target)]
+        crops = [self.crop(name, seq) for name, seq in originals[:3]]
+        crops += [self.crop(b"inside", self.target, start=64),
+                  self.crop(b"outside", self.novel, start=64), self.crop(b"mixed", self.target, start=64),
+                  self.crop(b"missing", self.novel)]
+        path = self.assemble(originals, crops, as_gzip=True)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        shutil.copy2(binary, bin_dir / ("ovasm.exe" if os.name == "nt" else "ovasm"))
+        modes = (
+            ("python", ["--python-placements"], self.root / "empty"),
+            ("default", [], bin_dir),
+            ("explicit", ["--exact-placement-bin", str(binary)], self.root / "empty"),
+        )
+        for policy in (TOOL["EXCLUDE_COMPETING"], TOOL["TARGET_ONLY"]):
+            published = {}
+            for label, extra, search_path in modes:
+                out, view = [self.root / f"{policy}-{label}.{suffix}" for suffix in ("json", "fa")]
+                subprocess.run([sys.executable, "-B", "-I", str(SCRIPT), str(path), "--retention-policy", policy,
+                                "--out", str(out), "--out-fasta", str(view), *extra],
+                               env={**os.environ, "PATH": str(search_path)}, check=True, timeout=5)
+                published[label] = (out.read_bytes(), view.read_bytes())
+            self.assertEqual(published["default"], published["python"])
+            self.assertEqual(published["explicit"], published["python"])
 
 
 if __name__ == "__main__":

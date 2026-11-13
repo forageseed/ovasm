@@ -107,6 +107,186 @@ fn parse_label(index: &FxHashMap<&str, usize>, label: &str) -> Result<Oriented> 
     Ok((s, fwd))
 }
 
+
+type ClosureEdge = (Oriented, Oriented);
+
+fn closure_edge(from: Oriented, to: Oriented) -> ClosureEdge {
+    (from, to).min((flip(to), flip(from)))
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosureLink {
+    from: String,
+    to: String,
+    overlaps_bp: BTreeSet<usize>,
+    single_record_crossings: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosure {
+    segment: String,
+    link: LocalRepeatClosureLink,
+    state: &'static str,
+    closed_walk_length: Option<usize>,
+    competing_links: Vec<LocalRepeatClosureLink>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosureContext {
+    source: &'static str,
+    path: String,
+    reported_records: u64,
+    closure_segments: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct LocalRepeatClosures {
+    scope: &'static str,
+    min_single_record_crossings: u64,
+    contexts_truncated: bool,
+    closures: Vec<LocalRepeatClosure>,
+    contexts: Vec<LocalRepeatClosureContext>,
+}
+
+fn local_repeat_closures(
+    g: &Graph,
+    report: &Value,
+    repeats: &[bool],
+    graph_bound_records: bool,
+    phases: &crate::phase::Constraints,
+    min_reads: u64,
+    context_budget: u64,
+) -> Option<LocalRepeatClosures> {
+    let seeds: BTreeSet<_> = g.links.iter()
+        .filter_map(|&(a, b)| (a == b && repeats[a.0]).then_some(a.0))
+        .collect();
+    if seeds.is_empty() {
+        return None;
+    }
+    let index: FxHashMap<_, _> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let mut edges: BTreeMap<ClosureEdge, BTreeSet<usize>> = BTreeMap::new();
+    let mut incident: BTreeMap<usize, BTreeSet<ClosureEdge>> = BTreeMap::new();
+    for (&(a, b), &overlap) in g.links.iter().zip(&g.overlaps) {
+        let key = closure_edge(a, b);
+        edges.entry(key).or_default().insert(overlap);
+        for s in [a.0, b.0] {
+            if seeds.contains(&s) {
+                incident.entry(s).or_default().insert(key);
+            }
+        }
+    }
+    let mut record_links = BTreeMap::new();
+    if graph_bound_records {
+        // ReadModel::load has already checked the graph, schema and uniqueness of
+        // these canonical links. Its producer counts each record once per link.
+        for row in report["thread_evidence"]["links"].as_array().into_iter().flatten() {
+            let from = parse_label(&index, row["from"].as_str().unwrap()).unwrap();
+            let to = parse_label(&index, row["to"].as_str().unwrap()).unwrap();
+            record_links.insert(closure_edge(from, to), row["records"].as_u64().unwrap());
+        }
+    }
+    let describe_link = |key: ClosureEdge| LocalRepeatClosureLink {
+        from: g.label(key.0),
+        to: g.label(key.1),
+        overlaps_bp: edges[&key].clone(),
+        single_record_crossings: graph_bound_records.then(|| record_links.get(&key).copied().unwrap_or(0)),
+    };
+    let min_reads = min_reads.max(1);
+    let closures = seeds.iter().map(|&s| {
+        let node = (s, true);
+        let key = closure_edge(node, node);
+        let link = describe_link(key);
+        let overlaps = &link.overlaps_bp;
+        let seq = &g.seqs[s];
+        let valid_overlap = overlaps.iter().next().copied().filter(|&n| {
+            overlaps.len() == 1 && n < seq.len() && seq[..n] == seq[seq.len() - n..]
+        });
+        let competing_links = incident[&s].iter().copied().filter(|&e| e != key)
+            .map(&describe_link).collect::<Vec<_>>();
+        let (state, closed_walk_length) = match valid_overlap {
+            None => ("unresolved_overlap", None),
+            Some(_) if !phases.allows_walk(&[node], true) => ("unresolved_phase_conflict", None),
+            Some(_) if link.single_record_crossings.is_none() => ("unresolved_no_graph_bound_crossings", None),
+            Some(_) if link.single_record_crossings.unwrap_or(0) < min_reads => ("unresolved_insufficient_crossings", None),
+            Some(n) if !competing_links.is_empty() => ("unresolved_competing_context", Some(seq.len() - n)),
+            Some(n) => ("unresolved_local_closed_walk", Some(seq.len() - n)),
+        };
+        LocalRepeatClosure { segment: g.names[s].clone(), link, state, closed_walk_length, competing_links }
+    }).collect();
+
+    // Store each canonical context once, even when it touches several closure
+    // segments. The separate path-scan budget cannot consume cover-search work.
+    let mut context_index = BTreeMap::<(&'static str, Vec<Oriented>), u64>::new();
+    let mut remaining = context_budget;
+    let mut contexts_truncated = false;
+    for (&(entry, segment, exit), &records) in &phases.phases {
+        let walk = vec![entry, segment, exit];
+        if !walk.iter().any(|o| seeds.contains(&o.0)) {
+            continue;
+        }
+        let Some(next) = remaining.checked_sub(3) else {
+            contexts_truncated = true;
+            break;
+        };
+        remaining = next;
+        let reverse = rc_walk(&walk);
+        let support = context_index.entry(("phase_report", walk.min(reverse))).or_default();
+        *support = (*support).max(records);
+    }
+    let inputs = [
+        ("single_record_thread", &report["thread_evidence"]["paths"], graph_bound_records),
+        ("observed_walk", &report["observed_walks"], true),
+        ("phased_path", &report["phased_paths"], true),
+    ];
+    'sources: for (source, rows, available) in inputs {
+        if contexts_truncated || !available {
+            continue;
+        }
+        for row in rows.as_array().into_iter().flatten() {
+            let (Some(path), Some(records)) = (row["path"].as_str(), row["reads"].as_u64()) else {
+                continue;
+            };
+            let mut walk = Vec::new();
+            for token in path.split_whitespace() {
+                let Some(next) = remaining.checked_sub(1) else {
+                    contexts_truncated = true;
+                    break 'sources;
+                };
+                remaining = next;
+                let Ok(node) = parse_label(&index, token) else {
+                    walk.clear();
+                    break;
+                };
+                walk.push(node);
+            }
+            if walk.len() < 2 || !walk.iter().any(|o| seeds.contains(&o.0))
+                || walk.windows(2).any(|w| !edges.contains_key(&closure_edge(w[0], w[1])))
+            {
+                continue;
+            }
+            let reverse = rc_walk(&walk);
+            let entry = context_index.entry((source, walk.min(reverse))).or_default();
+            *entry = (*entry).max(records);
+        }
+    }
+    let contexts = context_index.into_iter().map(|((source, walk), reported_records)| {
+        let touched: BTreeSet<_> = walk.iter().map(|o| o.0).filter(|s| seeds.contains(s)).collect();
+        LocalRepeatClosureContext {
+            source,
+            path: walk.iter().map(|&o| g.label(o)).collect::<Vec<_>>().join(" "),
+            reported_records,
+            closure_segments: touched.into_iter().map(|s| g.names[s].clone()).collect(),
+        }
+    }).collect();
+    Some(LocalRepeatClosures {
+        scope: "local repeat self-loop spellings; no complete molecule or physical topology inference",
+        min_single_record_crossings: min_reads,
+        contexts_truncated,
+        closures,
+        contexts,
+    })
+}
+
 /// Bridges in both directions: phased paths plus direct links between two anchors.
 fn bridges(
     g: &Graph,
@@ -615,6 +795,22 @@ fn weighted_median_depth(g: &Graph, depth: impl Fn(usize) -> f64, segs: &[usize]
         .map_or(0.0, |x| x.0)
 }
 
+/// Scale evidence work with the number of candidate covers on bounded components.
+/// A common fixed budget could discard *all* read-based rankings simply because a
+/// previously omitted cover size was included. Large components and candidate sets
+/// retain the original budget; the expanded budget has a hard upper bound.
+fn candidate_work_budget(base: u64, anchors: usize, candidates: usize) -> u64 {
+    if anchors <= 64 && candidates <= 100_000 {
+        base.saturating_mul(candidates.div_ceil(20_000).clamp(1, 5) as u64)
+    } else {
+        base
+    }
+}
+
+fn scoring_work_budget(anchors: usize, candidates: usize) -> u64 {
+    candidate_work_budget(crate::read_model::WORK_BUDGET, anchors, candidates)
+}
+
 /// All covers of `anchors` (one component) by exactly `m` molecules that together visit every
 /// required anchor once (either orientation); optional anchors may be passed through, each at most
 /// once. A molecule ends where it closes back to its start or, failing that, as a path.
@@ -666,6 +862,67 @@ fn search_phased_indexed(
     out_of: &FxHashMap<Oriented, Vec<usize>>,
     thread_ends: Option<&crate::read_model::ThreadEnds>,
 ) -> (Vec<Vec<Found>>, bool, bool) {
+    search_phased_indexed_impl(n_seg, anchors, optional, br, m, max_steps, phases, out_of, thread_ends, true)
+}
+
+/// Conservative directed reachability on the anchor endpoints. If the component
+/// cannot be represented exactly or exceeds its bounds, disable this shortcut.
+fn component_reachability(
+    anchors: &[usize], br: &[Bridge], out_of: &FxHashMap<Oriented, Vec<usize>>,
+) -> Option<(FxHashMap<Oriented, usize>, Vec<Vec<bool>>)> {
+    if anchors.is_empty() || anchors.len() > 256 { return None; }
+    let mut index = FxHashMap::default();
+    for &a in anchors { for side in [false, true] {
+        let next = index.len();
+        if index.insert((a, side), next).is_some() { return None; }
+    }}
+    let n = index.len();
+    let mut adj = vec![Vec::new(); n];
+    let mut edges = 0usize;
+    for (&node, &i) in &index {
+        for &j in out_of.get(&node).map(Vec::as_slice).unwrap_or(&[]) {
+            let b = br.get(j)?;
+            if b.walk.first().copied() != Some(node) { return None; }
+            let end = *b.walk.last()?;
+            let dst = *index.get(&end)?;
+            adj[i].push(dst);
+            edges = edges.checked_add(1)?;
+            if edges > 65_536 { return None; }
+        }
+    }
+    if n.checked_mul(n.checked_add(edges)?)? > 8_000_000 { return None; }
+    let mut reach = vec![vec![false; n]; n];
+    for src in 0..n {
+        let mut stack = vec![src]; reach[src][src] = true;
+        while let Some(x) = stack.pop() { for &y in &adj[x] {
+            if !reach[src][y] { reach[src][y] = true; stack.push(y); }
+        }}
+    }
+    Some((index, reach))
+}
+
+fn search_phased_indexed_impl(
+    n_seg: usize, anchors: &[usize], optional: &[bool], br: &[Bridge], m: usize,
+    max_steps: u64, phases: &crate::phase::Constraints,
+    out_of: &FxHashMap<Oriented, Vec<usize>>,
+    thread_ends: Option<&crate::read_model::ThreadEnds>, optimize: bool,
+) -> (Vec<Vec<Found>>, bool, bool) {
+    search_phased_indexed_bounded(n_seg, anchors, optional, br, m, max_steps, phases, out_of, thread_ends, optimize, None)
+}
+
+fn search_phased_indexed_bounded(
+    n_seg: usize,
+    anchors: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    m: usize,
+    max_steps: u64,
+    phases: &crate::phase::Constraints,
+    out_of: &FxHashMap<Oriented, Vec<usize>>,
+    thread_ends: Option<&crate::read_model::ThreadEnds>,
+    optimize: bool,
+    candidate_limit: Option<usize>,
+) -> (Vec<Vec<Found>>, bool, bool) {
     struct Ctx<'a> {
         phases: &'a crate::phase::Constraints,
         out_of: &'a FxHashMap<Oriented, Vec<usize>>,
@@ -675,7 +932,10 @@ fn search_phased_indexed(
         want: usize,
         m: usize,
         max_steps: u64,
+        candidate_limit: Option<usize>,
         topology_neutral: bool,
+        optimize: bool,
+        reach: Option<&'a (FxHashMap<Oriented, usize>, Vec<Vec<bool>>)>,
     }
     struct State {
         used: Vec<bool>,
@@ -700,6 +960,20 @@ fn search_phased_indexed(
         if s.steps > c.max_steps {
             s.truncated = true;
             return;
+        }
+        // Every later molecule must consume a distinct unused required anchor.
+        // Once too few remain, no continuation of this partial cover can succeed.
+        if c.optimize && c.want.saturating_sub(s.covered) < c.m.saturating_sub(s.done.len() + 1) {
+            return;
+        }
+        // Ignore used vertices and phase restrictions in this upper-bound graph:
+        // only provably unreachable mandatory anchors are pruned.
+        if !s.used[s.must] {
+            if let Some((index, reach)) = c.reach {
+                if let (Some(&from), Some(&p), Some(&q)) = (index.get(&at), index.get(&(s.must, false)), index.get(&(s.must, true))) {
+                    if !reach[from][p] && !reach[from][q] { return; }
+                }
+            }
         }
         if s.covered < c.want {
             for &i in c.out_of.get(&at).map(Vec::as_slice).unwrap_or(&[]) {
@@ -731,9 +1005,11 @@ fn search_phased_indexed(
             }
         }
         // End the molecule here.
-        if !visits(c, start, &s.path, s.must) {
-            return;
-        }
+        // `must` was unused when this molecule began; only this molecule can
+        // have set its bit. Keep the original scan as an oracle for tests.
+        let visited_must = if c.optimize { s.used[s.must] } else { visits(c, start, &s.path, s.must) };
+        debug_assert_eq!(visited_must, visits(c, start, &s.path, s.must));
+        if !visited_must { return; }
         let mut closings: Vec<usize> = c.out_of.get(&at).map(|v| {
             v.iter()
                 .copied()
@@ -805,6 +1081,11 @@ fn search_phased_indexed(
             if s.done.len() + 1 == c.m {
                 let mut cover = s.done.clone();
                 cover.push(mol);
+                if c.candidate_limit.is_some_and(|limit| s.found.len() >= limit) {
+                    eprintln!("[ovasm] warning: adaptive search reached its candidate limit");
+                    s.truncated = true;
+                    return;
+                }
                 s.found.push(cover);
             }
             continue;
@@ -933,12 +1214,17 @@ fn search_phased_indexed(
                 charge(&mut budget, cost + bridges.len())?;
                 let mut extended = cover.clone();
                 extended.last_mut().unwrap().bridges.extend(bridges);
+                if c.candidate_limit.is_some_and(|limit| covers.len() >= limit) {
+                    eprintln!("[ovasm] warning: adaptive terminal extension reached its candidate limit");
+                    return None;
+                }
                 covers.push(extended);
             }
         }
         Some(())
     }
 
+    let reach = optimize.then(|| component_reachability(anchors, br, out_of)).flatten();
     let ctx = Ctx {
         phases,
         out_of,
@@ -948,7 +1234,10 @@ fn search_phased_indexed(
         want: anchors.iter().filter(|&&a| !optional[a]).count(),
         m,
         max_steps,
+        candidate_limit,
         topology_neutral: thread_ends.is_some(),
+        optimize,
+        reach: reach.as_ref(),
     };
     let mut st = State {
         used: vec![false; n_seg],
@@ -1729,6 +2018,9 @@ pub struct LinearizeReport {
     pub weak_bridges: usize,
     /// Self-loops and paths returning to their own anchor (tandem or sub-circle evidence).
     pub self_loops: Vec<String>,
+    /// Local repeat self-loop hypotheses do not participate in complete covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_repeat_closures: Option<LocalRepeatClosures>,
     /// Anchors without any bridge: no path joins them to the rest, so each is reported as its own
     /// linear molecule (unless shallow); the graph is broken there or the reads do not cover it.
     pub unbridged_anchors: Vec<String>,
@@ -2213,21 +2505,39 @@ pub fn run_phased(
         // searched as before; explicit limits stay authoritative.
         let mut last = envelope.min(comp.len());
         let mut m = rep.min_molecules;
+        // A requested larger envelope can exhaust work at several cover sizes.
+        // Allow at most one retry per searched size, capped at six in total;
+        // default and compact-component searches retain one retry.
+        let retry_limit = if comp.len() > 32 && p.max_molecules > 4 {
+            p.max_molecules.min(6)
+        } else { 1 };
+        let mut retries = 0;
         while m <= last {
             let (mut found, mut truncated, mut terminal_truncated) = search_phased_indexed(
                 g.names.len(), &comp, &optional, &br, m, p.max_steps, &phases, &search_out_of, thread_ends.as_ref(),
             );
-            // Automatic mode retries only compact graphs with a modest number of candidates.
-            // Explicit --max-steps remains a hard limit. Release the first batch before retrying
-            // so candidate vectors from the two searches never coexist. One retry per component.
-            if truncated && p.adaptive_steps && !rep.adaptive_retry && comp.len() <= 32
-                && br.len() <= 128 && found.len() <= 1_000_000
+            // Retain the existing compact-component retry. For moderately sized
+            // components, retry once with a bounded candidate count so that a larger
+            // step budget does not turn into unbounded candidate memory.
+            // Explicit --max-steps remains authoritative.
+            let compact_retry = comp.len() <= 32 && found.len() <= 1_000_000;
+            let bounded_retry = comp.len() > 32 && comp.len() <= 64 && found.len() <= 1_000_000;
+            if (truncated || terminal_truncated) && p.adaptive_steps && retries < retry_limit
+                && ((compact_retry && br.len() <= 128) || (bounded_retry && br.len() <= 256))
             {
                 rep.adaptive_retry = true;
+                retries += 1;
                 drop(found);
-                (found, truncated, terminal_truncated) = search_phased_indexed(
+                let factor = if bounded_retry && p.max_molecules > 5 && m >= 6 { 20 }
+                    else if bounded_retry && p.max_molecules > 4 && m >= 5 { 10 }
+                    else if bounded_retry { 4 } else { 2 };
+                let cap = bounded_retry.then_some(if p.max_molecules > 5 && m >= 6 {
+                    2_000_000
+                } else { 1_000_000 });
+                (found, truncated, terminal_truncated) = search_phased_indexed_bounded(
                     g.names.len(), &comp, &optional, &br, m,
-                    p.max_steps.saturating_mul(2), &phases, &search_out_of, thread_ends.as_ref(),
+                    p.max_steps.saturating_mul(factor), &phases, &search_out_of, thread_ends.as_ref(),
+                    true, cap,
                 );
             }
             rep.search_truncated |= truncated || terminal_truncated;
@@ -2286,7 +2596,7 @@ pub fn run_phased(
             }
         }
         if let Some(model)=&component_model {
-            let mut budget=crate::read_model::WORK_BUDGET;
+            let mut budget=scoring_work_budget(comp.len(), ranked.len());
             for (walks,cover,_) in &mut ranked {
                 let circular:Vec<_>=cover.molecules.iter().map(|m|m.circular).collect();
                 cover.read_support=model.score(walks,&circular,&mut budget);
@@ -2334,7 +2644,7 @@ pub fn run_phased(
         if let Some(model)=&component_model {
             if !ranked.is_empty() && !rep.read_model_budget_exhausted {
                 let fits:Vec<_>=ranked.iter().map(|(_,c,_)|c.read_support.as_ref().unwrap()).collect();
-                let path_cover=model.path_cover(&fits,1_000_000);
+                let path_cover=model.path_cover(&fits,candidate_work_budget(1_000_000,comp.len(),ranked.len()));
                 rep.witness_configurations=path_cover.candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
                 rep.ambiguity_configurations=path_cover.equivalent_candidate_indices.iter().map(|&i|ranked[i].1.clone()).collect();
                 rep.read_path_cover=Some(path_cover);
@@ -2561,6 +2871,7 @@ pub fn run_phased(
             .filter(|&&s| !br.iter().any(|b| b.walk[0].0 == s))
             .map(|&s| g.names[s].clone())
             .collect(),
+        local_repeat_closures: local_repeat_closures(&g, &report, &repeat, read_model.is_some(), &phases, p.min_reads, p.max_steps),
         self_loops,
         unsolved_components: comps
             .iter()
@@ -3376,6 +3687,20 @@ mod tests {
     }
 
     #[test]
+    fn component_reachability_is_directed_and_fails_closed_on_external_endpoints() {
+        let make = |walk| Bridge { walk, reads: 3, topological: false, weak: false };
+        let br = vec![make(vec![(0, true), (1, true)]), make(vec![(1, true), (2, false)])];
+        let mut out = FxHashMap::default();
+        for (i, b) in br.iter().enumerate() { out.entry(b.walk[0]).or_insert_with(Vec::new).push(i); }
+        let (idx, r) = component_reachability(&[0, 1, 2], &br, &out).unwrap();
+        assert!(r[idx[&(0, true)]][idx[&(2, false)]]);
+        assert!(!r[idx[&(2, false)]][idx[&(0, true)]]);
+        assert!(!r[idx[&(0, false)]][idx[&(2, false)]]);
+        assert!(component_reachability(&[0, 1], &br, &out).is_none());
+        assert!(component_reachability(&(0..257).collect::<Vec<_>>(), &br, &out).is_none());
+    }
+
+    #[test]
     fn a_component_without_a_cover_comes_out_as_partial_paths_and_stays_unsolved() {
         // X leaves by A (30 reads) or B (10); A leads on to C, C to the shallow O. One molecule
         // cannot hold both A and B. U has no link at all. With one molecule allowed there is no
@@ -3476,6 +3801,205 @@ mod tests {
         assert!(r.best.as_ref().unwrap().circular);
         assert_eq!(r.molecules, 1);
         assert_eq!(r.repeats_not_placed, names(&["R"]));
+    }
+
+
+    fn repeat_closure_fixture() -> Graph {
+        Graph {
+            names: ["A", "R", "B", "S"].map(String::from).to_vec(),
+            seqs: vec![b"ACGT".repeat(6); 4],
+            links: vec![
+                ((1, true), (1, true)),
+                ((1, false), (1, false)),
+                ((0, true), (1, true)),
+                ((1, true), (2, true)),
+                ((3, true), (3, false)),
+            ],
+            overlaps: vec![0; 5],
+        }
+    }
+
+    fn repeat_closure_evidence(g: &Graph, direct: u64) -> Value {
+        json!({
+            "repeat_segments": ["R", "S"],
+            "links": link_reads(&[("R-", "R-", direct), ("R+", "B+", 1), ("A+", "R+", 2)]),
+            "observed_walks": [{"path":"R+ R+ B+", "reads":1}, {"path":"B- R- R-", "reads":1}],
+            "phased_paths": [{"path":"A+ R+ B+", "reads":2}],
+            "thread_evidence": {
+                "schema": crate::thread_evidence::SCHEMA,
+                "graph_fingerprint": crate::unzip::graph_fingerprint(g),
+                "accepted_records": 1,
+                "links": [
+                    {"from":"R-", "to":"R-", "records":direct},
+                    {"from":"R+", "to":"B+", "records":1},
+                    {"from":"A+", "to":"R+", "records":2}
+                ],
+                "paths": [{"path":"R+ R+ B+", "reads":1}]
+            }
+        })
+    }
+
+    #[test]
+    fn local_repeat_closures_keep_competing_links_and_distinct_contexts() {
+        let g = repeat_closure_fixture();
+        let ev = repeat_closure_evidence(&g, 3);
+        let repeat = [false, true, false, true];
+        assert!(crate::read_model::ReadModel::load(&g, &ev, &repeat, 2).unwrap().is_some());
+        let report = local_repeat_closures(&g, &ev, &repeat, true, &Default::default(), 2, 100).unwrap();
+        let [closure] = report.closures.as_slice() else { panic!("expected one same-strand loop") };
+        assert_eq!((closure.segment.as_str(), closure.state, closure.closed_walk_length),
+                   ("R", "unresolved_competing_context", Some(24)));
+        assert_eq!(closure.link.single_record_crossings, Some(3));
+        assert_eq!(closure.competing_links.len(), 2);
+        assert!(closure.competing_links.iter().any(|e| e.single_record_crossings == Some(1)));
+        assert_eq!(report.contexts.len(), 3);
+        assert!(!report.contexts_truncated);
+        assert_eq!(report.contexts.iter().find(|r| r.source == "observed_walk").unwrap().reported_records, 1);
+        let limited = local_repeat_closures(&g, &ev, &repeat, true, &Default::default(), 2, 1).unwrap();
+        assert!(limited.contexts_truncated);
+        assert_eq!(limited.closures[0].competing_links.len(), 2);
+        assert!(local_repeat_closures(&g, &ev, &[false; 4], true, &Default::default(), 2, 100).is_none());
+    }
+
+    #[test]
+    fn local_repeat_closures_withhold_unverified_or_insufficient_crossings_and_ambiguous_overlap() {
+        let mut g = repeat_closure_fixture();
+        let repeat = [false, true, false, true];
+        let ev = repeat_closure_evidence(&g, 1);
+        let get = |g: &Graph, bound| local_repeat_closures(g, &ev, &repeat, bound, &Default::default(), 2, 100).unwrap();
+        assert_eq!(get(&g, true).closures[0].state, "unresolved_insufficient_crossings");
+        assert_eq!(get(&g, false).closures[0].state, "unresolved_no_graph_bound_crossings");
+        assert!(get(&g, false).closures[0].closed_walk_length.is_none());
+        g.overlaps[1] = 4;
+        let ambiguous = get(&g, true);
+        assert_eq!(ambiguous.closures[0].state, "unresolved_overlap");
+        assert_eq!(ambiguous.closures[0].link.overlaps_bp, BTreeSet::from([0, 4]));
+    }
+
+    #[test]
+    fn local_repeat_closures_respect_conflicting_hard_phase() {
+        let g = repeat_closure_fixture();
+        let repeat = [false, true, false, true];
+        let ev = repeat_closure_evidence(&g, 3);
+        let path = std::env::temp_dir().join(format!("ovasm-local-closure-phase-{}.json", std::process::id()));
+        fs::write(&path, json!({
+            "graph_fingerprint": crate::unzip::graph_fingerprint(&g),
+            "min_count": 2,
+            "unique_records": 10,
+            "repeat_nodes": [{
+                "segment":"R", "classification":"resolved",
+                "entries":[{"segment":"A+","adjacency_reads":3},{"segment":"R+","adjacency_reads":3}],
+                "exits":[{"segment":"R+","adjacency_reads":3},{"segment":"B+","adjacency_reads":3}],
+                "phases":[{"entry":"A+","exit":"R+","reads":3,"supported":true},
+                          {"entry":"R+","exit":"B+","reads":3,"supported":true}]
+            }]
+        }).to_string()).unwrap();
+        let phase = crate::phase::Constraints::load(&g, &path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(!phase.allows_walk(&[(1, true)], true));
+        let report = local_repeat_closures(&g, &ev, &repeat, true, &phase, 2, 100).unwrap();
+        assert_eq!(report.closures[0].state, "unresolved_phase_conflict");
+        assert_eq!(report.closures[0].closed_walk_length, None);
+        assert_eq!(report.closures[0].competing_links.len(), 2);
+        assert_eq!(report.contexts.iter().filter(|row| row.source == "phase_report").count(), 2);
+    }
+
+    #[test]
+    fn scoring_budget_scales_only_for_bounded_components() {
+        let base = crate::read_model::WORK_BUDGET;
+        assert_eq!(scoring_work_budget(53, 0), base);
+        assert_eq!(scoring_work_budget(53, 20_000), base);
+        assert_eq!(scoring_work_budget(53, 44_432), base * 3);
+        assert_eq!(scoring_work_budget(53, 100_000), base * 5);
+        assert_eq!(scoring_work_budget(53, 100_001), base);
+        assert_eq!(scoring_work_budget(65, 44_432), base);
+        assert_eq!(candidate_work_budget(1_000_000, 53, 44_432), 3_000_000);
+        assert_eq!(candidate_work_budget(1_000_000, 65, 44_432), 1_000_000);
+    }
+
+    #[test]
+    fn bounded_retry_marks_candidate_limit_as_truncated() {
+        let anchors = [0usize];
+        let optional = [false];
+        let br = vec![Bridge { walk: vec![(0, true), (0, true)], reads: 2, weak: false, topological: false }];
+        let mut out = FxHashMap::default();
+        out.insert((0, true), vec![0]);
+        let phase = crate::phase::Constraints::default();
+        let unbounded = search_phased_indexed_impl(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true);
+        assert!(!unbounded.0.is_empty() && !unbounded.1);
+        let capped = search_phased_indexed_bounded(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true, Some(0));
+        assert!(capped.0.is_empty() && capped.1);
+        let enough = search_phased_indexed_bounded(1, &anchors, &optional, &br, 1, 1_000, &phase, &out, None, true, Some(unbounded.0.len()));
+        assert!(!enough.1 && !enough.2 && enough.0.len() == unbounded.0.len());
+    }
+
+    #[test]
+    fn optimized_cover_search_matches_unpruned_oracle() {
+        // Deterministic directed four-anchor graphs, including self closures,
+        // optional anchors, both orientations, and active phase checks.
+        let anchors = [0usize, 1, 2, 3];
+        let mut seed = 0x1234_5678u64;
+        for case in 0..64 {
+            let mut br = Vec::new();
+            for a in 0..4 { for b in 0..4 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if seed >> 62 == 0 {
+                    for forward in [true, false] {
+                        br.push(Bridge { walk: vec![(a, forward), (b, forward)], reads: (case % 7 + 1) as u64, weak: false, topological: false });
+                    }
+                }
+            }}
+            let mut out = FxHashMap::default();
+            for (i, b) in br.iter().enumerate() { out.entry(b.walk[0]).or_insert_with(Vec::new).push(i); }
+            let mut phase = crate::phase::Constraints::default();
+            if case % 2 == 0 { phase.active_nodes = 1; }
+            for mask in 0..16 {
+                let optional: Vec<bool> = (0..4).map(|i| mask & (1 << i) != 0).collect();
+                for m in 1..=4 {
+                    let a = search_phased_indexed_impl(4, &anchors, &optional, &br, m, 2_000_000, &phase, &out, None, true);
+                    let b = search_phased_indexed_impl(4, &anchors, &optional, &br, m, 2_000_000, &phase, &out, None, false);
+                    let repr = |c: &[Vec<Found>]| c.iter().map(|p| p.iter().map(|x| (x.start, x.bridges.clone(), x.circular)).collect::<Vec<_>>()).collect::<Vec<_>>();
+                    assert!(!a.1 && !b.1, "fixture budget case={case} mask={mask} m={m}");
+                    assert_eq!(repr(&a.0), repr(&b.0), "case={case} mask={mask} m={m}");
+                    assert_eq!(a.2, b.2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_cover_search_matches_phase_and_terminal_oracle() {
+        let gfa = gfa_text(&[("A",100),("C",100),("R",100),("B",100),("D",100)],
+            &[("A+","R+"),("C+","R+"),("R+","B+"),("R+","D+")]);
+        let dir = std::env::temp_dir().join(format!("ovasm-dfs-phase-oracle-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gp = dir.join("graph.gfa"); std::fs::write(&gp,&gfa).unwrap();
+        let graph = parse_gfa(&gp).unwrap();
+        let report = json!({"graph_fingerprint":crate::unzip::graph_fingerprint(&graph), "min_count":80, "unique_records":400,
+            "repeat_nodes":[{"segment":"R","classification":"resolved",
+            "entries":[{"segment":"A+","adjacency_reads":200},{"segment":"C+","adjacency_reads":200}],
+            "exits":[{"segment":"B+","adjacency_reads":200},{"segment":"D+","adjacency_reads":200}],
+            "phases":[{"entry":"A+","exit":"B+","reads":80,"supported":true},{"entry":"C+","exit":"D+","reads":80,"supported":true}]}]});
+        let pp=dir.join("phase.json"); std::fs::write(&pp,report.to_string()).unwrap();
+        let phases=crate::phase::Constraints::load(&graph,&pp).unwrap();
+        assert!(!phases.allows((0,true),(2,true),(4,true)));
+        assert!(!phases.allows((4,false),(2,false),(0,false)));
+        let links=[("A+","R+",2),("C+","R+",2),("R+","B+",2),("R+","D+",2)];
+        let ev=terminal_evidence(&gfa,&links,&[("A+ R+ B+",2),("C+ R+ D+",2)]);
+        let anchors: Vec<_>=(0..5).collect();let optional=vec![false,false,false,true,true];let repeats=vec![false;5];
+        let threads=crate::read_model::ReadModel::load(&graph,&ev,&repeats,2).unwrap().unwrap().thread_ends(&anchors,&optional);
+        assert!(!threads.is_empty());
+        let (br,_)=bridges(&graph,&ev,&repeats,2).unwrap();let mut out=FxHashMap::default();
+        for (i,b) in br.iter().enumerate(){out.entry(b.walk[0]).or_insert_with(Vec::new).push(i);}
+        for m in 1..=3 { for with_threads in [false,true] {
+            let t=with_threads.then_some(&threads);
+            let a=search_phased_indexed_impl(5,&anchors,&optional,&br,m,2_000_000,&phases,&out,t,true);
+            let b=search_phased_indexed_impl(5,&anchors,&optional,&br,m,2_000_000,&phases,&out,t,false);
+            let repr=|c:&[Vec<Found>]| c.iter().map(|p|p.iter().map(|f|(f.start,f.bridges.clone(),f.circular)).collect::<Vec<_>>()).collect::<Vec<_>>();
+            assert!(!a.1 && !b.1 && !a.2 && !b.2);
+            assert_eq!(repr(&a.0),repr(&b.0),"m={m} threads={with_threads}");
+        }}
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
