@@ -195,6 +195,9 @@ def anchor_len(args, flank):
     return max(1, min(args.anchor, flank - min(args.end_slack, flank // 4)))
 
 
+MIN_OWN = 50  # bases a flank segment needs outside its overlap to be told from its neighbour
+
+
 def build_probes(g, args):
     """Link probes, traversal probes and their spanning windows."""
     F = args.flank
@@ -217,6 +220,10 @@ def build_probes(g, args):
         xs = g.seq[x]
         for (a, ao), ov1 in ins:
             for (b, bo), ov2 in outs:
+                # an entry or exit lying (almost) wholly in its overlap with X has no flank of its
+                # own: its probe is X itself and draws every read through X (Leontodon u9 787/788)
+                if len(g.seq[a]) - ov1 < MIN_OWN or len(g.seq[b]) - ov2 < MIN_OWN:
+                    continue
                 mid = xs[ov1:]
                 right = g.oseq(b, bo)[ov2:][:F]
                 left = g.oseq(a, ao)[-F:]
@@ -521,9 +528,12 @@ def main():
                 return tindex.get(key, {}).get("heldout_reads", 0)
             p1 = tr(e[0], o[0]) + tr(e[1], o[1])
             p2 = tr(e[0], o[1]) + tr(e[1], o[0])
+            tied = any(tindex.get(canon_trav(*a, x, xo, *b), {}).get("status") == "ambiguous"
+                       for a in e for b in o)
+            call = "ambiguous" if p1 + p2 == 0 and tied else pair_call(p1, p2, args)
             rows_r.append(dict(repeat=f"{x}{xo}", length=seglen[x], bin=length_bin(seglen[x]),
                                ovasm_pairings=rp["pairing_reads"], ovasm_call=pair_call(*rp["pairing_reads"], args),
-                               heldout_pairings=[p1, p2], heldout_call=pair_call(p1, p2, args),
+                               heldout_pairings=[p1, p2], heldout_call=call,
                                ovasm_minor=minor(*rp["pairing_reads"]), heldout_minor=minor(p1, p2)))
     rows_m = []
     for key, qs in sorted(splits.items(), key=lambda kv: -len(kv[1])):
