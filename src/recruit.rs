@@ -1793,6 +1793,19 @@ fn extends(
     let bit = 1u8 << t;
     let new = gauge(g.profile_of(seq, deep, |km| bait.get(km) & bit == 0), floor, ceiling);
     if new == Gauge::Extends {
+        return (Gauge::Extends, true);
+    }
+    // What another target's bait holds stands at that target's depth, not this one's: an
+    // insertion of the plastid in the mitochondrion (MTPT) is as deep as the plastid in the
+    // library, thousands of x, and a mitochondrial read across it is no longer uniformly deep,
+    // nor is the sequence it adds while the insertion is part of it. Judged without it, the
+    // read is the target's own sequence and what no bait holds yet. Bellardia viscosa,
+    // Convolvulus arvensis and Carex laevigata stopped on both sides of a 7.9 kb, 6.6 kb and
+    // 10.4 kb stretch holding 2.9, 1.3 and 10.4 kb of plastid sequence, all three at the
+    // mitochondrion's depth in the library and crossed by 84, 956 and 11 reads.
+    let others = !bit;
+    let own = gauge(g.profile_of(seq, deep, |km| bait.get(km) & others == 0), floor, ceiling);
+    if own == Gauge::Extends {
         (Gauge::Extends, true)
     } else {
         (whole, false)
