@@ -1046,18 +1046,24 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
 /// k of the graph of corrected `reads`: `ASSEMBLE_K_HIGH`, or `ASSEMBLE_K_LOW` when its graph holds
 /// `ASSEMBLE_K_GROWTH` times the sequence of the higher k's (see there). Each probe is one
 /// `assemble graph` pass over the reads, written beside the graph and removed.
-fn choose_assemble_k(reads: &Path, dir: &Path) -> Result<usize> {
+fn choose_assemble_k(reads: &Path, dir: &Path, depth_reference: Option<&Path>) -> Result<usize> {
     let length = |k: usize| -> Result<f64> {
         let (gfa, json) = (
             dir.join(format!("probe-k{k}.gfa")),
             dir.join(format!("probe-k{k}.json")),
         );
-        Argv::new("assemble graph")
+        let mut probe = Argv::new("assemble graph")
             .opt("--reads", reads)
             .opt("--k", k.to_string())
             .opt("--out", &gfa)
-            .opt("--out-json", &json)
-            .run()?;
+            .opt("--out-json", &json);
+        // the depth the assembly itself uses: without it the nodes' plain median counts the
+        // error nodes of noisy reads (21x on Nipponbare ONT against 370x on the seeds' own
+        // nodes), the minimum count falls to 3 and both graphs fill with noise
+        if let Some(reference) = depth_reference {
+            probe = probe.opt("--depth-reference", reference);
+        }
+        probe.run()?;
         let total = read_json(&json)?["total_length"].as_f64().unwrap_or(0.0);
         for f in [&gfa, &json, &gfa.with_extension("cleaning.fa")] {
             let _ = std::fs::remove_file(f);
@@ -1108,7 +1114,7 @@ fn assemble(
         .collect();
     let assemble_k = match o.assemble_k {
         Some(k) => k,
-        None => choose_assemble_k(&r.corrected, dir)?,
+        None => choose_assemble_k(&r.corrected, dir, own_seeds.get(organelle).and_then(|v| v.first()).map(PathBuf::as_path))?,
     };
     log(&format!("assembling the corrected {organelle} reads from k {assemble_k}"));
     let mut summary = pipeline::run(&pipeline::RunConfig {
