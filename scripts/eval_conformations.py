@@ -368,14 +368,18 @@ def missing_share_upper(n):
     return 1.0 if n == 0 else 1.0 - 0.05 ** (1.0 / n)
 
 
-def call_status(reads, opp, args):
+def call_status(reads, opp, args, ambiguous=0):
     """opp: independent reads that could have shown it (the junction's or segment's spanners).
     A graph may keep a minor form (a few percent of molecules), so no read among a few dozen
-    is no contradiction: that needs the 95% upper bound of its share below --max-absent-share."""
+    is no contradiction: that needs the 95% upper bound of its share below --max-absent-share.
+    Reads tied between it and another probe (flanks identical over the probe) leave it
+    'ambiguous', not contradicted (Triglochin u7: entries sharing 2 kb upstream)."""
     if reads >= args.min_support:
         return "supported"
     if reads > 0:
         return "weak"
+    if ambiguous > 0:
+        return "ambiguous"
     if opp == 0:
         return "untestable"
     return "contradicted" if missing_share_upper(opp) < args.max_absent_share else "not_seen"
@@ -479,7 +483,7 @@ def main():
         r = support.get(n, 0)
         opp = len(near.get(n, ()))
         rows_l.append(dict(link=p["key"], heldout_reads=r, opportunity=opp, ambiguous=ambiguous.get(n, 0),
-                           status=call_status(r, opp, args),
+                           status=call_status(r, opp, args, ambiguous.get(n, 0)),
                            ovasm_reads=(ev["links"].get(p["key"]) if ev else None)))
     rows_t = []
     groups = defaultdict(list)
@@ -495,7 +499,7 @@ def main():
             r = support.get(n, 0)
             rows_t.append(dict(traversal=p["key"], segment=x, length=p["mid"], bin=length_bin(p["mid"]),
                                heldout_reads=r, group_spanning=total, group_ambiguous=amb,
-                               status=call_status(r, total, args),
+                               status=call_status(r, total, args, ambiguous.get(n, 0)),
                                ovasm_reads=(ev["traversals"].get(p["key"], 0) if ev else None)))
     tindex = {r["traversal"]: r for r in rows_t}
     rows_r = []
