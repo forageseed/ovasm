@@ -357,6 +357,8 @@ pub struct IterationStats {
     pub multi_target_reads: u64,
     /// k-mers added to each target's bait set after this pass (iterative baiting).
     pub bait_kmers_added: Vec<usize>,
+    /// Of `extended_from_reads`, mates of the target's reads (`MateReach`).
+    pub extended_from_mates: Vec<u64>,
     /// Reads each target's bait was extended from after this pass: only reads not used in an
     /// earlier pass, subsampled to `extend_depth`.
     pub extended_from_reads: Vec<u64>,
@@ -409,6 +411,8 @@ struct ScanResult {
     /// Each extending target's NUMT candidates that this pass classified anew: the partial reads
     /// at the edges its bait last grew to (`FRONTIER_STEPS`).
     frontier: Vec<Sample<FRONTIER_READS>>,
+    /// Mates of each target's reads that would extend it (`MateReach`).
+    mates: Vec<Sample<MATE_READS>>,
     /// A partial target candidate was observed, including unchanged cached calls.
     partial_candidates: Vec<bool>,
     /// Accepted short reads partially explained by gap-bridged bait, per target.
@@ -776,6 +780,57 @@ struct Writes<'a> {
     /// its gigabases are then no longer rewritten every pass, nor are the NUMT candidates
     /// (Nipponbare: 3 Gb a pass).
     keep: Option<&'a [Keep]>,
+    /// Read pairs (`MateReach`): the mates of each target's reads that the k-mer gate takes.
+    mates: Option<&'a MateReach<'a>>,
+}
+
+/// Most mates of a target's reads a pass keeps for its extension (`MateReach`), a uniform
+/// sample by name: about 75 Mb of 150 bp reads.
+const MATE_READS: usize = 500_000;
+/// Steps of extension from mates in a pass, and the bait k-mers a mate shares with the bait to
+/// extend it in a step: 25 bp of overlap, not a lone k-mer of a short repeat elsewhere.
+const MATE_STEPS: usize = 10;
+const MATE_MIN_SHARED: usize = 5;
+
+/// Short read pairs (`RecruitConfig::kmer_gate` with `mates_together`): a read the bait does not
+/// cover whose mate the target recruited extends it when the k-mers it would add stand at the
+/// target's depth (`mate_extends`). A read joins a target only when the bait covers `min_cover`
+/// of it, so extension from reads moves an edge by about a fifth of a read a pass, and the k-mer
+/// frontier walk keeps only what rejoins the bait: Nipponbare SRR25241092 (2 x 150 bp, insert
+/// ~350 bp, mitochondrion ~900x) stopped at 52.8% of its 376 kb in 86 gaps, at normal depth and
+/// GC. The mate of a read at an edge lies up to an insert length past it.
+struct MateReach<'a> {
+    /// Pair keys (`pair_key`) of the reads each target has recruited.
+    pairs: &'a [FxHashSet<u64>],
+    table: &'a crate::frontier::KmerCounts,
+    /// Each extending target's k-mer depth (None: not extending) and gate floor.
+    depth: &'a [Option<f64>],
+    floor: &'a [Option<f64>],
+}
+
+impl MateReach<'_> {
+    fn offer(&self, rec: &Rec, bait: &BaitSet, out: &mut [Sample<MATE_READS>]) {
+        let mut key = None;
+        for t in 0..self.pairs.len() {
+            let Some(d) = self.depth[t] else { continue };
+            if self.pairs[t].is_empty() {
+                continue;
+            }
+            let k = *key.get_or_insert_with(|| pair_key(&rec.id));
+            if !self.pairs[t].contains(&k) {
+                continue;
+            }
+            let floor = self.floor[t].unwrap_or(KMER_GATE_FLOOR * d);
+            if mate_extends(self.table, bait, t, &rec.seq, d, floor) {
+                out[t].offer(name_key(&rec.id), &rec.seq);
+            }
+        }
+    }
+}
+
+/// The key a pair's two mates share: that of the first word of the name without a /1 or /2.
+fn pair_key(id: &[u8]) -> u64 {
+    name_key(sample_name(id, true))
 }
 
 struct ScanPolicies<'a> {
@@ -858,6 +913,7 @@ fn scan(
         all_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         fresh_sample: (0..n_targets).map(|_| Sample::default()).collect(),
         frontier: (0..n_targets).map(|_| Sample::default()).collect(),
+        mates: (0..n_targets).map(|_| Sample::default()).collect(),
         partial_candidates: vec![false; n_targets],
         accepted_partial: (0..n_targets).map(|_| AcceptedPartialAudit::default()).collect(),
         numt: TargetCounts::default(),
@@ -1041,6 +1097,11 @@ fn scan(
             };
             if let Some(plan) = &mut policies.admission {
                 plan.observe(&entry.rec, call, original_input);
+            }
+            if call == Call::Other {
+                if let Some(m) = w.mates {
+                    m.offer(&entry.rec, bait, &mut out.mates);
+                }
             }
             if matches!(call, Call::Other | Call::Tandem) {
                 continue;
@@ -1471,17 +1532,31 @@ fn kmer_frontier(
 /// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
 /// those the target's bait lacks, at the target's depth `depth` by the table's counts.
 fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64, floor: f64) -> bool {
+    match new_kmer_median(table, bait, t, seq) {
+        None => true,
+        Some(m) => m >= floor && m <= KMER_GATE_CEILING * depth,
+    }
+}
+
+/// `kmer_extends` for the mate of a target's read (`MateReach`): one that adds fewer than
+/// `KMER_GATE_MIN_NEW` k-mers adds nothing and is not taken.
+fn mate_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64, floor: f64) -> bool {
+    new_kmer_median(table, bait, t, seq).is_some_and(|m| m >= floor && m <= KMER_GATE_CEILING * depth)
+}
+
+/// The median count of the k-mers of `seq` that target `t`'s bait lacks; None for fewer than
+/// `KMER_GATE_MIN_NEW` of them.
+fn new_kmer_median(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8]) -> Option<f64> {
     let bit = 1u8 << t;
     let mut new: Vec<u32> = CanonicalKmers::new(seq, bait.k)
         .filter(|&(_, km)| bait.get(km) & bit == 0)
         .map(|(_, km)| table.get(km))
         .collect();
     if new.len() < KMER_GATE_MIN_NEW {
-        return true;
+        return None;
     }
     new.sort_unstable();
-    let m = f64::from(new[new.len() / 2]);
-    m >= floor && m <= KMER_GATE_CEILING * depth
+    Some(f64::from(new[new.len() / 2]))
 }
 
 /// Keep the k-mers new to a target's bait that stand at its depth in the k-mer gate's table
@@ -2184,6 +2259,9 @@ pub(crate) fn run_with_options(
     // deep, already complete target (a plastid at 20,000x) is not re-counted every pass.
     // (64-bit hashes of the read names: millions of names, 8 bytes each instead of a string.)
     let mut used: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
+    // pair keys of each target's recruited reads, for the mates they bring (`MateReach`)
+    let mate_reach = cfg.kmer_gate && cfg.mates_together;
+    let mut mate_pairs: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
     // A target seeded from reads of the sample holds its whole genome already: extending it
     // only adds passes over the input (each a full decompression) for nothing.
     let mut saturated: Vec<bool> = bait.targets.iter().map(|t| t.from_reads).collect();
@@ -2281,6 +2359,15 @@ pub(crate) fn run_with_options(
             core: tandem_core.clone(),
             admitted: tandem_admit.clone(),
         });
+        let mate_depth: Vec<Option<f64>> = (0..n_targets)
+            .map(|t| kmer_target_depth[t].filter(|_| !saturated[t]))
+            .collect();
+        let mates = kmer_table.as_ref().filter(|_| mate_reach).map(|table| MateReach {
+            pairs: &mate_pairs,
+            table,
+            depth: &mate_depth,
+            floor: &kmer_floor,
+        });
         let mut res = scan(
             &cfg.inputs,
             &bait,
@@ -2290,6 +2377,7 @@ pub(crate) fn run_with_options(
                 numt_path: &numt_path,
                 used: &used,
                 keep: replaying.then_some(keep.as_slice()),
+                mates: mates.as_ref(),
             },
             replay.as_mut(),
             delta.as_ref(),
@@ -2431,6 +2519,7 @@ pub(crate) fn run_with_options(
         }
         let mut added = walked;
         let mut extended_from = vec![0u64; n_targets];
+        let mut mate_reads = vec![0u64; n_targets];
         let mut gated_out = vec![0u64; n_targets];
         let mut shallow_out = vec![0u64; n_targets];
         let mut deep_out = vec![0u64; n_targets];
@@ -2521,6 +2610,9 @@ pub(crate) fn run_with_options(
                         return;
                     }
                     fresh.push(key);
+                    if mate_reach {
+                        mate_pairs[t].insert(pair_key(&r.id));
+                    }
                     if fraction < 1.0 && unit_hash(&r.id, EXTEND_SALT) >= fraction {
                         extension_subsampled[t] = true;
                         if let Some(audit) = &mut frontier_audit {
@@ -2603,6 +2695,66 @@ pub(crate) fn run_with_options(
                         picked.iter().map(Vec::as_slice),
                         cfg.extend_min_count,
                     );
+                }
+                // The mates the k-mer gate took in this pass's scan (`MateReach`), step by step
+                // from the bait's edges: a mate that shares `MATE_MIN_SHARED` k-mers with the bait
+                // extends it without a gap, and the next step's mates reach past those, up to an
+                // insert length a pass. A mate further out waits for a later step or pass. Taken
+                // at once, the mates laid islands past the edges, two ends each, and the k-mer
+                // frontier walk stopped for good (`KMER_FRONTIER_MAX_END_GROWTH`; Nipponbare at
+                // 25%: 2,257 ends to 3,033 at pass 3). Only while the pass's own extension, from
+                // reads and the frontier walk, still added to the target: its edges are still
+                // moving. Past that, the mates the bait does not cover are not past an edge but
+                // beside a closed molecule, at the nuclear insertions and chimeric pairs of its
+                // reads; the Nipponbare plastid, a closed circle after four passes, kept taking
+                // mates of high-copy nuclear sequence at its depth and 760,000 more reads.
+                if mate_reach && !saturated[t] && added[t] > 0 {
+                    let bit = 1u8 << t;
+                    let mut pending: Vec<&[u8]> = res.mates[t]
+                        .reads()
+                        .into_iter()
+                        .filter(|s| fraction >= 1.0 || unit_hash(s, EXTEND_SALT) < fraction)
+                        .collect();
+                    let mut steps: Vec<(usize, usize, usize)> = Vec::new();
+                    let offered = pending.len();
+                    for _ in 0..MATE_STEPS {
+                        bait.prepare_lookup();
+                        let (ready, rest): (Vec<&[u8]>, Vec<&[u8]>) = pending.into_par_iter().partition(|s| {
+                            CanonicalKmers::new(s, bait.k).filter(|&(_, km)| bait.get(km) & bit != 0).nth(MATE_MIN_SHARED - 1).is_some()
+                        });
+                        pending = rest;
+                        if ready.is_empty() {
+                            break;
+                        }
+                        let mut new = bait.new_from_reads(t, ready.iter().copied(), cfg.extend_min_count);
+                        keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
+                        let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                        if runaway_growth(previous, added[t].saturating_add(new.len()), closing[t]) {
+                            saturated[t] = true;
+                            stopped[t] = Some("growing");
+                            let w = format!(
+                                "{}: extension from read pairs stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved",
+                                bait.targets[t].name, it + 1, added[t].saturating_add(new.len()), previous
+                            );
+                            eprintln!("[ovasm] warning: {w}");
+                            warnings.push(w);
+                            break;
+                        }
+                        let more = bait.add_kmers(t, &new);
+                        steps.push((ready.len(), new.len(), more));
+                        mate_reads[t] += ready.len() as u64;
+                        added[t] += more;
+                        if more == 0 {
+                            break;
+                        }
+                    }
+                    eprintln!(
+                        "[ovasm] mates {} pass {}: {} taken by the gate, steps (ready, new, added) {:?}",
+                        bait.targets[t].name, it + 1, offered, steps
+                    );
+                    if saturated[t] {
+                        continue;
+                    }
                 }
                 if !frontier_withheld[t] {
                     frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
@@ -2986,6 +3138,7 @@ pub(crate) fn run_with_options(
             tandem_admitted: tandem_admit.clone(),
             bait_kmers_added: added.clone(),
             extended_from_reads: extended_from,
+            extended_from_mates: mate_reads,
             saturated: saturated.clone(),
             bootstrapped_from_reads: bootstrapped,
             extension_gated_out: gated_out,
@@ -3062,6 +3215,7 @@ pub(crate) fn run_with_options(
                 numt_path: &numt_path,
                 used: &used,
                 keep: None,
+                mates: None,
             },
             replay.as_mut(),
             None,
@@ -3712,6 +3866,47 @@ mod tests {
         // 120 bp on the bait and 30 bp into the nucleus past the NUMT: does not
         let numt_edge = [&organelle[880..1000], &nucleus[..30]].concat();
         assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth, KMER_GATE_FLOOR * depth));
+    }
+
+    #[test]
+    fn a_mate_past_the_edge_extends_and_one_in_the_nucleus_does_not() {
+        // an organelle at 200x, its bait the first 1,000 bp; the nucleus at 5x
+        let organelle = pseudo_random(2000, 51);
+        let nucleus = pseudo_random(1000, 52);
+        let table = crate::frontier::KmerCounts::with_k(20, 21);
+        for (seq, copies) in [(&organelle, 200), (&nucleus, 5)] {
+            for _ in 0..copies {
+                for (_, km) in CanonicalKmers::new(seq, 21) {
+                    table.add(km);
+                }
+            }
+        }
+        let mut bait = BaitSet::new(21);
+        let t = bait.target("mitochondrion").unwrap();
+        bait.add_sequence(t, &organelle[..1000]);
+        bait.prepare_lookup();
+        let floor = KMER_GATE_FLOOR * 200.0;
+        // past the edge, no bait in it: extends (a read the bait would not take)
+        assert!(mate_extends(&table, &bait, t, &organelle[1100..1250], 200.0, floor));
+        // inside the bait: adds nothing, not taken
+        assert!(!mate_extends(&table, &bait, t, &organelle[100..250], 200.0, floor));
+        // in the nucleus: not taken
+        assert!(!mate_extends(&table, &bait, t, &nucleus[100..250], 200.0, floor));
+        // the mates' pair key, whole-name mates and /1 /2 mates alike
+        assert_eq!(pair_key(b"SRR1.7 A:1:2 length=150"), pair_key(b"SRR1.7 A:1:2 length=150"));
+        assert_eq!(pair_key(b"run/7/1"), pair_key(b"run/7/2"));
+        assert_ne!(pair_key(b"SRR1.7 x"), pair_key(b"SRR1.8 x"));
+        // offered by the scan: only the mate of a recruited pair, only past the edge
+        let pairs = vec![[pair_key(b"SRR1.7")].into_iter().collect::<FxHashSet<u64>>()];
+        let depth = [Some(200.0)];
+        let fl = [Some(floor)];
+        let reach = MateReach { pairs: &pairs, table: &table, depth: &depth, floor: &fl };
+        let mut out: Vec<Sample<MATE_READS>> = vec![Sample::default()];
+        let rec = |id: &[u8], seq: &[u8]| Rec { id: id.to_vec(), seq: seq.to_vec(), qual: None };
+        reach.offer(&rec(b"SRR1.7 x", &organelle[1100..1250]), &bait, &mut out);
+        reach.offer(&rec(b"SRR1.8 x", &organelle[1300..1450]), &bait, &mut out);
+        reach.offer(&rec(b"SRR1.7 x", &nucleus[100..250]), &bait, &mut out);
+        assert_eq!(out[0].reads(), vec![&organelle[1100..1250]]);
     }
 
     #[test]
