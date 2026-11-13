@@ -1613,6 +1613,39 @@ fn new_sequence_at_depth(depths: &mut [u32], own: f64) -> bool {
     let (mid, upper) = (q(0.5), q(0.75));
     (LEFTOVER_DEPTH.0 * own..=LEFTOVER_DEPTH.1 * own).contains(&mid) && upper <= ONE_COPY_SPREAD * mid
 }
+/// Whether leftover `seq` stands at target `t`'s depth, the band `(lo, hi)`: judged by the
+/// sequence it would add, its k-mers the bait lacks, where the sketch samples enough of them
+/// (`LEFTOVER_NEW_MIN_SAMPLES`), else by the whole read. A leftover holds a block of the bait,
+/// and that block is often a repeat the target shares with other sequence, deeper than either;
+/// what the read adds is what must be at the target's depth. A read of another circle of a
+/// multipartite mitochondrion adds sequence at that circle's depth; one from a NUMT adds
+/// nuclear flank at the nuclear depth, one from a high-copy nuclear repeat adds sequence far
+/// deeper. Judged as a batch, the Euphorbia lathyris leftovers (1,669 reads beside 707x) mixed
+/// the 86 kb and 33 kb circles Oatk assembles (0.71-0.90 of the target's depth) with such
+/// reads, their new k-mers at median 182x and upper quartile 655x, and all were held.
+fn leftover_at_depth(
+    g: &DepthGate,
+    bait: &BaitSet,
+    t: usize,
+    seq: &[u8],
+    deep: f64,
+    (lo, hi): (f64, f64),
+) -> bool {
+    if g.k() == bait.k {
+        let bit = 1u8 << t;
+        if let Some(new) = g
+            .profile_of(seq, deep, |km| bait.get(km) & bit == 0)
+            .filter(|p| p.sampled >= LEFTOVER_NEW_MIN_SAMPLES)
+        {
+            return (lo..=hi).contains(&new.median);
+        }
+    }
+    g.median_depth(seq).is_some_and(|d| (lo..=hi).contains(&d))
+}
+/// Fewest sampled new k-mers `leftover_at_depth` judges a leftover's added sequence by (one in
+/// 64 sampled: about 1 kb).
+const LEFTOVER_NEW_MIN_SAMPLES: usize = 16;
+
 /// See `new_sequence_at_depth`: halfway between one copy and two.
 const ONE_COPY_SPREAD: f64 = 1.5;
 /// Fewest sampled k-mers `new_sequence_at_depth` judges by (the sketch samples one k-mer in 64:
@@ -2700,7 +2733,7 @@ pub(crate) fn run_with_options(
                     let (p, k): (Vec<Vec<u8>>, Vec<u64>) = picked
                         .into_iter()
                         .zip(keys)
-                        .filter(|(s, _)| g.median_depth(s).is_some_and(|d| (lo..=hi).contains(&d)))
+                        .filter(|(s, _)| leftover_at_depth(g, &bait, t, s, deep, (lo, hi)))
                         .unzip();
                     if p.len() < LEFTOVER_MIN_READS {
                         continue;

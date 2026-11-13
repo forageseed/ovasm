@@ -555,6 +555,8 @@ pub struct ReadDepth {
     pub organelle_like: bool,
     /// Median sampled k-mer depth (sketch depth; about the read depth for HiFi reads).
     pub median: f64,
+    /// Sampled k-mers the depths were judged from.
+    pub sampled: usize,
 }
 
 impl DepthGate {
@@ -716,6 +718,7 @@ impl DepthGate {
         .map(|f| ReadDepth {
             organelle_like: passes(&f, &self.params),
             median: f.median,
+            sampled: f.sampled,
         })
     }
 
@@ -733,6 +736,7 @@ impl DepthGate {
         features_of(&kmers, &self.sketch, deep).map(|f| ReadDepth {
             organelle_like: passes(&f, &self.params),
             median: f.median,
+            sampled: f.sampled,
         })
     }
 
