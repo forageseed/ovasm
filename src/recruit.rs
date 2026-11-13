@@ -1646,6 +1646,19 @@ fn leftover_at_depth(
 /// 64 sampled: about 1 kb).
 const LEFTOVER_NEW_MIN_SAMPLES: usize = 16;
 
+/// Library depth below which a k-mer the leftovers add is taken for a recurrent read error, not
+/// sequence of a genome: half the nuclear depth, the shallowest genomic sequence, and at least
+/// `MIN_GENOMIC_DEPTH`. Leftovers of a circle hundreds of x deep repeat a read's systematic
+/// errors (homopolymer lengths) in two reads or more, and those k-mers are "solid" new k-mers
+/// at a few x in the library: Euphorbia lathyris, 1,661 leftovers of the 86 kb and 33 kb circles
+/// beside 707x, 331,366 new k-mers at median 197x for about 119 kb of sequence. Leftovers are at
+/// half the target's depth at least, three times the nuclear depth or more, far above this.
+fn read_error_depth(g: &DepthGate) -> f64 {
+    (g.nuclear_peak_depth as f64 / 2.0).max(MIN_GENOMIC_DEPTH)
+}
+/// See `read_error_depth`.
+const MIN_GENOMIC_DEPTH: f64 = 3.0;
+
 /// See `new_sequence_at_depth`: halfway between one copy and two.
 const ONE_COPY_SPREAD: f64 = 1.5;
 /// Fewest sampled k-mers `new_sequence_at_depth` judges by (the sketch samples one k-mer in 64:
@@ -2807,8 +2820,24 @@ pub(crate) fn run_with_options(
                         // the bait reaches only through short shared blocks, sampled by few of
                         // its reads (`new_sequence_at_depth`).
                         // (the gate counts k-mers of its own length; at another, nothing is judged)
-                        let mut new_depths = if g.k() == bait.k { g.sampled_depths(&new_kmers) } else { Vec::new() };
+                        let sampled = if g.k() == bait.k { g.sampled_depths(&new_kmers) } else { Vec::new() };
+                        let err_floor = read_error_depth(g);
+                        let mut new_depths: Vec<u32> = sampled.iter().copied().filter(|&d| d as f64 >= err_floor).collect();
                         new_depths.sort_unstable();
+                        // what the solid new k-mers hold beyond recurrent read errors
+                        let genomic = if sampled.len() >= MIN_DEPTH_SAMPLES {
+                            (solid as f64 * new_depths.len() as f64 / sampled.len() as f64).round() as usize
+                        } else {
+                            solid
+                        };
+                        if genomic < solid {
+                            eprintln!(
+                                "[ovasm] {}: leftover bootstrap round {}: {} of {} sampled new k-mers below {:.0}x left out as recurrent read errors",
+                                bait.targets[t].name, leftover_rounds[t] + 1,
+                                sampled.len() - new_depths.len(), sampled.len(), err_floor
+                            );
+                        }
+                        let solid = genomic;
                         let at_depth = new_sequence_at_depth(&mut new_depths, own);
                         let outgrow = leftovers_outgrow_their_depth(solid, picked_bases, longest, own);
                         if outgrow && at_depth {
@@ -5297,6 +5326,15 @@ mod tests {
         // too few to judge
         assert!(!new_sequence_at_depth(&mut [718; MIN_DEPTH_SAMPLES - 1], 718.0));
         assert!(!new_sequence_at_depth(&mut [718; 100], 0.0));
+    }
+
+    #[test]
+    fn read_error_depth_is_half_the_nucleus_and_at_least_three() {
+        assert_eq!(MIN_GENOMIC_DEPTH, 3.0);
+        // leftovers stand at half the target's depth at least, the target three times the
+        // nucleus or more: always above the floor
+        let (nuclear, target): (f64, f64) = (17.0, 51.0);
+        assert!((nuclear / 2.0).max(MIN_GENOMIC_DEPTH) < LEFTOVER_DEPTH.0 * target);
     }
 
     #[test]

@@ -732,6 +732,24 @@ fn class_seeds(
     (counts(forward) || diluted) && !counts(reversed) && span >= MIN_CLUSTER_SPAN
 }
 
+/// Drops from a cluster's `calls`, where both classes count in it, each class some other cluster
+/// seeds alone (`alone`), and returns them. A cluster at the mitochondrion's depth holds plastid
+/// genes in its plastid insertions (MTPTs); where the plastid has a cluster of its own, those are
+/// insertions, and a seed cropped around them (`crop`, the genes and `flank` bases each side) is
+/// mitochondrial sequence the plastid's bait then holds: the reads of the mitochondrion around the
+/// insertion fit the plastid better and are lost to it. Convolvulus arvensis (DToL): its 470x
+/// cluster seeded both, beside plastid clusters at 10,624x and 5,312x; 274 of the 337 reads
+/// entering the mitochondrion's 6.6 kb gap around a 664 bp insertion from one side went to the
+/// plastid, 29 to both. Bellardia viscosa likewise (558x, plastid at 16,384x; a 7.9 kb gap).
+fn insertion_calls(calls: &mut Vec<&'static str>, alone: &[&'static str]) -> Vec<&'static str> {
+    if calls.len() < 2 {
+        return Vec::new();
+    }
+    let dropped: Vec<&'static str> = calls.iter().copied().filter(|o| alone.contains(o)).collect();
+    calls.retain(|o| !alone.contains(o));
+    dropped
+}
+
 fn panel_gene_sets(panel: &Panel) -> Vec<PanelGeneSet> {
     ORGANELLES
         .iter()
@@ -923,7 +941,9 @@ pub fn run(
     let mut seeds = FxHashMap::default();
     let (mut seed_reads, mut seed_bases) = (FxHashMap::default(), FxHashMap::default());
     let mut clusters = Vec::new();
-    for (c, &peak) in peaks.iter().enumerate() {
+    // Each cluster's calls first: a class seeded by a cluster of its own elsewhere is not seeded
+    // from a cluster both classes count in (`insertion_calls`).
+    let judged: Vec<_> = peaks.iter().enumerate().map(|(c, &peak)| {
         let mine: Vec<&Scanned> = scanned.iter().filter(|s| s.cluster == c).collect();
         let n = mine.len() as u64;
         // only the stretches of each read's own class count, so a homologous gene of the other
@@ -970,6 +990,20 @@ pub fn run(
             })
             .map(|(_, o)| o)
             .collect();
+        (mine, classes, gene_evidence, gene_set_evidence, mitochondrion, plastid, md, pd, call,
+         cm, cp, ccall, span, n, legacy_calls)
+    }).collect();
+    let alone: Vec<&'static str> = judged.iter()
+        .filter(|j| j.14.len() == 1)
+        .map(|j| j.14[0])
+        .collect();
+    for (c, (&peak, j)) in peaks.iter().zip(judged).enumerate() {
+        let (mine, classes, gene_evidence, gene_set_evidence, mitochondrion, plastid, md, pd, call,
+             cm, cp, ccall, span, n, mut legacy_calls) = j;
+        let dropped = insertion_calls(&mut legacy_calls, &alone);
+        if !dropped.is_empty() {
+            eprintln!("[ovasm] protein seeds: cluster {} ({:.0}x) holds {:?} genes beside its other class, and a cluster of their own seeds them: insertions, not seeds", c + 1, 2f64.powf(peak), dropped);
+        }
         let nominated = gene_set_evidence.as_deref().filter(|_| paired_candidates)
             .map(|rows| nominated_organelle_sets(rows, want, p.panel.min_genes));
         let selected = nominated.as_ref().unwrap_or(&legacy_calls);
@@ -1954,6 +1988,23 @@ mod tests {
         assert!(!seeds((&class(4, 400), 2.0), (&none, 0.0), 52_337.0, &p));
         assert!(!seeds((&class(10, 400), 0.2), (&none, 0.0), 52_337.0, &p));
         assert!(!seeds((&class(5, 762), 2.14), (&none, 0.0), 23.0, &p));
+    }
+
+    #[test]
+    fn a_class_seeded_alone_elsewhere_is_no_seed_of_a_mixed_cluster() {
+        // Convolvulus arvensis: plastid clusters of their own, the 470x mitochondrial cluster
+        // counting plastid insertions too
+        let mut mixed = vec!["mitochondrion", "plastid"];
+        assert_eq!(insertion_calls(&mut mixed, &["plastid"]), vec!["plastid"]);
+        assert_eq!(mixed, vec!["mitochondrion"]);
+        // no cluster of its own: both stay
+        let mut mixed = vec!["mitochondrion", "plastid"];
+        assert!(insertion_calls(&mut mixed, &[]).is_empty());
+        assert_eq!(mixed.len(), 2);
+        // a cluster of one class keeps it
+        let mut own = vec!["plastid"];
+        assert!(insertion_calls(&mut own, &["plastid"]).is_empty());
+        assert_eq!(own, vec!["plastid"]);
     }
 
     #[test]
