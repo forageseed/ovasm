@@ -1804,7 +1804,14 @@ fn shortest_return(
 /// unit adds as many bases as the reads' crossings lie apart (`UNIT_SPACING_TOL`). A link with no
 /// such return, a unit of another length, or a unit that is the whole circle is left as it is: a
 /// read longer than a circular genome crosses its links twice, a turn apart. None when nothing is
-/// added; else the new walk and, per unit, the copies added.
+/// added; else the new walk, per unit the copies added, and whether a linear walk was closed.
+///
+/// A linear walk whose missing unit, closed by its link, passes every segment of the walk is that
+/// circle: the reads crossed the link a whole genome apart. Nipponbare ONT plastid (981c9d0): the
+/// inverted repeat came out at 1.18x the LSC depth, the bridges laid it once in the linear
+/// u0+ u1- u4- u2- u3- (LSC, IR, SSC), and reads crossing u0+ -> u1- twice, 134 kb apart, laid
+/// the whole circle twice more: a 382.6 kb linear molecule, 2.85 genomes. Closed, it is the
+/// 134.4 kb circle u0+ u1- u4- u2- u3- u2+ u4+ u1+.
 ///
 /// The bridges lay a tandem unit as often as its depth says (`copy_deviation`), and an anchor once.
 /// Where the reads are unevenly deep along the genome that undercounts: Haliclona indistincta
@@ -1822,11 +1829,13 @@ pub(crate) fn lay_read_copies(
     need: &FxHashMap<(Oriented, Oriented), (usize, usize)>,
     next: &FxHashMap<Oriented, Vec<Oriented>>,
     overlaps: &FxHashMap<(Oriented, Oriented), usize>,
-) -> Option<(Vec<Oriented>, Vec<(Vec<Oriented>, usize)>)> {
+) -> Option<(Vec<Oriented>, Vec<(Vec<Oriented>, usize)>, bool)> {
     if need.is_empty() || walk.is_empty() {
         return None;
     }
     let mut w = walk.to_vec();
+    let mut circular = circular;
+    let mut closed = false;
     let mut added: Vec<(Vec<Oriented>, usize)> = Vec::new();
     let mut total = 0;
     'grow: while total < MAX_READ_COPIES_ADDED {
@@ -1866,6 +1875,20 @@ pub(crate) fn lay_read_copies(
             if circular && unit.len() == n && canonical_key(&unit, true) == canonical_key(&w, true) {
                 continue;
             }
+            if !circular {
+                let ring: FxHashSet<usize> = unit.iter().map(|o| o.0).collect();
+                if w.iter().all(|o| ring.contains(&o.0)) {
+                    // the unit runs y .. x and the link x -> y closes it; start where the walk did
+                    let mut c = unit;
+                    if let Some(i) = c.iter().position(|&o| o == w[0]) {
+                        c.rotate_left(i);
+                    }
+                    w = c;
+                    circular = true;
+                    closed = true;
+                    continue 'grow;
+                }
+            }
             w.splice(t + 1..t + 1, unit.iter().copied());
             match added.iter_mut().find(|(u, _)| *u == unit) {
                 Some((_, c)) => *c += 1,
@@ -1876,7 +1899,7 @@ pub(crate) fn lay_read_copies(
         }
         break;
     }
-    (!added.is_empty()).then_some((w, added))
+    (!added.is_empty() || closed).then_some((w, added, closed))
 }
 
 /// Order of two covers of one component, across cover sizes; `Less` ranks first.
@@ -2677,8 +2700,12 @@ pub fn run_phased(
                 rep.decisive = false;
             }
             for (walk, molecule) in walks.iter_mut().zip(best.molecules.iter_mut()) {
-                if let Some((laid, added)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps)
+                if let Some((laid, added, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps)
                 {
+                    if closed {
+                        molecule.circular = true;
+                        rep.read_copies_added.push(format!("{} closed into a circle", label(&laid)));
+                    }
                     molecule.length = spelled_length(&g, &laid, molecule.circular, &indexed_overlaps)?;
                     molecule.path = label(&laid);
                     *walk = laid;
@@ -2948,11 +2975,11 @@ mod tests {
         let mut need = FxHashMap::default();
         need.insert(link_key(u1m, u2), (4, 500));
         let walk = vec![u0, u1m, u2, u1m];
-        let (laid, added) = lay_read_copies(&g, &walk, true, &need, &next, &ov).unwrap();
+        let (laid, added, _) = lay_read_copies(&g, &walk, true, &need, &next, &ov).unwrap();
         assert_eq!(laid, vec![u0, u1m, u2, u1m, u2, u1m, u2, u1m, u2, u1m]);
         assert_eq!(added, vec![(vec![u2, u1m], 3)]);
         // a linear walk through the unit once, with no cycle of its own: the graph's return
-        let (laid, _) = lay_read_copies(&g, &[u0, u1m, u2], false, &need, &next, &ov).unwrap();
+        let (laid, _, _) = lay_read_copies(&g, &[u0, u1m, u2], false, &need, &next, &ov).unwrap();
         assert_eq!(laid, vec![u0, u1m, u2, u1m, u2, u1m, u2, u1m, u2]);
         // the reverse complement of the link counts as the same link
         let mut rc = FxHashMap::default();
@@ -2971,6 +2998,25 @@ mod tests {
         assert!(lay_read_copies(&g2, &[u0, u1m, u2], false, &open, &line, &ov2).is_none());
     }
 
+    /// The plastid shape with its inverted repeat laid once: LSC u0, IR u1, SSC u2, the linear
+    /// u0+ u1+ u2+. Reads crossing u0+ -> u1+ twice a genome (1,800 bp) apart close it into the
+    /// circle u0+ u1+ u2+ u1-, not a second genome laid on a line.
+    #[test]
+    fn read_copies_a_genome_apart_close_a_linear_walk_into_its_circle() {
+        let (u0, u1, u2) = ((0, true), (1, true), (2, true));
+        let (g, next, ov) = blunt(&[1000, 300, 200], &[(u0, u1), (u1, u2), (u2, flip(u1)), (flip(u1), u0)]);
+        let mut need = FxHashMap::default();
+        need.insert(link_key(u0, u1), (2, 1800));
+        let (laid, added, closed) = lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov).unwrap();
+        assert!(closed);
+        assert_eq!(laid, vec![u0, u1, u2, flip(u1)]);
+        assert!(added.is_empty());
+        assert_eq!(spelled_length(&g, &laid, true, &ov).unwrap(), 1800);
+        // crossings a unit apart that is not the whole walk stay a tandem copy on the line
+        need.insert(link_key(u0, u1), (2, 900));
+        assert!(lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov).is_none());
+    }
+
     /// A self-loop's unit is its segment; a circle that is its unit alone stays as it is.
     #[test]
     fn read_copies_lay_a_self_loop_but_not_a_circle_of_its_unit() {
@@ -2978,7 +3024,7 @@ mod tests {
         let (g, next, ov) = blunt(&[1000, 100, 1000], &[(a, r), (r, r), (r, b), (b, a)]);
         let mut need = FxHashMap::default();
         need.insert(link_key(r, r), (3, 100));
-        let (laid, added) = lay_read_copies(&g, &[a, r, r, b], true, &need, &next, &ov).unwrap();
+        let (laid, added, _) = lay_read_copies(&g, &[a, r, r, b], true, &need, &next, &ov).unwrap();
         assert_eq!(laid, vec![a, r, r, r, r, b]);
         assert_eq!(added, vec![(vec![r], 2)]);
         // a link the walk does not pass is not laid
