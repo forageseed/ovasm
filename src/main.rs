@@ -13,6 +13,7 @@ mod exact_placements;
 mod frontier;
 mod gpu;
 mod genotype;
+mod hp_polish;
 mod hpc;
 mod identify;
 mod junctions;
@@ -151,6 +152,9 @@ enum FindCommand {
 enum AssembleCommand {
     /// Self-correct noisy organelle reads (ONT, CLR) against their own solid k-mers.
     Correct(CorrectArgs),
+    /// Set the homopolymer run lengths of assembled molecules (FASTA) to the most frequent call
+    /// of the uncorrected noisy reads (`run ont` and `run hybrid` do it to their molecules).
+    Polish(PolishArgs),
     /// Assemble HiFi organelle reads on a closed-syncmer sparse de Bruijn graph (GFA out).
     Graph(AssembleArgs),
     /// Keep the connected components of an assembly graph that are the target organelle (by
@@ -158,6 +162,43 @@ enum AssembleCommand {
     Filter(ComponentsArgs),
     /// Rewrite a backend's assembly graph as OV-GFA v1: blunt links, PanSN paths, common tags.
     Unify(UnifyArgs),
+}
+
+#[derive(clap::Args)]
+struct PolishArgs {
+    /// Molecules to polish (FASTA; `circular=true` in a header marks a circle).
+    #[arg(long)]
+    molecules: PathBuf,
+    /// Uncorrected long reads of the organelle (repeat the flag for several files).
+    #[arg(long = "reads", required = true)]
+    reads: Vec<PathBuf>,
+    /// Fewest observations for a run to be judged.
+    #[arg(long, default_value_t = hp_polish::MIN_OBSERVATIONS)]
+    min_observations: u32,
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Polished molecules (FASTA).
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long)]
+    out_json: PathBuf,
+}
+
+fn polish(args: PolishArgs) -> Result<()> {
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
+    }
+    let r = hp_polish::polish(&args.molecules, &args.reads, &args.out, args.min_observations)?;
+    for m in &r.molecules {
+        eprintln!(
+            "[ovasm] polish {}: {} -> {} bp; {} of {} runs judged, {} lengthened (+{} bp), {} shortened (-{} bp)",
+            m.name, m.length_before, m.length_after, m.runs_judged, m.runs, m.runs_lengthened, m.bases_added,
+            m.runs_shortened, m.bases_removed
+        );
+    }
+    eprintln!("[ovasm] polish: {} of {} reads placed, {} observations; {:.1}s", r.reads_placed, r.reads, r.observations, r.elapsed_seconds);
+    std::fs::write(&args.out_json, serde_json::to_string_pretty(&r)?)?;
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -2713,6 +2754,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Find(FindCommand::ExactPlacements(args)) => find_exact_placements(args),
         Command::Find(FindCommand::Label(args)) => label(args),
         Command::Assemble(AssembleCommand::Correct(args)) => correct(args),
+        Command::Assemble(AssembleCommand::Polish(args)) => polish(args),
         Command::Assemble(AssembleCommand::Graph(args)) => assemble(args),
         Command::Assemble(AssembleCommand::Filter(args)) => components(args),
         Command::Assemble(AssembleCommand::Unify(args)) => unify(args),

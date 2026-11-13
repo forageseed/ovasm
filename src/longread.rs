@@ -440,6 +440,10 @@ fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, 
         return Ok((reads.to_vec(), json!({"depth": depth, "kept_fraction": 1.0})));
     };
     let fraction = CORRECT_MAX_DEPTH / d;
+    // `run ont --read-set target` caps before anything else has made the correction folder
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let mut w = BufWriter::new(fs::File::create(out)?);
     let (mut n, mut b) = (0u64, 0u64);
     for (id, seq) in records.iter().filter(|r| read_share(&r.0, salt) < fraction) {
@@ -699,15 +703,18 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
     let single = (organelles.len() == 1).then(|| organelles[0]);
     let mut seeds = seed_map(&o.seeds, single)?;
     fs::create_dir_all(&o.out)?;
-    let mut builtin = BTreeSet::new();
-    if o.read_set == ReadSet::WholeGenome {
-        builtin = crate::seeddb::fill_missing(
-            &mut seeds,
-            &o.out.join("seeds"),
-            single,
-            o.single_seed,
-            o.lineage,
-        )?;
+    // with --read-set target too: the seeds are also the assembly's depth reference
+    // (`pipeline::run` passes the first, as `choose_assemble_k` does). Without one the node depth
+    // of corrected noisy reads is their error nodes' (Nipponbare ONT plastid: 8x where the
+    // sequence stood at 430x, min count 1, 833 unitigs, 46% explained)
+    let builtin = crate::seeddb::fill_missing(
+        &mut seeds,
+        &o.out.join("seeds"),
+        single,
+        o.single_seed,
+        o.lineage,
+    )?;
+    {
         if !builtin.is_empty() {
             log(&format!(
                 "no --seeds for {}: using the built-in {} seed library {}",
@@ -1154,6 +1161,27 @@ fn assemble(
         shallow_seeds: false,
         depth_reference: Default::default(),
     })?;
+    // homopolymer runs from the uncorrected reads (see `hp_polish`): the molecules the stages
+    // wrote are kept beside as molecules.unpolished.fasta
+    let molecules = dir.join("molecules.fasta");
+    let polish = if molecules.exists() {
+        log(&format!("polishing the homopolymer runs of the {organelle} molecules with the uncorrected reads"));
+        let unpolished = dir.join("molecules.unpolished.fasta");
+        fs::rename(&molecules, &unpolished)?;
+        let rep = crate::hp_polish::polish(&unpolished, &r.raw, &molecules, crate::hp_polish::MIN_OBSERVATIONS)?;
+        let (added, removed) = rep.molecules.iter().fold((0, 0), |a, m| (a.0 + m.bases_added, a.1 + m.bases_removed));
+        log(&format!(
+            "{} runs judged from {} reads; {} bases added, {} removed",
+            rep.molecules.iter().map(|m| m.runs_judged).sum::<usize>(),
+            rep.reads_placed,
+            added,
+            removed
+        ));
+        files.insert("unpolished_molecules".into(), path_str(&unpolished));
+        serde_json::to_value(&rep)?
+    } else {
+        Value::Null
+    };
     let mut short_evidence = Value::Null;
     if let Some(sr) = r.short["reads"].as_str() {
         let sr = PathBuf::from(sr);
@@ -1170,14 +1198,12 @@ fn assemble(
             });
         }
     }
-    let seed_info = if o.read_set == ReadSet::Target {
-        json!({"source": "none"})
-    } else {
-        json!({
-            "source": if builtin.contains(organelle) { "builtin" } else { "custom" },
-            "files": seeds.get(organelle).map(|v| v.iter().map(|p| path_str(p)).collect::<Vec<_>>()),
-        })
-    };
+    // --read-set target loads them too, for the depth reference only
+    let seed_info = json!({
+        "source": if builtin.contains(organelle) { "builtin" } else { "custom" },
+        "files": seeds.get(organelle).map(|v| v.iter().map(|p| path_str(p)).collect::<Vec<_>>()),
+        "used_for": if o.read_set == ReadSet::Target { "depth_reference" } else { "recruitment_and_depth_reference" },
+    });
     let s = summary.as_object_mut().context("summary.json is not an object")?;
     s.insert(
         "read_set".into(),
@@ -1204,6 +1230,7 @@ fn assemble(
         }),
     );
     s.insert("short_read_evidence".into(), short_evidence);
+    s.insert("homopolymer_polish".into(), polish);
     s.insert("total_elapsed_seconds".into(), t0.elapsed().as_secs_f64().into());
     s.insert("peak_rss_mb".into(), peak_rss_mb().into());
     if let Some(Value::Object(f)) = s.get_mut("files") {
