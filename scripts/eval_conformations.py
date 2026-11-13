@@ -274,6 +274,7 @@ def assign(args, probes, reads, skip, workdir):
             best[(h["q"], p["kind"], p["group"])].append((ident, h["AS"], h["t"]))
     support = defaultdict(int)
     ambiguous = defaultdict(int)
+    assigned = []  # (read, kind, probe key, supports|ambiguous) for --dump-reads
     for (q, kind, group), cands in best.items():
         per = {}
         for ident, AS, t in cands:
@@ -284,8 +285,15 @@ def assign(args, probes, reads, skip, workdir):
             for t, _ in ranked:
                 if ranked[0][1][0] - per[t][0] < args.tie_identity:
                     ambiguous[t] += 1
+                    assigned.append((q, probes[t]["kind"], probes[t]["key"], "ambiguous"))
             continue
         support[ranked[0][0]] += 1
+        assigned.append((q, kind, probes[ranked[0][0]]["key"], "supports"))
+    if args.dump_reads:
+        with open(os.path.join(workdir, "reads.tsv"), "w") as fh:
+            fh.write("read\tkind\tprobe\tcall\n")
+            for row in sorted(assigned):
+                fh.write("\t".join(row) + "\n")
     return support, ambiguous, near
 
 
@@ -451,6 +459,7 @@ def main():
     ap.add_argument("--restrict-fasta", help="evaluate only segments covered by this FASTA (asm20)")
     ap.add_argument("--restrict-cover", type=float, default=0.5)
     ap.add_argument("--no-compact", action="store_true", help="do not merge non-branching chains")
+    ap.add_argument("--dump-reads", action="store_true", help="write reads.tsv: each read's link/traversal")
     ap.add_argument("--min-segment", type=int, default=0,
                     help="ignore links and traversals touching segments shorter than this")
     args = ap.parse_args()
