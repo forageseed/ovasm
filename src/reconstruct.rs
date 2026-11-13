@@ -1168,17 +1168,21 @@ fn configurations(
     // Scores at 1e-9 resolution are tied; linked reads then break ties without adding
     // a second likelihood for the same reads. Remaining ties use deterministic order.
     order.sort_by(|&a, &b| rank_keys[b].cmp(&rank_keys[a]).then(a.cmp(&b)));
-    // the circular representative: of the configurations whose molecules of at least
-    // `pipeline::MIN_PIECE` are all circular, the best ranked by combined score; this is a representative, not a resolved call
+    // A circular representative may replace an incomplete result only when its
+    // rank ties the best candidate, regardless of the other candidates' topology.
+    let all_major_circular: Vec<bool> = found.iter().map(|(_, _, _, molecules)| {
+        let major: Vec<_> = molecules.iter()
+            .filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE)
+            .collect();
+        !major.is_empty() && major.iter().all(|m| m.0.circular)
+    }).collect();
+    let circular_candidate = best_ranked_circular(&order, &rank_keys, &all_major_circular);
     let mut circular: Option<Representative> = None;
     for (rank, &c) in order.iter().enumerate() {
         let (score, target_rank_score, copy_deviation, molecules) = &found[c];
         let n = rank + 1;
         let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
-        if !big.is_empty()
-            && big.iter().all(|m| m.0.circular)
-            && circular.is_none()
-        {
+        if circular_candidate == Some(c) {
             circular = Some(Representative {
                 configuration: n,
                 equally_ranked: tie_counts[&rank_keys[c]],
@@ -1318,6 +1322,18 @@ fn eligible_path_prior_indices(names: &[String], prior_reads: &BTreeMap<String, 
 fn candidate_rank_key(short_score: f64, target_link: f64, combined: f64, joint: usize, has_target: bool) -> (i128, i128, i128, usize) {
     if has_target { (score_bucket(short_score), score_bucket(target_link), score_bucket(combined), joint) }
     else { (score_bucket(combined), 0, 0, joint) }
+}
+
+// Candidate order is descending by the complete reported ranking key.
+fn best_ranked_circular(
+    order: &[usize],
+    rank_keys: &[(i128, i128, i128, usize)],
+    all_major_circular: &[bool],
+) -> Option<usize> {
+    let best = *rank_keys.get(*order.first()?)?;
+    order.iter().copied()
+        .take_while(|&candidate| rank_keys[candidate] == best)
+        .find(|&candidate| all_major_circular[candidate])
 }
 
 // Correlated counts and unequal detection mean this exploratory score is not a
@@ -1694,7 +1710,7 @@ fn final_outputs(
         circular = r.molecules.iter().map(|m| m.2).collect();
         let small = r.molecules.iter().filter(|m| (m.1.len() as u64) < pipeline::MIN_PIECE).count();
         reasons = vec![format!(
-            "the reads leave the repeat pairings open: configuration {} of {total}, ranked by the reported configuration ranking among circular candidates ({} molecules), is the representative; {} candidates share that score and tiebreak; all are in {organelle}.configurations.fasta",
+            "the reads leave the repeat pairings open: configuration {} of {total}, tied for the best reported configuration ranking ({} molecules), is the representative; {} candidates share that score and tiebreak; all are in {organelle}.configurations.fasta",
             r.configuration, r.pieces, r.equally_ranked
         )];
         if small > 0 {
@@ -1705,7 +1721,7 @@ fn final_outputs(
         }
         status = "circular_configuration_chosen".to_string();
         representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
-            "chosen_by": "reported configuration ranking among candidates whose major molecules are circular"});
+            "chosen_by": "best reported configuration ranking, with circular major molecules"});
     }
     // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
     let uncertain = if fasta_out.exists() {
@@ -2194,6 +2210,16 @@ mod tests {
         assert!(direct > panel);
         assert!(candidate_rank_key(1.0, 0.0, 0.0, 0, true) > direct);
         assert!(candidate_rank_key(0.0, 0.8, 0.1, 0, false) < candidate_rank_key(0.0, 0.5, 3.0, 10, false));
+    }
+
+    #[test]
+    fn circular_representative_must_tie_the_best_candidate() {
+        let best = (10, 0, 0, 0);
+        let lower = (9, 0, 0, 0);
+        assert_eq!(best_ranked_circular(&[0, 1], &[best, lower], &[false, true]), None);
+        assert_eq!(best_ranked_circular(&[0, 1], &[best, best], &[false, true]), Some(1));
+        assert_eq!(best_ranked_circular(&[0, 1], &[best, lower], &[true, true]), Some(0));
+        assert_eq!(best_ranked_circular(&[], &[], &[]), None);
     }
 
     #[test]

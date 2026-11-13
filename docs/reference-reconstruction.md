@@ -211,12 +211,14 @@ the called sites measures how far the reference runs predict this individual. Si
 could not call are imputed with the predicted allele and its probability, marked `imputed`.
 Imputed alleles are the runs', not the reads'.
 
-When the reads leave an organelle's repeat pairings open and some configuration's molecules
-of at least 1 kb are all circular, the one with the fewest of them (a master circle when there
-is one), the best ranked of those, is the representative: `<organelle>.fasta` holds its
-molecules (`chosen_by=fewest_circular_molecules reads_decide=false`; pieces under 1 kb,
-the graph's short dead-end tips, are marked `unplaced=true`), and the status is
-`circular_configuration_chosen`, with the choice in `representative`. The configuration walks
+When the result is incomplete and the reads leave repeat pairings open, a configuration whose
+molecules of at least 1 kb are all circular may be selected as the representative only if it
+ties the best reported configuration ranking across circular and linear candidates. The FASTA
+then records `chosen_by=reported_configuration_ranking reads_decide=false`; pieces under 1 kb
+are marked `unplaced=true`. The status is `circular_configuration_chosen`, and `representative`
+records the choice. If no circular configuration meets the ranking criterion, the incomplete
+result is retained. A closed but unresolved result is not replaced. These representatives do
+not establish the physical structure or prove that the reads resolve the configuration. The configuration walks
 of `<organelle>.gfa` follow the organelle graph's pieces exactly as `unify` makes them blunt
 (a repeat's bases shared with an overlapping neighbour are the neighbour's piece).
 
