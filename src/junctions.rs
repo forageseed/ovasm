@@ -18,6 +18,7 @@ use anyhow::{bail, Context, Result};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
+use crate::evidence::backbone_hits::SliceSource;
 use crate::evidence::{self, EvidenceParams, Graph, JunctionWitness, Oriented};
 use crate::kmer::CanonicalKmers;
 
@@ -142,13 +143,20 @@ pub(crate) fn inverted_repeats(
     found.into_iter().collect()
 }
 
-fn hypothesis_graph(g: &Graph, repeats: &[InvertedRepeat], flank: usize) -> Graph {
+/// The normal and inverted joins of each repeat, and where each of their segments lies in `g`
+/// (all are forward slices of it: `evidence::backbone_hits`).
+pub(crate) fn hypothesis_graph(
+    g: &Graph,
+    repeats: &[InvertedRepeat],
+    flank: usize,
+) -> (Graph, Vec<SliceSource>) {
     let mut out = Graph {
         names: Vec::new(),
         seqs: Vec::new(),
         links: Vec::new(),
         overlaps: Vec::new(),
     };
+    let mut sources = Vec::new();
     for (index, r) in repeats.iter().enumerate() {
         let seq = &g.seqs[r.segment];
         let (a, b, n) = (r.left, r.right, r.length);
@@ -163,6 +171,10 @@ fn hypothesis_graph(g: &Graph, repeats: &[InvertedRepeat], flank: usize) -> Grap
             seq[a..b + n].to_vec(),
             seq[b..seq.len().min(b + n + flank)].to_vec(),
         ]);
+        sources.extend([a.saturating_sub(flank), a, b].map(|start| SliceSource {
+            segment: r.segment,
+            start,
+        }));
         for (from, to) in [
             ((offset, true), (offset + 1, true)),
             ((offset + 1, true), (offset + 2, true)),
@@ -173,7 +185,7 @@ fn hypothesis_graph(g: &Graph, repeats: &[InvertedRepeat], flank: usize) -> Grap
             out.overlaps.push(n);
         }
     }
-    out
+    (out, sources)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -436,8 +448,9 @@ where
         report.elapsed_seconds = start.elapsed().as_secs_f64();
         return Ok(report);
     }
-    let hypotheses = hypothesis_graph(&g, &repeats, p.flank);
-    let counts = evidence::junction_support(&hypotheses, inputs, &p, nuclear_flanked)?;
+    let (hypotheses, sources) = hypothesis_graph(&g, &repeats, p.flank);
+    let counts =
+        evidence::junction_support(&hypotheses, Some((&g, &sources)), inputs, &p, nuclear_flanked)?;
     report.records_scanned = counts.records_scanned;
     report.unique_records = counts.unique_records;
     let eligible = |i: usize| {
@@ -587,7 +600,7 @@ mod tests {
     #[test]
     fn normal_and_alternative_context_overlaps_are_exact() {
         let (g, r) = toy();
-        let h = hypothesis_graph(&g, &[r], 2000);
+        let (h, _) = hypothesis_graph(&g, &[r], 2000);
         for (i, &(a, b)) in h.links.iter().enumerate() {
             let x = h.oriented_seq(a);
             let y = h.oriented_seq(b);
@@ -643,7 +656,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let h = hypothesis_graph(&g, &[r], 2000);
+        let (h, _) = hypothesis_graph(&g, &[r], 2000);
         let reads = dir.join("reads.fa");
         let mut text = String::new();
         for side in 0..2 {

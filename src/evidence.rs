@@ -21,6 +21,8 @@ use crate::kmer::CanonicalKmers;
 use crate::recruit::{peak_rss_mb, read_batches};
 use crate::repeat_depth::{FlankCalibration, Measure};
 
+pub(crate) mod backbone_hits;
+
 /// Oriented segment: (segment index, forward?).
 pub type Oriented = (usize, bool);
 
@@ -425,6 +427,46 @@ fn onward(
     done
 }
 
+/// Where the junction sequence of one link comes from: the last `left_len` bases of oriented `a`
+/// (from `left_skip` on) followed by `right_len` bases of oriented `b` after their overlap.
+#[derive(Clone, Copy)]
+struct JunctionPiece {
+    a: Oriented,
+    b: Oriented,
+    left_skip: usize,
+    left_len: usize,
+    overlap: usize,
+    right_len: usize,
+}
+
+/// The junction of every link, in link order (`build_index`, `backbone_hits::Layout`).
+fn junction_pieces(g: &Graph, p: &EvidenceParams) -> Vec<(Junction, JunctionPiece)> {
+    // keep room beyond the anchor so one error at the flank edge cannot veto support
+    let win = windows(g, p, p.flank.max(p.min_anchor + 500));
+    g.links
+        .iter()
+        .enumerate()
+        .map(|(li, &(a, b))| {
+            let (la, lb) = (g.seqs[a.0].len(), g.seqs[b.0].len());
+            // Left keeps the overlap at its end; right starts after it. Support must reach the
+            // unique sequence on both sides of the overlap.
+            let ov = g.overlaps[li];
+            let [wl, wr] = win[li];
+            let left_skip = la.saturating_sub(wl + ov);
+            let left_len = la - left_skip;
+            let right_len = lb.min(ov + wr) - ov;
+            let junction = Junction {
+                link: li,
+                left_len,
+                overlap: ov,
+                anchor_left: p.min_anchor.min((left_len - ov) * 9 / 10) as i64,
+                anchor_right: p.min_anchor.min(right_len * 9 / 10) as i64,
+            };
+            (junction, JunctionPiece { a, b, left_skip, left_len, overlap: ov, right_len })
+        })
+        .collect()
+}
+
 pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
     let mut idx = Index {
         k: p.k,
@@ -610,48 +652,81 @@ pub(crate) fn crossing_copies(
     out
 }
 
+/// The best anchored chain of one read on one junction and orientation, offered chain by chain
+/// in diagonal order (`crossings`; `backbone_hits` offers the same chains from range counts).
+#[derive(Default)]
+struct BestChain {
+    left: usize,
+    right: usize,
+    diag: i64,
+    share: f32,
+}
+
+impl BestChain {
+    /// A chain anchored on both sides (`anchored_sides`): `left`/`right` hits, junction span
+    /// [`min_j`, `max_j`), diagonal of its middle hit computed only when the chain is kept.
+    fn offer(
+        &mut self,
+        junction: &Junction,
+        k: i64,
+        (left, right, min_j, max_j): (usize, usize, i64, i64),
+        middle_diag: impl FnOnce() -> i64,
+    ) {
+        if left.min(right) > self.left.min(self.right) {
+            let joint = junction.left_len as i64;
+            let unique_left_end = joint - junction.overlap as i64;
+            // k-mers between two junction positions
+            let spanned = |from: i64, to: i64| (to - from - k + 1).max(1) as f32;
+            self.left = left;
+            self.right = right;
+            self.diag = middle_diag();
+            self.share = (left as f32 / spanned(min_j, unique_left_end))
+                .min(right as f32 / spanned(joint, max_j));
+        }
+    }
+
+    fn crossing(&self, junction: &Junction, along: bool) -> Option<Crossing> {
+        (self.left > 0).then(|| {
+            let joint = junction.left_len as i64;
+            let ov = junction.overlap as i64;
+            // Along: [.. left unique | overlap | right ..] -> `to` starts at the overlap.
+            // Against: the read shows the reverse complement, so the overlap follows the joint.
+            let (to_start, from_end) = if along {
+                (self.diag + joint - ov, self.diag + joint)
+            } else {
+                (self.diag - joint, self.diag - joint + ov)
+            };
+            Crossing {
+                link: junction.link,
+                along,
+                to_start,
+                from_end,
+                score: (self.left + self.right) as u32,
+                share: self.share,
+            }
+        })
+    }
+}
+
+/// Offer every chain of one junction's sorted hits (`junction_hits`) to `best`.
+fn offer_chains(best: &mut BestChain, h: &[(i64, u32)], junction: &Junction, k: i64, p: &EvidenceParams) {
+    for range in diagonal_chains(h, p.diag_tol) {
+        let chain = &h[range];
+        if let Some(sides) = anchored_sides(chain, junction, k, p) {
+            best.offer(junction, k, sides, || chain[chain.len() / 2].0);
+        }
+    }
+}
+
 pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
     let k = idx.k as i64;
     // a link has one junction per way its short sides go on (`build_index`): keep its best
     let mut best: FxHashMap<(usize, bool), Crossing> = FxHashMap::default();
     for ((ji, along), h) in junction_hits(read, idx) {
         let junction = &idx.junctions[ji as usize];
-        let joint = junction.left_len as i64;
-        let unique_left_end = joint - junction.overlap as i64;
-        let (mut best_left, mut best_right, mut best_diag) = (0usize, 0usize, 0i64);
-        let mut best_share = 0f32;
-        // k-mers between two junction positions
-        let spanned = |from: i64, to: i64| (to - from - k + 1).max(1) as f32;
-        for range in diagonal_chains(&h, p.diag_tol) {
-            let chain = &h[range];
-            let Some((left, right, min_j, max_j)) = anchored_sides(chain, junction, k, p) else {
-                continue;
-            };
-            if left.min(right) > best_left.min(best_right) {
-                best_left = left;
-                best_right = right;
-                best_diag = chain[chain.len() / 2].0;
-                best_share = (left as f32 / spanned(min_j, unique_left_end))
-                    .min(right as f32 / spanned(joint, max_j));
-            }
-        }
-        if best_left > 0 {
-            let ov = junction.overlap as i64;
-            // Along: [.. left unique | overlap | right ..] -> `to` starts at the overlap.
-            // Against: the read shows the reverse complement, so the overlap follows the joint.
-            let (to_start, from_end) = if along {
-                (best_diag + joint - ov, best_diag + joint)
-            } else {
-                (best_diag - joint, best_diag - joint + ov)
-            };
-            let c = Crossing {
-                link: junction.link,
-                along,
-                to_start,
-                from_end,
-                score: (best_left + best_right) as u32,
-                share: best_share,
-            };
+        let mut chain = BestChain::default();
+        offer_chains(&mut chain, &h, junction, k, p);
+        if let Some(c) = chain.crossing(junction, along) {
             let e = best.entry((c.link, along)).or_insert(c);
             if c.score > e.score {
                 *e = c;
@@ -789,8 +864,13 @@ const JUNCTION_MIN_SHARE: f32 = 0.5;
 /// bootstrap or topology inference, from reads that are copies of a junction's context
 /// (`JUNCTION_MIN_SHARE`). `nuclear_flanked` evaluates the complete input
 /// record; it must not infer origin from a recruitment label or short shared match.
+///
+/// `backbone`: the graph `g`'s segments are cut from, as (backbone, where each segment of `g`
+/// starts in it); the reads are then looked up on the backbone once (`backbone_hits`), with the
+/// same crossings. `OVASM_JUNCTION_INDEX=1` uses the per-junction index regardless.
 pub(crate) fn junction_support<F>(
     g: &Graph,
+    backbone: Option<(&Graph, &[backbone_hits::SliceSource])>,
     inputs: &[PathBuf],
     p: &EvidenceParams,
     nuclear_flanked: F,
@@ -799,7 +879,13 @@ where
     F: Fn(&crate::recruit::Rec, i64, i64) -> Result<bool> + Sync,
 {
     use std::hash::Hasher;
-    let idx = build_index(g, p);
+    let layout = backbone
+        .filter(|_| std::env::var_os("OVASM_JUNCTION_INDEX").is_none())
+        .and_then(|(b, sources)| backbone_hits::Layout::new(g, b, sources, p));
+    let idx = match layout {
+        Some(_) => None,
+        None => Some(build_index(g, p)),
+    };
     let mut witnesses = vec![Vec::new(); g.links.len()];
     let mut ambiguous_reads = vec![0; g.links.len()];
     let mut seen: FxHashMap<Vec<u8>, (usize, u64)> = FxHashMap::default();
@@ -820,10 +906,15 @@ where
                 let name = std::str::from_utf8(id)?.to_string();
                 let mut hash = rustc_hash::FxHasher::default();
                 hash.write(&r.seq.to_ascii_uppercase());
-                let close = crossings(&r.seq, &idx, p)
-                    .into_iter()
-                    .filter(|c| c.share >= JUNCTION_MIN_SHARE)
-                    .collect();
+                let mut close: Vec<Crossing> = match (&layout, &idx) {
+                    (Some(layout), _) => layout.crossings(&r.seq, p),
+                    (None, Some(idx)) => crossings(&r.seq, idx, p),
+                    (None, None) => unreachable!("an index is built without a backbone layout"),
+                };
+                close.retain(|c| c.share >= JUNCTION_MIN_SHARE);
+                // `crossings` comes in hash order; the order decides which of a read's two
+                // crossings of one link (both orientations) is its witness there
+                close.sort_unstable_by_key(|c| (c.link, c.along));
                 let (cs, ambiguous) = assign(g, close, p.spacing_tol);
                 let mut rows = Vec::new();
                 for c in cs {
