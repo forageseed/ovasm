@@ -71,6 +71,10 @@ class Graph:
             self.out[k] = sorted(set(self.out[k]))
         for k in self.inn:
             self.inn[k] = sorted(set(self.inn[k]))
+        self.names = list(self.seq)  # the GFA's own segment names
+        # oriented segment end -> its name in the current graph, for leaving / entering it
+        self.map_out = {(s, o): (s, o) for s in self.seq for o in "+-"}
+        self.map_in = dict(self.map_out)
 
     def compact(self):
         """Merge non-branching chains into unitigs so that every tool's graph is compared alike
@@ -122,6 +126,7 @@ class Graph:
                 seen.add(key)
                 links.append((*src, *dst, ov, tags))
         self.seq, self.links = seq, links
+        self.map_out, self.map_in = map_out, map_in
         self.out, self.inn = defaultdict(list), defaultdict(list)
         for a, ao, b, bo, ov, _ in links:
             self.out[(a, ao)].append(((b, bo), ov))
@@ -184,6 +189,12 @@ def decoy_reads(args, reads):
     return {q for q, c in cover.items() if c >= args.decoy_fraction * qlen[q]}
 
 
+def anchor_len(args, flank):
+    """The anchor a read must cover on a flank; a flank segment shorter than the anchor needs
+    all but its last end_slack bases (a quarter for very short ones)."""
+    return max(1, min(args.anchor, flank - min(args.end_slack, flank // 4)))
+
+
 def build_probes(g, args):
     """Link probes, traversal probes and their spanning windows."""
     F = args.flank
@@ -194,7 +205,7 @@ def build_probes(g, args):
         if not right:
             continue
         lf = len(left)
-        anc_l, anc_r = min(args.anchor, lf), min(args.anchor, len(right))
+        anc_l, anc_r = anchor_len(args, lf), anchor_len(args, len(right))
         key = canon_link(a, ao, b, bo)
         probes[f"L{len(probes)}"] = dict(seq=left + right, lo=lf - anc_l, hi=lf + anc_r, kind="link",
                                          key=key, group=key, junction=lf, anchors=(anc_l, anc_r))
@@ -215,7 +226,7 @@ def build_probes(g, args):
                 if key in trav:
                     continue
                 lf = len(left)
-                anc_l, anc_r = min(args.anchor, lf), min(args.anchor, len(right))
+                anc_l, anc_r = anchor_len(args, lf), anchor_len(args, len(right))
                 name = f"T{len(trav)}"
                 trav[key] = name
                 probes[name] = dict(seq=left + mid + right, lo=lf - anc_l, hi=lf + len(mid) + anc_r,
@@ -358,14 +369,19 @@ def missing_share_upper(n):
 
 
 def call_status(reads, opp, args):
+    """opp: independent reads that could have shown it (the junction's or segment's spanners).
+    A graph may keep a minor form (a few percent of molecules), so no read among a few dozen
+    is no contradiction: that needs the 95% upper bound of its share below --max-absent-share."""
     if reads >= args.min_support:
         return "supported"
     if reads > 0:
         return "weak"
-    return "contradicted" if opp >= args.min_opportunity else "untestable"
+    if opp == 0:
+        return "untestable"
+    return "contradicted" if missing_share_upper(opp) < args.max_absent_share else "not_seen"
 
 
-def load_evidence(path, strip):
+def load_evidence(path, strip, g):
     if not path:
         return None
     ev = json.load(open(path))
@@ -374,17 +390,24 @@ def load_evidence(path, strip):
         n, o = x[:-1], x[-1]
         return (strip(n), o)
 
+    # names after compaction: leaving a segment end / entering one (None inside a merged chain)
+    left = lambda e: g.map_out.get(e)
+    enter = lambda e: g.map_in.get(e)
     links, travs, reps = {}, {}, []
     for l in ev.get("links", []):
-        a, b = name(l["from"]), name(l["to"])
-        links[canon_link(a[0], a[1], b[0], b[1])] = l.get("reads", 0)
+        a, b = left(name(l["from"])), enter(name(l["to"]))
+        if a and b:
+            links[canon_link(*a, *b)] = l.get("reads", 0)
     for t in ev.get("traversals", []):
         p = [name(x) for x in t["path"].split()]
-        if len(p) == 3:
-            travs[canon_trav(*p[0], *p[1], *p[2])] = t.get("reads", 0)
+        if len(p) == 3 and left(p[0]) and enter(p[1]) and enter(p[2]):
+            travs[canon_trav(*left(p[0]), *enter(p[1]), *enter(p[2]))] = t.get("reads", 0)
     for r in ev.get("repeats", []):
-        reps.append(dict(repeat=name(r["repeat"]), entries=[name(x) for x in r["entries"]],
-                         exits=[name(x) for x in r["exits"]], pairing_reads=r["pairing_reads"]))
+        x = enter(name(r["repeat"]))
+        e = [left(name(v)) for v in r["entries"]]
+        o = [enter(name(v)) for v in r["exits"]]
+        if x and all(e) and all(o):
+            reps.append(dict(repeat=x, entries=e, exits=o, pairing_reads=r["pairing_reads"]))
     return dict(links=links, traversals=travs, repeats=reps)
 
 
@@ -407,7 +430,9 @@ def main():
     ap.add_argument("--end-slack", type=int, default=150,
                     help="an alignment may end this far short of both the probe end and the read end")
     ap.add_argument("--min-support", type=int, default=2)
-    ap.add_argument("--min-opportunity", type=int, default=10)
+    ap.add_argument("--max-absent-share", type=float, default=0.05,
+                    help="a link or traversal without reads is contradicted when its share's 95%% upper "
+                         "bound is below this (>=59 spanning reads at 0.05)")
     ap.add_argument("--max-missing-share", type=float, default=0.05,
                     help="a 2x2 repeat is 'apart' when the absent pairing's 95%% upper share is below this")
     ap.add_argument("--split-min-aln", type=int, default=1000)
@@ -421,19 +446,21 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     g = Graph(args.gfa)
 
-    def strip(n):
-        if n in g.seq:
+    names = set(g.names)
+
+    def strip(n):  # evidence.json may drop the GFA's '<sample>.' prefix
+        if n in names:
             return n
-        for s in g.seq:
+        for s in g.names:
             if s.endswith("." + n):
                 return s
         return n
 
-    ev = load_evidence(args.evidence, strip)
     if args.restrict_fasta:
         restrict(g, args)
     if not args.no_compact:
         g.compact()
+    ev = load_evidence(args.evidence, strip, g)
     skip = decoy_reads(args, args.reads)
     probes = build_probes(g, args)
     support, ambiguous, near = assign(args, probes, args.reads, skip, args.out)

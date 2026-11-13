@@ -42,13 +42,26 @@ class EvalConformationsTest(unittest.TestCase):
         gfa = "".join(f"S\t{n}\t{v}\n" for n, v in seg.items())
         gfa += "".join(f"L\t{a}\t{ao}\t{b}\t{bo}\t{ov}M\n" for a, ao, b, bo, ov in links)
         reads = [(circle + circle)[i * 211:i * 211 + 12000] for i in range(250)]
+        # evidence names the pieces (as an OVASM graph with a non-maximal chain would)
+        evidence = {"links": [{"from": "a1q+", "to": "X1-", "reads": 7}],
+                    "traversals": [{"path": "a1q+ X1- a2-", "reads": 1}],
+                    "repeats": [{"repeat": "X1-", "entries": ["a1q+", "a2+"], "exits": ["X2+", "X2+"],
+                                 "pairing_reads": [1, 1]},
+                                {"repeat": "X2-", "entries": ["b1-", "b2-"], "exits": ["X1+", "X1+"],
+                                 "pairing_reads": [1, 1]}]}
         with TemporaryDirectory() as d:
             d = Path(d)
             (d / "g.gfa").write_text(gfa)
             (d / "r.fa").write_text("".join(f">r{i}\n{r}\n" for i, r in enumerate(reads)))
+            (d / "ev.json").write_text(json.dumps(evidence))
             subprocess.run([sys.executable, "-I", str(SCRIPT), "--gfa", str(d / "g.gfa"), "--reads",
-                            str(d / "r.fa"), "--out", str(d / "out"), "--minimap2", MINIMAP2, "--threads", "2"],
+                            str(d / "r.fa"), "--out", str(d / "out"), "--minimap2", MINIMAP2, "--threads", "2",
+                            "--evidence", str(d / "ev.json")],
                            check=True, capture_output=True)
+            links = {r.split("\t")[0]: r.split("\t") for r in (d / "out/links.tsv").read_text().splitlines()[1:]}
+            self.assertIn("7", [r[5] for r in links.values()])  # a1q+ -> X1- found under its merged name
+            # the repeats name a piece inside the merged repeat (X2 on one, X1 on the other): skipped
+            self.assertEqual((d / "out/repeats.tsv").read_text(), "")
             summary = json.loads((d / "out/summary.json").read_text())
             self.assertEqual(summary["segments"], 5)
             self.assertEqual(summary["branching_segments"], 1)
