@@ -372,17 +372,17 @@ def call_status(reads, opp, args, ambiguous=0):
     """opp: independent reads that could have shown it (the junction's or segment's spanners).
     A graph may keep a minor form (a few percent of molecules), so no read among a few dozen
     is no contradiction: that needs the 95% upper bound of its share below --max-absent-share.
-    Reads tied between it and another probe (flanks identical over the probe) leave it
-    'ambiguous', not contradicted (Triglochin u7: entries sharing 2 kb upstream)."""
+    Without that, reads tied between it and another probe leave it 'ambiguous' (Triglochin u7:
+    entries u2 and u3 share their last 2 kb, so no read resolves either entry)."""
     if reads >= args.min_support:
         return "supported"
     if reads > 0:
         return "weak"
+    if opp > 0 and missing_share_upper(opp) < args.max_absent_share:
+        return "contradicted"
     if ambiguous > 0:
         return "ambiguous"
-    if opp == 0:
-        return "untestable"
-    return "contradicted" if missing_share_upper(opp) < args.max_absent_share else "not_seen"
+    return "not_seen" if opp > 0 else "untestable"
 
 
 def load_evidence(path, strip, g):
@@ -494,12 +494,19 @@ def main():
     for x, names in groups.items():
         total = sum(support.get(n, 0) for n in names)
         amb = sum(ambiguous.get(n, 0) for n in names)
+        # A traversal's opportunity: reads resolved to its own entry and to its own exit. Reads
+        # that cannot tell its entry (or exit) from another's say nothing against it.
+        by_entry, by_exit = defaultdict(int), defaultdict(int)
+        for n in names:
+            by_entry[probes[n]["entry"]] += support.get(n, 0)
+            by_exit[probes[n]["exit"]] += support.get(n, 0)
         for n in names:
             p = probes[n]
             r = support.get(n, 0)
+            opp = min(by_entry[p["entry"]], by_exit[p["exit"]])
             rows_t.append(dict(traversal=p["key"], segment=x, length=p["mid"], bin=length_bin(p["mid"]),
                                heldout_reads=r, group_spanning=total, group_ambiguous=amb,
-                               status=call_status(r, total, args, ambiguous.get(n, 0)),
+                               status=call_status(r, opp, args, ambiguous.get(n, 0)),
                                ovasm_reads=(ev["traversals"].get(p["key"], 0) if ev else None)))
     tindex = {r["traversal"]: r for r in rows_t}
     rows_r = []

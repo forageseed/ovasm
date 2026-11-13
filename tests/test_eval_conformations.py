@@ -41,7 +41,7 @@ class EvalConformationsTest(unittest.TestCase):
                  ("X1", "-", "X2", "+", 50), ("X2", "+", "b1", "+", 0), ("X2", "+", "b2", "+", 0)]
         gfa = "".join(f"S\t{n}\t{v}\n" for n, v in seg.items())
         gfa += "".join(f"L\t{a}\t{ao}\t{b}\t{bo}\t{ov}M\n" for a, ao, b, bo, ov in links)
-        reads = [(circle + circle)[i * 211:i * 211 + 12000] for i in range(250)]
+        reads = [(circle + circle)[i * 76:i * 76 + 12000] for i in range(500)]  # >=59 per entry
         # evidence names the pieces (as an OVASM graph with a non-maximal chain would)
         evidence = {"links": [{"from": "a1q+", "to": "X1-", "reads": 7}],
                     "traversals": [{"path": "a1q+ X1- a2-", "reads": 1}],
