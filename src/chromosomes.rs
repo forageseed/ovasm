@@ -106,6 +106,9 @@ pub struct Chromosome {
     pub bp: usize,
     pub depth: f64,
     pub seed_bp: Option<usize>,
+    /// Its segments in the assembly graph (`withhold`).
+    #[serde(skip)]
+    pub segment_names: Vec<String>,
     /// counted, or source_pending (rule 6)
     pub status: &'static str,
     /// Why it is source_pending.
@@ -130,9 +133,18 @@ pub struct Withheld {
     pub molecule: usize,
     pub name: String,
     pub length: usize,
-    /// Its components' bases and seed sequence.
-    pub components_bp: usize,
+    /// The components holding it (chromosome indices of chromosomes.json) and their segments
+    /// in the assembly graph (assembly.gfa; their sequence in components.withheld.fasta).
+    pub components: Vec<usize>,
+    pub segments: Vec<String>,
+    /// The four criteria, each as it stands: joined to the main component (no), seed sequence
+    /// against `min_seed_bp`, a circle among its molecules (no), bases against `max_bp`.
+    pub joined_to_main: bool,
     pub seed_bp: Option<usize>,
+    pub min_seed_bp: usize,
+    pub circular: bool,
+    pub components_bp: usize,
+    pub max_bp: usize,
     pub reason: &'static str,
 }
 
@@ -499,6 +511,7 @@ pub fn call(
                 })
                 .collect(),
             segments: c.len(),
+            segment_names: c.clone(),
             bp,
             depth,
             seed_bp: seed,
@@ -572,8 +585,14 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
             molecule: m,
             name: conf.name.clone(),
             length: conf.length,
-            components_bp: cs.iter().map(|&ci| report.chromosomes[ci].bp).sum(),
+            components: cs.iter().map(|&ci| report.chromosomes[ci].index).collect(),
+            segments: cs.iter().flat_map(|&ci| report.chromosomes[ci].segment_names.iter().cloned()).collect(),
+            joined_to_main: false,
             seed_bp: cs.iter().map(|&ci| report.chromosomes[ci].seed_bp).sum(),
+            min_seed_bp: MIN_SEED_BP,
+            circular: false,
+            components_bp: cs.iter().map(|&ci| report.chromosomes[ci].bp).sum(),
+            max_bp,
             reason: "free_fragment_without_seed",
         });
     }
@@ -586,6 +605,82 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
         ));
     }
     report.withheld = withheld;
+}
+
+/// Take the withheld molecules' segments (`withhold`) out of the organelle graph at `path`
+/// (organelle.gfa, its segments named `<sample>.<segment>[.<piece>]`), with their links and the
+/// paths made of them alone; a segment a kept path walks stays. The assembly graph keeps them.
+/// The number of segments taken out.
+pub fn drop_withheld_gfa(path: &Path, report: &ChromosomeReport) -> Result<usize> {
+    let gone: BTreeSet<&str> = report.withheld.iter().flat_map(|w| w.segments.iter().map(String::as_str)).collect();
+    if gone.is_empty() {
+        return Ok(0);
+    }
+    let text = fs::read_to_string(path)?;
+    let sample = text
+        .lines()
+        .find(|l| l.starts_with("H\t"))
+        .and_then(|h| h.split('\t').find_map(|f| f.strip_prefix("sn:Z:")))
+        .unwrap_or_default()
+        .to_string();
+    let base = |name: &str| -> String {
+        let own = name.strip_prefix(&format!("{sample}.")).unwrap_or(name);
+        own.split('.').next().unwrap_or(own).to_string()
+    };
+    let steps = |walk: &str| -> Vec<String> {
+        walk.split(',').map(|s| s.trim_end_matches(['+', '-']).to_string()).collect()
+    };
+    // segments a path that is not all withheld walks
+    let mut walked: BTreeSet<String> = BTreeSet::new();
+    for line in text.lines().filter(|l| l.starts_with("P\t")) {
+        let segs = steps(line.split('\t').nth(2).unwrap_or_default());
+        if !segs.iter().all(|s| gone.contains(base(s).as_str())) {
+            walked.extend(segs);
+        }
+    }
+    let drop = |name: &str| gone.contains(base(name).as_str()) && !walked.contains(name);
+    let (mut out, mut n) = (String::with_capacity(text.len()), 0);
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let keep = match f.first().copied() {
+            Some("S") => {
+                let d = drop(f.get(1).copied().unwrap_or_default());
+                n += d as usize;
+                !d
+            }
+            Some("L") => !drop(f.get(1).copied().unwrap_or_default()) && !drop(f.get(3).copied().unwrap_or_default()),
+            Some("P") => !steps(f.get(2).copied().unwrap_or_default()).iter().all(|s| drop(s)),
+            _ => true,
+        };
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    fs::write(path, out)?;
+    Ok(n)
+}
+
+/// The withheld molecules' segments of the assembly graph `gfa`, with their component and molecule.
+pub fn write_withheld_segments(gfa: &Path, to: &Path, report: &ChromosomeReport) -> Result<()> {
+    let mut of: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for w in &report.withheld {
+        for s in &w.segments {
+            let c = report.chromosomes.iter().find(|c| c.segment_names.contains(s)).map_or(0, |c| c.index);
+            of.entry(s.as_str()).or_insert((c, w.molecule));
+        }
+    }
+    let mut out = String::new();
+    for line in fs::read_to_string(gfa)?.lines().filter(|l| l.starts_with("S\t")) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if let (Some(name), Some(seq)) = (f.get(1), f.get(2)) {
+            if let Some((c, m)) = of.get(name) {
+                out.push_str(&format!(">{name} component={c} molecule={m} length={}\n{seq}\n", seq.len()));
+            }
+        }
+    }
+    fs::write(to, out)?;
+    Ok(())
 }
 
 /// Move the withheld molecules (`withhold`) from `path` to `to`, in their order.
@@ -913,6 +1008,29 @@ TT
         assert_eq!(fs::read_to_string(d.join("molecules.withheld.fasta")).unwrap(), ">linear.2
 GT
 ");
+        // the organelle graph loses the fragment, its link and its path; the free circle stays
+        let og = d.join("organelle.gfa");
+        let gfa_text = [
+            "H\tVN:Z:1.0\tsn:Z:sample",
+            "S\tsample.m\tACGT", "S\tsample.x.1\tACGT", "S\tsample.y\tACGT",
+            "L\tsample.m\t+\tsample.m\t+\t0M", "L\tsample.x.1\t+\tsample.x.1\t+\t0M", "L\tsample.y\t+\tsample.y\t+\t0M",
+            "P\tsample#1#mt.1\tsample.m+\t*", "P\tsample#2#mt.1\tsample.x.1+\t*", "P\tsample#3#mt.1\tsample.y+\t*",
+        ]
+        .join("\n");
+        fs::write(&og, gfa_text + "\n").unwrap();
+        assert_eq!(drop_withheld_gfa(&og, &r).unwrap(), 1);
+        let text = fs::read_to_string(&og).unwrap();
+        assert!(!text.contains("sample.x"), "{text}");
+        assert!(text.contains("S\tsample.y") && text.contains("S\tsample.m") && text.contains("sample#3#mt.1"), "{text}");
+        let asm = d.join("assembly.gfa");
+        fs::write(&asm, "S\tm\tACGT\nS\tx\tGGCC\nS\ty\tTTAA\n").unwrap();
+        write_withheld_segments(&asm, &d.join("components.withheld.fasta"), &r).unwrap();
+        assert_eq!(
+            fs::read_to_string(d.join("components.withheld.fasta")).unwrap(),
+            format!(">x component={} molecule=2 length=4
+GGCC
+", r.withheld[0].components[0])
+        );
         fs::remove_dir_all(&d).ok();
     }
 }
