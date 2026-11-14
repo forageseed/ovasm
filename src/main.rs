@@ -16,6 +16,7 @@ mod genotype;
 mod hp_polish;
 mod hpc;
 mod identify;
+mod junction_support;
 mod junctions;
 mod kmer;
 mod label;

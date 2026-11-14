@@ -2045,6 +2045,96 @@ fn final_outputs(
                 "chosen_by": "best reported configuration ranking, with circular major molecules"}),
         };
     }
+    // Every join a molecule makes through a repeat must be crossed by the target's own reads
+    // when its library could cross it (`junction_support`); a join they could cross and do not
+    // is cut, one they cannot reach is reported as undetermined, and segments whose depth says
+    // more (or fewer) copies than the walk visits are reported.
+    let assembly_gfa = dir.join("de-novo/assembly.gfa");
+    let junctions = if fasta_out.exists() && assembly_gfa.exists() {
+        use crate::junction_support as js;
+        let records = read_fasta(&fasta_out)?;
+        let molecules: Vec<js::Molecule> = records
+            .iter()
+            .map(|(h, s)| js::Molecule {
+                name: h.split(' ').next().unwrap_or("").to_string(),
+                sequence: s.clone(),
+                circular: h.split(' ').any(|w| w == "circular=true"),
+                path: js::header_path(h),
+            })
+            .collect();
+        let segs = js::read_segments(&assembly_gfa)?;
+        // the other organelle's reference: segments sharing its sequence take its reads too
+        let other = if organelle == "mitochondrion" { "plastid" } else { "mitochondrion" };
+        let other_reference = out.join("reference").join(format!("{other}.fasta"));
+        let other_sequences: Vec<Vec<u8>> = if other_reference.exists() {
+            read_fasta(&other_reference)?.into_iter().map(|(_, s)| s.to_ascii_uppercase()).collect()
+        } else {
+            Vec::new()
+        };
+        let (report, _) = js::analyse(&molecules, &segs, reads, &other_sequences)?;
+        let mut tsv = String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\n");
+        for j in &report.joins {
+            writeln!(tsv, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}", j.molecule, j.left, j.repeat.join(","), j.right, j.x, j.y, j.repeat_bp, j.crossing_fragments, j.expected, j.p_at_most_observed, j.class)?;
+        }
+        fs::write(dir.join("junctions.tsv"), tsv)?;
+        let mut ctsv = String::from("segment\tlength\tdepth\tcopy_estimate\tci95_low\tci95_high\tvisits\tclass\n");
+        for c in &report.copies {
+            writeln!(ctsv, "{}\t{}\t{:.1}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}", c.segment, c.length, c.depth, c.copy_estimate, c.copy_ci95.0, c.copy_ci95.1, c.visits, c.class)?;
+        }
+        fs::write(dir.join("copy_numbers.tsv"), ctsv)?;
+        eprintln!(
+            "[ovasm] reconstruct {organelle}: joins through repeats {} supported, {} unsupported (cut), {} undetermined (repeat beyond the library); segments under-traversed {}, over-traversed {}",
+            report.supported, report.unsupported, report.undetermined_long_repeat, report.under_traversed, report.over_traversed
+        );
+        if report.unsupported > 0 {
+            let headers: BTreeMap<String, String> = records
+                .iter()
+                .map(|(h, _)| (h.split(' ').next().unwrap_or("").to_string(), h.clone()))
+                .collect();
+            let pieces = js::cut(&molecules, &report.joins);
+            let mut text = String::new();
+            for (name, seq, circ, note) in &pieces {
+                let header = if note.is_empty() {
+                    headers[name].clone()
+                } else {
+                    let parent = &headers[name.rsplit_once(".j").map_or(name.as_str(), |p| p.0)];
+                    let rest: Vec<&str> = parent
+                        .split(' ')
+                        .skip(1)
+                        .filter(|w| !w.starts_with("circular=") && !w.starts_with("length=") && !w.starts_with("path="))
+                        .collect();
+                    format!("{name} circular={circ} length={} {} {note}", seq.len(), rest.join(" "))
+                };
+                writeln!(text, ">{header}")?;
+                for chunk in seq.chunks(80) {
+                    writeln!(text, "{}", std::str::from_utf8(chunk)?)?;
+                }
+            }
+            fs::write(&fasta_out, text)?;
+            lengths = pieces.iter().map(|p| p.1.len()).collect();
+            circular = pieces.iter().map(|p| p.2).collect();
+            status = "incomplete".to_string();
+            reasons.push(format!(
+                "{} join(s) through repeats that the target's reads could cross but do not: the molecule is cut there",
+                report.unsupported
+            ));
+        }
+        if report.undetermined_long_repeat > 0 {
+            reasons.push(format!(
+                "{} join(s) through repeats longer than the read library spans: their pairing is undetermined",
+                report.undetermined_long_repeat
+            ));
+        }
+        if report.under_traversed + report.over_traversed + report.uncertain_copy_calls > 0 {
+            reasons.push(format!(
+                "{} segment(s) visited fewer and {} more times than their read depth says; {} more whose depth suggests a different copy number without settling it",
+                report.under_traversed, report.over_traversed, report.uncertain_copy_calls
+            ));
+        }
+        serde_json::to_value(&report)?
+    } else {
+        Value::Null
+    };
     // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
     let uncertain = if fasta_out.exists() {
         let final_molecules: Vec<(String, Vec<u8>, bool)> = read_fasta(&fasta_out)?
@@ -2086,6 +2176,7 @@ fn final_outputs(
         "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
         "configurations": configurations_found, "representative": representative,
         "uncertain_regions": uncertain,
+        "junctions": junctions,
         "graph_loose_ends": loose, "status": status,
         "reasons": reasons, "decisive": decisive, "graph_solver_decisive": solver_decisive, "k_attempt_accepted": k_accepted,
         "repeats": if decisive {"every pairing decided by reads"} else {
