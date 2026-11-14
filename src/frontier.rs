@@ -439,7 +439,14 @@ pub fn extend(
     // recruitment pass then took 2.8 M reads (47,599 without the walk) and the graph broke into
     // 30,613 unitigs. Such a walk keeps only its bridges, the paths that rejoin the reference
     // (`extend_from_kmers`), as recruitment's own walk does.
-    if ext.new_kmers > ext.present_reference_kmers {
+    // So does a walk that dies at more dead ends than the ends it set out from: sequence of the
+    // molecule that the reference lacks goes on until it rejoins, so each end's walk dies at most
+    // once, while a repeat family entered from an end branches into its copies and dies at each.
+    // Rice's six pan reconstructions died at 11-44% of their ends (rice_717's mitochondrion 694
+    // of 1,595). Oat's plastid, at depth 86 under the same nucleus, walked 61,449 k-mers (fewer
+    // than its 85,589 present) in 1,846 pieces through 1,521 branches to 2,415 dead ends from
+    // 1,348 ends; its first recruitment pass then took 1.17 M reads (98,434 without the walk).
+    if ext.new_kmers > ext.present_reference_kmers || ext.dead_ends > ext.ends {
         let all = ext.new_kmers;
         ext = before;
         walk(counts, &known, ends, at_depth, budget, p, true, &mut ext);
@@ -903,9 +910,10 @@ mod tests {
             table.add_seq(&revcomp(&spur));
         }
         // a reference of the first 1,000 bases: the one walk passes the branch at 1,200. It holds
-        // more present elsewhere (another molecule), so the walk keeps all it took
+        // more present elsewhere, another molecule, circular (its ends walk round and rejoin), so
+        // the walk keeps all it took
         let other = random(4000, 18);
-        tile(&table, &other, 150, 3, 1);
+        tile(&table, &[other.clone(), other[..200].to_vec()].concat(), 150, 3, 1);
         let ext = extend(&table, &[genome[..1000].to_vec(), other], 7400, &Params::default());
         assert_eq!(ext.unbridged_walk_kmers, None, "{ext:?}");
         assert_eq!(ext.branches, 1, "{ext:?}");
@@ -953,6 +961,44 @@ mod tests {
         // a walk within the reference's own share keeps all it took
         let ok = extend(&table, &[genome.clone()], 4000, &Params::default());
         assert_eq!(ok.unbridged_walk_kmers, None);
+    }
+
+    #[test]
+    fn a_walk_dying_at_more_dead_ends_than_it_set_out_from_keeps_its_bridges_only() {
+        // a repeat family entered from the gap the reference lacks: sixteen copies, each sharing
+        // 80 bases with the gap and going on into 200 of its own, each a dead end. The walk takes
+        // fewer k-mers than the reference holds but dies at more dead ends than its ends
+        let genome = random(4000, 61);
+        let table = KmerCounts::new(22);
+        tile(&table, &genome, 150, 3, 1);
+        let mut tails = Vec::new();
+        for i in 0..16u64 {
+            // as deep as the genome: each leaves it after its 80 shared bases
+            let at = 1100 + 40 * i as usize;
+            let tail = random(200, 70 + i);
+            let copy = [genome[at - 80..at].to_vec(), tail.clone()].concat();
+            for _ in 0..40 {
+                table.add_seq(&copy);
+                table.add_seq(&revcomp(&copy));
+            }
+            tails.push(tail);
+        }
+        let other = random(4000, 62);
+        tile(&table, &other, 150, 3, 1);
+        let reference = [genome[..1000].to_vec(), random(300, 63), genome[1800..].to_vec()].concat();
+        let ext = extend(&table, &[reference, other], 7600, &Params::default());
+        let all = ext.unbridged_walk_kmers.expect("the walk died at more dead ends than its ends");
+        assert!(all <= ext.present_reference_kmers, "{ext:?}");
+        let held: FxHashSet<u64> = ext
+            .sequences
+            .iter()
+            .flat_map(|s| forward_kmers(s).into_iter().map(|(_, x)| canonical(x)))
+            .collect();
+        let gap = &genome[1000..1800];
+        assert!(forward_kmers(gap).iter().all(|&(_, x)| held.contains(&canonical(x))), "{ext:?}");
+        for tail in &tails {
+            assert!(forward_kmers(&tail[40..]).iter().all(|&(_, x)| !held.contains(&canonical(x))), "{ext:?}");
+        }
     }
 
     #[test]

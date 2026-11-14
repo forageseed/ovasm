@@ -1984,7 +1984,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                     if ext.budget_reached { " (budget reached)" } else { "" },
                     ext.unbridged_walk_kmers
                         .map(|a| format!(
-                            " (bridges only: the walk took {a}, more than the {} reference k-mers present)",
+                            " (bridges only: a walk keeping all it reached took {a}, against {} reference k-mers present)",
                             ext.present_reference_kmers
                         ))
                         .unwrap_or_default()
