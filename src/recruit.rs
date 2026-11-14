@@ -1516,17 +1516,22 @@ fn kmer_frontier(
 ) -> (crate::frontier::Extension, usize) {
     let known = bait.target_kmers(t);
     let budget = size_cap(&bait.targets[t].name).unwrap_or(KMER_FRONTIER_BUDGET) as usize;
-    let walk = crate::frontier::Params::default();
-    // the walk's own share of the depth, or the gate's floor when that is higher
-    let p = crate::frontier::Params {
-        max_ends,
-        floor: floor.map_or(walk.floor, |f| walk.floor.max(f / depth)),
-        ..walk
-    };
+    let p = walk_params(depth, floor, max_ends);
     let ext = crate::frontier::extend_from_kmers(table, &known, depth, budget, &p);
     drop(known);
     let added = ext.sequences.iter().map(|s| bait.add_sequence_counted(t, s)).sum();
     (ext, added)
+}
+
+/// The frontier walk's band at a target's `depth`: the walk's own share of the depth, or the
+/// gate's `floor` when that is higher.
+fn walk_params(depth: f64, floor: Option<f64>, max_ends: usize) -> crate::frontier::Params {
+    let walk = crate::frontier::Params::default();
+    crate::frontier::Params {
+        max_ends,
+        floor: floor.map_or(walk.floor, |f| walk.floor.max(f / depth)),
+        ..walk
+    }
 }
 
 /// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
@@ -2710,8 +2715,23 @@ pub(crate) fn run_with_options(
                 // beside a closed molecule, at the nuclear insertions and chimeric pairs of its
                 // reads; the Nipponbare plastid, a closed circle after four passes, kept taking
                 // mates of high-copy nuclear sequence at its depth and 760,000 more reads.
+                //
+                // A step may not leave the bait with more ends than before the mates
+                // (`frontier::count_ends`): a mate past an edge closes that end and opens one at
+                // its own tip, and one that bridges a gap closes two, while mates whose new
+                // k-mers sit in a nuclear repeat family at the target's depth (rDNA, satellites)
+                // open its branches. Without it the mates of a closed plastid took such families
+                // at its depth, its ends grew tenfold the next pass (ZM4 256 to 3,878, JN-L 1,075
+                // to 3,481, Nipponbare 134 to 2,608), the walk stopped and its reads went from
+                // 7.3 to 21 million (ZM4); the mitochondrion's walk stopped a pass early
+                // (ZM4 2,184 to 3,402) and its reads went on growing past twenty passes.
                 if mate_reach && !saturated[t] && !mates_stopped[t] && added[t] > 0 {
                     let bit = 1u8 << t;
+                    let ends_band = kmer_table.as_ref().zip(kmer_target_depth[t]).map(|(table, d)| (table, d, walk_params(d, kmer_floor[t], usize::MAX)));
+                    let mut known = if ends_band.is_some() { bait.target_kmers(t) } else { FxHashSet::default() };
+                    let ends_before = ends_band.as_ref().and_then(|(table, d, p)| crate::frontier::count_ends(table, &known, *d, p));
+                    let mut ends_now = ends_before;
+                    let mut withheld: Option<(usize, usize)> = None;
                     let mut pending: Vec<&[u8]> = res.mates[t]
                         .reads()
                         .into_iter()
@@ -2745,6 +2765,15 @@ pub(crate) fn run_with_options(
                             warnings.push(w);
                             break;
                         }
+                        if let (Some((table, d, p)), Some(limit)) = (&ends_band, ends_before) {
+                            known.extend(new.iter().copied());
+                            let e = crate::frontier::count_ends(table, &known, *d, p).unwrap_or(0);
+                            if e > limit {
+                                withheld = Some((new.len(), e));
+                                break;
+                            }
+                            ends_now = Some(e);
+                        }
                         let more = bait.add_kmers(t, &new);
                         steps.push((ready.len(), new.len(), more));
                         mate_reads[t] += ready.len() as u64;
@@ -2754,8 +2783,14 @@ pub(crate) fn run_with_options(
                         }
                     }
                     eprintln!(
-                        "[ovasm] mates {} pass {}: {} taken by the gate, steps (ready, new, added) {:?}",
-                        bait.targets[t].name, it + 1, offered, steps
+                        "[ovasm] mates {} pass {}: {} taken by the gate, steps (ready, new, added) {:?}, ends {:?} to {:?}{}",
+                        bait.targets[t].name,
+                        it + 1,
+                        offered,
+                        steps,
+                        ends_before,
+                        ends_now,
+                        withheld.map_or(String::new(), |(n, e)| format!("; a step of {n} k-mers withheld: {e} ends"))
                     );
                 }
                 if !frontier_withheld[t] {

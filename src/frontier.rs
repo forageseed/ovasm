@@ -529,6 +529,31 @@ fn set_depth(ext: &mut Extension, depth: f64, p: &Params) -> Option<impl Fn(u32)
     Some(move |c: u32| f64::from(c) >= floor && f64::from(c) <= ceiling)
 }
 
+/// The ends `extend_from_kmers` would walk from: the strands of `known`'s k-mers at depth with a
+/// successor at depth that `known` lacks. None for a depth too shallow to walk.
+pub fn count_ends(counts: &KmerCounts, known: &FxHashSet<u64>, depth: f64, p: &Params) -> Option<usize> {
+    let mut ext = Extension::default();
+    let at_depth = set_depth(&mut ext, depth, p)?;
+    let w = Words::new(counts.k);
+    let present = |x: u64| at_depth(counts.get(w.canonical(x)));
+    Some(
+        known
+            .par_iter()
+            .filter(|&&x| present(x))
+            .map(|&x| {
+                [x, w.rc(x)]
+                    .into_iter()
+                    .filter(|&y| {
+                        w.successors(y)
+                            .into_iter()
+                            .any(|s| !known.contains(&w.canonical(s)) && present(s))
+                    })
+                    .count()
+            })
+            .sum(),
+    )
+}
+
 /// Walk from every end (forward words) on the k-mers at depth, until the walk rejoins `known`
 /// (`JOIN_RUN`), stops, or runs out of budget; the new k-mers' unitigs go to `ext.sequences`.
 /// With `bridges_only`, an end's new k-mers are kept only on its paths to a rejoin.
@@ -1073,6 +1098,9 @@ mod tests {
         let p = Params { max_ends: all.ends - 1, ..Params::default() };
         let ext = extend_from_kmers(&table, &known, 100.0, 1_000_000, &p);
         assert_eq!((ext.skipped, ext.ends, ext.new_kmers), (Some("ends_growing"), all.ends, 0));
+        // the ends are those the walk counts
+        assert_eq!(count_ends(&table, &known, 100.0, &Params::default()), Some(all.ends));
+        assert_eq!(count_ends(&table, &known, 5.0, &Params::default()), None);
         assert!(ext.sequences.is_empty());
         let p = Params { max_ends: all.ends, ..Params::default() };
         assert_eq!(extend_from_kmers(&table, &known, 100.0, 1_000_000, &p).sequences, all.sequences);
