@@ -377,6 +377,54 @@ fn windows(g: &Graph, p: &EvidenceParams, flank: usize) -> Vec<[usize; 2]> {
     win
 }
 
+/// Most ways a short junction side goes on into the graph (`onward`); a side with more keeps its
+/// own sequence alone.
+const ONWARD_WAYS: usize = 8;
+
+/// The sequences beyond the end of `o`, one per way through the segments after it (each after its
+/// overlap), up to `want` bp; a way ends early at a dead end or a segment it already passed. One
+/// empty sequence when `o` leads nowhere or more than `ONWARD_WAYS` ways do.
+fn onward(
+    g: &Graph,
+    next: &FxHashMap<Oriented, Vec<(Oriented, usize)>>,
+    o: Oriented,
+    want: usize,
+) -> Vec<Vec<u8>> {
+    let mut done: Vec<Vec<u8>> = Vec::new();
+    // (way so far, its last segment, segments passed)
+    let mut open = vec![(Vec::new(), o, vec![o.0])];
+    while let Some((way, at, seen)) = open.pop() {
+        let ahead: Vec<&(Oriented, usize)> = next
+            .get(&at)
+            .into_iter()
+            .flatten()
+            .filter(|(nx, _)| !seen.contains(&nx.0))
+            .collect();
+        if way.len() >= want || ahead.is_empty() {
+            done.push(way);
+        }
+        else {
+            for &&(nx, ov) in &ahead {
+                let s = g.oriented_seq(nx);
+                let mut w = way.clone();
+                w.extend_from_slice(&s[ov.min(s.len())..]);
+                let mut passed = seen.clone();
+                passed.push(nx.0);
+                open.push((w, nx, passed));
+            }
+        }
+        if done.len() + open.len() > ONWARD_WAYS {
+            return vec![Vec::new()];
+        }
+    }
+    for w in &mut done {
+        w.truncate(want);
+    }
+    done.sort();
+    done.dedup();
+    done
+}
+
 pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
     let mut idx = Index {
         k: p.k,
@@ -385,6 +433,13 @@ pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
     };
     // keep room beyond the anchor so one error at the flank edge cannot veto support
     let win = windows(g, p, p.flank.max(p.min_anchor + 500));
+    let mut next: FxHashMap<Oriented, Vec<(Oriented, usize)>> = FxHashMap::default();
+    for (li, &(a, b)) in g.links.iter().enumerate() {
+        next.entry(a).or_default().push((b, g.overlaps[li]));
+        next.entry(flip(b)).or_default().push((flip(a), g.overlaps[li]));
+    }
+    // a side must hold `min_side_hits` k-mers
+    let reach = p.k + p.min_side_hits - 1;
     for (li, &(a, b)) in g.links.iter().enumerate() {
         let sa = g.oriented_seq(a);
         let sb = g.oriented_seq(b);
@@ -392,10 +447,38 @@ pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
         // unique sequence on both sides of the overlap.
         let ov = g.overlaps[li];
         let [wl, wr] = win[li];
-        let left = &sa[sa.len().saturating_sub(wl + ov)..];
-        let right = &sb[ov..sb.len().min(ov + wr)];
-        let mut j = left.to_vec();
-        j.extend_from_slice(right);
+        let own_left_seq = &sa[sa.len().saturating_sub(wl + ov)..];
+        let own_right_seq = &sb[ov..sb.len().min(ov + wr)];
+        // A side shorter than `min_anchor` goes on into the segments beyond it, one junction per
+        // way (`onward`): reads cross a link into a short segment and go on. Without this a link
+        // whose side holds fewer than `min_side_hits` k-mers had no read at all. Nipponbare ONT
+        // mitochondrion (e632af1): all 81 such links of 348 (u39+ -> u241+, 80 bp overlap into a
+        // 108 bp segment) had 0 reads, and the molecule broke at each: 27 pieces. A read takes
+        // one way; `crossings` keeps one crossing per link.
+        let (own_left, own_right) = (own_left_seq.len() - ov, own_right_seq.len());
+        let befores = if own_left < p.min_anchor {
+            onward(g, &next, flip(a), p.min_anchor - own_left)
+        } else {
+            vec![Vec::new()]
+        };
+        let afters = if own_right < p.min_anchor {
+            onward(g, &next, b, p.min_anchor - own_right)
+        } else {
+            vec![Vec::new()]
+        };
+        let anchor = |own: usize, all: usize| {
+            let anchor = p.min_anchor.min(own * 9 / 10);
+            if all > own { anchor.max(reach).min(all) } else { anchor }
+        };
+        for before in &befores {
+        for after in &afters {
+        let mut left = revcomp(before);
+        left.extend_from_slice(own_left_seq);
+        let mut right = own_right_seq.to_vec();
+        right.extend_from_slice(after);
+        let (anchor_left, anchor_right) = (anchor(own_left, left.len() - ov), anchor(own_right, right.len()));
+        let mut j = left.clone();
+        j.extend_from_slice(&right);
         let ji = idx.junctions.len() as u32;
         for (pos, kmer) in CanonicalKmers::new(&j, p.k) {
             let fwd = forward_is_canonical(&j[pos..pos + p.k], kmer);
@@ -405,9 +488,11 @@ pub(crate) fn build_index(g: &Graph, p: &EvidenceParams) -> Index {
             link: li,
             left_len: left.len(),
             overlap: ov,
-            anchor_left: p.min_anchor.min((left.len() - ov) * 9 / 10) as i64,
-            anchor_right: p.min_anchor.min(right.len() * 9 / 10) as i64,
+            anchor_left: anchor_left as i64,
+            anchor_right: anchor_right as i64,
         });
+        }
+        }
     }
     idx
 }
@@ -527,7 +612,8 @@ pub(crate) fn crossing_copies(
 
 pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Crossing> {
     let k = idx.k as i64;
-    let mut out = Vec::new();
+    // a link has one junction per way its short sides go on (`build_index`): keep its best
+    let mut best: FxHashMap<(usize, bool), Crossing> = FxHashMap::default();
     for ((ji, along), h) in junction_hits(read, idx) {
         let junction = &idx.junctions[ji as usize];
         let joint = junction.left_len as i64;
@@ -558,16 +644,22 @@ pub(crate) fn crossings(read: &[u8], idx: &Index, p: &EvidenceParams) -> Vec<Cro
             } else {
                 (best_diag - joint, best_diag - joint + ov)
             };
-            out.push(Crossing {
+            let c = Crossing {
                 link: junction.link,
                 along,
                 to_start,
                 from_end,
                 score: (best_left + best_right) as u32,
                 share: best_share,
-            });
+            };
+            let e = best.entry((c.link, along)).or_insert(c);
+            if c.score > e.score {
+                *e = c;
+            }
         }
     }
+    let mut out: Vec<Crossing> = best.into_values().collect();
+    out.sort_by_key(|c| (c.link, c.along));
     out
 }
 
@@ -2394,6 +2486,56 @@ mod tests {
             for read in [read.clone(), revcomp(&read)] {
                 let (kept, ambiguous) = assign(&g, crossings(&read, &idx, &p), p.spacing_tol);
                 assert_eq!(kept.iter().map(|c| c.link).collect::<Vec<_>>(), vec![link]);
+                assert!(ambiguous.is_empty());
+            }
+        }
+    }
+
+    /// A 15 bp segment between two long ones, shorter than k: neither link has a k-mer on its short side, yet
+    /// a read through all three crosses both, seen on the segments beyond the short one.
+    #[test]
+    fn links_into_a_short_segment_are_seen_beyond_it() {
+        let (a, s, c) = (rng_seq(3000, 81), rng_seq(15, 82), rng_seq(3000, 83));
+        let g = Graph {
+            names: ["A", "S", "C"].map(String::from).to_vec(),
+            seqs: vec![a.clone(), s.clone(), c.clone()],
+            links: vec![((0, true), (1, true)), ((1, true), (2, true))],
+            overlaps: vec![0, 0],
+        };
+        let p = params();
+        let idx = build_index(&g, &p);
+        let read = cat(&[&a[1000..], &s, &c[..2000]]);
+        for read in [read.clone(), revcomp(&read)] {
+            let (kept, _) = assign(&g, crossings(&read, &idx, &p), p.spacing_tol);
+            let mut links: Vec<usize> = kept.iter().map(|c| c.link).collect();
+            links.sort_unstable();
+            assert_eq!(links, vec![0, 1]);
+        }
+        // a read that leaves the short segment for elsewhere supports neither link through it
+        let read = cat(&[&a[1000..], &s, &rng_seq(2000, 84)]);
+        assert!(assign(&g, crossings(&read, &idx, &p), p.spacing_tol).0.iter().all(|c| c.link != 1));
+    }
+
+    /// The short segment branches after it, to C or D: a read through either way crosses the
+    /// link into it, once.
+    #[test]
+    fn links_into_a_short_segment_that_branches_are_seen_on_each_way() {
+        let (a, s, c, d) = (rng_seq(3000, 85), rng_seq(15, 86), rng_seq(3000, 87), rng_seq(3000, 88));
+        let g = Graph {
+            names: ["A", "S", "C", "D"].map(String::from).to_vec(),
+            seqs: vec![a.clone(), s.clone(), c.clone(), d.clone()],
+            links: vec![((0, true), (1, true)), ((1, true), (2, true)), ((1, true), (3, true))],
+            overlaps: vec![0, 0, 0],
+        };
+        let p = params();
+        let idx = build_index(&g, &p);
+        for (beyond, link) in [(&c, 1), (&d, 2)] {
+            let read = cat(&[&a[1000..], &s, &beyond[..2000]]);
+            for read in [read.clone(), revcomp(&read)] {
+                let (kept, ambiguous) = assign(&g, crossings(&read, &idx, &p), p.spacing_tol);
+                let mut links: Vec<usize> = kept.iter().map(|c| c.link).collect();
+                links.sort_unstable();
+                assert_eq!(links, vec![0, link]);
                 assert!(ambiguous.is_empty());
             }
         }
