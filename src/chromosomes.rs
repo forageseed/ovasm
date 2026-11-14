@@ -52,6 +52,15 @@ pub const SOURCE_FOLD: f64 = 2.0;
 /// organelle's own (rule 5): a gene or two of the land-plant seeds.
 const MIN_SEED_BP: usize = 300;
 const SEED_K: usize = 21;
+/// A short-read run does not deliver a molecule whose every component is free of the main one,
+/// holds under `MIN_SEED_BP` of seed sequence, closes no circle and is shorter than this many
+/// reads (`withhold`): ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
+/// them on the alfalfa nuclear genome, 155 at five copies or more) in two components unjoined to
+/// its mitochondrion, at 28-141x against its 123x, and five molecules of 226-583 bp of them were
+/// delivered beside its 306,690 bp one. Depth does not tell them: a nuclear family in the
+/// organelle's depth band stands at its depth. A small circle of a multipartite mitochondrion
+/// without seed genes is kept (it closes), as is any free component of a few reads' length.
+pub const WITHHOLD_READS: usize = 5;
 
 /// One-sided 95% upper bound of a share seen 0 times in `n`.
 pub fn missing_share_upper(n: u64) -> f64 {
@@ -114,6 +123,19 @@ pub struct Excluded {
     pub reason: &'static str,
 }
 
+/// A molecule not delivered (`withhold`), written to molecules.withheld.fasta.
+#[derive(Debug, Clone, Serialize)]
+pub struct Withheld {
+    /// Its place in molecules.fasta before (from 1), its name and length.
+    pub molecule: usize,
+    pub name: String,
+    pub length: usize,
+    /// Its components' bases and seed sequence.
+    pub components_bp: usize,
+    pub seed_bp: Option<usize>,
+    pub reason: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChromosomeReport {
     /// An estimate for the represented graph, not a certified physical chromosome count.
@@ -132,6 +154,8 @@ pub struct ChromosomeReport {
     pub source_fold: f64,
     pub chromosomes: Vec<Chromosome>,
     pub excluded: Vec<Excluded>,
+    /// Molecules not delivered (`withhold`); none unless a run asks.
+    pub withheld: Vec<Withheld>,
 }
 
 struct Molecule {
@@ -301,6 +325,7 @@ pub fn call(
         source_fold: SOURCE_FOLD,
         chromosomes: Vec::new(),
         excluded: Vec::new(),
+        withheld: Vec::new(),
     };
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut main_seen = false;
@@ -518,6 +543,68 @@ fn labels(report: &ChromosomeReport) -> BTreeMap<usize, (usize, usize, f64, &'st
         }
     }
     out
+}
+
+/// The molecules a short-read run does not deliver (`WITHHOLD_READS`): every component holding
+/// one is free of the main component (the first), holds seed sequence and under `MIN_SEED_BP` of
+/// it, has no circular molecule and is under `max_bp`. Without seeds nothing is withheld.
+pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
+    let mut of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (ci, c) in report.chromosomes.iter().enumerate() {
+        for m in &c.conformations {
+            of.entry(m.molecule).or_default().push(ci);
+        }
+    }
+    let fragment = |ci: usize| {
+        let c = &report.chromosomes[ci];
+        ci > 0
+            && c.seed_bp.is_some_and(|b| b < MIN_SEED_BP)
+            && c.conformations.iter().all(|m| !m.circular)
+            && c.bp < max_bp
+    };
+    let mut withheld = Vec::new();
+    for (&m, cs) in &of {
+        if !cs.iter().all(|&ci| fragment(ci)) {
+            continue;
+        }
+        let conf = report.chromosomes[cs[0]].conformations.iter().find(|c| c.molecule == m).unwrap();
+        withheld.push(Withheld {
+            molecule: m,
+            name: conf.name.clone(),
+            length: conf.length,
+            components_bp: cs.iter().map(|&ci| report.chromosomes[ci].bp).sum(),
+            seed_bp: cs.iter().map(|&ci| report.chromosomes[ci].seed_bp).sum(),
+            reason: "free_fragment_without_seed",
+        });
+    }
+    if !withheld.is_empty() {
+        report.reasons.push(format!(
+            "{} molecule(s) of {} bp in all not delivered: free components without seed sequence, \
+             no circle and under {max_bp} bp (molecules.withheld.fasta)",
+            withheld.len(),
+            withheld.iter().map(|w| w.length).sum::<usize>()
+        ));
+    }
+    report.withheld = withheld;
+}
+
+/// Move the withheld molecules (`withhold`) from `path` to `to`, in their order.
+pub fn split_withheld(path: &Path, to: &Path, report: &ChromosomeReport) -> Result<()> {
+    let gone: BTreeSet<usize> = report.withheld.iter().map(|w| w.molecule).collect();
+    let text = fs::read_to_string(path)?;
+    let (mut kept, mut moved) = (String::with_capacity(text.len()), String::new());
+    let mut n = 0;
+    for line in text.lines() {
+        if line.starts_with('>') {
+            n += 1;
+        }
+        let out = if gone.contains(&n) { &mut moved } else { &mut kept };
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(path, kept)?;
+    fs::write(to, moved)?;
+    Ok(())
 }
 
 /// Append `chromosome=`, `conformation=` and `share=` to the molecules' FASTA headers.
@@ -780,6 +867,52 @@ mod tests {
         let lib: BTreeMap<String, f64> = [("m".into(), 536.0), ("x".into(), 442.0)].into();
         let r = call(&g, &ev, &lin, Some(&lib), Some(&seeds)).unwrap();
         assert_eq!((r.count, r.source_pending), (Some(2), 0));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_free_fragment_without_seed_is_withheld_and_a_free_circle_is_not() {
+        let d = dir("withhold");
+        let g = gfa(&d, &[("m", 2000, 130.0), ("x", 300, 120.0), ("y", 5000, 125.0)]);
+        let ev = json!({"links": [link("m+", "m+", 50), link("y+", "y+", 30)], "repeats": [], "repeat_segments": []});
+        let lin = json!({"components": [
+            {"best": {"molecules": [{"path": "m+", "circular": true, "length": 2000}]}},
+            {"best": {"molecules": [{"path": "x+", "circular": false, "length": 300}]}},
+            {"best": {"molecules": [{"path": "y+", "circular": true, "length": 5000}]}}]});
+        let seeds = FxHashSet::default();
+        let mut r = call(&g, &ev, &lin, None, Some(&seeds)).unwrap();
+        // nothing unless asked
+        assert!(r.withheld.is_empty());
+        withhold(&mut r, 750);
+        assert_eq!(r.withheld.iter().map(|w| w.molecule).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(r.withheld[0].reason, "free_fragment_without_seed");
+        // a fragment longer than the bound is delivered
+        let mut r = call(&g, &ev, &lin, None, Some(&seeds)).unwrap();
+        withhold(&mut r, 300);
+        assert!(r.withheld.is_empty());
+        // without seeds nothing is judged
+        let mut r = call(&g, &ev, &lin, None, None).unwrap();
+        withhold(&mut r, 750);
+        assert!(r.withheld.is_empty());
+        let fa = d.join("molecules.fasta");
+        fs::write(&fa, ">linear.1
+AC
+>linear.2
+GT
+>linear.3
+TT
+").unwrap();
+        let mut r = call(&g, &ev, &lin, None, Some(&seeds)).unwrap();
+        withhold(&mut r, 750);
+        split_withheld(&fa, &d.join("molecules.withheld.fasta"), &r).unwrap();
+        assert_eq!(fs::read_to_string(&fa).unwrap(), ">linear.1
+AC
+>linear.3
+TT
+");
+        assert_eq!(fs::read_to_string(d.join("molecules.withheld.fasta")).unwrap(), ">linear.2
+GT
+");
         fs::remove_dir_all(&d).ok();
     }
 }

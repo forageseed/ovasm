@@ -365,6 +365,12 @@ struct ChromosomesArgs {
     /// source_pending (counted only in the range's maximum).
     #[arg(long)]
     depths: Option<PathBuf>,
+    /// Do not deliver molecules whose components are free of the main one, without seed
+    /// sequence, without a circle and under this many bp: they move from --molecules to
+    /// molecules.withheld.fasta beside it (`chromosomes::withhold`). Short-read runs pass
+    /// `WITHHOLD_READS` read lengths.
+    #[arg(long = "withhold-under")]
+    withhold_under: Option<usize>,
     #[arg(long = "out-json")]
     out_json: PathBuf,
 }
@@ -393,15 +399,21 @@ fn chromosomes(args: ChromosomesArgs) -> Result<()> {
     } else {
         Some(chromosomes::seed_kmers(&args.seeds)?)
     };
-    let report = chromosomes::call(
+    let mut report = chromosomes::call(
         &args.gfa,
         &read(&args.evidence)?,
         &read(&args.linearization)?,
         depths.as_ref(),
         seeds.as_ref(),
     )?;
+    if let Some(bp) = args.withhold_under {
+        chromosomes::withhold(&mut report, bp);
+    }
     if let Some(p) = args.molecules.as_ref().filter(|p| p.exists()) {
         chromosomes::annotate_fasta(p, &report)?;
+        if !report.withheld.is_empty() {
+            chromosomes::split_withheld(p, &p.with_file_name("molecules.withheld.fasta"), &report)?;
+        }
     }
     if let Some(p) = args.organelle_gfa.as_ref().filter(|p| p.exists()) {
         chromosomes::annotate_gfa(p, &report)?;

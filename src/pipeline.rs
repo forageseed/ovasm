@@ -554,6 +554,19 @@ struct GraphAttempts<'a> {
     experimental_deep_bubble_fraction: Option<f64>,
 }
 
+/// The median length of the first reads of `reads` (up to 100,000 of the first file).
+fn median_read_length(reads: &[PathBuf]) -> Option<usize> {
+    let mut lens = Vec::new();
+    crate::recruit::for_each_rec(reads.first()?, |r| {
+        if lens.len() < 100_000 {
+            lens.push(r.seq.len());
+        }
+    })
+    .ok()?;
+    lens.sort_unstable();
+    lens.get(lens.len() / 2).copied()
+}
+
 fn molecules_of(linearization: &Value) -> Vec<&Value> {
     linearization["components"]
         .as_array()
@@ -1917,6 +1930,12 @@ fn assemble_organelle(
     // chromosomes and their conformations among the molecules (`ovasm solve chromosomes`); the
     // depth is that of the kept reads, so a shallow component is only to be checked
     log("calling chromosomes and conformations");
+    // a short-read run does not deliver free fragments without seed sequence
+    // (`chromosomes::WITHHOLD_READS` read lengths)
+    let withhold = (cfg.read_type == ReadType::Sr)
+        .then(|| median_read_length(&reads_used))
+        .flatten()
+        .map(|l| PathBuf::from((l * crate::chromosomes::WITHHOLD_READS).to_string()));
     Argv::new("solve chromosomes")
         .opt("--gfa", &graph)
         .opt("--evidence", dir.join("evidence.json"))
@@ -1924,9 +1943,16 @@ fn assemble_organelle(
         .opt("--molecules", dir.join("molecules.fasta"))
         .opt("--organelle-gfa", dir.join("organelle.gfa"))
         .each("--seeds", cfg.seeds.get(organelle).map_or(&[][..], Vec::as_slice))
+        .each("--withhold-under", withhold.as_slice())
         .opt("--out-json", dir.join("chromosomes.json"))
         .run()?;
     let chromosomes = read_json(&dir.join("chromosomes.json"))?;
+    let withheld: BTreeSet<u64> = chromosomes["withheld"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["molecule"].as_u64())
+        .collect();
     // what the run's own files say about the result, no other tool (`ovasm check assess`)
     log("assessing the assembly from its own evidence");
     Argv::new("check assess")
@@ -1961,7 +1987,12 @@ fn assemble_organelle(
         _ => "fast",
     };
 
-    let molecules = molecules_of(&linear);
+    let molecules: Vec<&Value> = molecules_of(&linear)
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !withheld.contains(&(*i as u64 + 1)))
+        .map(|(_, m)| m)
+        .collect();
     let n_links = evidence["links"].as_array().map_or(0, Vec::len);
     for (key, name) in [
         ("assembly_graph", "assembly.gfa"),
