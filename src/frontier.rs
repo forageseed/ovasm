@@ -554,6 +554,87 @@ pub fn count_ends(counts: &KmerCounts, known: &FxHashSet<u64>, depth: f64, p: &P
     )
 }
 
+/// Split `new` into pieces, k-mers linked by an overlap of k-1 on either strand, and keep those
+/// whose k-mers, added to `known`, leave it with no more ends (`count_ends`) than before: a piece
+/// past an edge closes that end and opens one at its own tip, one across a gap closes two, and
+/// one in a repeat family at the depth opens its branches. Pieces are taken in turn, each kept one
+/// joining `known`. The kept k-mers, and the number withheld in how many pieces.
+pub fn keep_closing_pieces(
+    counts: &KmerCounts,
+    known: &mut FxHashSet<u64>,
+    new: &[u64],
+    depth: f64,
+    p: &Params,
+) -> (Vec<u64>, usize, usize) {
+    let mut ext = Extension::default();
+    let Some(at_depth) = set_depth(&mut ext, depth, p) else {
+        return (new.to_vec(), 0, 0);
+    };
+    let w = Words::new(counts.k);
+    let present = |x: u64| at_depth(counts.get(w.canonical(x)));
+    // the canonical neighbours of a canonical k-mer, on both strands
+    let neighbours = |x: u64| {
+        [x, w.rc(x)]
+            .into_iter()
+            .flat_map(|y| w.successors(y))
+            .map(|s| w.canonical(s))
+    };
+    let index: FxHashMap<u64, usize> = new.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+    let mut parent: Vec<usize> = (0..new.len()).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (i, &x) in new.iter().enumerate() {
+        for n in neighbours(x) {
+            if let Some(&j) = index.get(&n) {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut pieces: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
+    for (i, &x) in new.iter().enumerate() {
+        let r = find(&mut parent, i);
+        pieces.entry(r).or_default().push(x);
+    }
+    let mut pieces: Vec<Vec<u64>> = pieces.into_values().collect();
+    pieces.sort_unstable_by_key(|piece| piece.iter().copied().min());
+    // the strands of `x` with a successor at depth outside `held`
+    let open = |x: u64, held: &dyn Fn(u64) -> bool| -> isize {
+        if !present(x) {
+            return 0;
+        }
+        [x, w.rc(x)]
+            .into_iter()
+            .filter(|&y| w.successors(y).into_iter().any(|s| !held(w.canonical(s)) && present(s)))
+            .count() as isize
+    };
+    let (mut kept, mut withheld, mut withheld_pieces) = (Vec::new(), 0, 0);
+    for piece in pieces {
+        let inside: FxHashSet<u64> = piece.iter().copied().collect();
+        let mut touched: Vec<u64> = piece.iter().flat_map(|&x| neighbours(x)).filter(|n| known.contains(n)).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let before: isize = touched.iter().map(|&n| open(n, &|s| known.contains(&s))).sum();
+        let held = |s: u64| known.contains(&s) || inside.contains(&s);
+        let after: isize = touched.iter().chain(piece.iter()).map(|&n| open(n, &held)).sum();
+        if after <= before {
+            known.extend(piece.iter().copied());
+            kept.extend(piece);
+        } else {
+            withheld += piece.len();
+            withheld_pieces += 1;
+        }
+    }
+    (kept, withheld, withheld_pieces)
+}
+
 /// Walk from every end (forward words) on the k-mers at depth, until the walk rejoins `known`
 /// (`JOIN_RUN`), stops, or runs out of budget; the new k-mers' unitigs go to `ext.sequences`.
 /// With `bridges_only`, an end's new k-mers are kept only on its paths to a rejoin.
@@ -1101,6 +1182,19 @@ mod tests {
         // the ends are those the walk counts
         assert_eq!(count_ends(&table, &known, 100.0, &Params::default()), Some(all.ends));
         assert_eq!(count_ends(&table, &known, 5.0, &Params::default()), None);
+        // the walk's own bridges close the ends they leave from, and are kept whole; the repeat
+        // family's k-mers at depth branch, and are withheld
+        let bridges: Vec<u64> = all.sequences.iter().flat_map(|s| w.forward(s).into_iter().map(|(_, x)| w.canonical(x))).filter(|x| !known.contains(x)).collect::<FxHashSet<u64>>().into_iter().collect();
+        let mut held = known.clone();
+        let (kept, withheld, _) = keep_closing_pieces(&table, &mut held, &bridges, 100.0, &Params::default());
+        assert_eq!((kept.len(), withheld), (bridges.len(), 0));
+        assert!(count_ends(&table, &held, 100.0, &Params::default()).unwrap() <= all.ends);
+        let family: Vec<u64> = words(&repeat).into_iter().filter(|x| !known.contains(x) && !organelles.contains(x)).collect::<FxHashSet<u64>>().into_iter().collect();
+        if !family.is_empty() {
+            let mut held = known.clone();
+            let (kept, _, _) = keep_closing_pieces(&table, &mut held, &family, 100.0, &Params::default());
+            assert!(count_ends(&table, &held, 100.0, &Params::default()).unwrap() <= all.ends, "{} kept", kept.len());
+        }
         assert!(ext.sequences.is_empty());
         let p = Params { max_ends: all.ends, ..Params::default() };
         assert_eq!(extend_from_kmers(&table, &known, 100.0, 1_000_000, &p).sequences, all.sequences);
