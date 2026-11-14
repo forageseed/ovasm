@@ -2262,6 +2262,8 @@ pub(crate) fn run_with_options(
     // pair keys of each target's recruited reads, for the mates they bring (`MateReach`)
     let mate_reach = cfg.kmer_gate && cfg.mates_together;
     let mut mate_pairs: Vec<FxHashSet<u64>> = vec![FxHashSet::default(); n_targets];
+    // targets whose mates stopped for good (rapid bait growth): their reads still extend them
+    let mut mates_stopped = vec![false; n_targets];
     // A target seeded from reads of the sample holds its whole genome already: extending it
     // only adds passes over the input (each a full decompression) for nothing.
     let mut saturated: Vec<bool> = bait.targets.iter().map(|t| t.from_reads).collect();
@@ -2708,7 +2710,7 @@ pub(crate) fn run_with_options(
                 // beside a closed molecule, at the nuclear insertions and chimeric pairs of its
                 // reads; the Nipponbare plastid, a closed circle after four passes, kept taking
                 // mates of high-copy nuclear sequence at its depth and 760,000 more reads.
-                if mate_reach && !saturated[t] && added[t] > 0 {
+                if mate_reach && !saturated[t] && !mates_stopped[t] && added[t] > 0 {
                     let bit = 1u8 << t;
                     let mut pending: Vec<&[u8]> = res.mates[t]
                         .reads()
@@ -2729,11 +2731,14 @@ pub(crate) fn run_with_options(
                         let mut new = bait.new_from_reads(t, ready.iter().copied(), cfg.extend_min_count);
                         keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
                         let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                        // Mates past what the reads and the walk give stop for good, and the
+                        // target goes on as it would without them: stopping the target itself
+                        // left the whole Nipponbare library's mitochondrion at pass 4, where at a
+                        // quarter of it the reads went on to pass 7.
                         if runaway_growth(previous, added[t].saturating_add(new.len()), closing[t]) {
-                            saturated[t] = true;
-                            stopped[t] = Some("growing");
+                            mates_stopped[t] = true;
                             let w = format!(
-                                "{}: extension from read pairs stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved",
+                                "{}: extension from read pairs stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved; extension from reads goes on",
                                 bait.targets[t].name, it + 1, added[t].saturating_add(new.len()), previous
                             );
                             eprintln!("[ovasm] warning: {w}");
@@ -2752,9 +2757,6 @@ pub(crate) fn run_with_options(
                         "[ovasm] mates {} pass {}: {} taken by the gate, steps (ready, new, added) {:?}",
                         bait.targets[t].name, it + 1, offered, steps
                     );
-                    if saturated[t] {
-                        continue;
-                    }
                 }
                 if !frontier_withheld[t] {
                     frontier_withheld[t] = picked.iter().any(|seq| has_unbaited_kmer(&bait, t, seq));
