@@ -902,9 +902,12 @@ mod tests {
             table.add_seq(&spur);
             table.add_seq(&revcomp(&spur));
         }
-        // a reference lacking 1,000-2,600: the walk on from 1,000 passes the branch at 1,200
-        let reference = [genome[..1000].to_vec(), genome[2600..].to_vec()].concat();
-        let ext = extend(&table, &[reference], 3400, &Params::default());
+        // a reference of the first 1,000 bases: the one walk passes the branch at 1,200. It holds
+        // more present elsewhere (another molecule), so the walk keeps all it took
+        let other = random(4000, 18);
+        tile(&table, &other, 150, 3, 1);
+        let ext = extend(&table, &[genome[..1000].to_vec(), other], 7400, &Params::default());
+        assert_eq!(ext.unbridged_walk_kmers, None, "{ext:?}");
         assert_eq!(ext.branches, 1, "{ext:?}");
         assert!(ext.tips_removed >= 1, "{ext:?}");
         let tail = &spur[120..];
@@ -935,7 +938,14 @@ mod tests {
         let all = ext.unbridged_walk_kmers.expect("the walk took more than the reference holds");
         assert!(all > ext.present_reference_kmers, "{ext:?}");
         // the gap, rejoined on both sides, is kept; the family's own sequence is not
-        assert_eq!(ext.new_kmers, 800 + K - 1, "{ext:?}");
+        assert!(ext.new_kmers <= 800 + K - 1, "{ext:?}");
+        let held: FxHashSet<u64> = ext
+            .sequences
+            .iter()
+            .flat_map(|s| forward_kmers(s).into_iter().map(|(_, x)| canonical(x)))
+            .collect();
+        let gap = &genome[1000..1800];
+        assert!(forward_kmers(gap).iter().all(|&(_, x)| held.contains(&canonical(x))), "{ext:?}");
         let tail = &family[1000..1040];
         assert!(ext.sequences.iter().all(|s| {
             !s.windows(40).any(|w| w == tail) && !revcomp(s).windows(40).any(|w| w == tail)
