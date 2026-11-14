@@ -695,17 +695,28 @@ fn join_dead_ends(
 }
 
 /// Places where `pat` or its reverse complement occurs in `seqs`, counted up to `cap + 1`.
+/// Matches starting within `SLIP` bases of the previous one in the same sequence are one place:
+/// a stretch that begins or ends in a homopolymer also matches a base or two to the side
+/// (Pseudognaphalium luteoalbum, half of the HiFi run: the 51 bp two dead ends shared matched
+/// the exit at three offsets in a row, counted as three places, so the join of a circle that
+/// 274 independent reads cross was refused as a repeat).
 fn occurrences(seqs: &[Vec<u8>], pat: &[u8], cap: usize) -> usize {
+    const SLIP: usize = 4;
     let rc = revcomp(pat);
     let mut n = 0;
     for s in seqs {
-        for w in s.windows(pat.len()) {
-            if w == pat || w == rc.as_slice() {
+        let mut last: Option<usize> = None;
+        for (i, w) in s.windows(pat.len()).enumerate() {
+            if w != pat && w != rc.as_slice() {
+                continue;
+            }
+            if last.map_or(true, |j| i - j > SLIP) {
                 n += 1;
                 if n > cap {
                     return n;
                 }
             }
+            last = Some(i);
         }
     }
     n
@@ -3261,6 +3272,26 @@ mod tests {
             join_dead_ends(&[circle], &[], &[false], 33, 99, false),
             vec![(((0, false), (0, false)), 50)] // the canonical side of the self-link
         );
+    }
+
+    #[test]
+    fn dead_ends_meeting_in_a_homopolymer_join_when_the_run_is_unique() {
+        // Pseudognaphalium luteoalbum (half of the HiFi run): one dead end ran into a poly-A of
+        // 53 bp, the other started with 51 A; reads disagree on the run's length, so no k-mer
+        // crossed it and the gap fill cannot walk a homopolymer. The 51 A they share match the
+        // exit at three offsets in a row: one place there, one in the entry, joined. A run as
+        // long elsewhere in the graph still makes it a repeat.
+        let a = |n: usize| vec![b'A'; n];
+        let shared = a(51);
+        let exit = [seq(3000, 102), b"T".to_vec(), a(53)].concat();
+        let entry = [a(51), b"TGAAG".to_vec(), seq(3000, 103)].concat();
+        let pair = [exit.clone(), entry.clone()];
+        assert_eq!(occurrences(&pair, &shared, 2), 2);
+        let joins = join_dead_ends(&pair, &[], &[false, false], GAP_K, 2002, true);
+        assert_eq!(joins, vec![(((0, true), (1, true)), 51)]);
+        let elsewhere = [seq(500, 104), b"C".to_vec(), a(51), b"C".to_vec(), seq(500, 105)].concat();
+        let three = [exit, entry, elsewhere];
+        assert!(join_dead_ends(&three, &[], &[false, false, true], GAP_K, 2002, true).is_empty());
     }
 
     #[test]
