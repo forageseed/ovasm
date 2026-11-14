@@ -2116,6 +2116,19 @@ fn runaway_growth(previous: Option<usize>, gain: usize, closing: bool) -> bool {
     !closing && runaway_bait_gain(previous, gain)
 }
 
+/// The gain a pass's bait gain is weighed against (`runaway_bait_gain`): the last pass's (`last`),
+/// or in the first pass, which has none, the k-mers the bait held at the target's depth when the
+/// k-mer gate's table was counted (`present`). What the individual holds that its bait lacks is
+/// a share of what the bait already holds of it at its depth; a first pass gaining more than that
+/// half again is taking the nucleus's repeats, which a genome of 11 Gb under 1x holds at an
+/// organelle's depth in their tens of copies. Without it the first pass had no bound: oat
+/// SAMEA111508749's mitochondrion (Illumina, k-mer depth 38, floor 10) gained 962,196 k-mers
+/// from 232,326 reads in its first pass and ended with 3.7 M reads. Nipponbare's (`run short`,
+/// a quarter of its reads) gained 113,206 against 130,237 at its depth.
+fn previous_gain(last: Option<usize>, present: Option<usize>) -> Option<usize> {
+    last.or(present)
+}
+
 fn has_unbaited_kmer(bait: &BaitSet, target: usize, seq: &[u8]) -> bool {
     let bit = 1u8 << target;
     CanonicalKmers::new(seq, bait.k).any(|(_, km)| bait.get(km) & bit == 0)
@@ -2219,7 +2232,10 @@ pub(crate) fn run_with_options(
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
     // and each one's floor (`kmer_gate_floor`)
     let mut kmer_floor: Vec<Option<f64>> = vec![None; n_targets];
-    let mut gpu = (crate::gpu::requested() && replay.is_some() && cfg.iterations > 1)
+    // and the bait k-mers at its depth when the table was counted, the first pass's bound on its
+    // gain (`previous_gain`)
+    let mut kmer_present: Vec<Option<usize>> = vec![None; n_targets];
+    let mut gpu =(crate::gpu::requested() && replay.is_some() && cfg.iterations > 1)
         .then(|| match crate::gpu::Gpu::open() {
             Ok(g) => {
                 eprintln!("[ovasm] recruit: replay passes check changed k-mers on the GPU (OVASM_GPU=1)");
@@ -2307,14 +2323,25 @@ pub(crate) fn run_with_options(
                 let reads = res.all_sample[t].reads();
                 kmer_target_depth[t] = kmer_depth(&table, &bait, t, &reads);
                 kmer_floor[t] = kmer_target_depth[t].map(|d| kmer_gate_floor(&mut library, d));
+                kmer_present[t] = kmer_target_depth[t].map(|d| {
+                    let floor = kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d);
+                    bait.target_kmers(t)
+                        .par_iter()
+                        .filter(|&&km| {
+                            let c = f64::from(table.get(km));
+                            c >= floor && c <= KMER_GATE_CEILING * d
+                        })
+                        .count()
+                });
             }
             eprintln!(
-                "[ovasm] k-mer gate: {} k-mers of {} reads counted in {:.0}s; target depths {:?}, floors {:?}",
+                "[ovasm] k-mer gate: {} k-mers of {} reads counted in {:.0}s; target depths {:?}, floors {:?}, bait k-mers at depth {:?}",
                 bait.k,
                 table.reads,
                 table.seconds,
                 kmer_target_depth,
-                kmer_floor.iter().map(|f| f.map(|x| x.round())).collect::<Vec<_>>()
+                kmer_floor.iter().map(|f| f.map(|x| x.round())).collect::<Vec<_>>(),
+                kmer_present
             );
             kmer_table = Some(table);
         }
@@ -2555,12 +2582,14 @@ pub(crate) fn run_with_options(
                     let before = new.len();
                     keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
                     frontier_withheld[t] |= new.len() < before;
-                    let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                    let last = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                    let previous = previous_gain(last, kmer_present[t]);
                     if runaway_growth(previous, added[t] + new.len(), closing[t]) {
                         saturated[t] = true;
                         stopped[t] = Some("growing");
+                        let than = if last.is_some() { "the previous gain" } else { "the bait's k-mers at its depth" };
                         let w = format!(
-                            "{}: extension stopped at pass {}: bait gain {} exceeds 1.5 times the previous gain {:?}; rapid bait growth, sequence source unresolved",
+                            "{}: extension stopped at pass {}: bait gain {} exceeds 1.5 times {than} {:?}; rapid bait growth, sequence source unresolved",
                             bait.targets[t].name, it + 1, added[t] + new.len(), previous
                         );
                         eprintln!("[ovasm] warning: {w}");
@@ -2644,7 +2673,10 @@ pub(crate) fn run_with_options(
                             new.dedup();
                         }
                         keep_at_target_depth(kmer_table.as_ref(), kmer_target_depth[t], kmer_floor[t], &mut new);
-                        let previous = iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]);
+                        let previous = previous_gain(
+                            iterations.last().map(|s: &IterationStats| s.bait_kmers_added[t]),
+                            kmer_present[t],
+                        );
                         if runaway_bait_gain(previous, added[t].saturating_add(new.len())) {
                             saturated[t] = true;
                             stopped[t] = Some("growing");
@@ -3620,6 +3652,19 @@ mod tests {
         assert!(runaway_growth(Some(7_156), 22_084, false));
         assert!(!runaway_growth(Some(7_156), 22_084, true));
         assert!(!runaway_growth(Some(20_000), 15_001, false));
+    }
+
+    #[test]
+    fn a_first_pass_gain_is_weighed_against_the_bait_at_depth() {
+        // first passes (bait k-mers at depth, gain): oat SAMEA111508749's mitochondrion stops
+        assert!(runaway_growth(previous_gain(None, Some(338_658)), 962_196, false));
+        // ZM4, Nipponbare, JN-L (`run short`) and rice SAMEA115396717 (pan) go on
+        for (present, gain) in [(103_784, 117_264), (130_738, 105_067), (190_571, 135_385), (369_042, 17_183)] {
+            assert!(!runaway_growth(previous_gain(None, Some(present)), gain, false));
+        }
+        // later passes, and targets without the k-mer gate, are as before
+        assert_eq!(previous_gain(Some(7_156), Some(338_658)), Some(7_156));
+        assert_eq!(previous_gain(None, None), None);
     }
 
     #[test]

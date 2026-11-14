@@ -326,6 +326,10 @@ pub struct Extension {
     pub unitig_bases: usize,
     /// None, or why the target was not walked.
     pub skipped: Option<&'static str>,
+    /// `extend` only: the new k-mers a walk keeping all it reached at depth took, when they
+    /// outnumbered `present_reference_kmers` and the walk was redone keeping bridges only
+    /// (`extend`).
+    pub unbridged_walk_kmers: Option<usize>,
     #[serde(skip)]
     pub sequences: Vec<Vec<u8>>,
 }
@@ -424,7 +428,23 @@ pub fn extend(
         })
         .collect();
     let budget = (p.max_fold * stored_bases as f64) as usize;
-    walk(counts, &known, ends, at_depth, budget, p, false, &mut ext);
+    let before = ext.clone();
+    walk(counts, &known, ends.clone(), at_depth, budget, p, false, &mut ext);
+    // What an individual's organelle holds that its reference lacks is a share of what the
+    // reference holds of it: rice's six pan reconstructions walked 0-23% of their present
+    // reference k-mers (rice_715's mitochondrion 82,125 of 358,692). A walk that takes more than
+    // the reference holds is in the nucleus. Oat SAMEA111508749's mitochondrion (Illumina, 11 Gb
+    // nucleus under 1x, mitochondrion at 35): 114,765 reference k-mers present, 493,615 walked
+    // in 15,207 pieces through 13,213 branches and 17,686 dead ends with 13 rejoins; its first
+    // recruitment pass then took 2.8 M reads (47,599 without the walk) and the graph broke into
+    // 30,613 unitigs. Such a walk keeps only its bridges, the paths that rejoin the reference
+    // (`extend_from_kmers`), as recruitment's own walk does.
+    if ext.new_kmers > ext.present_reference_kmers {
+        let all = ext.new_kmers;
+        ext = before;
+        walk(counts, &known, ends, at_depth, budget, p, true, &mut ext);
+        ext.unbridged_walk_kmers = Some(all);
+    }
     ext
 }
 
@@ -882,8 +902,9 @@ mod tests {
             table.add_seq(&spur);
             table.add_seq(&revcomp(&spur));
         }
-        // a reference of the first 1,000 bases only: the one walk passes the branch at 1,200
-        let ext = extend(&table, &[genome[..1000].to_vec()], 3400, &Params::default());
+        // a reference lacking 1,000-2,600: the walk on from 1,000 passes the branch at 1,200
+        let reference = [genome[..1000].to_vec(), genome[2600..].to_vec()].concat();
+        let ext = extend(&table, &[reference], 3400, &Params::default());
         assert_eq!(ext.branches, 1, "{ext:?}");
         assert!(ext.tips_removed >= 1, "{ext:?}");
         let tail = &spur[120..];
@@ -898,6 +919,30 @@ mod tests {
             .collect();
         let missing = &genome[1000 - K + 1..1600 + K - 1];
         assert!(forward_kmers(missing).iter().all(|&(_, x)| held.contains(&canonical(x))));
+    }
+
+    #[test]
+    fn a_walk_taking_more_than_the_reference_holds_keeps_its_bridges_only() {
+        // oat SAMEA111508749: a nuclear repeat family as deep as the mitochondrion, entered from
+        // the gap the reference lacks, took four times the reference's present k-mers
+        let genome = random(4000, 51);
+        let family = [genome[1200..1400].to_vec(), random(8000, 52)].concat();
+        let table = KmerCounts::new(22);
+        tile(&table, &genome, 150, 3, 1); // ~100x
+        tile(&table, &family, 150, 3, 1); // ~100x, leaving the organelle at 1,400
+        let reference = [genome[..1000].to_vec(), random(300, 53), genome[1800..].to_vec()].concat();
+        let ext = extend(&table, &[reference], 3300, &Params::default());
+        let all = ext.unbridged_walk_kmers.expect("the walk took more than the reference holds");
+        assert!(all > ext.present_reference_kmers, "{ext:?}");
+        // the gap, rejoined on both sides, is kept; the family's own sequence is not
+        assert_eq!(ext.new_kmers, 800 + K - 1, "{ext:?}");
+        let tail = &family[1000..1040];
+        assert!(ext.sequences.iter().all(|s| {
+            !s.windows(40).any(|w| w == tail) && !revcomp(s).windows(40).any(|w| w == tail)
+        }));
+        // a walk within the reference's own share keeps all it took
+        let ok = extend(&table, &[genome.clone()], 4000, &Params::default());
+        assert_eq!(ok.unbridged_walk_kmers, None);
     }
 
     #[test]

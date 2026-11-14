@@ -1974,14 +1974,20 @@ pub fn run(cfg: &Config) -> Result<Value> {
                     &ext,
                 )?;
                 eprintln!(
-                    "[ovasm] reconstruct {o}: depth {:.0}, {} ends, {} extended, {} new {}-mers in {} pieces{}",
+                    "[ovasm] reconstruct {o}: depth {:.0}, {} ends, {} extended, {} new {}-mers in {} pieces{}{}",
                     ext.depth,
                     ext.ends,
                     ext.ends_extended,
                     ext.new_kmers,
                     frontier::K,
                     ext.unitigs,
-                    if ext.budget_reached { " (budget reached)" } else { "" }
+                    if ext.budget_reached { " (budget reached)" } else { "" },
+                    ext.unbridged_walk_kmers
+                        .map(|a| format!(
+                            " (bridges only: the walk took {a}, more than the {} reference k-mers present)",
+                            ext.present_reference_kmers
+                        ))
+                        .unwrap_or_default()
                 );
                 targets.insert(o, ext);
             }
