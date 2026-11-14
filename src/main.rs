@@ -2799,6 +2799,7 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             gate_fold: args.gate_fold,
             nuclear_depth: args.nuclear_depth,
             genome_size: args.genome_size,
+            growth_bound: None,
         },
         args.frontier_audit,
         args.read_admission_manifest.as_deref(),

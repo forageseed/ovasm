@@ -1458,6 +1458,15 @@ pub struct RecruitConfig {
     pub nuclear_depth: Option<u32>,
     /// The nuclear genome's collapsed size: the gate's nuclear peak is the input's bases over it.
     pub genome_size: Option<u64>,
+    /// A bait that already is the individual's own sequence, a panel of its species
+    /// (`pan reconstruct`): with the k-mer gate a read extends a target only from a long exact
+    /// overlap with it (`KMER_GATE_ANCHOR`) from the first pass on, and a target stops once its
+    /// bait has grown by this share of what it started with (`growth_bound` stop). The panel
+    /// holds nearly all of the individual; what it lacks is found at its edges, not by passes of
+    /// open-ended extension, which took rice SAMEA115396710's mitochondrion through 13 passes of
+    /// its 64.7 M reads (each 2-6 min) from 1.57 to 2.32 M reads, and oat SAMEA111508749's
+    /// first pass's extension 962,196 k-mers into the nucleus.
+    pub growth_bound: Option<f64>,
 }
 
 /// Counters of the k-mer gate's table: 2^31 of 16 bits, 4 GiB (4 MiB in tests).
@@ -1575,12 +1584,46 @@ fn walk_params(depth: f64, floor: Option<f64>, max_ends: usize) -> crate::fronti
     }
 }
 
+/// The share of a read's length that must lie on the bait in one exact run, k-mer after k-mer,
+/// for the read to extend it when the bait is the individual's own (`RecruitConfig::growth_bound`).
+/// A read is recruited when the bait covers `min_cover` of it with blocks bridged over gaps of
+/// `block_gap` and a fifth of its k-mers hit (`ClassifyParams`), so scattered fragments of nuclear
+/// repeats the bait holds carry reads past its edge pass after pass. GetOrganelle extends only
+/// from reads sharing a word of about two thirds of their length with those it holds: a repeat
+/// shorter than that cannot carry a read past the edge, which still moves a third of a read.
+const KMER_GATE_ANCHOR: f64 = 2.0 / 3.0;
+
+/// The longest run of consecutive k-mers of `seq` that target `t`'s bait holds, in bases.
+fn longest_anchor(bait: &BaitSet, t: usize, seq: &[u8]) -> usize {
+    let bit = 1u8 << t;
+    let (mut best, mut start, mut next) = (0usize, None::<usize>, 0usize);
+    for (pos, km) in CanonicalKmers::new(seq, bait.k) {
+        if bait.get(km) & bit == 0 {
+            start = None;
+            continue;
+        }
+        let s0 = match start {
+            Some(s0) if pos == next => s0,
+            _ => pos,
+        };
+        start = Some(s0);
+        next = pos + 1;
+        best = best.max(pos + bait.k - s0);
+    }
+    best
+}
+
 /// Whether a read may extend target `t` (`RecruitConfig::kmer_gate`): the k-mers it would add,
-/// those the target's bait lacks, at the target's depth `depth` by the table's counts.
-fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64, floor: f64) -> bool {
+/// those the target's bait lacks, at the target's depth `depth` by the table's counts, and, when
+/// `anchored`, the bait holding `KMER_GATE_ANCHOR` of the read in one exact run.
+fn kmer_extends(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, seq: &[u8], depth: f64, floor: f64, anchored: bool) -> bool {
     match new_kmer_median(table, bait, t, seq) {
         None => true,
-        Some(m) => m >= floor && m <= KMER_GATE_CEILING * depth,
+        Some(m) => {
+            (!anchored || longest_anchor(bait, t, seq) as f64 >= KMER_GATE_ANCHOR * seq.len() as f64)
+                && m >= floor
+                && m <= KMER_GATE_CEILING * depth
+        }
     }
 }
 
@@ -2342,6 +2385,13 @@ pub(crate) fn run_with_options(
         .map(|t| t.from_reads.then_some("seeded_from_reads"))
         .collect();
     let mut previous = vec![0u64; n_targets];
+    // What each target's bait started with and has grown by (`RecruitConfig::growth_bound`).
+    let start_kmers: Vec<usize> = if cfg.growth_bound.is_some() {
+        (0..n_targets).map(|t| bait.target_kmers(t).len()).collect()
+    } else {
+        vec![0; n_targets]
+    };
+    let mut grown = vec![0usize; n_targets];
     // Reads each target gained in the last pass (`STEADY_GROWTH`).
     let mut last_growth = vec![0u64; n_targets];
     // The same for the genome each target's reads stand for (with the depth sketch).
@@ -2691,7 +2741,7 @@ pub(crate) fn run_with_options(
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
-                        if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d)) {
+                        if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d), cfg.growth_bound.is_some()) {
                             gated_out[t] += 1;
                             if (!frontier_withheld[t] || frontier_audit.is_some())
                                 && has_unbaited_kmer(&bait, t, &r.seq)
@@ -3274,6 +3324,26 @@ pub(crate) fn run_with_options(
             implied_size: depths.implied_size,
         });
         result = Some(res);
+        if let Some(bound) = cfg.growth_bound {
+            for t in 0..n_targets {
+                grown[t] += added[t];
+                let cap = (bound * start_kmers[t] as f64) as usize;
+                if !saturated[t] && grown[t] > cap {
+                    saturated[t] = true;
+                    stopped[t] = Some("growth_bound");
+                    warnings.push(format!(
+                        "{}: its bait grew by {} k-mers by pass {}, more than {:.0}% of the {} it \
+                         started with; extension stopped there",
+                        bait.targets[t].name,
+                        grown[t],
+                        it + 1,
+                        100.0 * bound,
+                        start_kmers[t]
+                    ));
+                    eprintln!("[ovasm] warning: {}", warnings.last().unwrap());
+                }
+            }
+        }
         // Nothing new to bait with: this pass already used the final bait set (unless it changed
         // which tandem reads a target takes).
         if !last && added.iter().all(|&a| a == 0) && !tandem_changed {
@@ -3891,7 +3961,7 @@ mod tests {
             params:ClassifyParams {min_cover:0.8,min_hit_frac:0.2,numt_min_block:usize::MAX,block_gap:40,min_distinct:0.0},
             iterations,extend_min_count:3,auto_shallow_edge_support:false,extend_depth:200.0,saturation:0.05,
             target_depth:None,salt:0,out_dir:dir.join(label),bootstrap:false,extend_gate:false,max_read_depth:None,
-            max_bases:None,mates_together:false,kmer_gate:false,gate_fold:None,nuclear_depth:None,genome_size:None
+            max_bases:None,mates_together:false,kmer_gate:false,gate_fold:None,nuclear_depth:None,genome_size:None,growth_bound:None
         };
         let report = run(bait.clone(), make_cfg("one",1,false)).unwrap();
         assert_eq!(report.outputs[0].recruited_reads,6); assert_eq!(report.outputs[1].recruited_reads,1);
@@ -3985,10 +4055,11 @@ mod tests {
         let depth = kmer_depth(&table, &bait, t, &reads).unwrap();
         assert!((depth - 200.0).abs() < 10.0, "{depth}");
         // 120 bp on the bait and 30 bp further into the organelle: extends
-        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth, KMER_GATE_FLOOR * depth));
+        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth, KMER_GATE_FLOOR * depth, false));
+        assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth, KMER_GATE_FLOOR * depth, true));
         // 120 bp on the bait and 30 bp into the nucleus past the NUMT: does not
         let numt_edge = [&organelle[880..1000], &nucleus[..30]].concat();
-        assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth, KMER_GATE_FLOOR * depth));
+        assert!(!kmer_extends(&table, &bait, t, &numt_edge, depth, KMER_GATE_FLOOR * depth, false));
     }
 
     #[test]
@@ -4430,6 +4501,7 @@ mod tests {
             gate_fold: None,
             nuclear_depth: None,
             genome_size: None,
+            growth_bound: None,
         };
         let ids = |path: &str| {
             let mut v = Vec::new();
@@ -4942,6 +5014,7 @@ mod tests {
             gate_fold: None,
             nuclear_depth: None,
             genome_size: None,
+            growth_bound: None,
         };
         let nuclear_reads = |r: &RecruitReport| {
             let mut n = 0;
@@ -5108,6 +5181,7 @@ mod tests {
             gate_fold: None,
             nuclear_depth: None,
             genome_size: None,
+            growth_bound: None,
         };
         let one = run(bait.clone(), cfg(1)).unwrap();
         let mut single_cfg = cfg(1);
@@ -5277,6 +5351,7 @@ mod tests {
             gate_fold: None,
             nuclear_depth: None,
             genome_size: None,
+            growth_bound: None,
         }
     }
 
@@ -5421,6 +5496,7 @@ mod tests {
         let cfg = RecruitConfig {
             bait_growth_guard: false,
             genome_size: Some(size),
+            growth_bound: None,
             ..test_config(&fa, dir.join("size"), 80, true)
         };
         let sized = run(bait_from(&mito[..6000], 21), cfg).unwrap();

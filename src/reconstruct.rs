@@ -2378,6 +2378,15 @@ pub struct Config {
 /// `--recruit-max-depth` default.
 const RECRUIT_MAX_READ_DEPTH: f64 = 250.0;
 
+/// Passes of recruitment over the reads: the panel's k-mers recruit in the first, and the rest
+/// only reach past its edges (`recruit::RecruitConfig::growth_bound`). Each pass reads every
+/// read of the sample; twenty took rice SAMEA115396710's 64.7 M reads through 13 of them.
+const PAN_RECRUIT_PASSES: usize = 4;
+/// What a target's bait may grow by over the panel, as a share of the panel's k-mers it starts
+/// with (`recruit::RecruitConfig::growth_bound`): an individual's sequence the panel lacks is a
+/// small share of it, and growth past it is the bait going into the nucleus.
+const PAN_GROWTH_BOUND: f64 = 0.25;
+
 pub fn run(cfg: &Config) -> Result<Value> {
     if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
         bail!("sample must be a nonempty PanSN field");
@@ -2527,7 +2536,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                     numt_min_block: usize::MAX,
                     block_gap: 40,
                 },
-                iterations: 20,
+                iterations: PAN_RECRUIT_PASSES,
                 extend_min_count: 3,
                 auto_shallow_edge_support: false,
                 extend_depth: 200.0,
@@ -2553,6 +2562,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 gate_fold: None,
                 nuclear_depth: None,
                 genome_size: None,
+                growth_bound: Some(PAN_GROWTH_BOUND),
             },
         )?)?
     };
