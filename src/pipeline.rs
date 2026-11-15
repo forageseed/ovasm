@@ -818,11 +818,17 @@ fn free_bytes(_: &Path) -> Option<u64> {
 /// free besides it; `None` otherwise, and the passes read the input files instead. The cache
 /// saves every pass after the first, and the depth sketch's two, a decompression of the input
 /// (Nipponbare's 28.6 GB, read from a busy disk: 5,462 s for the first pass and the sketch).
+/// Whether a recruitment cache of `need` bytes fits a disk with `free` bytes free
+/// (`default_recruit_cache`): it must leave at least as much again, and 20 GB, besides it.
+fn cache_fits(need: u64, free: Option<u64>) -> bool {
+    free.is_some_and(|f| f >= need + need.max(20_000_000_000))
+}
+
 fn default_recruit_cache(reads: &[PathBuf], out: &Path, recruit_dir: &Path) -> Result<Option<PathBuf>> {
     let need = cache_estimate(reads)?;
     let free = free_bytes(out);
     let gb = |b: u64| b as f64 / 1e9;
-    if !free.is_some_and(|f| f >= need + need.max(20_000_000_000)) {
+    if !cache_fits(need, free) {
         log(&format!(
             "not caching the reads for recruitment ({} free, up to {:.1} GB needed); \
              every pass reads the input files",
@@ -2724,6 +2730,16 @@ mod tests {
         assert!(e.contains("closer reference seed") && e.contains("seed-free discovery"));
     }
 
+    #[test]
+    fn the_recruitment_cache_leaves_its_size_again_and_20_gb_free() {
+        const GB: u64 = 1_000_000_000;
+        assert!(!cache_fits(0, None), "unknown free space: no cache");
+        assert!(cache_fits(0, Some(20 * GB)));
+        assert!(!cache_fits(0, Some(16 * GB)), "a small input still needs 20 GB besides it");
+        assert!(cache_fits(29 * GB, Some(58 * GB)), "a large one its size again");
+        assert!(!cache_fits(29 * GB, Some(57 * GB)));
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ovasm-run-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -2864,10 +2880,14 @@ mod tests {
         let (mt_seed, pt_seed) = (dir.join("mt.fa"), dir.join("pt.fa"));
         fasta(&mt_seed, &[("mt".into(), mito.clone())]);
         fasta(&pt_seed, &[("pt".into(), plastid.clone())]);
-        let mut cfg = config(wgs, OrganelleChoice::Both, dir.join("out"));
+        let mut cfg = config(wgs.clone(), OrganelleChoice::Both, dir.join("out"));
         cfg.read_set = ReadSet::WholeGenome;
         cfg.seeds.insert("mitochondrion".into(), vec![mt_seed]);
         cfg.seeds.insert("plastid".into(), vec![pt_seed]);
+        // whether this host's temporary disk has room for the default cache (`cache_fits`: 20 GB
+        // besides it); forageseed-235's root disk had 16 GB free on 11-15 and the run read the
+        // input files, as it should
+        let cached = cache_fits(cache_estimate(&[wgs]).unwrap(), free_bytes(&dir));
         let report = run(&cfg).unwrap();
         assert_eq!(report["failed"], json!([]));
         for (organelle, genome, n_reads) in
@@ -2923,7 +2943,7 @@ mod tests {
         }
         let recruitment = read_json(&cfg.out.join("recruit/recruit.json")).unwrap();
         assert_eq!(recruitment["auto_shallow_edge_support"], json!(true));
-        assert!(recruitment["input_replay"].is_object(), "the reads were cached");
+        assert_eq!(recruitment["input_replay"].is_object(), cached, "the reads were cached when they fit");
         assert!(!cfg.out.join("recruit/input-cache").exists(), "and the cache removed");
         assert_eq!(recruitment["iterations_requested"], json!(GATED_RECRUIT_PASSES));
         assert!(recruitment["iterations_run"].as_u64().unwrap() < 10, "both stopped growing");
