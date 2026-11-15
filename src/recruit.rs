@@ -1460,7 +1460,11 @@ pub struct RecruitConfig {
     pub genome_size: Option<u64>,
     /// A bait that already is the individual's own sequence, a panel of its species
     /// (`pan reconstruct`): with the k-mer gate a read extends a target only from a long exact
-    /// overlap with it (`KMER_GATE_ANCHOR`) from the first pass on, and a target stops once its
+    /// overlap with it (`KMER_GATE_ANCHOR`) from the second pass on, once the bait holds the
+    /// individual's own sequence at the panel's edges (from the first, rice SAMEA115396710's
+    /// mitochondrion, the panel without it, gained 6,140, 383 and 211 k-mers in its first three
+    /// passes against 9,641, 10,797 and 14,440, and its recall fell from 0.94 to 0.84), and a
+    /// target stops once its
     /// bait has grown by this share of what it started with (`growth_bound` stop). The panel
     /// holds nearly all of the individual; what it lacks is found at its edges, not by passes of
     /// open-ended extension, which took rice SAMEA115396710's mitochondrion through 13 passes of
@@ -2741,7 +2745,7 @@ pub(crate) fn run_with_options(
                         return;
                     }
                     if let (Some(table), Some(d)) = (kmer_table.as_ref(), kmer_target_depth[t]) {
-                        if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d), cfg.growth_bound.is_some()) {
+                        if !kmer_extends(table, &bait, t, &r.seq, d, kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d), cfg.growth_bound.is_some() && it > 0) {
                             gated_out[t] += 1;
                             if (!frontier_withheld[t] || frontier_audit.is_some())
                                 && has_unbaited_kmer(&bait, t, &r.seq)
