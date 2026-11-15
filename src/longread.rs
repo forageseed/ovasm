@@ -336,6 +336,193 @@ pub fn at_target_depth(recruited: &[Vec<u8>], partial: &[&[u8]]) -> Vec<bool> {
         .collect()
 }
 
+/// Filter partly covered reads assigned to target `t` against competing organelles that are >2x
+/// deeper after normalizing each target's k-mer counts by `1 / sampling_fraction`.
+///
+/// When `plastid` is capped by `--recruit-max-bases` (e.g. `sampling_fraction = 0.216` on
+/// Nipponbare ONT), raw counts in `plastid.fastq` understate true plastid depth nearly fivefold,
+/// while noisy pure-plastid reads with an error cluster can fall just under `min_cover` on the
+/// plastid seed and match a mitochondrial MTPT block (`Call::NumtCandidate(mitochondrion)`).
+/// Conversely, a genuine mitochondrial read crossing an MTPT boundary (`2.5 kb mt_own + 6 kb MTPT`)
+/// also has its whole-read median k-mer inside the MTPT at plastid depth, so a whole-read median
+/// comparison alone would discard real crossing reads.
+///
+/// A read whose normalized median depth in a deeper target `u` exceeds `2 * max(med_t, ref_t)` is
+/// therefore kept iff it carries a gap-bridged `>= min_own_block` span of `depth_kmers` (`>= 8`
+/// sampled k-mers) that stand at target `t`'s own depth (`>= PARTIAL_DEPTH_SHARE * ref_t`) and
+/// are NOT shared with any >2x deeper target `u` (`norm_u < PARTIAL_DEPTH_SHARE * ref_t` and
+/// `2 * norm_u < norm_t`). Pure donor leaks have zero target-unique blocks; genuine crossing reads
+/// carry their target-unique flank and are preserved.
+pub fn filter_cross_organelle_partials(
+    recruited: &[Vec<Vec<u8>>],
+    sampling_fractions: &[f64],
+    partial: &[(&[u8], usize)],
+    min_own_block: usize,
+) -> Vec<bool> {
+    use rayon::prelude::*;
+    let n = recruited.len();
+    if n <= 1 || partial.is_empty() {
+        return vec![true; partial.len()];
+    }
+    let scales: Vec<f64> = (0..n)
+        .map(|t| {
+            let f = sampling_fractions.get(t).copied().unwrap_or(1.0).clamp(1e-6, 1.0);
+            1.0 / f
+        })
+        .collect();
+    let mut counts: Vec<rustc_hash::FxHashMap<u64, u32>> = vec![Default::default(); n];
+    let mut ref_depth: Vec<Option<f64>> = vec![None; n];
+
+    // 1. Build clean count maps from recruited reads for every target that recruited reads.
+    for t in 0..n {
+        if recruited[t].is_empty() {
+            continue;
+        }
+        for seq in &recruited[t] {
+            for km in depth_kmers(seq) {
+                *counts[t].entry(km).or_insert(0) += 1;
+            }
+        }
+        let own_meds: Vec<Option<u32>> = recruited[t]
+            .par_iter()
+            .map(|seq| {
+                let mut c: Vec<u32> = depth_kmers(seq)
+                    .filter_map(|km| counts[t].get(&km).copied().filter(|&v| v >= 2))
+                    .collect();
+                if c.is_empty() {
+                    return None;
+                }
+                let mid = c.len() / 2;
+                Some(*c.select_nth_unstable(mid).1)
+            })
+            .collect();
+        ref_depth[t] = depth_quantile(&own_meds, 0.5).map(|d| d * scales[t]);
+    }
+
+    // 2. Fallback for a target that recruited 0 full reads in round 1 (distant multi-species seed):
+    // count its partial candidates over k-mers absent from already-recruited competing organelles.
+    for t in 0..n {
+        if !recruited[t].is_empty() {
+            continue;
+        }
+        let mine: Vec<&[u8]> = partial
+            .iter()
+            .filter_map(|&(seq, u)| (u == t).then_some(seq))
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        for seq in &mine {
+            for km in depth_kmers(seq) {
+                let in_other = (0..n).any(|u| {
+                    u != t
+                        && !recruited[u].is_empty()
+                        && counts[u].get(&km).copied().unwrap_or(0) > 1
+                });
+                if !in_other {
+                    *counts[t].entry(km).or_insert(0) += 1;
+                }
+            }
+        }
+        let meds: Vec<Option<u32>> = mine
+            .par_iter()
+            .map(|seq| {
+                let mut c: Vec<u32> = depth_kmers(seq)
+                    .filter_map(|km| counts[t].get(&km).copied().filter(|&v| v >= 2))
+                    .collect();
+                if c.is_empty() {
+                    return None;
+                }
+                let mid = c.len() / 2;
+                Some(*c.select_nth_unstable(mid).1)
+            })
+            .collect();
+        ref_depth[t] = depth_quantile(&meds, SELF_DEPTH_QUANTILE).filter(|&d| d > 0.0);
+    }
+
+    let gap_limit = (min_own_block / 3).max(400);
+    partial
+        .par_iter()
+        .map(|&(seq, t)| {
+            if t >= n {
+                return false;
+            }
+            let Some(rt) = ref_depth[t].filter(|&d| d > 0.0) else {
+                return true;
+            };
+            // Measure copy depth over matched solid k-mers (`v >= 2`) rather than 0-count error
+            // k-mers: once ONT read error exceeds ~4.1%, `(1 - e)^17 < 0.5` collapses an
+            // unfiltered whole-read median to 0, whereas the median over matched solid k-mers
+            // stays invariant to sequencing error rate and chimeric nuclear tails.
+            let solid_med = |u: usize, min_hits: usize| -> Option<f64> {
+                let mut c: Vec<u32> = depth_kmers(seq)
+                    .filter_map(|km| counts[u].get(&km).copied().filter(|&v| v >= 2))
+                    .collect();
+                if c.len() < min_hits {
+                    return None;
+                }
+                let mid = c.len() / 2;
+                Some(*c.select_nth_unstable(mid).1 as f64 * scales[u])
+            };
+            let med_t = solid_med(t, 4).unwrap_or(0.0);
+            let dominated = (0..n).any(|u| {
+                u != t
+                    && ref_depth[u].is_some_and(|ru| ru > 2.0 * rt)
+                    && solid_med(u, 8).is_some_and(|mu| mu > 2.0 * med_t.max(rt))
+            });
+            if !dominated {
+                return true;
+            }
+            // Rescue genuine crossing reads that carry a >= min_own_block target-unique flank.
+            let (mut start, mut last_end, mut hits) = (0usize, 0usize, 0usize);
+            for (pos, km) in CanonicalKmers::new(seq, DEPTH_K) {
+                if km.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 61 != 0 {
+                    continue;
+                }
+                let raw_t = counts[t].get(&km).copied().unwrap_or(0);
+                let nt = raw_t as f64 * scales[t];
+                let donor_shared = (0..n).any(|u| {
+                    u != t
+                        && ref_depth[u].is_some_and(|ru| ru > 2.0 * rt)
+                        && {
+                            let nu = counts[u].get(&km).copied().unwrap_or(0) as f64 * scales[u];
+                            nu > 2.0 * rt && nu > 2.0 * nt
+                        }
+                });
+                if donor_shared {
+                    // Donor-shared stretches break target-unique runs so scattered SNPs inside a
+                    // diverged MTPT cannot chain across conserved donor sequence (e.g. NUMT+MTPT).
+                    hits = 0;
+                    continue;
+                }
+                let own_only = raw_t >= 2
+                    && nt >= PARTIAL_DEPTH_SHARE * rt
+                    && (0..n).all(|u| {
+                        if u == t || !ref_depth[u].is_some_and(|ru| ru > 2.0 * rt) {
+                            return true;
+                        }
+                        let nu = counts[u].get(&km).copied().unwrap_or(0) as f64 * scales[u];
+                        nu < PARTIAL_DEPTH_SHARE * rt && nu * 2.0 < nt
+                    });
+                if !own_only {
+                    continue;
+                }
+                if hits == 0 || pos > last_end + gap_limit {
+                    start = pos;
+                    hits = 1;
+                } else {
+                    hits += 1;
+                }
+                last_end = pos + DEPTH_K;
+                if last_end - start >= min_own_block && hits >= 8 {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect()
+}
+
 /// Short tandem repeats masked out of corrected reads used as bait: a run of at least this many
 /// bases of period 1 to `TANDEM_MAX_PERIOD`. Microsatellites occur all over the nuclear genome,
 /// so their k-mers in a bait recruit nuclear reads that are mostly microsatellite: ZM4's ONT at
@@ -528,6 +715,7 @@ fn split_partial(
         }
     }
     // only reads at the depth of what their target recruited (see `at_target_depth`)
+    let mut recruited_all: Vec<Vec<Vec<u8>>> = Vec::with_capacity(bait.targets.len());
     for (t, target) in bait.targets.iter().enumerate() {
         let recruited = read_seqs(&dir.join(format!("{}.fastq", target.name)))?;
         let idx: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].2 == t).collect();
@@ -547,6 +735,56 @@ fn split_partial(
         for (&i, k) in idx.iter().zip(keep) {
             if !k {
                 calls[i].2 = usize::MAX;
+            }
+        }
+        recruited_all.push(recruited);
+    }
+    if bait.targets.len() > 1 {
+        let report_path = dir.join("recruit.json");
+        let report_json = report_path.is_file().then(|| read_json(&report_path)).transpose()?;
+        let fractions: Vec<f64> = bait
+            .targets
+            .iter()
+            .map(|target| {
+                report_json
+                    .as_ref()
+                    .and_then(|r| target_output(r, &target.name).ok())
+                    .and_then(|o| o["sampling_fraction"].as_f64())
+                    .unwrap_or(1.0)
+            })
+            .collect();
+        let active: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].2 != usize::MAX).collect();
+        let active_refs: Vec<(&[u8], usize)> = active
+            .iter()
+            .map(|&i| (calls[i].1.as_slice(), calls[i].2))
+            .collect();
+        let keep_cross = filter_cross_organelle_partials(
+            &recruited_all,
+            &fractions,
+            &active_refs,
+            params.numt_min_block,
+        );
+        let mut dropped_by_target = vec![0usize; bait.targets.len()];
+        let mut before_by_target = vec![0usize; bait.targets.len()];
+        for (&i, keep) in active.iter().zip(keep_cross) {
+            let t = calls[i].2;
+            before_by_target[t] += 1;
+            if !keep {
+                dropped_by_target[t] += 1;
+                calls[i].2 = usize::MAX;
+            }
+        }
+        for (t, target) in bait.targets.iter().enumerate() {
+            if dropped_by_target[t] > 0 {
+                log(&format!(
+                    "{} of {} partly covered {} reads stand at another deeper organelle's \
+                     normalized depth without a {} bp {}-unique flank and are left out",
+                    dropped_by_target[t],
+                    before_by_target[t],
+                    target.name,
+                    params.numt_min_block,
+                    target.name
+                ));
             }
         }
     }
@@ -910,6 +1148,39 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                         Err(e) => { reads.insert(organelle, Err(e.context("bait correction"))); }
                     }
                 }
+                // A capped organelle (e.g. plastid reaching --recruit-max-bases in round 1) keeps
+                // this round's uniform sample for assembly, but must also self-correct its own
+                // sample-specific bait before later rounds run: otherwise round 2 competes a
+                // sample-specific mitochondrial bait (holding exact sample MTPTs) against only
+                // multi-species plastid seeds, causing thousands of pure plastid reads over MTPTs
+                // to defect into mitochondrion and overwrite mitochondrial MTPT alleles.
+                for &organelle in &capped {
+                    let Some(Ok(r)) = reads.get_mut(organelle) else { continue };
+                    if r.bait.is_some() || r.kept.map_or(0, |k| k.1) < MIN_RECRUITED_BASES {
+                        continue;
+                    }
+                    log(&format!(
+                        "self-correcting the {organelle} long reads to assemble, and as competitive bait for the next round"
+                    ));
+                    let fasta = o.out.join(format!("correct/{organelle}.fasta"));
+                    let result = (|| -> Result<(Value, PathBuf)> {
+                        let mut c = correct(&r.raw, None, &fasta, o.salt)?;
+                        c["purpose"] = "assembly".into();
+                        let masked = fasta.with_extension("masked.fasta");
+                        c["tandem_masked_bases"] = mask_tandem_fasta(&fasta, &masked)?.into();
+                        Ok((c, masked))
+                    })();
+                    match result {
+                        Ok((c, masked)) => {
+                            r.corrected = fasta;
+                            r.bait = Some(masked);
+                            r.corrections.push(c);
+                        }
+                        Err(e) => {
+                            reads.insert(organelle, Err(e.context("self correction for assembly")));
+                        }
+                    }
+                }
             }
             for (&organelle, entry) in reads.iter_mut() {
                 let Ok(r) = entry else { continue };
@@ -921,6 +1192,9 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                          too distant for noisy reads; give closer seeds or more --recruit-rounds",
                         r.rounds.len()
                     ));
+                    continue;
+                }
+                if !r.corrected.as_os_str().is_empty() {
                     continue;
                 }
                 log(&format!("self-correcting the {organelle} long reads to assemble"));
@@ -1587,7 +1861,7 @@ mod tests {
         assert_eq!(rounds[0]["used"], json!(true));
         assert_eq!(rounds[1]["used"], json!(false));
         assert_eq!(rounds[1]["capped_before"], json!(true));
-        assert_eq!(rounds[1]["bait"], "seeds", "no bait of reads for a capped organelle");
+        assert_eq!(rounds[1]["bait"], "seeds + corrected reads", "competitive read bait for a capped organelle");
         let purposes: Vec<&Value> =
             p["long_read"]["corrections"].as_array().unwrap().iter().map(|c| &c["purpose"]).collect();
         assert_eq!(purposes, [&json!("assembly")]);
@@ -1828,5 +2102,54 @@ mod tests {
         let o = options(&["--organelle", "plastid", "--out", out.to_str().unwrap(), "--recruit-rounds", "0"]);
         assert!(run(&[reads], None, &o).unwrap_err().to_string().contains("at least 1"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cross_organelle_partial_filter_drops_downsampled_donor_leaks_and_rescues_crossing_reads() {
+        // Mito (12 kb) and plastid (16 kb) share a 5 kb MTPT; plastid is 20x deeper in the WGS
+        // library (600x vs 30x) but downsampled to sampling_fraction = 0.2 (120x raw in file).
+        let mut mito = seq(12_000, 901);
+        let mut plastid = seq(16_000, 902);
+        let mtpt = seq(5_000, 903);
+        mito[4_000..9_000].copy_from_slice(&mtpt);
+        plastid[5_000..10_000].copy_from_slice(&mtpt);
+        for p in (4_060..8_940).step_by(120) {
+            mito[p] = if mito[p] == b'A' { b'C' } else { b'A' };
+        }
+        let tile_noisy = |g: &[u8], step: usize, len: usize, seed0: u64| -> Vec<Vec<u8>> {
+            let circ = [g, &g[..len]].concat();
+            (0..g.len())
+                .step_by(step)
+                .enumerate()
+                .map(|(i, st)| noisy(&circ[st..st + len], 0.05, &mut Rng(seed0 + i as u64)))
+                .collect()
+        };
+        let mt_rec = tile_noisy(&mito, 100, 3_000, 1_000); // ~30x
+        let pt_rec = tile_noisy(&plastid, 25, 3_000, 5_000); // ~120x raw, fraction 0.2 => ~600x true
+
+        // 1) Pure plastid read spanning plastid + MTPT (7 kb), misassigned to mito (0): must drop.
+        let pure_pt = noisy(&plastid[3_500..10_500], 0.05, &mut Rng(9_001));
+        // 2) Genuine crossing mito read: 2.8 kb mt_own + 4.5 kb MTPT (median k-mer sits in MTPT!): must rescue!
+        let crossing_mt = noisy(&mito[1_200..8_500], 0.05, &mut Rng(9_002));
+        // 3) Pure mt_own read (4 kb): must keep.
+        let pure_mt = noisy(&mito[0..4_000], 0.05, &mut Rng(9_003));
+        // 4) NUMT + MTPT read: 2.8 kb nuclear + 4.5 kb MTPT: must drop!
+        let mut numt_mtpt = seq(2_800, 999);
+        numt_mtpt.extend_from_slice(&mito[4_000..8_500]);
+        let numt_mtpt = noisy(&numt_mtpt, 0.05, &mut Rng(9_004));
+
+        let partial = [
+            (pure_pt.as_slice(), 0usize),
+            (crossing_mt.as_slice(), 0usize),
+            (pure_mt.as_slice(), 0usize),
+            (numt_mtpt.as_slice(), 0usize),
+        ];
+        let keep = filter_cross_organelle_partials(
+            &[mt_rec, pt_rec],
+            &[1.0, 0.2],
+            &partial,
+            2_000,
+        );
+        assert_eq!(keep, vec![false, true, true, false], "keep={keep:?}");
     }
 }
