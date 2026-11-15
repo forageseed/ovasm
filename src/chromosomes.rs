@@ -53,8 +53,10 @@ pub const SOURCE_FOLD: f64 = 2.0;
 const MIN_SEED_BP: usize = 300;
 const SEED_K: usize = 21;
 /// A short-read run does not deliver a molecule whose every component is free of the main one,
-/// holds under `MIN_SEED_BP` of seed sequence, closes no circle and is shorter than this many
-/// reads (`withhold`): ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
+/// holds under `MIN_SEED_BP` of seed sequence, closes no circle and has no segment as long as
+/// this many reads (`withhold`): pieces of a nuclear family the reads could not join into longer
+/// sequence, whatever they add up to (in the whole ZM4 library two such components of 2,009 and
+/// 2,016 bp, of segments of 60-402 bp). ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
 /// them on the alfalfa nuclear genome, 155 at five copies or more) in two components unjoined to
 /// its mitochondrion, at 28-141x against its 123x, and five molecules of 226-583 bp of them were
 /// delivered beside its 306,690 bp one. Depth does not tell them: a nuclear family in the
@@ -109,6 +111,9 @@ pub struct Chromosome {
     /// Its segments in the assembly graph (`withhold`).
     #[serde(skip)]
     pub segment_names: Vec<String>,
+    /// Its longest segment (`withhold`).
+    #[serde(skip)]
+    pub longest_segment: usize,
     /// counted, or source_pending (rule 6)
     pub status: &'static str,
     /// Why it is source_pending.
@@ -144,6 +149,8 @@ pub struct Withheld {
     pub min_seed_bp: usize,
     pub circular: bool,
     pub components_bp: usize,
+    /// Its components' longest segment, against `max_bp`.
+    pub longest_segment: usize,
     pub max_bp: usize,
     pub reason: &'static str,
 }
@@ -512,6 +519,7 @@ pub fn call(
                 .collect(),
             segments: c.len(),
             segment_names: c.clone(),
+            longest_segment: c.iter().map(|s| length[s]).max().unwrap_or(0),
             bp,
             depth,
             seed_bp: seed,
@@ -560,7 +568,7 @@ fn labels(report: &ChromosomeReport) -> BTreeMap<usize, (usize, usize, f64, &'st
 
 /// The molecules a short-read run does not deliver (`WITHHOLD_READS`): every component holding
 /// one is free of the main component (the first), holds seed sequence and under `MIN_SEED_BP` of
-/// it, has no circular molecule and is under `max_bp`. Without seeds nothing is withheld.
+/// it, has no circular molecule and no segment of `max_bp` or more. Without seeds nothing is withheld.
 pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
     let mut of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (ci, c) in report.chromosomes.iter().enumerate() {
@@ -573,7 +581,7 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
         ci > 0
             && c.seed_bp.is_some_and(|b| b < MIN_SEED_BP)
             && c.conformations.iter().all(|m| !m.circular)
-            && c.bp < max_bp
+            && c.longest_segment < max_bp
     };
     let mut withheld = Vec::new();
     for (&m, cs) in &of {
@@ -592,6 +600,7 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
             min_seed_bp: MIN_SEED_BP,
             circular: false,
             components_bp: cs.iter().map(|&ci| report.chromosomes[ci].bp).sum(),
+            longest_segment: cs.iter().map(|&ci| report.chromosomes[ci].longest_segment).max().unwrap_or(0),
             max_bp,
             reason: "free_fragment_without_seed",
         });
@@ -599,7 +608,7 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
     if !withheld.is_empty() {
         report.reasons.push(format!(
             "{} molecule(s) of {} bp in all not delivered: free components without seed sequence, \
-             no circle and under {max_bp} bp (molecules.withheld.fasta)",
+             no circle and no segment of {max_bp} bp (molecules.withheld.fasta)",
             withheld.len(),
             withheld.iter().map(|w| w.length).sum::<usize>()
         ));

@@ -366,7 +366,7 @@ struct ChromosomesArgs {
     #[arg(long)]
     depths: Option<PathBuf>,
     /// Do not deliver molecules whose components are free of the main one, without seed
-    /// sequence, without a circle and under this many bp: they move from --molecules to
+    /// sequence, without a circle and with no segment of this many bp: they move from --molecules to
     /// molecules.withheld.fasta beside it (`chromosomes::withhold`). Short-read runs pass
     /// `WITHHOLD_READS` read lengths.
     #[arg(long = "withhold-under")]
