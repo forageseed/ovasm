@@ -2102,9 +2102,12 @@ fn shortest_return(
 /// From another draw of its reads the same graph gave the linear u0+ u1- u2+, which passes the
 /// unit junction once and holds no cycle of its own: the return u2+ -> u1- comes from the graph.
 ///
-/// A unit of mostly single-copy sequence (`repeat` false for more than half its bases) is not
-/// laid: those segments stand at the depth of one copy, so a read that crosses the link again a
-/// unit later went round a subcircle, it did not read a second copy. Nipponbare ONT mitochondrion
+/// A unit of mostly single-copy sequence (more than half of the bases it adds are single copy) is
+/// not laid: those segments stand at the depth of one copy, so a read that crosses the link again
+/// a unit later went round a subcircle, it did not read a second copy. A single-copy segment counts
+/// only its own bases: where it overlaps a repeat neighbour (at k up to 1001), those bases are the
+/// repeat's. Counted raw, a short segment between two repeats of a ~1 kb array would weigh its
+/// overlaps in twice and could cross the half (review by Gemini, 11-15). Nipponbare ONT mitochondrion
 /// (ont-sr-fix read pool, 11-15): seven units of 59-131 kb, 85-100% of them single-copy segments
 /// at 0.67-1.30x the median depth, each from 3-5 reads with two crossings, were laid once each:
 /// 997 kb of molecules for a 490 kb genome. Haliclona's 986 bp unit is 45% single copy (u2 652 bp;
@@ -2177,13 +2180,24 @@ pub(crate) fn lay_read_copies(
                     continue 'grow;
                 }
             }
-            let single: usize = unit
-                .iter()
-                .filter(|o| !repeat.get(o.0).copied().unwrap_or(true))
-                .map(|o| g.seqs[o.0].len())
+            // the unit runs y .. x and the link x -> y closes it: neighbours wrap round
+            let is_repeat = |o: Oriented| repeat.get(o.0).copied().unwrap_or(true);
+            let m = unit.len();
+            let single: usize = (0..m)
+                .filter(|&i| !is_repeat(unit[i]))
+                .map(|i| {
+                    let (before, after) = (unit[(i + m - 1) % m], unit[(i + 1) % m]);
+                    let mut own = g.seqs[unit[i].0].len();
+                    if is_repeat(before) {
+                        own = own.saturating_sub(overlaps.get(&(before, unit[i])).copied().unwrap_or(0));
+                    }
+                    if is_repeat(after) {
+                        own = own.saturating_sub(overlaps.get(&(unit[i], after)).copied().unwrap_or(0));
+                    }
+                    own
+                })
                 .sum();
-            let all: usize = unit.iter().map(|o| g.seqs[o.0].len()).sum();
-            if 2 * single > all {
+            if 2 * single > adds {
                 continue;
             }
             w.splice(t + 1..t + 1, unit.iter().copied());
@@ -3387,6 +3401,32 @@ mod tests {
         let (laid, added, closed) = lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov, &repeats).unwrap();
         assert!(!closed);
         assert_eq!(laid, vec![u0, u1, u2, u3, u1, u2]);
+        assert_eq!(added.len(), 1);
+    }
+
+    /// A short tandem array: u1 (repeat, 600 bp) and u2 (single copy, 1,000 bp) overlap by 459 bp
+    /// both ways, as at k = 501. Raw lengths make the unit 62% single copy; u2's own bases (1,000 less
+    /// two 459 bp overlaps with the repeat) are 82 of the 682 the unit adds: laid as a tandem copy.
+    #[test]
+    fn a_short_array_unit_counts_only_the_single_copy_bases_outside_its_overlaps() {
+        let (u0, u1, u2, u3) = ((0, true), (1, true), (2, true), (3, true));
+        let lens = [5000usize, 600, 1000, 5000];
+        let links = [(u0, u1), (u1, u2), (u2, u1), (u2, u3)];
+        let mut g = Graph { names: (0..4).map(|i| format!("u{i}")).collect(), seqs: lens.iter().map(|&n| vec![b'A'; n]).collect(), links: links.to_vec(), overlaps: vec![0, 459, 459, 0] };
+        g.links = links.to_vec();
+        let mut next: FxHashMap<Oriented, Vec<Oriented>> = FxHashMap::default();
+        let mut ov: FxHashMap<(Oriented, Oriented), usize> = FxHashMap::default();
+        for (&(a, b), &o) in links.iter().zip(&g.overlaps) {
+            next.entry(a).or_default().push(b);
+            next.entry(flip(b)).or_default().push(flip(a));
+            ov.insert((a, b), o);
+            ov.insert((flip(b), flip(a)), o);
+        }
+        let mut need = FxHashMap::default();
+        need.insert(link_key(u1, u2), (2, 682));
+        let repeats = [false, true, false, false];
+        let (laid, added, _) = lay_read_copies(&g, &[u0, u1, u2, u3], false, &need, &next, &ov, &repeats).unwrap();
+        assert_eq!(laid, vec![u0, u1, u2, u1, u2, u3]);
         assert_eq!(added.len(), 1);
     }
 
