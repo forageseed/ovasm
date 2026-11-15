@@ -651,6 +651,70 @@ pub fn cut(molecules: &[Molecule], joins: &[Join]) -> Vec<(String, Vec<u8>, bool
     out
 }
 
+/// How the panel layer of a reconstruction was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelMode {
+    /// No panel report: the reads decided, or no panel was given.
+    NoPanel,
+    /// The panel has runs whose walks it can use.
+    Panel,
+    /// A panel was given but none of its runs is usable evidence (a graph merged before source
+    /// boundaries were recorded leaves every unresolved walk out): nothing is attributed to it.
+    /// Merge the panel again with this version.
+    NoUsableRuns,
+}
+
+pub fn panel_mode(report_present: bool, usable_runs: u64) -> PanelMode {
+    match (report_present, usable_runs) {
+        (false, _) => PanelMode::NoPanel,
+        (true, 0) => PanelMode::NoUsableRuns,
+        (true, _) => PanelMode::Panel,
+    }
+}
+
+/// Where a join's pairing comes from. `bridge`: the panel's (probability, informative, taken)
+/// for it; `panel_adopted`: the molecule is the panel's representative.
+pub fn join_source(class: &str, bridge: Option<(f64, bool, bool)>, panel_adopted: bool, mode: PanelMode) -> &'static str {
+    match class {
+        "supported" => "reads",
+        "unsupported" => "contradicted_by_reads",
+        _ if mode == PanelMode::Panel
+            && panel_adopted
+            && bridge.is_some_and(|(_, informative, taken)| informative && taken) =>
+        {
+            "panel"
+        }
+        _ => "undetermined",
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn a_join_is_the_panels_only_when_its_adopted_representative_took_it() {
+        let b = Some((0.8, true, true));
+        let p = PanelMode::Panel;
+        assert_eq!(join_source("supported", b, true, p), "reads");
+        assert_eq!(join_source("unsupported", b, true, p), "contradicted_by_reads");
+        assert_eq!(join_source("undetermined_long_repeat", b, true, p), "panel");
+        assert_eq!(join_source("undetermined_long_repeat", b, false, p), "undetermined");
+        assert_eq!(join_source("undetermined_long_repeat", Some((0.8, true, false)), true, p), "undetermined");
+        assert_eq!(join_source("undetermined_long_repeat", Some((0.5, false, true)), true, p), "undetermined");
+        assert_eq!(join_source("undetermined_long_repeat", None, true, p), "undetermined");
+        assert_eq!(join_source("undetermined_long_repeat", b, true, PanelMode::NoUsableRuns), "undetermined");
+    }
+
+    #[test]
+    fn a_panel_without_usable_runs_is_reported() {
+        assert_eq!(panel_mode(true, 0), PanelMode::NoUsableRuns);
+        assert_eq!(panel_mode(true, 47), PanelMode::Panel);
+        assert_eq!(panel_mode(false, 0), PanelMode::NoPanel);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

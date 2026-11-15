@@ -1316,6 +1316,7 @@ fn configurations(
                         (format!("{sample}_configuration{n}#1#{short}.{}", molecules.len() + j + 1), m.2.clone(), m.3)
                     }))
                     .collect(),
+                paths: molecules.iter().map(|m| m.0.path.replace(' ', ",")).collect(),
                 panel: panel_choice,
             });
         }
@@ -1520,6 +1521,9 @@ struct Representative {
     equally_ranked: usize,
     pieces: usize,
     molecules: Vec<(String, Vec<u8>, bool)>,
+    /// Each molecule's walk of the de novo graph (the path= of its FASTA header), which
+    /// `junction_support` places step by step.
+    paths: Vec<String>,
     /// Set when the configuration is the one the reference panel supports best
     /// (`pan_posterior`), not one the ranking of the searched covers gave.
     panel: Option<PanChoice>,
@@ -1984,12 +1988,13 @@ fn final_outputs(
             )
         });
         let mut text = String::new();
-        for (name, seq, circ) in &r.molecules {
+        for (i, (name, seq, circ)) in r.molecules.iter().enumerate() {
             let unplaced = (seq.len() as u64) < pipeline::MIN_PIECE;
             writeln!(
                 text,
-                ">{name} circular={circ} length={} configuration={} of={total} chosen_by={} reads_decide=false{}{}",
+                ">{name} circular={circ} length={} path={} configuration={} of={total} chosen_by={} reads_decide=false{}{}",
                 seq.len(),
+                r.paths.get(i).map_or("", String::as_str),
                 r.configuration,
                 if by_panel.is_some() { "pan_posterior" } else { "reported_configuration_ranking" },
                 by_panel.as_deref().unwrap_or(""),
@@ -2072,11 +2077,80 @@ fn final_outputs(
             Vec::new()
         };
         let (report, _) = js::analyse(&molecules, &segs, reads, &other_sequences)?;
-        let mut tsv = String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\n");
+        // the panel's view of each join: its bridge from the left anchor to the right one, read
+        // either way, in the panel report of the configurations
+        let pan = &configurations_found["pan_posterior"];
+        let mode = js::panel_mode(pan.is_object(), pan["panel_runs"].as_u64().unwrap_or(0));
+        if mode == js::PanelMode::NoUsableRuns {
+            eprintln!("[ovasm] reconstruct {organelle}: WARNING no run of the panel is usable evidence (a panel graph merged before source boundaries were recorded?): no join is attributed to the panel; merge the panel again with `ovasm pan merge` of this version");
+        }
+        let flip_name = |s: &str| -> String {
+            let (n, o) = s.split_at(s.len().saturating_sub(1));
+            format!("{n}{}", if o == "+" { "-" } else { "+" })
+        };
+        let mut bridge_p: BTreeMap<(String, String), (f64, bool, bool)> = BTreeMap::new();
+        for b in pan["junctions"].as_array().into_iter().flatten() {
+            let steps: Vec<&str> = b["bridge"].as_str().unwrap_or("").split_whitespace().collect();
+            let (Some(first), Some(last)) = (steps.first(), steps.last()) else { continue };
+            let v = (
+                b["probability"].as_f64().unwrap_or(f64::NAN),
+                b["runs_informative"].as_u64().unwrap_or(0) > 0,
+                b["taken"].as_bool().unwrap_or(false),
+            );
+            for key in [(first.to_string(), last.to_string()), (flip_name(last), flip_name(first))] {
+                let e = bridge_p.entry(key).or_insert(v);
+                if (v.2 && !e.2) || (v.2 == e.2 && v.0 > e.0) {
+                    *e = v;
+                }
+            }
+        }
+        let adopted: BTreeSet<String> = records
+            .iter()
+            .filter(|(h, _)| h.split(' ').any(|w| w == "chosen_by=pan_posterior"))
+            .map(|(h, _)| h.split(' ').next().unwrap_or("").to_string())
+            .collect();
+        let short = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
+        let mut tsv = String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\n");
+        let mut sources: BTreeMap<&str, usize> = BTreeMap::new();
         for j in &report.joins {
-            writeln!(tsv, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}", j.molecule, j.left, j.repeat.join(","), j.right, j.x, j.y, j.repeat_bp, j.crossing_fragments, j.expected, j.p_at_most_observed, j.class)?;
+            let p = bridge_p.get(&(short(&j.left), short(&j.right))).copied();
+            let source = js::join_source(j.class, p, adopted.contains(&j.molecule), mode);
+            *sources.entry(source).or_default() += 1;
+            writeln!(tsv, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{}\t{}\t{}", j.molecule, j.left, j.repeat.join(","), j.right, j.x, j.y, j.repeat_bp, j.crossing_fragments, j.expected, j.p_at_most_observed, j.class,
+                p.map_or("NA".to_string(), |x| format!("{:.4}", x.0)), p.map_or("NA", |x| if x.2 { "yes" } else { "no" }), source)?;
         }
         fs::write(dir.join("junctions.tsv"), tsv)?;
+        // reads layer: the molecules cut at every join the target's reads do not decide
+        let headers_all: BTreeMap<String, String> = records
+            .iter()
+            .map(|(h, _)| (h.split(' ').next().unwrap_or("").to_string(), h.clone()))
+            .collect();
+        let reads_joins: Vec<js::Join> = report
+            .joins
+            .iter()
+            .cloned()
+            .map(|mut j| {
+                if j.class != "supported" {
+                    j.class = "unsupported";
+                }
+                j
+            })
+            .collect();
+        let mut reads_text = String::new();
+        for (name, seq, circ, note) in &js::cut(&molecules, &reads_joins) {
+            let parent = &headers_all[name.rsplit_once(".j").map_or(name.as_str(), |p| p.0)];
+            let rest: Vec<&str> = parent
+                .split(' ')
+                .skip(1)
+                .filter(|w| !w.starts_with("circular=") && !w.starts_with("length=") && !w.starts_with("path=") && !w.starts_with("chosen_by="))
+                .collect();
+            let note = note.replace("cut_at=unsupported_join", "cut_at=join_not_decided_by_reads");
+            writeln!(reads_text, ">{name} circular={circ} length={} layer=reads {} {note}", seq.len(), rest.join(" "))?;
+            for chunk in seq.chunks(80) {
+                writeln!(reads_text, "{}", std::str::from_utf8(chunk)?)?;
+            }
+        }
+        fs::write(out.join(format!("{organelle}.reads.fasta")), reads_text)?;
         let mut ctsv = String::from("segment\tlength\tdepth\tcopy_estimate\tci95_low\tci95_high\tvisits\tclass\n");
         for c in &report.copies {
             writeln!(ctsv, "{}\t{}\t{:.1}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}", c.segment, c.length, c.depth, c.copy_estimate, c.copy_ci95.0, c.copy_ci95.1, c.visits, c.class)?;
@@ -2131,7 +2205,11 @@ fn final_outputs(
                 report.under_traversed, report.over_traversed, report.uncertain_copy_calls
             ));
         }
-        serde_json::to_value(&report)?
+        let mut value = serde_json::to_value(&report)?;
+        value["sources"] = json!(sources);
+        value["panel_mode"] = json!(mode);
+        value["reads_layer_fasta"] = json!(out.join(format!("{organelle}.reads.fasta")));
+        value
     } else {
         Value::Null
     };
