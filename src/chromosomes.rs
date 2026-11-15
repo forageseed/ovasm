@@ -56,13 +56,14 @@ const SEED_K: usize = 21;
 /// holds under `MIN_SEED_BP` of seed sequence, closes no circle and has no segment as long as
 /// this many reads (`withhold`): pieces of a nuclear family the reads could not join into longer
 /// sequence, whatever they add up to (in the whole ZM4 library two such components of 2,009 and
-/// 2,016 bp, of segments of 60-402 bp). ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
+/// 2,016 bp, of segments of 60-402 bp). Not five: JN-L's graph holds unplaced pieces of its
+/// mitochondrion's own repeats of 532-698 bp, on its reference at 97-99% of their length. ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
 /// them on the alfalfa nuclear genome, 155 at five copies or more) in two components unjoined to
 /// its mitochondrion, at 28-141x against its 123x, and five molecules of 226-583 bp of them were
 /// delivered beside its 306,690 bp one. Depth does not tell them: a nuclear family in the
 /// organelle's depth band stands at its depth. A small circle of a multipartite mitochondrion
 /// without seed genes is kept (it closes), as is any free component of a few reads' length.
-pub const WITHHOLD_READS: usize = 5;
+pub const WITHHOLD_READS: usize = 3;
 
 /// One-sided 95% upper bound of a share seen 0 times in `n`.
 pub fn missing_share_upper(n: u64) -> f64 {
