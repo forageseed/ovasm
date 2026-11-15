@@ -2101,6 +2101,14 @@ fn shortest_return(
 /// 0.81) although single reads crossed its junction up to 4 times (9 reads; 10 reads 3 times).
 /// From another draw of its reads the same graph gave the linear u0+ u1- u2+, which passes the
 /// unit junction once and holds no cycle of its own: the return u2+ -> u1- comes from the graph.
+///
+/// A unit of mostly single-copy sequence (`repeat` false for more than half its bases) is not
+/// laid: those segments stand at the depth of one copy, so a read that crosses the link again a
+/// unit later went round a subcircle, it did not read a second copy. Nipponbare ONT mitochondrion
+/// (ont-sr-fix read pool, 11-15): seven units of 59-131 kb, 85-100% of them single-copy segments
+/// at 0.67-1.30x the median depth, each from 3-5 reads with two crossings, were laid once each:
+/// 997 kb of molecules for a 490 kb genome. Haliclona's 986 bp unit is 45% single copy (u2 652 bp;
+/// u1 at 1.36x is a repeat) and is still laid. A linear walk that a unit closes is closed first.
 pub(crate) fn lay_read_copies(
     g: &Graph,
     walk: &[Oriented],
@@ -2108,6 +2116,7 @@ pub(crate) fn lay_read_copies(
     need: &FxHashMap<(Oriented, Oriented), (usize, usize)>,
     next: &FxHashMap<Oriented, Vec<Oriented>>,
     overlaps: &FxHashMap<(Oriented, Oriented), usize>,
+    repeat: &[bool],
 ) -> Option<(Vec<Oriented>, Vec<(Vec<Oriented>, usize)>, bool)> {
     if need.is_empty() || walk.is_empty() {
         return None;
@@ -2167,6 +2176,15 @@ pub(crate) fn lay_read_copies(
                     closed = true;
                     continue 'grow;
                 }
+            }
+            let single: usize = unit
+                .iter()
+                .filter(|o| !repeat.get(o.0).copied().unwrap_or(true))
+                .map(|o| g.seqs[o.0].len())
+                .sum();
+            let all: usize = unit.iter().map(|o| g.seqs[o.0].len()).sum();
+            if 2 * single > all {
+                continue;
             }
             w.splice(t + 1..t + 1, unit.iter().copied());
             match added.iter_mut().find(|(u, _)| *u == unit) {
@@ -3014,7 +3032,7 @@ fn run_inner(
                 rep.decisive = false;
             }
             for (walk, molecule) in walks.iter_mut().zip(best.molecules.iter_mut()) {
-                if let Some((laid, added, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps)
+                if let Some((laid, added, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps, &repeat)
                 {
                     if closed {
                         molecule.circular = true;
@@ -3036,7 +3054,7 @@ fn run_inner(
                 let (mut walks, mut report) = cover_report(&cover)?;
                 // tandem units as often as single reads cross them, as for `best`
                 for (walk, molecule) in walks.iter_mut().zip(report.molecules.iter_mut()) {
-                    if let Some((laid, _, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps) {
+                    if let Some((laid, _, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps, &repeat) {
                         molecule.circular |= closed;
                         molecule.length = spelled_length(&g, &laid, molecule.circular, &indexed_overlaps)?;
                         molecule.path = label(&laid);
@@ -3312,27 +3330,27 @@ mod tests {
         let mut need = FxHashMap::default();
         need.insert(link_key(u1m, u2), (4, 500));
         let walk = vec![u0, u1m, u2, u1m];
-        let (laid, added, _) = lay_read_copies(&g, &walk, true, &need, &next, &ov).unwrap();
+        let (laid, added, _) = lay_read_copies(&g, &walk, true, &need, &next, &ov, &[true; 8]).unwrap();
         assert_eq!(laid, vec![u0, u1m, u2, u1m, u2, u1m, u2, u1m, u2, u1m]);
         assert_eq!(added, vec![(vec![u2, u1m], 3)]);
         // a linear walk through the unit once, with no cycle of its own: the graph's return
-        let (laid, _, _) = lay_read_copies(&g, &[u0, u1m, u2], false, &need, &next, &ov).unwrap();
+        let (laid, _, _) = lay_read_copies(&g, &[u0, u1m, u2], false, &need, &next, &ov, &[true; 8]).unwrap();
         assert_eq!(laid, vec![u0, u1m, u2, u1m, u2, u1m, u2, u1m, u2]);
         // the reverse complement of the link counts as the same link
         let mut rc = FxHashMap::default();
         rc.insert(link_key(flip(u2), flip(u1m)), (2, 500));
-        assert_eq!(lay_read_copies(&g, &walk, true, &rc, &next, &ov).unwrap().0.len(), 6);
+        assert_eq!(lay_read_copies(&g, &walk, true, &rc, &next, &ov, &[true; 8]).unwrap().0.len(), 6);
         // crossings a whole circle apart (a read longer than the genome) are no tandem unit
         let mut wrap = FxHashMap::default();
         wrap.insert(link_key(u1m, u2), (2, 1500));
-        assert!(lay_read_copies(&g, &walk, true, &wrap, &next, &ov).is_none());
+        assert!(lay_read_copies(&g, &walk, true, &wrap, &next, &ov, &[true; 8]).is_none());
         // already enough passes, or no return to the link in the graph: unchanged
         need.insert(link_key(u1m, u2), (1, 500));
-        assert!(lay_read_copies(&g, &walk, true, &need, &next, &ov).is_none());
+        assert!(lay_read_copies(&g, &walk, true, &need, &next, &ov, &[true; 8]).is_none());
         let mut open = FxHashMap::default();
         open.insert(link_key(u0, u1m), (3, 500));
         let (g2, line, ov2) = blunt(&[1000, 300, 200], &[(u0, u1m), (u1m, u2)]);
-        assert!(lay_read_copies(&g2, &[u0, u1m, u2], false, &open, &line, &ov2).is_none());
+        assert!(lay_read_copies(&g2, &[u0, u1m, u2], false, &open, &line, &ov2, &[true; 8]).is_none());
     }
 
     /// The plastid shape with its inverted repeat laid once: LSC u0, IR u1, SSC u2, the linear
@@ -3344,14 +3362,32 @@ mod tests {
         let (g, next, ov) = blunt(&[1000, 300, 200], &[(u0, u1), (u1, u2), (u2, flip(u1)), (flip(u1), u0)]);
         let mut need = FxHashMap::default();
         need.insert(link_key(u0, u1), (2, 1800));
-        let (laid, added, closed) = lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov).unwrap();
+        let (laid, added, closed) = lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov, &[true; 8]).unwrap();
         assert!(closed);
         assert_eq!(laid, vec![u0, u1, u2, flip(u1)]);
         assert!(added.is_empty());
         assert_eq!(spelled_length(&g, &laid, true, &ov).unwrap(), 1800);
         // crossings a unit apart that is not the whole walk stay a tandem copy on the line
         need.insert(link_key(u0, u1), (2, 900));
-        assert!(lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov).is_none());
+        assert!(lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov, &[true; 8]).is_none());
+    }
+
+    /// u0 u1 u2 linear; reads cross u1+ -> u2+ twice, 5.5 kb apart, and the graph returns
+    /// u2 -> u3 -> u1. With u3 (5 kb) single copy the unit u2 u3 u1 is mostly single copy: a
+    /// subcircle read round, nothing is laid. With every segment a repeat it is a tandem copy.
+    #[test]
+    fn a_unit_of_mostly_single_copy_sequence_is_a_subcircle_not_a_tandem_copy() {
+        let (u0, u1, u2, u3) = ((0, true), (1, true), (2, true), (3, true));
+        let (g, next, ov) = blunt(&[1000, 300, 200, 5000], &[(u0, u1), (u1, u2), (u2, u3), (u3, u1)]);
+        let mut need = FxHashMap::default();
+        need.insert(link_key(u1, u2), (2, 5500));
+        let single = [false, false, false, false];
+        assert!(lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov, &single).is_none());
+        let repeats = [false, true, true, true];
+        let (laid, added, closed) = lay_read_copies(&g, &[u0, u1, u2], false, &need, &next, &ov, &repeats).unwrap();
+        assert!(!closed);
+        assert_eq!(laid, vec![u0, u1, u2, u3, u1, u2]);
+        assert_eq!(added.len(), 1);
     }
 
     /// A self-loop's unit is its segment; a circle that is its unit alone stays as it is.
@@ -3361,12 +3397,12 @@ mod tests {
         let (g, next, ov) = blunt(&[1000, 100, 1000], &[(a, r), (r, r), (r, b), (b, a)]);
         let mut need = FxHashMap::default();
         need.insert(link_key(r, r), (3, 100));
-        let (laid, added, _) = lay_read_copies(&g, &[a, r, r, b], true, &need, &next, &ov).unwrap();
+        let (laid, added, _) = lay_read_copies(&g, &[a, r, r, b], true, &need, &next, &ov, &[true; 8]).unwrap();
         assert_eq!(laid, vec![a, r, r, r, r, b]);
         assert_eq!(added, vec![(vec![r], 2)]);
         // a link the walk does not pass is not laid
-        assert!(lay_read_copies(&g, &[a, r, b], true, &need, &next, &ov).is_none());
-        assert!(lay_read_copies(&g, &[r], true, &need, &next, &ov).is_none());
+        assert!(lay_read_copies(&g, &[a, r, b], true, &need, &next, &ov, &[true; 8]).is_none());
+        assert!(lay_read_copies(&g, &[r], true, &need, &next, &ov, &[true; 8]).is_none());
     }
 
     /// Anchors A, B, C, D around one repeat R: A->R, C->R, R->B, R->D, plus B->C and D->C.
