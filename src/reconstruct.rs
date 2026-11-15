@@ -2076,7 +2076,7 @@ fn final_outputs(
         } else {
             Vec::new()
         };
-        let (report, _) = js::analyse(&molecules, &segs, reads, &other_sequences)?;
+        let (report, all_steps) = js::analyse(&molecules, &segs, reads, &other_sequences)?;
         // the panel's view of each join: its bridge from the left anchor to the right one, read
         // either way, in the panel report of the configurations
         let pan = &configurations_found["pan_posterior"];
@@ -2136,8 +2136,17 @@ fn final_outputs(
                 j
             })
             .collect();
+        // each piece's walk, in the order `cut` gives the pieces (molecule by molecule)
+        let piece_walks: Vec<String> = molecules
+            .iter()
+            .zip(&all_steps)
+            .flat_map(|(m, st)| {
+                let p = js::piece_paths(m, st, &reads_joins);
+                if p.is_empty() { vec![String::new(); js::cut(std::slice::from_ref(m), &reads_joins).len()] } else { p }
+            })
+            .collect();
         let mut reads_text = String::new();
-        for (name, seq, circ, note) in &js::cut(&molecules, &reads_joins) {
+        for (k, (name, seq, circ, note)) in js::cut(&molecules, &reads_joins).iter().enumerate() {
             let parent = &headers_all[name.rsplit_once(".j").map_or(name.as_str(), |p| p.0)];
             let rest: Vec<&str> = parent
                 .split(' ')
@@ -2145,7 +2154,8 @@ fn final_outputs(
                 .filter(|w| !w.starts_with("circular=") && !w.starts_with("length=") && !w.starts_with("path=") && !w.starts_with("chosen_by="))
                 .collect();
             let note = note.replace("cut_at=unsupported_join", "cut_at=join_not_decided_by_reads");
-            writeln!(reads_text, ">{name} circular={circ} length={} layer=reads {} {note}", seq.len(), rest.join(" "))?;
+            let walk = piece_walks.get(k).filter(|w| !w.is_empty()).map_or(String::new(), |w| format!(" path={w}"));
+            writeln!(reads_text, ">{name} circular={circ} length={}{walk} layer=reads {} {note}", seq.len(), rest.join(" "))?;
             for chunk in seq.chunks(80) {
                 writeln!(reads_text, "{}", std::str::from_utf8(chunk)?)?;
             }

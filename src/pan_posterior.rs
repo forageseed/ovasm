@@ -495,6 +495,8 @@ pub struct Matching {
     /// The target's single records the matching explains: those through two repeats or more,
     /// and all.
     pub records: (u64, u64),
+    /// Components of the end graph given a partial matching (too many open ends or over budget).
+    pub partial_components: usize,
 }
 
 fn bucket(x: f64) -> i128 {
@@ -552,9 +554,11 @@ fn molecules(partner: &[usize]) -> usize {
 /// An end no edge reaches is where the graph stops and ends a linear molecule
 /// (`edge_at`: `usize::MAX`). The ends that edges reach are all matched where that can be;
 /// a component where it cannot (bridges through one repeat and the ends they join) leaves the
-/// fewest open, as `cover_order` takes the fewest linear molecules first. None when a
-/// component would need more than two such ends or has more matchings than `budget` steps
-/// enumerate.
+/// fewest open, as `cover_order` takes the fewest linear molecules first. A component that
+/// would need more than `MAX_OPEN` such ends (a fragmented graph: a shallow or very low-depth
+/// sample) or has more matchings than `budget` steps enumerate gets a partial matching of its
+/// own (`partial`): the bridges the reads measured or the panel favours, the rest of its ends
+/// left open; the other components are matched exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub fn best_matching(
     ends: usize,
@@ -685,10 +689,43 @@ pub fn best_matching(
         }
         false
     }
+    /// A partial matching of one component: its edges that the reads measured or that the
+    /// prior favours (`prior` above 1: more than even odds at its two ends on average), measured
+    /// first, then the likelier, then the greater read share; each taken when both its ends are
+    /// still free. The component's other ends stay open.
+    fn partial(members: &[usize], at: &[Vec<usize>], edges: &[Edge]) -> Vec<usize> {
+        let mut candidates: Vec<usize> = members.iter().flat_map(|&x| at[x].iter().copied()).collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|&i| !edges[i].incomplete || edges[i].prior > 1.0);
+        candidates.sort_by(|&i, &j| {
+            let (a, b) = (&edges[i], &edges[j]);
+            a.incomplete
+                .cmp(&b.incomplete)
+                .then(b.prior.total_cmp(&a.prior))
+                .then(b.read_ln.total_cmp(&a.read_ln))
+                .then(i.cmp(&j))
+        });
+        let mut used: FxHashMap<usize, ()> = FxHashMap::default();
+        let mut taken = Vec::new();
+        for i in candidates {
+            let e = &edges[i];
+            if used.contains_key(&e.a) || used.contains_key(&e.b) {
+                continue;
+            }
+            used.insert(e.a, ());
+            used.insert(e.b, ());
+            taken.push(i);
+        }
+        taken
+    }
     let mut examined = 0u64;
+    let mut partial_components = 0usize;
     let mut options: Vec<[Best; 2]> = Vec::new();
     for members in comps.values() {
         let mut best = [Best { key: None, ties: Vec::new(), count: 0 }, Best { key: None, ties: Vec::new(), count: 0 }];
+        // each component its own budget, so that one large component does not withdraw the others
+        let (mut steps, mut exhausted) = (0u64, false);
         // Every end joined if that can be; else the fewest left open, two more at a time: each
         // open end ends a linear molecule, and `cover_order` takes the fewest of those first. A
         // graph that lacks one link has such a component (a repeat with one entry too few).
@@ -735,20 +772,31 @@ pub fn best_matching(
                         }
                     }
                 };
-                if !enumerate(members, &at, edges, &mut used, &mut Vec::new(), &mut examined, budget, &mut visit) {
-                    return None;
+                if !enumerate(members, &at, edges, &mut used, &mut Vec::new(), &mut steps, budget, &mut visit) {
+                    exhausted = true;
+                    break;
                 }
                 if !next_choice(&mut pick, members.len()) {
                     break;
                 }
             }
-            if best[1].key.is_some() {
+            if exhausted || best[1].key.is_some() {
                 break;
             }
             open += 2;
             if open > MAX_OPEN.min(members.len()) {
-                return None;
+                break;
             }
+        }
+        examined = examined.saturating_add(steps);
+        if exhausted || best[1].key.is_none() {
+            let taken = partial(members, &at, edges);
+            partial_components += 1;
+            // the partial matching stands for both classes: it is the only one this component has
+            best = [
+                Best { key: Some((0, 0, 0, 0)), ties: vec![taken.clone()], count: 1 },
+                Best { key: Some((0, 0, 0, 0)), ties: vec![taken], count: 1 },
+            ];
         }
         options.push(best);
     }
@@ -825,12 +873,30 @@ pub fn best_matching(
         edge_at,
         equally_good,
         examined,
+        partial_components,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_component_with_too_many_open_ends_gets_a_partial_matching() {
+        // one end (0) reaches five others through one repeat: at most one of them can be joined
+        // to it, so four would stay open. The measured bridge is taken; the others stay open.
+        let e = |b: usize, incomplete: bool, prior: f64| Edge { a: 0, b, read_ln: -1.0, incomplete, prior, passes: vec![7] };
+        let edges = vec![e(1, true, 0.4), e(2, true, 0.4), e(3, false, 0.4), e(4, true, 0.4), e(5, true, 0.4)];
+        let m = best_matching(6, &edges, &|_| None, 0.0, &[], &|_| (0, 0), 1_000).expect("a partial matching");
+        assert_eq!(m.partial_components, 1);
+        assert_eq!(m.edge_at[0], 2);
+        assert_eq!(m.edge_at[3], 2);
+        assert!([1, 2, 4, 5].iter().all(|&x| m.edge_at[x] == usize::MAX));
+        // nothing measured and the panel favours none: every end stays open
+        let edges = vec![e(1, true, 0.4), e(2, true, 0.4), e(3, true, 0.4), e(4, true, 0.4), e(5, true, 0.4)];
+        let m = best_matching(6, &edges, &|_| None, 0.0, &[], &|_| (0, 0), 1_000).expect("a partial matching");
+        assert!(m.edge_at.iter().all(|&x| x == usize::MAX));
+    }
 
     fn seq(n: usize, seed: u64) -> Vec<u8> {
         let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1062,9 +1128,13 @@ mod tests {
         let odd = vec![edge(1, 2, 0.0, true, 1.0), edge(1, 3, 0.0, true, 1.5)];
         let m = best_matching(4, &odd, &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((m.molecules, m.equally_good, m.edge_at.clone()), (1, 1, vec![usize::MAX, 1, usize::MAX, 1]));
-        // no bridge at all, or too small a budget: no matching
+        // no bridge at all: no matching
         assert!(best_matching(4, &[], &|_| None, 2.0, &[], &|_| (0, 0), 1000).is_none());
-        assert!(best_matching(4, &tied, &|_| None, 2.0, &[], &|_| (0, 0), 1).is_none());
+        // too small a budget: that component falls back to its partial matching (here no bridge is
+        // measured or favoured, so every end stays open) instead of withdrawing the matching
+        let m = best_matching(4, &tied, &|_| None, 2.0, &[], &|_| (0, 0), 1).unwrap();
+        assert_eq!(m.partial_components, 1);
+        assert!(m.edge_at.iter().all(|&x| x == usize::MAX));
     }
 
     #[test]

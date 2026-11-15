@@ -689,6 +689,71 @@ pub fn join_source(class: &str, bridge: Option<(f64, bool, bool)>, panel_adopted
     }
 }
 
+/// The walk of every piece `cut` makes of `m` (in its order of pieces), as `path=` steps
+/// (`u1+,u26-`): the steps that start inside the piece. A piece cut at the start of a unique
+/// step holds the steps from there on, so pieces never share a step. Empty when `steps` is.
+pub fn piece_paths(m: &Molecule, steps: &[Step], joins: &[Join]) -> Vec<String> {
+    let label = |s: &Step| format!("{}{}", s.segment, if s.forward { '+' } else { '-' });
+    let l = m.sequence.len();
+    let mut at: Vec<usize> = joins
+        .iter()
+        .filter(|j| j.molecule == m.name && j.class == "unsupported")
+        .map(|j| j.y % l.max(1))
+        .collect();
+    at.sort_unstable();
+    at.dedup();
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    if at.is_empty() {
+        return vec![steps.iter().map(label).collect::<Vec<_>>().join(",")];
+    }
+    let inside = |s: usize, e: usize, x: usize| if s <= e { x >= s && x < e } else { x >= s || x < e };
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    if m.circular {
+        for (i, &s) in at.iter().enumerate() {
+            bounds.push((s, at[(i + 1) % at.len()]));
+        }
+    } else {
+        let mut s = 0;
+        for &e in at.iter().chain(std::iter::once(&l)) {
+            if e > s {
+                bounds.push((s, e));
+            }
+            s = e;
+        }
+    }
+    bounds
+        .into_iter()
+        .map(|(s, e)| {
+            // a circle's piece across the origin lists its steps in molecule order from s
+            let mut own: Vec<&Step> = steps.iter().filter(|st| inside(s, e, st.start)).collect();
+            if m.circular && s > e {
+                own.sort_by_key(|st| if st.start >= s { st.start - s } else { st.start + l - s });
+            }
+            own.into_iter().map(label).collect::<Vec<_>>().join(",")
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn each_piece_gets_the_steps_that_start_in_it() {
+        let st = |seg: &str, start, end| Step { segment: seg.into(), forward: true, start, end };
+        let steps = vec![st("a", 0, 4), st("r", 4, 6), st("b", 6, 10), st("c", 10, 16)];
+        let m = Molecule { name: "m".into(), sequence: vec![b'A'; 16], circular: false, path: None };
+        let j = |y| Join { molecule: "m".into(), left: String::new(), right: String::new(), repeat: vec![], x: 0, y,
+            repeat_bp: 0, crossing_fragments: 0, expected: 0.0, p_at_most_observed: 0.0, class: "unsupported" };
+        assert_eq!(piece_paths(&m, &steps, &[j(6)]), vec!["a+,r+".to_string(), "b+,c+".to_string()]);
+        assert_eq!(piece_paths(&m, &steps, &[]), vec!["a+,r+,b+,c+".to_string()]);
+        let circle = Molecule { circular: true, ..m };
+        assert_eq!(piece_paths(&circle, &steps, &[j(6), j(10)]), vec!["b+".to_string(), "c+,a+,r+".to_string()]);
+    }
+}
+
 #[cfg(test)]
 mod source_tests {
     use super::*;
