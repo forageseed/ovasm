@@ -279,6 +279,9 @@ pub struct WholeReadScan {
     /// (Acanthosoma haemorrhoidale: mitochondrion at 312x over a 4x nucleus, clusters called none).
     /// Only the first is shallow.
     pub seed_reads_above_gate: FxHashMap<&'static str, usize>,
+    /// Of those, the reads whose median sketch depth reaches the gate's organelle threshold
+    /// (`seed_at_gate_depth`), uniformly deep or not.
+    pub seed_reads_at_gate_depth: FxHashMap<&'static str, usize>,
     /// The depth gate's nuclear peak stands for less sequence than a nuclear genome
     /// (`seedfree::MIN_NUCLEAR_GENOME`): the nucleus does not show in the sketch, and the gate's
     /// threshold, a multiple of that peak, sets nothing apart.
@@ -300,11 +303,22 @@ impl WholeReadScan {
     /// standing for 0.8 Mb): 13 of 21 cropped seeds passed a 6x threshold, recruitment was
     /// gated over the usual passes and took in nuclear repeats above it (59 molecules, 927 kb,
     /// none of the 46.5 kb mitochondrion); judged shallow, 27 kb of it at 99.7% identity.
+    ///
+    /// Nor is an organelle shallow whose seeds mostly stand at the gate's threshold by their median
+    /// depth, though not nine tenths of their k-mers (`seed_at_gate_depth`): a seed read is the
+    /// organelle by its genes, so its depth is the organelle's. Ceratobasidium cereale (PMAT2
+    /// benchmark, 0.33 Gb: mitochondrion of 153 kb at 12-38x, nuclear peak 8x over 26 Mb,
+    /// threshold 24x): none of 84 seeds was uniformly above 24x; called shallow and recruited in
+    /// one ungated pass, 149 reads standing for 71 kb gave an 82 kb piece, where the gated passes
+    /// take 231 reads, 223 of the 249 mitochondrial ones. Orcinus orca and Acipenser ruthenus
+    /// (mitochondrion 3x and 7x, as deep as the nucleus) have their seeds below the threshold.
     fn shallow(&self) -> bool {
         self.seed_reads.iter().any(|(o, &n)| {
+            let above = |m: &FxHashMap<&'static str, usize>| m.get(o).copied().unwrap_or(0);
             n > 0
                 && (self.gate_without_nucleus
-                    || 2 * self.seed_reads_above_gate.get(o).copied().unwrap_or(0) <= n)
+                    || (2 * above(&self.seed_reads_above_gate) <= n
+                        && 2 * above(&self.seed_reads_at_gate_depth) <= n))
         })
     }
 }
@@ -316,6 +330,12 @@ impl WholeReadScan {
 /// in one pass, 7 reads from the cropped seeds).
 fn seed_above_gate(gate: &DepthGate, seq: &[u8], lo: usize, hi: usize) -> bool {
     gate.profile(&seq[lo..hi]).is_some_and(|d| d.organelle_like)
+}
+
+/// Whether a whole-read seed, the span `lo..hi` of `seq`, stands at the gate's organelle threshold
+/// by its median depth (`WholeReadScan::shallow`).
+fn seed_at_gate_depth(gate: &DepthGate, seq: &[u8], lo: usize, hi: usize) -> bool {
+    gate.profile(&seq[lo..hi]).is_some_and(|d| d.median >= gate.organelle_min_depth)
 }
 
 /// Distinct genes of its class a read needs in the whole-read scan. Without the depth gate a
@@ -355,11 +375,12 @@ impl ProteinSeedReport {
             .collect();
         let whole = match &self.whole_read_scan {
             Some(w) => format!(
-                "; whole-read scan for {} ({} reads): {} seed reads, {} above the depth gate{}",
+                "; whole-read scan for {} ({} reads): {} seed reads, {} above the depth gate, {} at its depth by median{}",
                 w.organelles.join(" and "),
                 w.reads,
                 w.seed_reads.values().sum::<usize>(),
                 w.seed_reads_above_gate.values().sum::<usize>(),
+                w.seed_reads_at_gate_depth.values().sum::<usize>(),
                 if self.shallow() { " (shallow)" } else { "" }
             ),
             None => String::new(),
@@ -1307,6 +1328,7 @@ fn whole_read_seeds(
     audit_gene_sets: bool,
 ) -> Result<(WholeReadScan, FxHashMap<&'static str, u64>)> {
     let mut above: FxHashMap<&'static str, usize> = FxHashMap::default();
+    let mut at_depth: FxHashMap<&'static str, usize> = FxHashMap::default();
     let t0 = Instant::now();
     let mut writers: FxHashMap<&'static str, std::io::BufWriter<std::fs::File>> = FxHashMap::default();
     let (mut n, mut b): (FxHashMap<&'static str, usize>, FxHashMap<&'static str, u64>) =
@@ -1329,6 +1351,9 @@ fn whole_read_seeds(
             if seed_above_gate(gate, &read.seq, lo, hi) {
                 *above.entry(class).or_insert(0) += 1;
             }
+            if seed_at_gate_depth(gate, &read.seq, lo, hi) {
+                *at_depth.entry(class).or_insert(0) += 1;
+            }
             Ok(())
         },
     )?;
@@ -1345,6 +1370,7 @@ fn whole_read_seeds(
             bases,
             seed_reads: n,
             seed_reads_above_gate: above,
+            seed_reads_at_gate_depth: at_depth,
             gate_without_nucleus: gate.report.peak_window_bases < crate::seedfree::MIN_NUCLEAR_GENOME,
             seconds: t0.elapsed().as_secs_f64(),
             paired_gene_evidence,
@@ -2031,6 +2057,7 @@ mod tests {
             bases: 10_000_000,
             seed_reads: seeds.iter().map(|&(o, n, _)| (o, n)).collect(),
             seed_reads_above_gate: seeds.iter().map(|&(o, _, a)| (o, a)).collect(),
+            seed_reads_at_gate_depth: seeds.iter().map(|&(o, _, a)| (o, a)).collect(),
             gate_without_nucleus: false,
             seconds: 0.0,
             paired_gene_evidence: None,
@@ -2058,6 +2085,18 @@ mod tests {
         let mut s = scan(&[("mitochondrion", 0, 0)]);
         s.gate_without_nucleus = true;
         assert!(!s.shallow());
+        // Ceratobasidium cereale: no seed uniformly above the gate, most at its depth by median
+        let mut s = scan(&[("mitochondrion", 84, 0)]);
+        assert!(s.shallow());
+        s.seed_reads_at_gate_depth.insert("mitochondrion", 60);
+        assert!(!s.shallow());
+        // but not where the gate has no nucleus to judge against
+        s.gate_without_nucleus = true;
+        assert!(s.shallow());
+        // half at its depth by median is still shallow
+        let mut s = scan(&[("mitochondrion", 84, 0)]);
+        s.seed_reads_at_gate_depth.insert("mitochondrion", 42);
+        assert!(s.shallow());
     }
 
     fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
@@ -2101,6 +2140,8 @@ mod tests {
         );
         assert!(seed_above_gate(&gate, &read, 0, 3000), "its seed is organelle-deep");
         assert!(!seed_above_gate(&gate, &read, 3000, 6000), "a nuclear span is not");
+        assert!(seed_at_gate_depth(&gate, &read, 0, 3000), "and at its depth by median");
+        assert!(!seed_at_gate_depth(&gate, &read, 3000, 6000));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
