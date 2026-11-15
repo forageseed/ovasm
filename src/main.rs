@@ -419,7 +419,7 @@ fn chromosomes(args: ChromosomesArgs) -> Result<()> {
         chromosomes::annotate_gfa(p, &report)?;
         chromosomes::drop_withheld_gfa(p, &report)?;
     }
-    if !report.withheld.is_empty() {
+    if !report.withheld.is_empty() || report.excluded.iter().any(|e| e.withheld) {
         let to = args.out_json.with_file_name("components.withheld.fasta");
         chromosomes::write_withheld_segments(&args.gfa, &to, &report)?;
     }

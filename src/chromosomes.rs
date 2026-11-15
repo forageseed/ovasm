@@ -127,6 +127,11 @@ pub struct Excluded {
     pub bp: usize,
     pub depth: f64,
     pub seed_bp: Option<usize>,
+    /// Its longest segment (`withhold`).
+    pub longest_segment: usize,
+    /// Taken out of the organelle graph (`withhold`): without seed sequence and no segment as
+    /// long as the bound, as the withheld molecules' components.
+    pub withheld: bool,
     /// possibly_nuclear_or_contamination (rule 5), or unplaced (no molecule)
     pub reason: &'static str,
 }
@@ -360,6 +365,8 @@ pub fn call(
                 bp,
                 depth,
                 seed_bp: seed,
+                longest_segment: c.iter().map(|s| length[s]).max().unwrap_or(0),
+                withheld: false,
                 reason: "unplaced",
             });
             continue;
@@ -374,6 +381,8 @@ pub fn call(
                 bp,
                 depth,
                 seed_bp: seed,
+                longest_segment: c.iter().map(|s| length[s]).max().unwrap_or(0),
+                withheld: false,
                 reason: "possibly_nuclear_or_contamination",
             });
             continue;
@@ -605,6 +614,19 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
             reason: "free_fragment_without_seed",
         });
     }
+    let mut unplaced = (0usize, 0usize);
+    for e in report.excluded.iter_mut().filter(|e| e.reason == "unplaced") {
+        if e.seed_bp.is_some_and(|b| b < MIN_SEED_BP) && e.longest_segment < max_bp {
+            e.withheld = true;
+            unplaced = (unplaced.0 + 1, unplaced.1 + e.bp);
+        }
+    }
+    if unplaced.0 > 0 {
+        report.reasons.push(format!(
+            "{} unplaced component(s) of {} bp in all taken out of the organelle graph: without              seed sequence and no segment of {max_bp} bp (components.withheld.fasta)",
+            unplaced.0, unplaced.1
+        ));
+    }
     if !withheld.is_empty() {
         report.reasons.push(format!(
             "{} molecule(s) of {} bp in all not delivered: free components without seed sequence, \
@@ -621,7 +643,12 @@ pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
 /// paths made of them alone; a segment a kept path walks stays. The assembly graph keeps them.
 /// The number of segments taken out.
 pub fn drop_withheld_gfa(path: &Path, report: &ChromosomeReport) -> Result<usize> {
-    let gone: BTreeSet<&str> = report.withheld.iter().flat_map(|w| w.segments.iter().map(String::as_str)).collect();
+    let gone: BTreeSet<&str> = report
+        .withheld
+        .iter()
+        .flat_map(|w| w.segments.iter().map(String::as_str))
+        .chain(report.excluded.iter().filter(|e| e.withheld).flat_map(|e| e.segments.iter().map(String::as_str)))
+        .collect();
     if gone.is_empty() {
         return Ok(0);
     }
@@ -677,6 +704,12 @@ pub fn write_withheld_segments(gfa: &Path, to: &Path, report: &ChromosomeReport)
         for s in &w.segments {
             let c = report.chromosomes.iter().find(|c| c.segment_names.contains(s)).map_or(0, |c| c.index);
             of.entry(s.as_str()).or_insert((c, w.molecule));
+        }
+    }
+    // unplaced components hold no molecule: component and molecule 0
+    for e in report.excluded.iter().filter(|e| e.withheld) {
+        for s in &e.segments {
+            of.entry(s.as_str()).or_insert((0, 0));
         }
     }
     let mut out = String::new();
@@ -977,8 +1010,8 @@ mod tests {
     #[test]
     fn a_free_fragment_without_seed_is_withheld_and_a_free_circle_is_not() {
         let d = dir("withhold");
-        let g = gfa(&d, &[("m", 2000, 130.0), ("x", 300, 120.0), ("y", 5000, 125.0)]);
-        let ev = json!({"links": [link("m+", "m+", 50), link("y+", "y+", 30)], "repeats": [], "repeat_segments": []});
+        let g = gfa(&d, &[("m", 2000, 130.0), ("x", 300, 120.0), ("y", 5000, 125.0), ("z", 200, 90.0)]);
+        let ev = json!({"links": [link("m+", "m+", 50), link("y+", "y+", 30), link("z+", "z+", 20)], "repeats": [], "repeat_segments": []});
         let lin = json!({"components": [
             {"best": {"molecules": [{"path": "m+", "circular": true, "length": 2000}]}},
             {"best": {"molecules": [{"path": "x+", "circular": false, "length": 300}]}},
@@ -990,6 +1023,8 @@ mod tests {
         withhold(&mut r, 750);
         assert_eq!(r.withheld.iter().map(|w| w.molecule).collect::<Vec<_>>(), vec![2]);
         assert_eq!(r.withheld[0].reason, "free_fragment_without_seed");
+        // a component no molecule holds (z) goes out of the organelle graph too
+        assert!(r.excluded.iter().any(|e| e.withheld && e.segments == vec!["z".to_string()]), "{:?}", r.excluded);
         // a fragment longer than the bound is delivered
         let mut r = call(&g, &ev, &lin, None, Some(&seeds)).unwrap();
         withhold(&mut r, 300);
@@ -1021,15 +1056,15 @@ GT
         let og = d.join("organelle.gfa");
         let gfa_text = [
             "H\tVN:Z:1.0\tsn:Z:sample",
-            "S\tsample.m\tACGT", "S\tsample.x.1\tACGT", "S\tsample.y\tACGT",
+            "S\tsample.m\tACGT", "S\tsample.x.1\tACGT", "S\tsample.y\tACGT", "S\tsample.z\tACGT",
             "L\tsample.m\t+\tsample.m\t+\t0M", "L\tsample.x.1\t+\tsample.x.1\t+\t0M", "L\tsample.y\t+\tsample.y\t+\t0M",
             "P\tsample#1#mt.1\tsample.m+\t*", "P\tsample#2#mt.1\tsample.x.1+\t*", "P\tsample#3#mt.1\tsample.y+\t*",
         ]
         .join("\n");
         fs::write(&og, gfa_text + "\n").unwrap();
-        assert_eq!(drop_withheld_gfa(&og, &r).unwrap(), 1);
+        assert_eq!(drop_withheld_gfa(&og, &r).unwrap(), 2);
         let text = fs::read_to_string(&og).unwrap();
-        assert!(!text.contains("sample.x"), "{text}");
+        assert!(!text.contains("sample.x") && !text.contains("sample.z"), "{text}");
         assert!(text.contains("S\tsample.y") && text.contains("S\tsample.m") && text.contains("sample#3#mt.1"), "{text}");
         let asm = d.join("assembly.gfa");
         fs::write(&asm, "S\tm\tACGT\nS\tx\tGGCC\nS\ty\tTTAA\n").unwrap();
