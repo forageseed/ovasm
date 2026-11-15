@@ -2481,7 +2481,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         // Complete target reads cover these reference graph bases directly. This is
         // only a conservative k-ladder retry guard: it does not add reference bases,
         // certify organelle origin, or define the target's genome size.
-        let retry_floor = projection["certain_exact_reference_bases"].as_u64().map(|n| n / 2).filter(|&n| n > 0);
+        let retry_floor = projection["certain_exact_reference_bases"].as_u64().filter(|&n| n > 0);
         let assembly = pipeline::run_with_experimental_deep_bubble(&pipeline::RunConfig {
             reads: reads.clone(),
             organelle: if o == "mitochondrion" {

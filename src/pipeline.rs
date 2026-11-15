@@ -417,8 +417,13 @@ pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
 /// The optional floor is a conservative retry guard from target-read-covered
 /// reference sequence, not an expected genome size or evidence of molecule origin.
 fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> Result<Ladder> {
+    // `floor`: the reference bases complete target reads cover. An attempt qualifies when its
+    // graph holds at least half of them (a retry guard, not a genome size); among qualifying
+    // attempts more of them held comes before fewer pieces (rice SAMEA115396715's mitochondrion
+    // in a pan reconstruction: k 127 held 213 kb in 39 pieces, k 99 438 kb in 42; with half the
+    // bases as the only bar k 127 was kept and 27% of the held-out mitochondrion came out).
     let floor = floor.unwrap_or(0);
-    let qualifies = |o: &Outcome| o.accepted() && o.total_length >= floor;
+    let qualifies = |o: &Outcome| o.accepted() && o.total_length >= floor / 2;
     // Fewer pieces is the better genome only among attempts whose molecules hold as much of it:
     // an attempt that explains none of its graph has no piece at all. Rice SAMEA115396709's
     // mitochondrion in a pan reconstruction: k 77 gave 9 molecules of 54,837 bp, k 55 one of
@@ -1891,10 +1896,10 @@ fn assemble_organelle(
     if let Some(floor) = sr_min_graph_bases {
         write_json(&dir.join("pan_retry_floor.json"), &json!({
             "floor_bases": floor, "chosen": ladder.chosen, "accepted": ladder.accepted,
-            "basis": "half the uniquely placed reference bases covered by complete target reads; a retry guard, not a genome size, proof of origin or completeness",
+            "basis": "uniquely placed reference bases covered by complete target reads: an attempt qualifies at half of them and attempts are ranked by how many of them their graph holds; a retry guard, not a genome size, proof of origin or completeness",
             "attempts": ladder.tried.iter().map(|o| json!({"k": o.k, "graph_bases": o.total_length,
                 "molecules": o.molecules, "molecule_bases": o.molecule_bases,
-                "passes_floor": o.total_length >= floor})).collect::<Vec<_>>(),
+                "passes_floor": o.total_length >= floor / 2})).collect::<Vec<_>>(),
         }))?;
     }
     if ladder.result().total_length == 0 {
@@ -2690,19 +2695,26 @@ mod tests {
         let o = |k, graph, molecules, bases| Outcome { k, total_length: graph, molecules, molecule_bases: bases, pieces: molecules, unitigs: 1, open_ends: 0 };
         let candidates = vec![o(127, 8931, 1, 5006), o(99, 220562, 3, 224833), o(77, 224785, 2, 230798), o(55, 226854, 1, 232196)];
         let mut a = Sized { outcomes: candidates.clone(), calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut a, Some(122477)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut a, Some(244954)).unwrap();
         assert_eq!(a.calls, [127, 99, 77, 55]); assert_eq!(r.result().k, 55); assert!(r.accepted);
         let mut b = Sized { outcomes: candidates.clone(), calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut b, Some(300000)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut b, Some(600000)).unwrap();
         assert_eq!(b.calls, [127, 99, 77, 55]); assert!(!r.accepted);
         let mut c = Sized { outcomes: candidates, calls: vec![] };
         let r = sr_ladder(&mut c).unwrap(); assert_eq!(c.calls, [127]); assert!(r.accepted);
         // neither accepted: the one whose molecules hold more, not the one with fewer pieces
         let rice = vec![o(127, 8_000, 0, 0), o(99, 400_000, 4, 20_000), o(77, 495_635, 9, 54_837), Outcome { pieces: 0, ..o(55, 729_616, 1, 1_717) }];
         let mut d = Sized { outcomes: rice, calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut d, Some(179_464)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut d, Some(358_928)).unwrap();
         assert!(!r.accepted);
         assert_eq!(r.result().k, 77);
+        // rice SAMEA115396715: every k qualifies; k 127 has the fewest pieces but holds half the
+        // read-covered reference, so k 99 is kept
+        let rice715 = vec![o(127, 212_904, 39, 195_347), o(99, 437_956, 42, 427_935), o(77, 440_727, 45, 426_827), o(55, 437_272, 59, 421_238)];
+        let mut e = Sized { outcomes: rice715, calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut e, Some(357_616)).unwrap();
+        assert!(r.accepted);
+        assert_eq!(r.result().k, 99);
     }
 
     #[test]
