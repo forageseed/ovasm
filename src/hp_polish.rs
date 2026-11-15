@@ -184,6 +184,15 @@ fn judge(current: u32, seen: &[u32; MAX_RUN + 1], min_obs: u32) -> Option<u32> {
 /// Run lengths by likelihood under the reads' own error model (hard EM). `runs` holds each judged
 /// run's class (0 A/T, 1 G/C), its calls and its starting length (the mode); returns the lengths,
 /// the rounds taken, and the model's exact-call rate of A/T lengths 1 to 12.
+/// Known limitation: a length that no run starts at (the mode of its calls) is never chosen. Its
+/// prior and its call table come from the same runs, the ones currently called that length, so
+/// both are empty together; smoothing the prior changes nothing, and a table borrowed from the
+/// length below, shifted a base, does not win either (runs all called 10 mix true 10s and 11s).
+/// When a true 11 is read mostly as 10 the reads alone cannot tell it from a 10: with nanopore
+/// reads alone the longest runs come out systematically short (Nipponbare ONT: exact-call rate 0
+/// at 11 bp A/T). Telling them apart needs a parametric model of how the error grows with run
+/// length, extrapolated from the short runs (not done). `run hybrid` judges the runs with its short
+/// reads instead (see `longread::assemble`), which this does not affect.
 fn em_lengths(runs: &[(usize, &[u32; MAX_RUN + 1])], start: &[u32]) -> (Vec<u32>, usize, Vec<f64>) {
     type Table = Vec<[f64; MAX_RUN + 1]>;
     let mut call = start.to_vec();
