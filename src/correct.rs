@@ -139,6 +139,28 @@ impl Bloom {
 
 /// Solid-count threshold: the first local minimum of the count histogram (from 2 up), the
 /// valley between the error peak and the organelle peak.
+/// Most buckets of the k-mer count histogram (`solid_peak`); a count above it goes to one overflow
+/// bucket, from which no peak is taken.
+const HIST_MAX: usize = 1 << 22;
+
+/// The valley after the error k-mers and the solid peak of `counts`, the histogram one bucket per
+/// count up to the largest. With a 10,001-bucket histogram every count above 10,000 went to its
+/// last bucket, and deep short reads of `run hybrid` (Nipponbare, single-copy mitochondrial
+/// k-mers at ~1,877x, the plastid's far above) piled up there: the solid peak came out as 10,000,
+/// the minimum count about 3,000, and the mitochondrion's own k-mers were all left out (code
+/// audit 11-15; hybrid mitochondrion 66% of the gold, 276 substitutions).
+fn valley_and_peak(counts: &FxHashMap<u64, u32>) -> (u32, u32) {
+    let top = counts.values().copied().max().unwrap_or(0) as usize;
+    let len = top.min(HIST_MAX) + 2;
+    let mut hist = vec![0u64; len];
+    for &c in counts.values() {
+        hist[(c as usize).min(len - 1)] += 1;
+    }
+    let low = valley(&hist);
+    let solid_peak = (low as usize..len - 1).max_by_key(|&c| hist[c]).unwrap_or(0) as u32;
+    (low, solid_peak)
+}
+
 fn valley(hist: &[u64]) -> u32 {
     for c in 3..hist.len().saturating_sub(1) {
         if hist[c] <= hist[c - 1] && hist[c] < hist[c + 1] {
@@ -453,14 +475,7 @@ fn round(
     let t0 = Instant::now();
     let k = p.k;
     let counts = count_kmers(short.unwrap_or(&reads), k);
-    let mut hist = vec![0u64; 10_001];
-    for &c in counts.values() {
-        hist[(c as usize).min(10_000)] += 1;
-    }
-    let low = valley(&hist);
-    let solid_peak = (low as usize..hist.len())
-        .max_by_key(|&c| hist[c])
-        .unwrap_or(0) as u32;
+    let (low, solid_peak) = valley_and_peak(&counts);
     let min_count = p
         .min_count
         .unwrap_or_else(|| low.max((p.peak_fraction * solid_peak as f64) as u32));
@@ -624,6 +639,29 @@ mod tests {
         let (_, r) = forward_kmers(&revcomp(s), k)[0];
         assert_eq!(rc_kmer(f, k), r);
         assert_eq!(canon(f, k), canon(r, k));
+    }
+
+    /// Deep short reads: 50,000 single-copy k-mers at 1,700-2,050x, 20,000 plastid ones at
+    /// 18,000-25,000x and errors at 1-3: the solid peak is the single-copy one, not an overflow.
+    #[test]
+    fn the_solid_peak_of_deep_reads_is_not_an_overflow_bucket() {
+        let mut counts: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut key = 0u64;
+        for i in 0..50_000u32 {
+            counts.insert(key, 1_700 + (i * 7919) % 351);
+            key += 1;
+        }
+        for i in 0..20_000u32 {
+            counts.insert(key, 18_000 + (i * 104_729) % 7_001);
+            key += 1;
+        }
+        for i in 0..200_000u32 {
+            counts.insert(key, 1 + i % 3);
+            key += 1;
+        }
+        let (low, peak) = valley_and_peak(&counts);
+        assert!(low >= 4 && low < 1_700, "valley {low}");
+        assert!((1_700..=2_050).contains(&peak), "solid peak {peak}");
     }
 
     #[test]
