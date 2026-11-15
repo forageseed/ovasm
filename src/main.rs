@@ -25,6 +25,7 @@ mod longread;
 mod pan;
 mod pan_external;
 mod pan_backend;
+mod pan_cohort;
 mod pan_posterior;
 mod panel;
 mod phase;
@@ -340,6 +341,27 @@ enum PanCommand {
     Identify(IdentifyArgs),
     /// Retain exact MT/PT sharing evidence from an existing both-organelle assembly.
     Sharing(SharingArgs),
+    /// Summarize many samples' `pan reconstruct` runs on one panel: cohort graph with each
+    /// sample's read-decided paths, segment presence, site genotypes (VCF), junction
+    /// configuration frequencies (reads vs panel) and each sample's nearest panel run.
+    Cohort(PanCohortArgs),
+}
+
+#[derive(clap::Args)]
+struct PanCohortArgs {
+    /// Tab-separated: sample<TAB>pan reconstruct output directory, one sample a line.
+    #[arg(long)]
+    samples: PathBuf,
+    /// Output directory: <organelle>/{cohort.gfa,presence.tsv,presence.calls.tsv,
+    /// genotypes.tsv,genotypes.vcf,junctions.tsv,nearest.tsv} and cohort.json.
+    #[arg(long)]
+    out: PathBuf,
+    /// mitochondrion, plastid or both.
+    #[arg(long, default_value = "both")]
+    organelle: String,
+    /// ORGANELLE=GFA: the panel graph, when the runs' reference.json does not name one.
+    #[arg(long = "reference")]
+    references: Vec<String>,
 }
 
 #[derive(clap::Args)]
@@ -2843,6 +2865,22 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Pan(PanCommand::Merge(args)) => pan(args),
         Command::Pan(PanCommand::Reconstruct(args)) => reconstruct(args),
         Command::Pan(PanCommand::Identify(args)) => identify(args),
+        Command::Pan(PanCommand::Cohort(args)) => {
+            let organelles: Vec<String> = match args.organelle.as_str() {
+                "both" => pan_cohort::ORGANELLES.iter().map(|s| s.to_string()).collect(),
+                o if pan_cohort::ORGANELLES.contains(&o) => vec![o.to_string()],
+                o => bail!("--organelle must be mitochondrion, plastid or both, got {o:?}"),
+            };
+            let mut references = rustc_hash::FxHashMap::default();
+            for spec in &args.references {
+                let (o, path) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--reference expects ORGANELLE=GFA, got {spec:?}"))?;
+                references.insert(o.to_string(), PathBuf::from(path));
+            }
+            let samples = pan_cohort::read_samples(&args.samples)?;
+            let report = pan_cohort::run(pan_cohort::CohortArgs { samples, out: args.out.clone(), organelles, references })?;
+            eprintln!("[ovasm] pan cohort: {} -> {}", serde_json::to_string(&report["organelles"])?, args.out.display());
+            Ok(())
+        }
         Command::Pan(PanCommand::Sharing(args)) => {
             if !(1..=kmer::MAX_K).contains(&args.k) {
                 bail!("--k must be between 1 and {}", kmer::MAX_K);
