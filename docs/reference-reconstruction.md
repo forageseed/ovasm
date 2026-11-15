@@ -185,6 +185,15 @@ are listed, and the FASTA headers and P walks (`rp:f`) carry the score. This is 
 other individuals: a repeat that recombines differs between individuals, and the reads of this
 one still decide nothing between the configurations.
 
+That ranking orders the covers a search listed, and it takes only walks the reads decided
+throughout. The representative no longer depends on it where the panel has more to say: the
+configuration the panel supports best among those the reads rank alike is built from the
+graph's bridges and is configuration 1 (see [the panel's configuration](pan-configuration-posterior.md):
+closest relative by alleles, the panel's own estimate of how often junctions are conserved,
+maximum expected number of correctly joined anchor ends, exact matching). It also uses walks
+tagged unresolved, inside the stretches their own graph does not branch in (`uj:Z:`, written
+by `pan merge`).
+
 ## Genotypes against the reference graph
 
 Each organelle's reads are also genotyped at every known variant site of its reference graph
@@ -217,8 +226,14 @@ ties the best reported configuration ranking across circular and linear candidat
 then records `chosen_by=reported_configuration_ranking reads_decide=false`; pieces under 1 kb
 are marked `unplaced=true`. The status is `circular_configuration_chosen`, and `representative`
 records the choice. If no circular configuration meets the ranking criterion, the incomplete
-result is retained. A closed but unresolved result is not replaced. These representatives do
-not establish the physical structure or prove that the reads resolve the configuration. The configuration walks
+result is retained. A closed but unresolved result is not replaced by a searched cover. It is
+replaced by the panel's configuration when the panel tells bridges apart at one open anchor
+end or more: `chosen_by=pan_posterior`, status `pan_configuration_chosen`, with the expected
+share of correctly joined anchor ends in the header and the record (a held-out Arabidopsis
+panel of 48: 38% of the junctions the emitted molecules made were not the individual's, 2.4%
+of the panel's). These
+representatives do not establish the physical structure or prove that the reads resolve the
+configuration. The configuration walks
 of `<organelle>.gfa` follow the organelle graph's pieces exactly as `unify` makes them blunt
 (a repeat's bases shared with an overlapping neighbour are the neighbour's piece).
 
@@ -255,6 +270,11 @@ and propagates reference-filled segment membership to a path-level `rf` marker.
 Tagged unresolved/reference-filled paths remain recruitment candidates but are excluded
 from reference-prior ranking and gap filling. Legacy graphs whose tags were already
 lost cannot retroactively acquire trusted provenance and require a provenance audit.
+An unresolved path is evidence of junctions only where its own reads decided them: `pan
+merge` records where the sample's own graph branches (`uj:Z:` offsets on the path), and the
+panel's configuration counts a junction of such a path only when it spans none of them.
+Reference-filled paths, external intervals and unresolved paths without `uj` (graphs merged
+before it existed; merge them again from the samples' graphs) count for nothing.
 
 Length-uncertain FASTA outputs carry `length_uncertain=true`, so exporting a FASTA does not
 silently drop the JSON uncertainty. External pan builders restore known OVASM FASTA provenance

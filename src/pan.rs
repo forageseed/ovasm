@@ -155,6 +155,58 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
             path.display()
         );
     }
+    // Where each unresolved walk's own graph branches (`uj:Z:`, offsets in bases from the walk's
+    // start, 0 for a circular walk's closing junction, `-` for none): the sample's reads did not
+    // decide what follows what across a link that is not the only one at both of its ends, so
+    // the walk is evidence of the sample's junctions only between these offsets
+    // (`pan_posterior`: an Arabidopsis HiFi assembly unresolved at its two recombining repeats
+    // still shows how every shorter repeat is joined). Only for the graph of one sample: a
+    // merged graph branches wherever any of its samples does, and its walks keep the offsets
+    // they came with.
+    if paths.iter().all(|(name, _, _)| name.split('#').next() == Some(sample.as_str())) {
+        let index: FxHashMap<&str, usize> = graph.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        // links leaving each oriented segment
+        let mut leaving: FxHashMap<Oriented, usize> = FxHashMap::default();
+        for &(a, b) in &graph.links {
+            *leaving.entry(a).or_default() += 1;
+            *leaving.entry((b.0, !b.1)).or_default() += 1;
+        }
+        let branches = |x: Oriented, y: Oriented| {
+            leaving.get(&x).copied().unwrap_or(0) != 1 || leaving.get(&(y.0, !y.1)).copied().unwrap_or(0) != 1
+        };
+        for (name, labels, circular) in &paths {
+            let Some(tags) = path_tags.get_mut(name) else { continue };
+            let unresolved = tags.iter().any(|t| t == "st:Z:unresolved_configuration" || t.starts_with("up:"));
+            if !unresolved || tags.iter().any(|t| t.starts_with("uj:")) {
+                continue;
+            }
+            let walk: Vec<Oriented> = labels
+                .split(' ')
+                .filter_map(|l| {
+                    let (n, o) = l.split_at(l.len() - 1);
+                    index.get(n).map(|&i| (i, o == "+"))
+                })
+                .collect();
+            if walk.is_empty() || walk.len() != labels.split(' ').count() {
+                continue; // an unknown segment: `parse_walk` reports it
+            }
+            let (mut cuts, mut offset) = (Vec::new(), 0usize);
+            if *circular && branches(walk[walk.len() - 1], walk[0]) {
+                cuts.push(0);
+            }
+            for w in walk.windows(2) {
+                offset += graph.seqs[w[0].0].len();
+                if branches(w[0], w[1]) {
+                    cuts.push(offset);
+                }
+            }
+            tags.push(if cuts.is_empty() {
+                "uj:Z:-".to_string()
+            } else {
+                format!("uj:Z:{}", cuts.iter().map(usize::to_string).collect::<Vec<_>>().join(","))
+            });
+        }
+    }
     Ok(SampleGraph {
         sample,
         path: path.to_path_buf(),
@@ -621,6 +673,34 @@ mod tests {
         run(&[input], &PanParams { k: 31 }, &out, &dir.join("pan.json")).unwrap();
         let output = fs::read_to_string(out).unwrap();
         assert!(output.lines().any(|l| l.starts_with("P\ttags#1#mt\t") && l.contains("st:Z:unresolved_configuration") && l.contains("rf:Z:source")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unresolved_walk_carries_the_offsets_where_its_own_graph_branches() {
+        let dir = std::env::temp_dir().join(format!("ovasm-pan-uj-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let input = sample_gfa(&dir, "S", &seq(300, 1), &seq(300, 2), &seq(100, 3), false);
+        let text = fs::read_to_string(&input).unwrap().replace("TP:Z:circular", "TP:Z:circular\tst:Z:unresolved_configuration");
+        fs::write(&input, text).unwrap();
+        let out = dir.join("pan.gfa");
+        run(&[input], &PanParams { k: 31 }, &out, &dir.join("pan.json")).unwrap();
+        let tags = |text: &str, name: &str| -> Vec<String> {
+            let line = text.lines().find(|l| l.starts_with(&format!("P\t{name}\t"))).unwrap();
+            line.split('\t').skip(4).map(str::to_string).collect()
+        };
+        let merged = fs::read_to_string(&out).unwrap();
+        // u0 (300) -> u2 (100) -> u1 (300) -> u2 -> back to u0: the repeat u2 branches at both ends
+        assert!(tags(&merged, "S#1#mt").contains(&"uj:Z:0,300,400,700".to_string()), "{:?}", tags(&merged, "S#1#mt"));
+        // a walk the reads decided carries none
+        assert!(!tags(&merged, "S#2#mt").iter().any(|t| t.starts_with("uj:")));
+        // a merged graph is no sample's own: its walks keep the offsets they came with
+        let other = sample_gfa(&dir, "T", &seq(300, 1), &seq(300, 2), &seq(100, 3), true);
+        let again = dir.join("again.gfa");
+        run(&[out, other], &PanParams { k: 31 }, &again, &dir.join("again.json")).unwrap();
+        let merged = fs::read_to_string(&again).unwrap();
+        assert!(tags(&merged, "S#1#mt").contains(&"uj:Z:0,300,400,700".to_string()));
+        assert!(!tags(&merged, "T#1#mt").iter().any(|t| t.starts_with("uj:")));
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -24,6 +24,7 @@ mod longread;
 mod pan;
 mod pan_external;
 mod pan_backend;
+mod pan_posterior;
 mod panel;
 mod phase;
 mod protein_seed;
@@ -271,6 +272,57 @@ enum SolveCommand {
     /// across a repeat with reads for both pairings): a JSON report; annotates the molecules'
     /// FASTA headers and the organelle GFA's paths, sequences unchanged.
     Chromosomes(ChromosomesArgs),
+    /// The configuration of an assembly graph that a reference graph's panel supports best among
+    /// those the reads rank alike, as `pan reconstruct` takes it, from files a reconstruction
+    /// left (no reads): its molecules and the panel's support of every junction.
+    PanConfiguration(PanConfigurationArgs),
+}
+
+#[derive(clap::Args)]
+struct PanConfigurationArgs {
+    /// The individual's assembly graph (`<organelle>/de-novo/assembly.gfa` of a reconstruction).
+    #[arg(long)]
+    gfa: PathBuf,
+    /// The `check evidence` report of that graph (`de-novo/evidence.json`).
+    #[arg(long)]
+    evidence: PathBuf,
+    /// Species reference graph of `ovasm pan merge`; walks of the sample itself are left out.
+    #[arg(long)]
+    reference: PathBuf,
+    /// The individual's `genotypes.tsv` against that graph (`<organelle>/genotypes.tsv`):
+    /// tells which panel run is its closest relative. Without it the runs count alike.
+    #[arg(long)]
+    genotypes: Option<PathBuf>,
+    /// PanSN sample of the individual.
+    #[arg(long)]
+    sample: String,
+    #[arg(long)]
+    out_fasta: PathBuf,
+    #[arg(long)]
+    out_json: PathBuf,
+}
+
+fn pan_configuration(args: PanConfigurationArgs) -> Result<()> {
+    let report = reconstruct::choose_configuration(&reconstruct::ChooseConfig {
+        gfa: args.gfa,
+        evidence: args.evidence,
+        reference: args.reference,
+        genotypes: args.genotypes,
+        sample: args.sample,
+        out_fasta: args.out_fasta,
+        out_json: args.out_json,
+    })?;
+    let cover = &report["pan_posterior"]["cover"];
+    eprintln!(
+        "[ovasm] pan-configuration: {} panel runs, rho {:.3}; {} of {} open anchor ends decided by the panel, expected share of correct ends {:.3}, {} configurations rank as well",
+        report["pan_posterior"]["panel_runs"],
+        report["pan_posterior"]["junction_conservation_rho"].as_f64().unwrap_or(f64::NAN),
+        cover["ends_decided_by_panel"],
+        cover["open_ends"],
+        cover["expected_correct_fraction"].as_f64().unwrap_or(f64::NAN),
+        cover["equally_good_configurations"]
+    );
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -2764,6 +2816,7 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
         Command::Solve(SolveCommand::Primary(args)) => primary(args),
         Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),
+        Command::Solve(SolveCommand::PanConfiguration(args)) => pan_configuration(args),
         Command::Pan(PanCommand::Import(args)) => {
             pan_external::run(&pan_external::Config { input: args.input, extra_paths: args.extra_paths, out: args.out, sample: args.sample })?;
             Ok(())

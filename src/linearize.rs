@@ -87,6 +87,40 @@ pub struct LinearizeParams {
     pub optional_below: f64,
 }
 
+/// A bridge as `bridges` builds it, for a caller that weighs bridges from outside the reads
+/// (`open_bridges`).
+pub(crate) struct BridgeView {
+    pub walk: Vec<Oriented>,
+    pub reads: u64,
+    pub topological: bool,
+    pub weak: bool,
+}
+
+/// Junction preferences from outside the target's reads (`pan reconstruct`: a species panel):
+/// per bridge walk, the probability that the molecule leaves the walk's first anchor that way.
+/// They order only covers the reads rank alike (`pan_posterior::best_matching`).
+pub struct BridgePrior {
+    pub probability: FxHashMap<Vec<Oriented>, f64>,
+}
+
+/// The cover of a component a `BridgePrior` takes among those the reads rank alike: every
+/// anchor end a bridge leaves is on one bridge.
+#[derive(Clone, Serialize)]
+pub struct PriorCover {
+    pub cover: CoverReport,
+    /// Anchor ends of the component that a bridge leaves, those with more than one bridge to
+    /// take, and those of them where the prior tells the bridges apart.
+    pub ends: usize,
+    pub open_ends: usize,
+    pub decided_ends: usize,
+    /// Sum over the ends of the prior probability of the bridge taken there: the expected number
+    /// of correctly joined ends.
+    pub expected_correct_ends: f64,
+    /// Covers the reads and the prior rank as well (the one with the fewest molecules is given).
+    pub equally_good: u64,
+    pub matchings_examined: u64,
+}
+
 fn rc_walk(w: &[Oriented]) -> Vec<Oriented> {
     w.iter().rev().map(|&o| flip(o)).collect()
 }
@@ -1561,6 +1595,165 @@ fn candidate_walk(br: &[Bridge], f: &Found) -> Vec<Oriented> {
     walk
 }
 
+/// The bridges `run` joins the anchors of a graph by, and which segments are repeats: what a
+/// caller needs to weigh the bridges from outside the reads before `run_with_prior`.
+pub(crate) fn open_bridges(gfa: &Path, evidence: &Path, min_reads: u64) -> Result<(Graph, Vec<bool>, Vec<BridgeView>)> {
+    let g = parse_gfa(gfa)?;
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(evidence).with_context(|| format!("cannot read {}", evidence.display()))?,
+    )?;
+    let repeat_names: BTreeSet<&str> = report["repeat_segments"]
+        .as_array()
+        .context("evidence has no repeat_segments")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let repeat: Vec<bool> = g.names.iter().map(|n| repeat_names.contains(n.as_str())).collect();
+    let (mut br, _) = bridges(&g, &report, &repeat, min_reads)?;
+    let spanned = spanned_walks(&g, &report, &repeat, min_reads)?;
+    merge_spanned(&mut br, &spanned);
+    let views = br
+        .into_iter()
+        .map(|b| BridgeView { walk: b.walk, reads: b.reads, topological: b.topological, weak: b.weak })
+        .collect();
+    Ok((g, repeat, views))
+}
+
+/// The closed cover of a component (every anchor once, every anchor end on one bridge) that a
+/// prior takes among those the reads rank alike: `pan_posterior::best_matching` over the
+/// component's bridges, each with its share of the reads and the prior's probability at both of
+/// its ends (an end the prior does not know: its bridges alike). An anchor end no bridge leaves
+/// is where the graph stops: it ends a linear molecule, as in every cover, and an optional
+/// anchor may be left out. The `PriorCover` comes back without its report. None for a
+/// component whose bridged ends cannot be joined but for two of a repeat's, or with more
+/// matchings than the budget.
+fn prior_cover(
+    comp: &[usize],
+    optional: &[bool],
+    br: &[Bridge],
+    frac: &[f64],
+    expected: &[Option<usize>],
+    prior: &BridgePrior,
+) -> Option<(Vec<Found>, PriorCover)> {
+    let local: FxHashMap<usize, usize> = comp.iter().enumerate().map(|(k, &a)| (a, k)).collect();
+    // an anchor end, as the oriented anchor a walk leaves it by: anchor k has ends 2k and 2k + 1
+    let end = |o: Oriented| local.get(&o.0).map(|&k| 2 * k + usize::from(!o.1));
+    let pos: FxHashMap<&[Oriented], usize> = br.iter().enumerate().map(|(i, b)| (b.walk.as_slice(), i)).collect();
+    let mut leaving: Vec<Vec<usize>> = vec![Vec::new(); 2 * comp.len()];
+    for (i, b) in br.iter().enumerate() {
+        if let Some(e) = end(b.walk[0]) {
+            leaving[e].push(i);
+        }
+    }
+    let probability = |i: usize| -> f64 {
+        prior.probability.get(&br[i].walk).copied().unwrap_or_else(|| {
+            let e = end(br[i].walk[0]).expect("a bridge of the component");
+            1.0 / leaving[e].len().max(1) as f64
+        })
+    };
+    let mut edges = Vec::new();
+    // per edge: the bridge leaving its first end and the same bridge leaving its other end
+    let mut directions: Vec<(usize, usize)> = Vec::new();
+    for (i, b) in br.iter().enumerate() {
+        let (Some(a), Some(z)) = (end(b.walk[0]), end(flip(b.walk[b.walk.len() - 1]))) else {
+            continue;
+        };
+        let j = *pos.get(rc_walk(&b.walk).as_slice())?;
+        // a walk back into the end it left is no junction of two ends; each bridge once
+        if a == z || j <= i {
+            continue;
+        }
+        edges.push(crate::pan_posterior::Edge {
+            a,
+            b: z,
+            read_ln: frac[i].max(1e-9).ln(),
+            incomplete: b.weak || b.topological,
+            prior: probability(i) + probability(j),
+            passes: b.walk[1..b.walk.len() - 1].iter().map(|o| o.0).collect(),
+        });
+        directions.push((i, j));
+    }
+    // An optional (shallow) anchor may be left out, as in every cover: its two ends joined to
+    // each other, with no bridge. Leaving it out costs no read share, so it is left out unless
+    // an end beside it would stay open, as the search does.
+    const LEFT_OUT: usize = usize::MAX - 1;
+    for (k, _) in comp.iter().enumerate().filter(|&(_, &a)| optional[a]) {
+        edges.push(crate::pan_posterior::Edge { a: 2 * k, b: 2 * k + 1, read_ln: 0.0, incomplete: false, prior: 0.0, passes: Vec::new() });
+        directions.push((LEFT_OUT, LEFT_OUT));
+    }
+    let m = crate::pan_posterior::best_matching(2 * comp.len(), &edges, &|r| expected[r], COPY_PENALTY_LN, 2_000_000)?;
+    // the bridge leaving each end; none where the graph stops (the end of a linear molecule)
+    let leave: Vec<usize> = m
+        .edge_at
+        .iter()
+        .enumerate()
+        .map(|(x, &e)| match e {
+            usize::MAX => usize::MAX,
+            e if edges[e].a == x => directions[e].0,
+            e => directions[e].1,
+        })
+        .collect();
+    // the molecules: leave an anchor by one end, enter the next, leave it by its other end
+    let oriented = |x: usize| (comp[x / 2], x % 2 == 0);
+    let mut on_molecule: Vec<bool> = (0..comp.len()).map(|k| leave[2 * k] == LEFT_OUT).collect();
+    let left_out = on_molecule.iter().filter(|&&x| x).count();
+    let mut cover = Vec::new();
+    // linear ones first, each from an end the graph stops at to the next such end
+    for stop in 0..2 * comp.len() {
+        if leave[stop] != usize::MAX || on_molecule[stop / 2] {
+            continue;
+        }
+        let (mut x, mut taken) = (stop ^ 1, Vec::new());
+        on_molecule[x / 2] = true;
+        while leave[x] != usize::MAX {
+            taken.push(leave[x]);
+            let entered = *br[leave[x]].walk.last().expect("a bridge has anchors");
+            x = end(entered).expect("a bridge of the component");
+            on_molecule[x / 2] = true;
+        }
+        cover.push(Found { start: oriented(stop ^ 1), bridges: taken, circular: false });
+    }
+    for k in 0..comp.len() {
+        if on_molecule[k] {
+            continue;
+        }
+        let (mut x, mut taken) = (2 * k, Vec::new());
+        loop {
+            on_molecule[x / 2] = true;
+            taken.push(leave[x]);
+            let entered = *br[leave[x]].walk.last().expect("a bridge has anchors");
+            x = end(entered).expect("a bridge of the component");
+            if x == 2 * k {
+                break;
+            }
+        }
+        cover.push(Found { start: (comp[k], true), bridges: taken, circular: true });
+    }
+    debug_assert_eq!(m.molecules, cover.len() + left_out);
+    debug_assert_eq!(m.uses_incomplete, cover.iter().flat_map(|f| &f.bridges).any(|&i| br[i].weak || br[i].topological));
+    if cover.is_empty() {
+        return None;
+    }
+    let open: Vec<&Vec<usize>> = leaving.iter().filter(|l| l.len() > 1).collect();
+    let decided = open
+        .iter()
+        .filter(|l| {
+            let p: Vec<f64> = l.iter().map(|&i| probability(i)).collect();
+            p.iter().copied().fold(f64::NEG_INFINITY, f64::max) - p.iter().copied().fold(f64::INFINITY, f64::min) > 1e-9
+        })
+        .count();
+    let stats = PriorCover {
+        cover: CoverReport { score: 0.0, molecules: Vec::new(), weak_bridges: 0, topological_bridges: 0, copy_deviation: 0, read_support: None },
+        ends: leave.iter().filter(|&&i| i < LEFT_OUT).count(),
+        open_ends: open.len(),
+        decided_ends: decided,
+        expected_correct_ends: m.expected,
+        equally_good: m.equally_good,
+        matchings_examined: m.examined,
+    };
+    Some((cover, stats))
+}
+
 /// One key for a path and its reverse complement, and for every rotation of a circle.
 fn canonical_key(walk: &[Oriented], circular: bool) -> Vec<Oriented> {
     let rc = rc_walk(walk);
@@ -1994,6 +2187,10 @@ pub struct ComponentReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub read_copies_added: Vec<String>,
     pub alternatives: Vec<CoverReport>,
+    /// With a `BridgePrior`: the closed cover it takes among those the reads rank alike. Not
+    /// among `candidates`: it is built, not searched, so a truncated search does not miss it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_cover: Option<PriorCover>,
 }
 
 /// Summarize only ranked components; unplaced/skipped fragments have no ranking.
@@ -2236,7 +2433,7 @@ pub fn run(
     out_partial: Option<&Path>,
     out_json: &Path,
 ) -> Result<LinearizeReport> {
-    run_phased(gfa, evidence, p, out_fasta, out_partial, out_json, None, None)
+    run_inner(gfa, evidence, p, out_fasta, out_partial, out_json, None, None, None)
 }
 
 pub fn run_phased(
@@ -2248,6 +2445,36 @@ pub fn run_phased(
     out_json: &Path,
     phase_report: Option<&Path>,
     out_candidate: Option<&Path>,
+) -> Result<LinearizeReport> {
+    run_inner(gfa, evidence, p, out_fasta, out_partial, out_json, phase_report, out_candidate, None)
+}
+
+/// `run`, and per component the closed cover `prior` takes among those the reads rank alike
+/// (`ComponentReport::prior_cover`). The search, its ranking and the files are as `run` gives
+/// them.
+pub(crate) fn run_with_prior(
+    gfa: &Path,
+    evidence: &Path,
+    p: LinearizeParams,
+    out_fasta: &Path,
+    out_partial: Option<&Path>,
+    out_json: &Path,
+    prior: &BridgePrior,
+) -> Result<LinearizeReport> {
+    run_inner(gfa, evidence, p, out_fasta, out_partial, out_json, None, None, Some(prior))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
+    gfa: &Path,
+    evidence: &Path,
+    p: LinearizeParams,
+    out_fasta: &Path,
+    out_partial: Option<&Path>,
+    out_json: &Path,
+    phase_report: Option<&Path>,
+    out_candidate: Option<&Path>,
+    prior: Option<&BridgePrior>,
 ) -> Result<LinearizeReport> {
     let partial_fasta = out_partial.map_or_else(|| partial_fasta_path(out_fasta), Path::to_path_buf);
     let configuration_path = configuration_fasta_path(out_fasta);
@@ -2493,6 +2720,7 @@ pub fn run_phased(
             decisive: false,
             tails_cut: Vec::new(),
             read_copies_added: Vec::new(),
+            prior_cover: None,
             alternatives: Vec::new(),
         };
         if rep.skipped {
@@ -2717,6 +2945,22 @@ pub fn run_phased(
             rep.best = Some(best);
         }
         rep.alternatives = it.take(p.max_alternatives).map(|(_, c, _)| c).collect();
+        if let Some(prior) = prior {
+            if let Some((cover, mut taken)) = prior_cover(&comp, &optional, &br, &frac, &expected, prior) {
+                let (mut walks, mut report) = cover_report(&cover)?;
+                // tandem units as often as single reads cross them, as for `best`
+                for (walk, molecule) in walks.iter_mut().zip(report.molecules.iter_mut()) {
+                    if let Some((laid, _, closed)) = lay_read_copies(&g, walk, molecule.circular, &read_copies, &graph_next, &indexed_overlaps) {
+                        molecule.circular |= closed;
+                        molecule.length = spelled_length(&g, &laid, molecule.circular, &indexed_overlaps)?;
+                        molecule.path = label(&laid);
+                        *walk = laid;
+                    }
+                }
+                taken.cover = report;
+                rep.prior_cover = Some(taken);
+            }
+        }
         comps.push(rep);
     }
     // An anchor no bridge reaches is still assembled sequence of the genome: where the reads
@@ -2808,6 +3052,7 @@ pub fn run_phased(
             decisive: false,
             tails_cut: Vec::new(),
             read_copies_added: Vec::new(),
+            prior_cover: None,
             alternatives: Vec::new(),
         });
     }
@@ -4190,6 +4435,131 @@ mod tests {
     }
 
     /// Linearize a GFA and evidence report given as text and JSON.
+    /// A and C enter repeat R, B and D leave it, B leads on to C and D back to A: one circle
+    /// A R B C R D, or two, A R D and C R B. `phased`: reads across R.
+    fn prior_run(phased: &[(&str, u64)], prior: &[(&str, f64)], dir_name: &str) -> LinearizeReport {
+        let s = |n, seed| String::from_utf8(seq(n, seed)).unwrap();
+        let gfa = format!(
+            "H\tVN:Z:1.0\nS\tA\t{}\nS\tB\t{}\nS\tC\t{}\nS\tD\t{}\nS\tR\t{}\n\
+             L\tA\t+\tR\t+\t0M\nL\tC\t+\tR\t+\t0M\nL\tR\t+\tB\t+\t0M\nL\tR\t+\tD\t+\t0M\n\
+             L\tB\t+\tC\t+\t0M\nL\tD\t+\tA\t+\t0M\n",
+            s(400, 1),
+            s(300, 2),
+            s(350, 3),
+            s(250, 4),
+            s(120, 5)
+        );
+        let ev = json!({
+            "repeat_segments": ["R"],
+            "segment_depths": {"A": 50.0, "B": 50.0, "C": 50.0, "D": 50.0, "R": 100.0},
+            "median_depth": 50.0,
+            "phased_paths": phased.iter().map(|(p, n)| json!({"path": p, "reads": n})).collect::<Vec<_>>(),
+            "links": [{"from": "B+", "to": "C+", "reads": 20}, {"from": "D+", "to": "A+", "reads": 20}],
+        });
+        let dir = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.gfa"), &gfa).unwrap();
+        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
+        let g = parse_gfa(&dir.join("g.gfa")).unwrap();
+        let index: FxHashMap<&str, usize> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        let prior = BridgePrior {
+            probability: prior
+                .iter()
+                .map(|(labels, p)| (labels.split(' ').map(|l| parse_label(&index, l).unwrap()).collect(), *p))
+                .collect(),
+        };
+        let params = LinearizeParams { min_reads: 2, max_steps: 1_000_000, adaptive_steps: false, max_molecules: 4, max_alternatives: 10, optional_below: 0.5 };
+        let r = run_with_prior(&dir.join("g.gfa"), &dir.join("e.json"), params, &dir.join("m.fa"), None, &dir.join("l.json"), &prior).unwrap();
+        // the bridges a caller weighs are the solver's own
+        let (_, repeat, views) = open_bridges(&dir.join("g.gfa"), &dir.join("e.json"), 2).unwrap();
+        assert_eq!(repeat, vec![false, false, false, false, true]);
+        assert!(views.iter().any(|b| b.walk.len() == 2 && !b.topological && !b.weak && b.reads == 20));
+        assert!(views.iter().all(|b| !repeat[b.walk[0].0] && !repeat[b.walk[b.walk.len() - 1].0]));
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    #[test]
+    fn a_prior_takes_one_of_the_covers_reads_leave_open() {
+        // no read crosses R: the search's representative is the cover with the fewest molecules
+        let two_circles = [("A+ R+ B+", 0.1), ("A+ R+ D+", 0.9), ("C+ R+ B+", 0.9), ("C+ R+ D+", 0.1)];
+        let r = prior_run(&[], &two_circles, "ovasm-prior-open");
+        let c = &r.components[0];
+        assert_eq!(c.best.as_ref().unwrap().molecules.len(), 1);
+        assert!(!c.decisive);
+        let p = c.prior_cover.as_ref().unwrap();
+        assert_eq!(p.cover.molecules.len(), 2);
+        assert!(p.cover.molecules.iter().all(|m| m.circular && m.length == 770), "{:?}", p.cover.molecules.iter().map(|m| &m.path).collect::<Vec<_>>());
+        assert_eq!((p.ends, p.open_ends, p.decided_ends, p.equally_good), (8, 4, 2, 1));
+        // A+ and C+ at 0.9, their bridges' other ends unknown to the prior (1/2), the two read links 1 at each end
+        assert!((p.expected_correct_ends - 6.8).abs() < 1e-9, "{}", p.expected_correct_ends);
+        assert_eq!(p.cover.topological_bridges, 2);
+        // a prior that tells nothing apart: the fewest molecules of the tied covers, as the search
+        let r = prior_run(&[], &[], "ovasm-prior-flat");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!((p.cover.molecules.len(), p.decided_ends, p.equally_good), (1, 0, 2));
+        assert_eq!(p.cover.molecules[0].length, 400 + 120 + 300 + 350 + 120 + 250);
+    }
+
+    #[test]
+    fn a_prior_never_outranks_what_reads_measured() {
+        let two_circles = [("A+ R+ B+", 0.1), ("A+ R+ D+", 0.9), ("C+ R+ B+", 0.9), ("C+ R+ D+", 0.1)];
+        // few reads across R: the unread pairings stay possible, but a cover of read bridges comes first
+        let r = prior_run(&[("A+ R+ B+", 3), ("C+ R+ D+", 4)], &two_circles, "ovasm-prior-few");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!((p.cover.molecules.len(), p.cover.topological_bridges), (1, 0));
+        // many reads: the unread pairings are no bridges at all
+        let r = prior_run(&[("A+ R+ B+", 30), ("C+ R+ D+", 20)], &two_circles, "ovasm-prior-many");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!((p.cover.molecules.len(), p.open_ends, p.equally_good), (1, 0, 1));
+        assert_eq!(p.cover.molecules[0].path, r.components[0].best.as_ref().unwrap().molecules[0].path);
+    }
+
+    #[test]
+    fn a_prior_cover_leaves_a_shallow_anchor_out_and_ends_where_the_graph_stops() {
+        let s = |n, seed| String::from_utf8(seq(n, seed)).unwrap();
+        let params = LinearizeParams { min_reads: 2, max_steps: 1_000_000, adaptive_steps: false, max_molecules: 4, max_alternatives: 10, optional_below: 0.5 };
+        let solve = |gfa: &str, ev: Value, name: &str| {
+            let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("g.gfa"), gfa).unwrap();
+            std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
+            let prior = BridgePrior { probability: FxHashMap::default() };
+            let r = run_with_prior(&dir.join("g.gfa"), &dir.join("e.json"), params, &dir.join("m.fa"), None, &dir.join("l.json"), &prior).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            r
+        };
+        // A and B in a circle, with a shallow segment o between them on a second way
+        let gfa = format!(
+            "H\tVN:Z:1.0\nS\tA\t{}\nS\tB\t{}\nS\to\t{}\nL\tA\t+\to\t+\t0M\nL\to\t+\tB\t+\t0M\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tA\t+\t0M\n",
+            s(400, 1),
+            s(300, 2),
+            s(200, 3)
+        );
+        let ev = json!({"repeat_segments": [], "segment_depths": {"A": 50.0, "B": 50.0, "o": 10.0}, "median_depth": 50.0, "phased_paths": [],
+            "links": [{"from": "A+", "to": "o+", "reads": 5}, {"from": "o+", "to": "B+", "reads": 5},
+                {"from": "A+", "to": "B+", "reads": 40}, {"from": "B+", "to": "A+", "reads": 45}]});
+        let r = solve(&gfa, ev, "ovasm-prior-optional");
+        assert_eq!(r.optional_anchors, vec!["o".to_string()]);
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!(p.cover.molecules.len(), 1);
+        assert_eq!((p.cover.molecules[0].length, p.cover.molecules[0].circular, p.ends), (700, true, 4));
+        // A, B and C in a row: the graph stops at both ends, and the cover is that one linear molecule
+        let gfa = format!(
+            "H\tVN:Z:1.0\nS\tA\t{}\nS\tB\t{}\nS\tC\t{}\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\n",
+            s(400, 1),
+            s(300, 2),
+            s(200, 3)
+        );
+        let ev = json!({"repeat_segments": [], "segment_depths": {"A": 50.0, "B": 50.0, "C": 50.0}, "median_depth": 50.0, "phased_paths": [],
+            "links": [{"from": "A+", "to": "B+", "reads": 40}, {"from": "B+", "to": "C+", "reads": 45}]});
+        let r = solve(&gfa, ev, "ovasm-prior-linear");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!(p.cover.molecules.len(), 1);
+        assert_eq!((p.cover.molecules[0].length, p.cover.molecules[0].circular, p.ends), (900, false, 4));
+        assert!(["A+ B+ C+", "C- B- A-"].contains(&p.cover.molecules[0].path.as_str()), "{}", p.cover.molecules[0].path);
+    }
+
     fn run_graph(gfa: &str, ev: Value, dir_name: &str) -> LinearizeReport {
         let dir = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

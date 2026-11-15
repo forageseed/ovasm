@@ -32,6 +32,30 @@ struct Walk {
     sequence: Vec<u8>,
     circular: bool,
     trusted_prior: bool,
+    /// Junction evidence (`pan_posterior`): offsets where the walk's own graph branches, so
+    /// that its reads did not decide what follows what across them. Empty for a walk its reads
+    /// decided throughout; `uj:Z:` (written by `pan merge` from the sample's graph) for a walk
+    /// tagged unresolved; None for a walk that is no evidence of junctions at all (reference
+    /// fill, external intervals, an unresolved walk of a graph merged before `uj` existed).
+    cuts: Option<Vec<usize>>,
+}
+
+/// A path tag that leaves a walk usable as junction evidence inside its decided stretches.
+fn junction_evidence_tag(t: &str) -> bool {
+    t == "st:Z:unresolved_configuration"
+        || t == "up:Z:unresolved"
+        || !(t.starts_with("rf:") || t.starts_with("up:") || t.starts_with("st:"))
+}
+
+/// The offsets of a `uj:Z:` tag: `-` for none, else a comma-separated list.
+fn parse_cuts(value: &str) -> Result<Vec<usize>> {
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|x| x.parse::<usize>().with_context(|| format!("invalid uj:Z: offset {x:?}")))
+        .collect()
 }
 
 struct Reference {
@@ -105,6 +129,15 @@ impl Reference {
             sources.insert(f[1].split('#').next().unwrap().to_string());
             let trusted_prior = !f[4..].iter().any(|t| t.starts_with("rf:") || t.starts_with("up:") || *t == "st:Z:unresolved_configuration" || *t == "st:Z:reference_fill" || *t == "st:Z:external_walk_interval" || *t == "st:Z:reference_backbone_only")
                 && steps.iter().all(|(id, _)| !inferred_segments.contains(graph.names[*id].as_str()));
+            let cuts = if trusted_prior {
+                Some(Vec::new())
+            } else if f[4..].iter().all(|t| junction_evidence_tag(t))
+                && steps.iter().all(|(id, _)| !inferred_segments.contains(graph.names[*id].as_str()))
+            {
+                f[4..].iter().find_map(|t| t.strip_prefix("uj:Z:")).map(parse_cuts).transpose()?
+            } else {
+                None
+            };
             walks.push(Walk {
                 name: f[1].into(),
                 steps,
@@ -112,6 +145,7 @@ impl Reference {
                 sequence,
                 circular,
                 trusted_prior,
+                cuts,
             });
         }
         if walks.is_empty() {
@@ -145,6 +179,23 @@ impl Reference {
 
     fn stored_bases(&self) -> u64 {
         self.graph.seqs.iter().map(|s| s.len() as u64).sum()
+    }
+
+    /// The other individuals' walks that are evidence of junctions (`Walk::cuts`), for
+    /// `pan_posterior`: never the sample's own.
+    fn panel(&self, sample: &str) -> Vec<crate::pan_posterior::PanelWalk> {
+        self.walks
+            .iter()
+            .filter(|w| w.name.split('#').next() != Some(sample))
+            .filter_map(|w| {
+                Some(crate::pan_posterior::PanelWalk {
+                    run: w.name.split('#').next().unwrap_or("").to_string(),
+                    sequence: w.sequence.clone(),
+                    circular: w.circular,
+                    cuts: w.cuts.clone()?,
+                })
+            })
+            .collect()
     }
 
     fn add_bait(&self, bait: &mut BaitSet, name: &str, out: &Path) -> Result<Value> {
@@ -932,23 +983,43 @@ fn configurations(
     prior_reads: &BTreeMap<String, Vec<PathBuf>>,
     target_hifi: &[PathBuf],
     target_hifi_strength: bool,
+    panel: &[crate::pan_posterior::PanelWalk],
 ) -> Result<(Value, Option<Representative>)> {
     let d = dir.join("de-novo");
-    let mut rep = crate::linearize::run(
-        &d.join("assembly.gfa"),
-        &d.join("evidence.json"),
-        crate::linearize::LinearizeParams {
-            min_reads: 2,
-            max_steps: 5_000_000,
-            adaptive_steps: true,
-            max_molecules: 0,
-            max_alternatives: MAX_CONFIGURATIONS,
-            optional_below: 0.5,
-        },
-        &d.join("configurations.best.fasta"),
-        Some(&d.join("configurations.partial.fasta")),
-        &d.join("configurations.json"),
-    )?;
+    // What the panel says of every bridge the reads leave open (`pan_posterior`): the
+    // configuration it supports best is built by `linearize` beside the covers it searches.
+    let (bridge_graph, bridge_repeat, bridge_views) =
+        crate::linearize::open_bridges(&d.join("assembly.gfa"), &d.join("evidence.json"), 2)?;
+    let bridge_walks: Vec<Vec<Oriented>> = bridge_views.iter().map(|b| b.walk.clone()).collect();
+    let sites = if dir.join("genotypes.tsv").exists() {
+        crate::pan_posterior::read_genotypes(&dir.join("genotypes.tsv"))?
+    } else {
+        Vec::new()
+    };
+    let posterior = (!panel.is_empty()).then(|| crate::pan_posterior::posterior(&bridge_graph, &bridge_walks, panel, &sites));
+    let bridge_prior = crate::linearize::BridgePrior {
+        probability: posterior
+            .as_ref()
+            .map(|p| bridge_walks.iter().cloned().zip(p.probability.iter().copied()).collect())
+            .unwrap_or_default(),
+    };
+    let solve = |params: crate::linearize::LinearizeParams| {
+        let (fasta, partial, report) =
+            (d.join("configurations.best.fasta"), d.join("configurations.partial.fasta"), d.join("configurations.json"));
+        if posterior.is_some() {
+            crate::linearize::run_with_prior(&d.join("assembly.gfa"), &d.join("evidence.json"), params, &fasta, Some(&partial), &report, &bridge_prior)
+        } else {
+            crate::linearize::run(&d.join("assembly.gfa"), &d.join("evidence.json"), params, &fasta, Some(&partial), &report)
+        }
+    };
+    let mut rep = solve(crate::linearize::LinearizeParams {
+        min_reads: 2,
+        max_steps: 5_000_000,
+        adaptive_steps: true,
+        max_molecules: 0,
+        max_alternatives: MAX_CONFIGURATIONS,
+        optional_below: 0.5,
+    })?;
     // For compact graphs, attempt every possible cover size after the automatic envelope.
     // Keep the same hard per-size search budget and expose any truncation; a 12-anchor cap
     // prevents this retry from silently multiplying work on large organelles.
@@ -958,13 +1029,8 @@ fn configurations(
         && max_anchors > 0 && max_anchors <= 12
     {
         eprintln!("[ovasm] reconstruct {organelle}: expanding compact-graph cover search to {max_anchors} molecules");
-        rep = crate::linearize::run(
-            &d.join("assembly.gfa"), &d.join("evidence.json"),
-            crate::linearize::LinearizeParams { min_reads: 2, max_steps: 5_000_000, adaptive_steps: false,
-                max_molecules: max_anchors, max_alternatives: MAX_CONFIGURATIONS, optional_below: 0.5 },
-            &d.join("configurations.best.fasta"), Some(&d.join("configurations.partial.fasta")),
-            &d.join("configurations.json"),
-        )?;
+        rep = solve(crate::linearize::LinearizeParams { min_reads: 2, max_steps: 5_000_000, adaptive_steps: false,
+            max_molecules: max_anchors, max_alternatives: MAX_CONFIGURATIONS, optional_below: 0.5 })?;
     }
     let repeats: BTreeSet<String> = rep.repeats.iter().cloned().collect();
     // the component holding most of the organelle
@@ -973,8 +1039,11 @@ fn configurations(
     }) else {
         return Ok((json!({"configurations": 0, "reason": "no component"}), None));
     };
-    let covers: Vec<_> = component.best.iter().chain(&component.alternatives).collect();
-    let candidate_list_limited = component.candidates > covers.len();
+    // The panel's cover, where the panel tells bridges apart, goes first: it is built from the
+    // bridges, so it is there even when the search above stopped at its budget.
+    let pan_cover = component.prior_cover.as_ref().filter(|c| c.decided_ends > 0);
+    let covers: Vec<_> = pan_cover.iter().map(|c| &c.cover).chain(component.best.iter()).chain(&component.alternatives).collect();
+    let candidate_list_limited = component.candidates + usize::from(pan_cover.is_some()) > covers.len();
     // segments of the organelle graph by the assembly segment they came from, in order
     let text = fs::read_to_string(gfa_out)?;
     let sample = text
@@ -1036,7 +1105,9 @@ fn configurations(
     // what the GFA walk spells))
     type Molecule<'a> = (&'a crate::linearize::Linearization, Vec<(String, bool)>, Vec<String>, Vec<u8>, usize);
     let mut found: Vec<(f64, f64, usize, Vec<Molecule>)> = Vec::new();
-    'covers: for cover in covers {
+    // where the panel's cover is among `found`
+    let mut pan_found: Option<usize> = None;
+    'covers: for (cover_index, cover) in covers.into_iter().enumerate() {
         let mut key = Vec::new();
         let mut molecules = Vec::new();
         for m in &cover.molecules {
@@ -1068,6 +1139,9 @@ fn configurations(
         }
         key.sort();
         if seen.insert(key) {
+            if cover_index == 0 && pan_cover.is_some() {
+                pan_found = Some(found.len());
+            }
             found.push((cover.score, cover.ranked_score(), cover.copy_deviation, molecules));
         }
     }
@@ -1168,6 +1242,12 @@ fn configurations(
     // Scores at 1e-9 resolution are tied; linked reads then break ties without adding
     // a second likelihood for the same reads. Remaining ties use deterministic order.
     order.sort_by(|&a, &b| rank_keys[b].cmp(&rank_keys[a]).then(a.cmp(&b)));
+    // The panel's cover is configuration 1: among the covers the reads rank alike it has the
+    // greatest expected number of correctly joined anchor ends, whatever the search listed.
+    if let Some(pc) = pan_found {
+        order.retain(|&c| c != pc);
+        order.insert(0, pc);
+    }
     // A circular representative may replace an incomplete result only when its
     // rank ties the best candidate, regardless of the other candidates' topology.
     let all_major_circular: Vec<bool> = found.iter().map(|(_, _, _, molecules)| {
@@ -1176,22 +1256,31 @@ fn configurations(
             .collect();
         !major.is_empty() && major.iter().all(|m| m.0.circular)
     }).collect();
-    let circular_candidate = best_ranked_circular(&order, &rank_keys, &all_major_circular);
+    // The panel's cover is the representative whatever its molecules' topology: it is linear
+    // only where the graph stops (`final_outputs` joins it as the de novo molecule was joined).
+    let circular_candidate = pan_found.or_else(|| best_ranked_circular(&order, &rank_keys, &all_major_circular));
     let mut circular: Option<Representative> = None;
     for (rank, &c) in order.iter().enumerate() {
         let (score, target_rank_score, copy_deviation, molecules) = &found[c];
         let n = rank + 1;
         let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
         if circular_candidate == Some(c) {
+            let panel_choice = pan_cover.filter(|_| pan_found == Some(c)).map(|p| PanChoice {
+                expected_fraction: p.expected_correct_ends / p.ends.max(1) as f64,
+                open_ends: p.open_ends,
+                decided_ends: p.decided_ends,
+                equally_good: p.equally_good,
+            });
             circular = Some(Representative {
                 configuration: n,
-                equally_ranked: tie_counts[&rank_keys[c]],
+                equally_ranked: panel_choice.as_ref().map_or(tie_counts[&rank_keys[c]], |p| usize::try_from(p.equally_good).unwrap_or(usize::MAX)),
                 pieces: big.len(),
                 molecules: molecules
                     .iter()
                     .enumerate()
                     .map(|(j, m)| (format!("{sample}_configuration{n}#1#{short}.{}", j + 1), m.3.clone(), m.0.circular))
                     .collect(),
+                panel: panel_choice,
             });
         }
         let runs = &prior.runs_with_all[c];
@@ -1263,6 +1352,8 @@ fn configurations(
         "target_hifi_evidence": target_report, "target_hifi_ranking_method": if target_hifi.is_empty() { "none" } else if target_hifi_strength { "mean_log1p_read_count" } else { "pairing_presence_at_least_3_reads" }, "ranking_basis": if target_hifi.is_empty() { "combined target and pan heuristic score, then panel linked-walk tiebreak" } else { "target short-read graph score, then selected same-individual HiFi score, then pan combined score and linked-walk tiebreak; heuristic, not a posterior" }, "prior_read_evidence": read_reports, "prior_read_origin_certified": false, "prior_nuclear_competition": "not performed by this reconstruction; recruited reads may include nuclear organelle insertions or other homologous sequences", "joint_evidence_truncated": joint_evidence_truncated, "joint_evidence_limit": joint_evidence_limit, "joint_tiebreak_basis": "At equal combined score to 1e-9, count samples with at least three reads supporting a single chain spanning two or more repeat nodes. This is an uncalibrated tiebreak, not independent evidence multiplied into relative weights.", "prior_scoring": "reference paths excluding read-prior sample labels plus read-backed presence mean", "reference_path_runs_excluded_for_read_prior": ref_names.iter().map(|n| n.split('#').next().unwrap_or("")).filter(|n| prior_reads.contains_key(*n)).collect::<BTreeSet<_>>(),
         "weight_interpretation": "Normalized heuristic weights within enumerated candidates, not posterior probabilities. They exclude same-individual HiFi ranking and the linked-walk tiebreak and can disagree with the final ordering. The target score includes copy-number penalties and can include synthetic topological bridge weights; it is not a calibrated data likelihood. The read-backed score is an uncalibrated mean fraction of samples with at least three spanning reads per pairing, added to the target read score with unit weight; samples and pairings may be correlated, absence may reflect low coverage, and the search may be incomplete.",
         "circular_representative": circular.as_ref().map(|r| r.configuration),
+        "panel_configuration": pan_found.map(|_| 1),
+        "pan_posterior": posterior.as_ref().map(|p| pan_posterior_report(&bridge_graph, &bridge_repeat, &bridge_walks, &bridge_views, p, component.prior_cover.as_ref())),
         "basis": "enumerated covers of the anchor graph; the reads do not decide between \
                   them; ranking is reported in ranking_basis and uses heuristic scores; these do not establish target topology"}),
         circular,
@@ -1373,6 +1464,93 @@ struct Representative {
     equally_ranked: usize,
     pieces: usize,
     molecules: Vec<(String, Vec<u8>, bool)>,
+    /// Set when the configuration is the one the reference panel supports best
+    /// (`pan_posterior`), not one the ranking of the searched covers gave.
+    panel: Option<PanChoice>,
+}
+
+/// How far the reference panel supports the configuration it chose.
+struct PanChoice {
+    /// Expected share of correctly joined anchor ends.
+    expected_fraction: f64,
+    /// Anchor ends with more than one bridge to take, and those the panel tells apart.
+    open_ends: usize,
+    decided_ends: usize,
+    /// Configurations the reads and the panel rank as well.
+    equally_good: u64,
+}
+
+/// The panel's posterior as reported: the model's quantities, the closest relatives, the cover
+/// taken and every bridge of an anchor end with more than one.
+fn pan_posterior_report(
+    g: &Graph,
+    repeat: &[bool],
+    walks: &[Vec<Oriented>],
+    views: &[crate::linearize::BridgeView],
+    post: &crate::pan_posterior::Posterior,
+    cover: Option<&crate::linearize::PriorCover>,
+) -> Value {
+    let mut order: Vec<usize> = (0..post.runs.len()).collect();
+    order.sort_by(|&a, &b| post.relative_weights[b].total_cmp(&post.relative_weights[a]).then(a.cmp(&b)));
+    let closest: Vec<Value> = order
+        .iter()
+        .take(5)
+        .map(|&r| json!({"run": post.runs[r], "weight": post.relative_weights[r]}))
+        .collect();
+    // the bridges the cover takes, from its molecules' paths
+    let index: BTreeMap<&[Oriented], usize> = walks.iter().enumerate().map(|(i, w)| (w.as_slice(), i)).collect();
+    let names: BTreeMap<&str, usize> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let mut taken: BTreeSet<usize> = BTreeSet::new();
+    for m in cover.iter().flat_map(|c| &c.cover.molecules) {
+        let steps: Vec<Oriented> = m
+            .path
+            .split_whitespace()
+            .filter_map(|t| {
+                let (name, sign) = t.split_at(t.len().checked_sub(1)?);
+                Some((*names.get(name)?, sign == "+"))
+            })
+            .collect();
+        let at: Vec<usize> = (0..steps.len()).filter(|&i| !repeat[steps[i].0]).collect();
+        for (j, &i) in at.iter().enumerate() {
+            let walk: Vec<Oriented> = match at.get(j + 1) {
+                Some(&k) => steps[i..=k].to_vec(),
+                None if m.circular => steps[i..].iter().chain(&steps[..=at[0]]).copied().collect(),
+                None => continue,
+            };
+            let back: Vec<Oriented> = walk.iter().rev().map(|&o| flip(o)).collect();
+            for w in [walk, back] {
+                if let Some(&b) = index.get(w.as_slice()) {
+                    taken.insert(b);
+                }
+            }
+        }
+    }
+    let mut by_end: BTreeMap<Oriented, Vec<usize>> = BTreeMap::new();
+    for (i, w) in walks.iter().enumerate() {
+        by_end.entry(w[0]).or_default().push(i);
+    }
+    let mut junctions: Vec<Value> = Vec::new();
+    for at in by_end.values().filter(|at| at.len() > 1) {
+        for &i in at {
+            junctions.push(json!({
+                "bridge": walks[i].iter().map(|&o| g.label(o)).collect::<Vec<_>>().join(" "),
+                "probability": post.probability[i], "relatives_share": post.votes[i], "species_frequency": post.frequency[i],
+                "runs_holding": post.runs_holding[i], "runs_informative": post.runs_informative[i],
+                "taken": taken.contains(&i), "reads": views[i].reads,
+                "measured_by_reads": !(views[i].topological || views[i].weak)}));
+        }
+    }
+    json!({
+        "model": "The target's junctions are those of its closest relative in the panel unless they changed since; a changed junction is drawn from the species' frequency. Closest relative: posterior of each run from the target's alleles at the graph's variant sites (mismatch rate integrated under Jeffreys' prior). rho: probability that a junction is as the closest relative has it, the panel's own leave-one-out estimate. Probability of a bridge = rho * relatives_share + (1 - rho) * species_frequency. The cover taken maximizes the expected number of correctly joined anchor ends among the covers the target's reads rank alike (exact maximum-weight perfect matching of the anchor ends). No constant is fitted to results; the reads decide nothing between these configurations.",
+        "panel_runs": post.runs.len(), "variant_sites_called": post.sites, "closest_relatives": closest,
+        "junction_conservation_rho": post.rho, "rho_junctions": post.rho_junctions,
+        "cover": cover.map(|c| json!({"anchor_ends": c.ends, "open_ends": c.open_ends, "ends_decided_by_panel": c.decided_ends,
+            "expected_correct_ends": c.expected_correct_ends, "expected_correct_fraction": c.expected_correct_ends / c.ends.max(1) as f64,
+            "expected_correct_fraction_of_open_ends": (c.open_ends > 0).then(|| (c.expected_correct_ends - (c.ends - c.open_ends) as f64) / c.open_ends as f64),
+            "equally_good_configurations": c.equally_good, "matchings_examined": c.matchings_examined,
+            "molecules": c.cover.molecules.len(), "copy_number_deviation": c.cover.copy_deviation})),
+        "junctions": junctions,
+    })
 }
 
 /// A repeat's copy entered from one step and left to another: (from, repeat, to), as the
@@ -1541,6 +1719,7 @@ fn final_outputs(
     prior_reads: &BTreeMap<String, Vec<PathBuf>>,
     target_hifi: &[PathBuf],
     target_hifi_strength: bool,
+    panel: &[crate::pan_posterior::PanelWalk],
 ) -> Result<Value> {
     let graph = dir.join("de-novo/organelle.gfa");
     let fasta = dir.join("de-novo/molecules.fasta");
@@ -1564,6 +1743,9 @@ fn final_outputs(
     let mut closure = Value::Null;
     let mut reference_fill = Value::Null;
     let mut reference_bp = 0usize;
+    // a join made for the single linear molecule: (the molecule before it, the bases joined in,
+    // the header's note, by read pairs?)
+    let mut applied_join: Option<(Vec<u8>, Vec<u8>, String, bool)> = None;
     if let [i] = pieces[..] {
         if !circular[i] {
             eprintln!("[ovasm] reconstruct {organelle}: closing the linear molecule with read pairs");
@@ -1604,6 +1786,7 @@ fn final_outputs(
                         if how == "reference_fill" {
                             reference_bp = fill.len();
                         }
+                        applied_join = Some((molecules[i].1.clone(), fill.clone(), note.clone(), how == "read_pairs"));
                         let (h, s) = &mut molecules[i];
                         s.extend_from_slice(&fill);
                         let renamed = h
@@ -1672,7 +1855,7 @@ fn final_outputs(
     };
     // the reads leave the configuration open: every one the graph allows
     let (configurations_found, chosen) = if should_evaluate_configurations(decisive, pieces.len()) {
-        configurations(dir, out, organelle, &gfa_out, walks, walk_names, prior_reads, target_hifi, target_hifi_strength)?
+        configurations(dir, out, organelle, &gfa_out, walks, walk_names, prior_reads, target_hifi, target_hifi_strength, panel)?
     } else {
         (Value::Null, None)
     };
@@ -1689,16 +1872,61 @@ fn final_outputs(
     // tips beside a repeat (ZM4: two dead-end tips of 177 and 168 bp at its 360 bp repeat).
     // Keep a read-pair or reference-filled closure intact. The candidate enumeration is
     // reported for closed but unresolved graphs, without replacing their sequence.
-    if let Some(r) = chosen.as_ref().filter(|_| was_incomplete) {
+    // The configuration the reference panel supports best is the representative of a closed
+    // graph too: the de novo molecule there is the first cover a search found among covers the
+    // reads rank alike (a held-out Arabidopsis panel of 48: 38% of the junctions the emitted
+    // molecules made were not the individual's, against 2.4% of the panel's), and the panel's
+    // cover is built from the same graph, sequence for sequence. Where the graph stops at two ends the panel's
+    // molecule is linear between them, as the de novo molecule was before read pairs joined
+    // its ends: the same join closes it (it lies between the same two ends). A reference-filled
+    // closure is kept as it is, and so is any result whose join does not fit the panel's
+    // molecule.
+    let mut join_note = String::new();
+    let chosen = match chosen {
+        Some(mut r) if r.panel.is_some() => {
+            let major: Vec<usize> = (0..r.molecules.len()).filter(|&i| r.molecules[i].1.len() as u64 >= pipeline::MIN_PIECE).collect();
+            let linear: Vec<usize> = major.iter().copied().filter(|&i| !r.molecules[i].2).collect();
+            match (&applied_join, linear.as_slice()) {
+                (None, _) => Some(r),
+                (Some((before, fill, note, true)), [i]) if major.len() == 1 => {
+                    let k = 31.min(before.len());
+                    let same = |s: &[u8]| s.len() >= k && s[..k] == before[..k] && s[s.len() - k..] == before[before.len() - k..];
+                    let seq = r.molecules[*i].1.clone();
+                    let turned = revcomp(&seq);
+                    match if same(&seq) { Some(seq) } else if same(&turned) { Some(turned) } else { None } {
+                        Some(mut joined) => {
+                            joined.extend_from_slice(fill);
+                            r.molecules[*i].1 = joined;
+                            r.molecules[*i].2 = true;
+                            join_note = format!(" {note}");
+                            Some(r)
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        other => other.filter(|_| was_incomplete),
+    };
+    if let Some(r) = chosen.as_ref() {
         let total = configurations_found["configurations"].as_u64().unwrap_or(0);
+        let by_panel = r.panel.as_ref().map(|p| {
+            format!(
+                " expected_junction_accuracy={:.3} open_junction_ends={} panel_decided_ends={}{join_note}",
+                p.expected_fraction, p.open_ends, p.decided_ends
+            )
+        });
         let mut text = String::new();
         for (name, seq, circ) in &r.molecules {
             let unplaced = (seq.len() as u64) < pipeline::MIN_PIECE;
             writeln!(
                 text,
-                ">{name} circular={circ} length={} configuration={} of={total} chosen_by=reported_configuration_ranking reads_decide=false{}",
+                ">{name} circular={circ} length={} configuration={} of={total} chosen_by={} reads_decide=false{}{}",
                 seq.len(),
                 r.configuration,
+                if by_panel.is_some() { "pan_posterior" } else { "reported_configuration_ranking" },
+                by_panel.as_deref().unwrap_or(""),
                 if unplaced { " unplaced=true" } else { "" }
             )?;
             for chunk in seq.chunks(80) {
@@ -1709,19 +1937,47 @@ fn final_outputs(
         lengths = r.molecules.iter().map(|m| m.1.len()).collect();
         circular = r.molecules.iter().map(|m| m.2).collect();
         let small = r.molecules.iter().filter(|m| (m.1.len() as u64) < pipeline::MIN_PIECE).count();
-        reasons = vec![format!(
-            "the reads leave the repeat pairings open: configuration {} of {total}, tied for the best reported configuration ranking ({} molecules), is the representative; {} candidates share that score and tiebreak; all are in {organelle}.configurations.fasta",
-            r.configuration, r.pieces, r.equally_ranked
-        )];
+        let earlier = std::mem::take(&mut reasons);
+        reasons = vec![match &r.panel {
+            Some(p) => format!(
+                "the reads leave the repeat pairings open: configuration {} of {total} ({} molecules), the one the reference panel supports best among those the reads rank alike, is the representative (expected share of correctly joined anchor ends {:.3}; the panel tells the bridges apart at {} of {} open ends; {} configurations rank as well); all are in {organelle}.configurations.fasta",
+                r.configuration, r.pieces, p.expected_fraction, p.decided_ends, p.open_ends, p.equally_good
+            ),
+            None => format!(
+                "the reads leave the repeat pairings open: configuration {} of {total}, tied for the best reported configuration ranking ({} molecules), is the representative; {} candidates share that score and tiebreak; all are in {organelle}.configurations.fasta",
+                r.configuration, r.pieces, r.equally_ranked
+            ),
+        }];
         if small > 0 {
             reasons.push(format!("{small} piece(s) under {} bp not placed: the graph's short dead-end tips", pipeline::MIN_PIECE));
         }
         if !k_accepted {
             reasons.push("no short-read k attempt met its assembly acceptance and read-covered reference retry floor".to_string());
         }
-        status = "circular_configuration_chosen".to_string();
-        representative = json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
-            "chosen_by": "best reported configuration ranking, with circular major molecules"});
+        let closed = r.molecules.iter().filter(|m| m.1.len() as u64 >= pipeline::MIN_PIECE).all(|m| m.2);
+        status = match (&r.panel, closed) {
+            (Some(_), true) => "pan_configuration_chosen",
+            // the graph stops at ends no bridge leaves and no read pair joins: the panel's
+            // molecule is as incomplete as the de novo one, for the same reasons
+            (Some(_), false) => {
+                for reason in earlier {
+                    if !reasons.contains(&reason) {
+                        reasons.push(reason);
+                    }
+                }
+                "incomplete"
+            }
+            (None, _) => "circular_configuration_chosen",
+        }
+        .to_string();
+        representative = match &r.panel {
+            Some(p) => json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
+                "chosen_by": "pan_posterior: the configuration the reference panel supports best among those the target's reads rank alike",
+                "expected_junction_accuracy": p.expected_fraction, "open_junction_ends": p.open_ends, "panel_decided_ends": p.decided_ends,
+                "replaced_closed_de_novo_molecule": !was_incomplete}),
+            None => json!({"configuration": r.configuration, "circular_molecules": r.pieces, "equally_ranked_candidates": r.equally_ranked,
+                "chosen_by": "best reported configuration ranking, with circular major molecules"}),
+        };
     }
     // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
     let uncertain = if fasta_out.exists() {
@@ -1740,6 +1996,8 @@ fn final_outputs(
             status = "closed_length_uncertain".to_string();
         } else if status == "closed_configuration_uncertain" {
             status = "closed_configuration_and_length_uncertain".to_string();
+        } else if status == "pan_configuration_chosen" {
+            status = "pan_configuration_chosen_length_uncertain".to_string();
         }
         reasons.push("reads do not establish lengths of all repeat regions".to_string());
         // Keep uncertainty when a FASTA, rather than its JSON sidecar, is passed to
@@ -2130,7 +2388,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             let walks: Vec<(Vec<u8>, bool)> =
                 r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| (w.sequence.clone(), w.circular)).collect();
             let names: Vec<String> = r.walks.iter().filter(|w| independent_prior(w, &cfg.sample)).map(|w| w.name.clone()).collect();
-            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names, cfg.prior_reads.get(o).unwrap_or(&BTreeMap::new()), cfg.target_hifi.get(o).map(Vec::as_slice).unwrap_or(&[]), cfg.target_hifi_strength)?
+            final_outputs(&dir, &cfg.out, o, &de_novo, &reads, &walks, &names, cfg.prior_reads.get(o).unwrap_or(&BTreeMap::new()), cfg.target_hifi.get(o).map(Vec::as_slice).unwrap_or(&[]), cfg.target_hifi_strength, &r.panel(&cfg.sample))?
         } else {
             json!({"status":"failed","reasons":["de novo assembly failed"]})
         };
@@ -2179,6 +2437,100 @@ pub fn run(cfg: &Config) -> Result<Value> {
         bail!("de novo target assembly failed; reconstruction.json preserves errors and partial graph evidence");
     }
     Ok(result)
+}
+
+/// `ovasm solve pan-configuration`: an assembly graph, its evidence report and a reference
+/// graph, without the reads.
+pub struct ChooseConfig {
+    pub gfa: PathBuf,
+    pub evidence: PathBuf,
+    pub reference: PathBuf,
+    /// `genotypes.tsv` of the individual against the reference graph; without it the panel's
+    /// runs count alike.
+    pub genotypes: Option<PathBuf>,
+    pub sample: String,
+    pub out_fasta: PathBuf,
+    pub out_json: PathBuf,
+}
+
+/// The configuration of an assembly graph that the reference graph's panel supports best among
+/// those the reads rank alike (`pan_posterior`), as `pan reconstruct` takes it, from files a
+/// reconstruction left: its molecules as FASTA and the panel's posterior as JSON. A component
+/// the panel says nothing about keeps the cover `linearize` ranks first.
+pub fn choose_configuration(cfg: &ChooseConfig) -> Result<Value> {
+    if cfg.sample.is_empty() || cfg.sample.contains(['#', '\t', '\n', ' ']) {
+        bail!("sample must be a nonempty PanSN field");
+    }
+    let reference = Reference::read(&cfg.reference)?;
+    let panel = reference.panel(&cfg.sample);
+    let (g, repeat, views) = crate::linearize::open_bridges(&cfg.gfa, &cfg.evidence, 2)?;
+    let walks: Vec<Vec<Oriented>> = views.iter().map(|b| b.walk.clone()).collect();
+    let sites = match &cfg.genotypes {
+        Some(p) => crate::pan_posterior::read_genotypes(p)?,
+        None => Vec::new(),
+    };
+    let post = crate::pan_posterior::posterior(&g, &walks, &panel, &sites);
+    let prior = crate::linearize::BridgePrior {
+        probability: walks.iter().cloned().zip(post.probability.iter().copied()).collect(),
+    };
+    let beside = |ext: &str| PathBuf::from(format!("{}.{ext}", cfg.out_json.with_extension("").display()));
+    // the panel's cover is built from the bridges: the search beside it needs no large budget
+    let rep = crate::linearize::run_with_prior(
+        &cfg.gfa,
+        &cfg.evidence,
+        crate::linearize::LinearizeParams { min_reads: 2, max_steps: 200_000, adaptive_steps: false, max_molecules: 0, max_alternatives: 0, optional_below: 0.5 },
+        &beside("search.fasta"),
+        Some(&beside("search.partial.fasta")),
+        &beside("search.json"),
+        &prior,
+    )?;
+    let names: BTreeMap<&str, usize> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let (mut fasta, mut components, mut n) = (String::new(), Vec::new(), 0usize);
+    for c in &rep.components {
+        let (cover, by) = match (&c.prior_cover, &c.best) {
+            (Some(p), _) if p.decided_ends > 0 => (&p.cover, "pan_posterior"),
+            (_, Some(b)) => (b, "reads_then_search_order"),
+            _ => continue,
+        };
+        for m in &cover.molecules {
+            n += 1;
+            let walk: Vec<Oriented> = m
+                .path
+                .split_whitespace()
+                .map(|t| {
+                    let (name, sign) = t.split_at(t.len() - 1);
+                    names.get(name).map(|&i| (i, sign == "+")).with_context(|| format!("unknown segment {name}"))
+                })
+                .collect::<Result<_>>()?;
+            let seq = crate::linearize::spell(&g, &walk, m.circular)?;
+            writeln!(
+                fasta,
+                ">{}#1#{n} circular={} length={} path={} chosen_by={by} reads_decide=false",
+                cfg.sample,
+                m.circular,
+                seq.len(),
+                m.path.replace(' ', ",")
+            )?;
+            for chunk in seq.chunks(80) {
+                writeln!(fasta, "{}", std::str::from_utf8(chunk)?)?;
+            }
+        }
+        components.push(json!({"anchors": c.anchors.len(), "chosen_by": by, "molecules": cover.molecules.len(),
+            "search_truncated": c.search_truncated, "covers_searched": c.candidates,
+            "panel_cover": c.prior_cover.as_ref().map(|p| json!({"anchor_ends": p.ends, "open_ends": p.open_ends,
+                "ends_decided_by_panel": p.decided_ends, "expected_correct_ends": p.expected_correct_ends,
+                "equally_good_configurations": p.equally_good, "matchings_examined": p.matchings_examined}))}));
+    }
+    fs::write(&cfg.out_fasta, fasta)?;
+    let largest = rep.components.iter().filter_map(|c| c.prior_cover.as_ref()).max_by_key(|p| p.ends);
+    let report = json!({"tool": "ovasm solve pan-configuration", "sample": cfg.sample, "graph": cfg.gfa, "evidence": cfg.evidence,
+        "reference": cfg.reference, "genotypes": cfg.genotypes, "panel_walks": panel.len(),
+        "reference_walks_without_junction_evidence": reference.walks.iter()
+            .filter(|w| w.cuts.is_none() && w.name.split('#').next() != Some(cfg.sample.as_str())).count(),
+        "bridges": views.len(), "components": components, "fasta": cfg.out_fasta,
+        "pan_posterior": pan_posterior_report(&g, &repeat, &walks, &views, &post, largest)});
+    fs::write(&cfg.out_json, serde_json::to_string_pretty(&report)?)?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -2320,6 +2672,116 @@ mod tests {
         fs::remove_file(p).unwrap();
         r
     }
+    #[test]
+    fn an_unresolved_walk_is_junction_evidence_only_with_its_own_branch_offsets() {
+        let g = reference(
+            "S\ta\tACGTACGTACGT\nL\ta\t+\ta\t+\t0M\n\
+             P\tknown#1#pt\ta+\t*\n\
+             P\tguess#1#pt\ta+\t*\tst:Z:unresolved_configuration\n\
+             P\tcut#1#pt\ta+\t*\tTP:Z:circular\tst:Z:unresolved_configuration\tup:Z:unresolved\tCF:i:2\tuj:Z:0,7\n\
+             P\tnone#1#pt\ta+\t*\tst:Z:unresolved_configuration\tuj:Z:-\n\
+             P\tfilled#1#pt\ta+\t*\trf:Z:source\tuj:Z:3\n\
+             P\tsample#1#pt\ta+\t*\n",
+        );
+        let cuts: Vec<Option<Vec<usize>>> = g.walks.iter().map(|w| w.cuts.clone()).collect();
+        assert_eq!(cuts, vec![Some(vec![]), None, Some(vec![0, 7]), Some(vec![]), None, Some(vec![])]);
+        // the path prior of the searched covers is as it was: walks the reads decided throughout
+        assert_eq!(g.walks.iter().filter(|w| w.trusted_prior).count(), 2);
+        // the panel: every walk with evidence, never the sample's own
+        let panel = g.panel("sample");
+        assert_eq!(panel.iter().map(|w| w.run.as_str()).collect::<Vec<_>>(), ["known", "cut", "none"]);
+        assert_eq!((panel[1].cuts.clone(), panel[1].circular), (vec![0, 7], true));
+        assert!(parse_cuts("3,x").is_err());
+    }
+
+    #[test]
+    fn the_panels_configuration_is_chosen_from_a_reconstructions_files() {
+        fn seq(n: usize, seed: u64) -> String {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"ACGT"[(x % 4) as usize] as char
+                })
+                .collect()
+        }
+        let dir = std::env::temp_dir().join(format!("ovasm-pan-configuration-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // A and C enter repeat R, B and D leave it, B leads on to C and D back to A: one circle
+        // A R B C R D or two circles A R D and C R B; no read crosses R
+        let (a, b, c, d, r) = (seq(400, 1), seq(300, 2), seq(350, 3), seq(250, 4), seq(120, 5));
+        fs::write(
+            dir.join("assembly.gfa"),
+            format!(
+                "H\tVN:Z:1.0\nS\tA\t{a}\nS\tB\t{b}\nS\tC\t{c}\nS\tD\t{d}\nS\tR\t{r}\n\
+                 L\tA\t+\tR\t+\t0M\nL\tC\t+\tR\t+\t0M\nL\tR\t+\tB\t+\t0M\nL\tR\t+\tD\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tD\t+\tA\t+\t0M\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("evidence.json"),
+            json!({"repeat_segments": ["R"], "segment_depths": {"A": 50.0, "B": 50.0, "C": 50.0, "D": 50.0, "R": 100.0},
+                "median_depth": 50.0, "phased_paths": [],
+                "links": [{"from": "B+", "to": "C+", "reads": 20}, {"from": "D+", "to": "A+", "reads": 20}]})
+            .to_string(),
+        )
+        .unwrap();
+        // three other individuals, each with the two circles; the target's own walk says otherwise and is left out
+        let mut reference = String::from("H\tVN:Z:1.0\n");
+        for run in ["x", "y", "z"] {
+            reference += &format!(
+                "S\t{run}1\t{a}{r}{d}\nS\t{run}2\t{c}{r}{b}\nL\t{run}1\t+\t{run}1\t+\t0M\nL\t{run}2\t+\t{run}2\t+\t0M\n\
+                 P\t{run}#1#mt.1\t{run}1+\t*\tTP:Z:circular\nP\t{run}#1#mt.2\t{run}2+\t*\tTP:Z:circular\n"
+            );
+        }
+        reference += &format!("S\tt1\t{a}{r}{b}{c}{r}{d}\nL\tt1\t+\tt1\t+\t0M\nP\ttarget#1#mt\tt1+\t*\tTP:Z:circular\n");
+        fs::write(dir.join("reference.gfa"), reference).unwrap();
+        let report = choose_configuration(&ChooseConfig {
+            gfa: dir.join("assembly.gfa"),
+            evidence: dir.join("evidence.json"),
+            reference: dir.join("reference.gfa"),
+            genotypes: None,
+            sample: "target".into(),
+            out_fasta: dir.join("chosen.fasta"),
+            out_json: dir.join("chosen.json"),
+        })
+        .unwrap();
+        let fasta = fs::read_to_string(dir.join("chosen.fasta")).unwrap();
+        let headers: Vec<&str> = fasta.lines().filter(|l| l.starts_with('>')).collect();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(headers.iter().all(|h| h.contains("circular=true length=770") && h.contains("chosen_by=pan_posterior")), "{headers:?}");
+        let post = &report["pan_posterior"];
+        assert_eq!(post["panel_runs"], 3);
+        assert_eq!(post["cover"]["molecules"], 2);
+        assert_eq!(post["cover"]["open_ends"], 4);
+        assert_eq!(post["cover"]["ends_decided_by_panel"], 4);
+        assert_eq!(post["cover"]["equally_good_configurations"], 1);
+        // every run holds A-R-D and C-R-B: taken, with three of three runs
+        let taken: Vec<&Value> = post["junctions"].as_array().unwrap().iter().filter(|j| j["taken"] == true).collect();
+        assert_eq!(taken.len(), 4);
+        assert!(taken.iter().all(|j| j["runs_holding"] == 3 && j["probability"].as_f64().unwrap() > 0.85), "{taken:?}");
+        // without a panel that tells bridges apart the search's cover stands: one circle
+        fs::write(dir.join("reference.gfa"), format!("H\tVN:Z:1.0\nS\tt1\t{a}{r}{b}{c}{r}{d}\nL\tt1\t+\tt1\t+\t0M\nP\ttarget#1#mt\tt1+\t*\tTP:Z:circular\n")).unwrap();
+        let report = choose_configuration(&ChooseConfig {
+            gfa: dir.join("assembly.gfa"),
+            evidence: dir.join("evidence.json"),
+            reference: dir.join("reference.gfa"),
+            genotypes: None,
+            sample: "target".into(),
+            out_fasta: dir.join("alone.fasta"),
+            out_json: dir.join("alone.json"),
+        })
+        .unwrap();
+        assert_eq!(report["panel_walks"], 0);
+        let fasta = fs::read_to_string(dir.join("alone.fasta")).unwrap();
+        let headers: Vec<&str> = fasta.lines().filter(|l| l.starts_with('>')).collect();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].contains("length=1540") && headers[0].contains("chosen_by=reads_then_search_order"), "{headers:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn random(n: usize) -> String {
         let mut x = 811u64;
         (0..n)
