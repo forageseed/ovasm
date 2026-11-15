@@ -57,13 +57,18 @@ const SEED_K: usize = 21;
 /// this many reads (`withhold`): pieces of a nuclear family the reads could not join into longer
 /// sequence, whatever they add up to (in the whole ZM4 library two such components of 2,009 and
 /// 2,016 bp, of segments of 60-402 bp). Not five: JN-L's graph holds unplaced pieces of its
-/// mitochondrion's own repeats of 532-698 bp, on its reference at 97-99% of their length. ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
+/// mitochondrion's own repeats of 532-698 bp, on its reference at 97-99% of their length. An
+/// empirical bound from these two samples alone (`WITHHOLD_RULE`): the pieces' sequence does not
+/// tell them apart, JN-L's sharing 0-15% of their 21-mers with its delivered molecules (the other
+/// copy of each repeat is not assembled) and ZM4's none. ZM4's read-pair recruitment left 175 pieces of 60-683 bp (20.9 kb, 166 of
 /// them on the alfalfa nuclear genome, 155 at five copies or more) in two components unjoined to
 /// its mitochondrion, at 28-141x against its 123x, and five molecules of 226-583 bp of them were
 /// delivered beside its 306,690 bp one. Depth does not tell them: a nuclear family in the
 /// organelle's depth band stands at its depth. A small circle of a multipartite mitochondrion
 /// without seed genes is kept (it closes), as is any free component of a few reads' length.
 pub const WITHHOLD_READS: usize = 3;
+/// What `withhold` rests on, written to chromosomes.json (`withhold_rule`).
+pub const WITHHOLD_RULE: &str = "a free component without seed sequence (under 300 bp), with no circle and no segment of 3 median read lengths is not delivered; the length bound is empirical, from two samples: ZM4 (nuclear pieces up to 402 bp brought in by read pairs) and JN-L (unplaced pieces of the mitochondrion's own repeats of 532-698 bp, kept)";
 
 /// One-sided 95% upper bound of a share seen 0 times in `n`.
 pub fn missing_share_upper(n: u64) -> f64 {
@@ -181,6 +186,9 @@ pub struct ChromosomeReport {
     pub excluded: Vec<Excluded>,
     /// Molecules not delivered (`withhold`); none unless a run asks.
     pub withheld: Vec<Withheld>,
+    /// The rule `withhold` applied (`WITHHOLD_RULE`), when a run asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withhold_rule: Option<&'static str>,
 }
 
 struct Molecule {
@@ -351,6 +359,7 @@ pub fn call(
         chromosomes: Vec::new(),
         excluded: Vec::new(),
         withheld: Vec::new(),
+        withhold_rule: None,
     };
     let (mut lo, mut hi) = (0usize, 0usize);
     let mut main_seen = false;
@@ -580,6 +589,7 @@ fn labels(report: &ChromosomeReport) -> BTreeMap<usize, (usize, usize, f64, &'st
 /// one is free of the main component (the first), holds seed sequence and under `MIN_SEED_BP` of
 /// it, has no circular molecule and no segment of `max_bp` or more. Without seeds nothing is withheld.
 pub fn withhold(report: &mut ChromosomeReport, max_bp: usize) {
+    report.withhold_rule = Some(WITHHOLD_RULE);
     let mut of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (ci, c) in report.chromosomes.iter().enumerate() {
         for m in &c.conformations {
