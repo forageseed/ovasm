@@ -157,7 +157,19 @@ fn valley_and_peak(counts: &FxHashMap<u64, u32>) -> (u32, u32) {
         hist[(c as usize).min(len - 1)] += 1;
     }
     let low = valley(&hist);
-    let solid_peak = (low as usize..len - 1).max_by_key(|&c| hist[c]).unwrap_or(0) as u32;
+    // The peak is the count with the most k-mers within +-10% of it, not the tallest single bucket:
+    // at ~1,877x the single-copy k-mers spread over hundreds of buckets, a few hundred each, while
+    // the error tail of real short reads runs to counts of 4-40 at thousands a bucket, and a wiggle
+    // there could pass for the valley and then for the peak (review by Gemini, 11-15).
+    let mut below = vec![0u64; len + 1];
+    for c in 0..len {
+        below[c + 1] = below[c] + hist[c];
+    }
+    let mass = |c: usize| {
+        let (lo, hi) = (c - c / 10, (c + c / 10).min(len - 2));
+        below[hi + 1] - below[lo]
+    };
+    let solid_peak = (low as usize..len - 1).max_by_key(|&c| (mass(c), hist[c])).unwrap_or(0) as u32;
     (low, solid_peak)
 }
 
@@ -662,6 +674,17 @@ mod tests {
         let (low, peak) = valley_and_peak(&counts);
         assert!(low >= 4 && low < 1_700, "valley {low}");
         assert!((1_700..=2_050).contains(&peak), "solid peak {peak}");
+        // an error tail of 4-40 at ~3,000 a bucket, with a wiggle (7 above 6): the valley may land
+        // in it, the peak must not
+        for c in 4..=40u32 {
+            let n = if c == 7 { 3_100 } else { 3_000 - 20 * c };
+            for _ in 0..n {
+                counts.insert(key, c);
+                key += 1;
+            }
+        }
+        let (_, peak) = valley_and_peak(&counts);
+        assert!((1_700..=2_050).contains(&peak), "solid peak with an error tail {peak}");
     }
 
     #[test]
