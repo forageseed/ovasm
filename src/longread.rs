@@ -1435,14 +1435,26 @@ fn assemble(
         shallow_seeds: false,
         depth_reference: Default::default(),
     })?;
-    // homopolymer runs from the uncorrected reads (see `hp_polish`): the molecules the stages
-    // wrote are kept beside as molecules.unpolished.fasta
+    // homopolymer runs from the reads (see `hp_polish`): the molecules the stages wrote are kept
+    // beside as molecules.unpolished.fasta. With short reads of the sample (`run hybrid`) those
+    // judge the runs: they read homopolymers right, and the hybrid correction has already set
+    // the runs they cover; the uncorrected long reads would set them back to their own systematic
+    // lengths (code audit 11-15: 11 homopolymer differences written into the plastid). A run the
+    // short reads do not reach `MIN_OBSERVATIONS` times stays as the hybrid correction left it.
     let molecules = dir.join("molecules.fasta");
+    let short_for_polish = r.short["reads"]
+        .as_str()
+        .filter(|_| r.short["kept_bases"].as_u64().unwrap_or(0) >= MIN_RECRUITED_BASES)
+        .map(PathBuf::from);
+    let (polish_reads, polish_with) = match short_for_polish {
+        Some(sr) => (vec![sr], "short reads"),
+        None => (r.raw.clone(), "uncorrected reads"),
+    };
     let polish = if molecules.exists() {
-        log(&format!("polishing the homopolymer runs of the {organelle} molecules with the uncorrected reads"));
+        log(&format!("polishing the homopolymer runs of the {organelle} molecules with the {polish_with}"));
         let unpolished = dir.join("molecules.unpolished.fasta");
         fs::rename(&molecules, &unpolished)?;
-        let rep = crate::hp_polish::polish(&unpolished, &r.raw, &molecules, crate::hp_polish::MIN_OBSERVATIONS)?;
+        let rep = crate::hp_polish::polish(&unpolished, &polish_reads, &molecules, crate::hp_polish::MIN_OBSERVATIONS)?;
         let (added, removed) = rep.molecules.iter().fold((0, 0), |a, m| (a.0 + m.bases_added, a.1 + m.bases_removed));
         log(&format!(
             "{} runs judged from {} reads; {} bases added, {} removed",
@@ -1452,7 +1464,9 @@ fn assemble(
             removed
         ));
         files.insert("unpolished_molecules".into(), path_str(&unpolished));
-        serde_json::to_value(&rep)?
+        let mut v = serde_json::to_value(&rep)?;
+        v["reads_used"] = polish_with.into();
+        v
     } else {
         Value::Null
     };
@@ -2086,6 +2100,8 @@ mod tests {
         let assembled = Path::new(m["long_read"]["assembled_reads"].as_str().unwrap());
         assert!(assembled.ends_with(Path::new("hybrid").join("mitochondrion.fasta")));
         assert!(m["long_read"]["short_reads"]["kept_reads"].as_u64().unwrap() >= 2 * 1400);
+        // the homopolymer runs are judged from the short reads, not the uncorrected long ones
+        assert_eq!(m["homopolymer_polish"]["reads_used"], "short reads");
         assert!(out.join("evidence.short.json").is_file());
         assert!(m["short_read_evidence"]["links"].as_u64().is_some());
         fs::remove_dir_all(&dir).ok();
