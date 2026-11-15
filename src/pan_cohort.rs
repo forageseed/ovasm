@@ -2,8 +2,10 @@
 //!
 //! Each sample's run holds its organelle graph against the panel graph: the panel segments its
 //! reads support, its own new segments from the de novo assembly, its molecules as walks of
-//! de novo unitigs, and each repeat junction with what decided it (`junctions.tsv`: `source` =
-//! reads, panel or undetermined). The cohort merges them per organelle into:
+//! de novo unitigs (the representative configuration, `configuration=1`, where the panel layer
+//! lists several), and each repeat junction with what decided it (`junctions.tsv`: `source` =
+//! reads, contradicted_by_reads, panel or undetermined). The cohort merges them per organelle
+//! into:
 //!
 //! - `cohort.gfa`: the panel segments (their own names) and the new segments (`n<i>`, one per
 //!   distinct sequence in either orientation), the panel's links and the links the samples'
@@ -372,6 +374,7 @@ pub fn read_sample(
     let mut junction_rows = Vec::new();
     for row in &jt.rows {
         let molecule = jt.get(row, "molecule")?.to_string();
+        let molecule_of_row = molecule.clone();
         let left = jt.get(row, "left")?.to_string();
         let repeat: Vec<String> = jt.get(row, "repeat")?.split(',').map(str::to_string).collect();
         let right = jt.get(row, "right")?.to_string();
@@ -380,14 +383,21 @@ pub fn read_sample(
         if !reads_decided(&source) {
             undecided.entry(molecule).or_default().push((left.clone(), repeat.clone(), right.clone()));
         }
-        junction_rows.push((left, repeat, right, source, class));
+        junction_rows.push((molecule_of_row, left, repeat, right, source, class));
     }
     // molecules (final layer, de novo unitig walks), cut at undecided joins
     let fasta = fs::read_to_string(dir.join(format!("{o}.fasta")))
         .with_context(|| format!("{sample}: reading {o}.fasta"))?;
     let mut walks = Vec::new();
+    let mut other_configuration: FxHashSet<String> = FxHashSet::default();
     for header in fasta.lines().filter(|l| l.starts_with('>')) {
         let name = header[1..].split_whitespace().next().unwrap_or("").to_string();
+        // the panel layer can list several configurations (configuration=i of=n): the cohort
+        // takes the representative one, so a sample counts once
+        if header.split_whitespace().any(|w| w.strip_prefix("configuration=").is_some_and(|c| c != "1")) {
+            other_configuration.insert(name);
+            continue;
+        }
         let Some(path) = header.split_whitespace().find_map(|w| w.strip_prefix("path=")) else {
             continue;
         };
@@ -417,7 +427,10 @@ pub fn read_sample(
     }
     // junction keys in cohort terms
     let mut junctions = Vec::new();
-    for (left, repeat, right, source, class) in junction_rows {
+    for (molecule, left, repeat, right, source, class) in junction_rows {
+        if other_configuration.contains(&molecule) {
+            continue;
+        }
         let mut parts = Vec::new();
         for u in std::iter::once(&left).chain(repeat.iter()).chain(std::iter::once(&right)) {
             let (unitig, fwd) = parse_oriented(u)?;
@@ -868,7 +881,7 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
     for (s, r) in &runs {
         for (key, source, class) in &r.junctions {
             let kind = match (source.as_str(), class.as_str()) {
-                ("reads", "unsupported") => "reads_unsupported",
+                ("contradicted_by_reads", _) | ("reads", "unsupported") => "reads_unsupported",
                 ("reads", _) => "reads_supported",
                 ("panel", _) => "panel_inferred",
                 _ => "undetermined",
@@ -1022,7 +1035,7 @@ mod tests {
             fs::write(o.join("junctions.tsv"), "molecule\tleft\trepeat\tright\tclass\tsource\nm1\tu1+\tu2+\tu1+\tundetermined_long_repeat\tpanel\n").unwrap();
             fs::write(o.join("presence.tsv"), format!("segment\tlength\tkmers\tdepth\trelative\tcall\n1\t5\t1\t30\t1\tpresent\n2\t5\t1\t{}\t1\t{}\n3\t5\t1\t{}\t1\t{}\n4\t5\t1\t30\t1\tpresent\n", if refn == 1 { "30" } else { "0" }, if refn == 1 { "present" } else { "absent" }, if refn == 2 { "30" } else { "0" }, if refn == 2 { "present" } else { "absent" })).unwrap();
             fs::write(o.join("genotypes.tsv"), format!("site\tleft\tright\tallele\tallele_bp\treference_runs\tkmers\tdepth\tshare\tcall\n0\t1+\t4+\t2+\t5\tR1\t1\t30\t1\t{}\n0\t1+\t4+\t3+\t5\tR2\t1\t30\t1\t{}\n", if refn == 1 { "major" } else { "absent" }, if refn == 2 { "major" } else { "absent" })).unwrap();
-            fs::write(d.join("mitochondrion.fasta"), ">m1 circular=false path=u1+,u2+,u1+\nN\n").unwrap();
+            fs::write(d.join("mitochondrion.fasta"), ">m1 circular=false path=u1+,u2+,u1+ configuration=1 of=2\nN\n>m2 circular=false path=u1+ configuration=2 of=2\nN\n").unwrap();
         }
         fs::write(dir.join("samples.tsv"), format!("s1\t{}\ns2\t{}\n", dir.join("s1").display(), dir.join("s2").display())).unwrap();
         let samples = read_samples(&dir.join("samples.tsv")).unwrap();
