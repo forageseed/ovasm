@@ -16,7 +16,13 @@
 //! - `genotypes.tsv` / `genotypes.vcf`: the panel's variant sites x samples (major allele).
 //! - `junctions.tsv`: each repeat junction's configurations across the cohort, counted apart by
 //!   what decided them: reads (supported or not) or the panel.
-//! - `nearest.tsv`: each sample's nearest panel runs and nearest cohort sample by major alleles.
+//! - `nearest.tsv`: each sample's nearest panel runs and nearest cohort sample by major alleles,
+//!   and its run's own closest panel members by posterior weight (reconstruction.json).
+//!
+//! Presence calls are present or absent only where presence.tsv says so and the segment has at
+//! least MIN_OWN_KMERS own k-mers; otherwise undetermined. Samples whose median read length is
+//! below `min_read_length` (or that are data_limited) keep their own columns and paths but are
+//! left out of every count and frequency (GFA NS/RS, VCF AF/NS, junctions.tsv).
 //!
 //! The panel graph is the one each run's `reference.json` names, or `--reference`; either way
 //! every run's `presence.tsv` must list the panel's segments at their lengths.
@@ -27,6 +33,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+/// A panel segment with fewer own k-mers than this cannot be called present or absent.
+pub const MIN_OWN_KMERS: usize = 20;
+/// Default shortest median read length a sample needs to count in the cohort's frequencies.
+pub const MIN_READ_LENGTH: f64 = 90.0;
 
 pub const ORGANELLES: [&str; 2] = ["mitochondrion", "plastid"];
 
@@ -192,8 +203,11 @@ enum Piece {
 pub struct SampleOrganelle {
     /// Read-decided pieces of its molecules as cohort walks.
     pub walks: Vec<(String, Vec<Step>)>,
-    /// Panel segment -> (depth, call), from presence.tsv.
+    /// Panel segment -> (depth, call), from presence.tsv; the call is present, absent or
+    /// undetermined (presence.tsv's low or no_own_kmers, or fewer than MIN_OWN_KMERS own k-mers).
     pub presence: FxHashMap<String, (Option<f64>, String)>,
+    /// The run's closest panel members (run, posterior weight), from reconstruction.json.
+    pub relatives: Vec<(String, f64)>,
     /// New segments it holds.
     pub new_segments: FxHashSet<String>,
     /// site -> (major allele, minor alleles), from genotypes.tsv.
@@ -204,6 +218,43 @@ pub struct SampleOrganelle {
     pub missing_pieces: usize,
     /// De novo unitigs the individual graph does not map (each taken as one new segment).
     pub unmapped_unitigs: usize,
+    /// Whether the run wrote junctions.tsv.
+    pub has_junctions: bool,
+}
+
+/// The first `key` anywhere under `v`, depth first.
+fn find_key<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match v {
+        serde_json::Value::Object(m) => m.get(key).or_else(|| m.values().find_map(|x| find_key(x, key))),
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
+        _ => None,
+    }
+}
+
+/// The run's closest panel members for the organelle, by posterior weight (reconstruction.json,
+/// `closest_relatives`: [{run, weight}]); empty when the run lists none.
+fn closest_relatives(dir: &Path, o: &str) -> Result<Vec<(String, f64)>> {
+    let p = dir.join("reconstruction.json");
+    if !p.exists() {
+        return Ok(Vec::new());
+    }
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p)?).with_context(|| format!("parsing {}", p.display()))?;
+    let Some(list) = find_key(&v["organelles"][o], "closest_relatives").and_then(|x| x.as_array()) else { return Ok(Vec::new()) };
+    Ok(list.iter().filter_map(|e| Some((e["run"].as_str()?.to_string(), e["weight"].as_f64()?))).collect())
+}
+
+/// Reads per-sample read lengths (a table with `sample`, `read_length_median` and, if present,
+/// `data_limited`, such as a run directory's summary.tsv): sample -> (median, data_limited).
+pub fn read_sample_info(path: &Path) -> Result<FxHashMap<String, (Option<f64>, bool)>> {
+    let t = Table::read(path)?;
+    let limited = t.col("data_limited").ok();
+    let mut out = FxHashMap::default();
+    for row in &t.rows {
+        let len = t.get(row, "read_length_median")?.parse::<f64>().ok();
+        let lim = limited.is_some_and(|i| row.get(i).is_some_and(|x| x == "1" || x == "true"));
+        out.insert(t.get(row, "sample")?.to_string(), (len, lim));
+    }
+    Ok(out)
 }
 
 /// Whether a junction's join was decided by reads.
@@ -369,7 +420,11 @@ pub fn read_sample(
         Some(if fwd { s } else { s.flip() })
     };
     // junctions the reads did not decide, per molecule
-    let jt = Table::read(&od.join("junctions.tsv"))?;
+    // a run whose molecules never reached the junction check writes no junctions.tsv: no
+    // junctions, and its walks are not cut
+    let junctions_file = od.join("junctions.tsv");
+    let has_junctions = junctions_file.exists();
+    let jt = if has_junctions { Table::read(&junctions_file)? } else { Table::parse("molecule\n")? };
     let mut undecided: FxHashMap<String, Vec<(String, Vec<String>, String)>> = FxHashMap::default();
     let mut junction_rows = Vec::new();
     for row in &jt.rows {
@@ -480,7 +535,12 @@ pub fn read_sample(
             _ => bail!("{sample}: {o} segment {seg} ({len} bp) is not in the panel graph at that length; the run used another panel"),
         }
         let depth = pt.get(row, "depth")?.parse::<f64>().ok();
-        presence.insert(seg, (depth, pt.get(row, "call")?.to_string()));
+        let kmers: usize = pt.get(row, "kmers")?.parse().unwrap_or(0);
+        let call = match pt.get(row, "call")? {
+            c @ ("present" | "absent") if kmers >= MIN_OWN_KMERS => c,
+            _ => "undetermined",
+        };
+        presence.insert(seg, (depth, call.to_string()));
     }
     // genotypes
     let gt = Table::read(&od.join("genotypes.tsv"))?;
@@ -496,7 +556,8 @@ pub fn read_sample(
         }
     }
     let missing_pieces = missing.len();
-    Ok(Some(SampleOrganelle { walks, presence, new_segments, calls, junctions, missing_pieces, unmapped_unitigs }))
+    let relatives = closest_relatives(dir, o)?;
+    Ok(Some(SampleOrganelle { walks, presence, new_segments, calls, junctions, missing_pieces, unmapped_unitigs, has_junctions, relatives }))
 }
 
 /// A junction (left anchor step, repeat steps, right anchor step) and its reverse are one.
@@ -634,6 +695,11 @@ pub struct CohortArgs {
     pub out: PathBuf,
     pub organelles: Vec<String>,
     pub references: FxHashMap<String, PathBuf>,
+    /// sample -> (median read length, data_limited); samples absent here count.
+    pub read_lengths: FxHashMap<String, (Option<f64>, bool)>,
+    /// Samples whose median read length is below this (or that are data_limited) keep their
+    /// own columns and paths but do not count in any frequency.
+    pub min_read_length: f64,
 }
 
 /// Reads the samples TSV: sample<TAB>pan reconstruct output directory.
@@ -671,6 +737,21 @@ pub fn run(args: CohortArgs) -> Result<serde_json::Value> {
     let mut report = serde_json::json!({"tool": "ovasm pan cohort", "version": env!("CARGO_PKG_VERSION"),
         "samples": args.samples.iter().map(|(s, d)| serde_json::json!({"sample": s, "dir": d})).collect::<Vec<_>>(),
         "organelles": {}});
+    // short-read samples: their own calls stand, but they are left out of every frequency
+    let excluded: FxHashSet<String> = args
+        .samples
+        .iter()
+        .filter(|(s, _)| args.read_lengths.get(s).is_some_and(|(len, lim)| *lim || len.is_some_and(|l| l < args.min_read_length)))
+        .map(|(s, _)| s.clone())
+        .collect();
+    report["min_read_length"] = serde_json::json!(args.min_read_length);
+    report["excluded_from_frequencies"] = serde_json::json!(args
+        .samples
+        .iter()
+        .filter(|(s, _)| excluded.contains(s))
+        .map(|(s, _)| serde_json::json!({"sample": s, "read_length_median": args.read_lengths[s].0, "data_limited": args.read_lengths[s].1}))
+        .collect::<Vec<_>>());
+    report["samples_without_read_length"] = serde_json::json!(args.samples.iter().filter(|(s, _)| !args.read_lengths.contains_key(s)).count());
     for o in &args.organelles {
         let reference = match args.references.get(o) {
             Some(p) => p.clone(),
@@ -692,7 +773,7 @@ pub fn run(args: CohortArgs) -> Result<serde_json::Value> {
                 }
             }
         };
-        let summary = run_organelle(o, &reference, &args.samples, &args.out.join(o))?;
+        let summary = run_organelle(o, &reference, &args.samples, &args.out.join(o), &excluded, &args.read_lengths)?;
         report["organelles"][o] = summary;
     }
     report["elapsed_seconds"] = serde_json::json!(t0.elapsed().as_secs_f64());
@@ -708,7 +789,15 @@ fn peak_rss_mb() -> Option<f64> {
     Some(kb / 1024.0)
 }
 
-fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: &Path) -> Result<serde_json::Value> {
+fn run_organelle(
+    o: &str,
+    reference: &Path,
+    samples: &[(String, PathBuf)],
+    out: &Path,
+    excluded: &FxHashSet<String>,
+    read_lengths: &FxHashMap<String, (Option<f64>, bool)>,
+) -> Result<serde_json::Value> {
+    let counted = |s: &str| !excluded.contains(s);
     fs::create_dir_all(out)?;
     let panel = Panel::read(reference)?;
     let mut new = NewSegments::default();
@@ -743,16 +832,16 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
         let mut g = BufWriter::new(fs::File::create(out.join("cohort.gfa"))?);
         writeln!(g, "H\tVN:Z:1.0")?;
         for name in &panel.names {
-            let n = runs.iter().filter(|(_, r)| r.presence.get(name).is_some_and(|p| p.1 == "present")).count();
+            let n = runs.iter().filter(|(s, r)| counted(s) && r.presence.get(name).is_some_and(|p| p.1 == "present")).count();
             writeln!(g, "S\t{name}\t{}\tLN:i:{}\tNS:i:{n}\tSO:Z:panel", String::from_utf8_lossy(&panel.seqs[name]), panel.seqs[name].len())?;
         }
         for (id, seq) in &new.seqs {
-            let n = new.samples.get(id).map_or(0, |s| s.len());
+            let n = new.samples.get(id).map_or(0, |s| s.iter().filter(|x| counted(x)).count());
             writeln!(g, "S\t{id}\t{}\tLN:i:{}\tNS:i:{n}\tSO:Z:new", String::from_utf8_lossy(seq), seq.len())?;
         }
         for ((a, b), (in_panel, who)) in &links {
             let src = if *in_panel { "panel" } else { "reads" };
-            writeln!(g, "L\t{}\t{}\t{}\t{}\t0M\tSO:Z:{src}\tRS:i:{}", a.seg, if a.fwd { '+' } else { '-' }, b.seg, if b.fwd { '+' } else { '-' }, who.len())?;
+            writeln!(g, "L\t{}\t{}\t{}\t{}\t0M\tSO:Z:{src}\tRS:i:{}", a.seg, if a.fwd { '+' } else { '-' }, b.seg, if b.fwd { '+' } else { '-' }, who.iter().filter(|x| counted(x)).count())?;
         }
         for (s, r) in &runs {
             for (name, w) in &r.walks {
@@ -783,10 +872,7 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
                             ("present", Some(x)) => format!("{x}"),
                             _ => "NA".into(),
                         });
-                        cv.push(match call.as_str() {
-                            "present" | "absent" => call.clone(),
-                            _ => "NA".into(),
-                        });
+                        cv.push(call.clone());
                     }
                     None => {
                         dv.push("NA".into());
@@ -822,8 +908,8 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
             writeln!(v, "##contig=<ID={pname},length={len}>")?;
         }
         writeln!(v, "##INFO=<ID=SITE,Number=1,Type=Integer,Description=\"Site of the panel's genotypes.tsv\">")?;
-        writeln!(v, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Share of called samples with each ALT allele as major\">")?;
-        writeln!(v, "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Samples with a major call\">")?;
+        writeln!(v, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Share of called samples with each ALT allele as major (samples counted in frequencies)\">")?;
+        writeln!(v, "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Samples counted in frequencies with a major call\">")?;
         writeln!(v, "##INFO=<ID=WALK,Number=.,Type=String,Description=\"Panel segment walk of REF then each ALT\">")?;
         writeln!(v, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Major allele (haploid)\">")?;
         writeln!(v, "##FORMAT=<ID=MN,Number=1,Type=String,Description=\"Minor alleles seen (indices)\">")?;
@@ -860,11 +946,11 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
             };
             let mut counts = vec![0usize; order.len()];
             let mut gts = Vec::new();
-            for (_, r) in &runs {
+            for (s, r) in &runs {
                 match r.calls.get(id) {
                     Some((Some(m), minors)) => {
                         let i = idx(m).and_then(|i| order.iter().position(|&x| x == i));
-                        if let Some(i) = i {
+                        if let Some(i) = i.filter(|_| counted(s)) {
                             counts[i] += 1;
                         }
                         let mn: Vec<String> = minors.iter().filter_map(|a| idx(a).and_then(|i| order.iter().position(|&x| x == i))).map(|i| i.to_string()).collect();
@@ -890,7 +976,7 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
     }
     // junctions
     let mut jcount: BTreeMap<String, BTreeMap<&str, Vec<String>>> = BTreeMap::new();
-    for (s, r) in &runs {
+    for (s, r) in runs.iter().filter(|(s, _)| counted(s)) {
         for (key, source, class) in &r.junctions {
             let kind = match (source.as_str(), class.as_str()) {
                 ("contradicted_by_reads", _) | ("reads", "unsupported") => "reads_unsupported",
@@ -902,7 +988,7 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
         }
     }
     {
-        let n = runs.len().max(1) as f64;
+        let n = runs.iter().filter(|(s, _)| counted(s)).count().max(1) as f64;
         let mut j = BufWriter::new(fs::File::create(out.join("junctions.tsv"))?);
         writeln!(j, "left\trepeat\tright\treads_supported\treads_unsupported\tpanel_inferred\tundetermined\treads_frequency\tpanel_frequency\tsamples_reads\tsamples_panel")?;
         for (key, kinds) in &jcount {
@@ -929,7 +1015,7 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
     // nearest
     {
         let mut f = BufWriter::new(fs::File::create(out.join("nearest.tsv"))?);
-        writeln!(f, "sample\tnearest_panel_run\tdistance\tsites\tsecond_panel_run\tsecond_distance\tsecond_sites\tnearest_cohort_sample\tcohort_distance\tcohort_sites")?;
+        writeln!(f, "sample\tnearest_panel_run\tdistance\tsites\tsecond_panel_run\tsecond_distance\tsecond_sites\tnearest_cohort_sample\tcohort_distance\tcohort_sites\tclosest_relatives\tread_length_median\tin_frequencies")?;
         for (i, (s, r)) in runs.iter().enumerate() {
             let near = nearest_runs(&r.calls, &sites);
             let fmt = |k: usize| near.get(k).map_or(("-".to_string(), "NA".to_string(), "0".to_string()), |(n, d, c)| (n.clone(), format!("{d:.5}"), c.to_string()));
@@ -946,16 +1032,26 @@ fn run_organelle(o: &str, reference: &Path, samples: &[(String, PathBuf)], out: 
                 }
             }
             let (c, cd, cn) = best.map_or(("-".to_string(), "NA".to_string(), "0".to_string()), |(t, d, n)| (t, format!("{d:.5}"), n.to_string()));
-            writeln!(f, "{s}\t{a}\t{ad}\t{an}\t{b}\t{bd}\t{bn}\t{c}\t{cd}\t{cn}")?;
+            // the run's own posterior over panel members, by name
+            let rel = if r.relatives.is_empty() {
+                "-".to_string()
+            } else {
+                r.relatives.iter().map(|(n, w)| format!("{n}={w:.3e}")).collect::<Vec<_>>().join(",")
+            };
+            let len = read_lengths.get(s).and_then(|x| x.0).map_or("NA".to_string(), |l| format!("{l}"));
+            let inf = if counted(s) { "yes" } else { "no" };
+            writeln!(f, "{s}\t{a}\t{ad}\t{an}\t{b}\t{bd}\t{bn}\t{c}\t{cd}\t{cn}\t{rel}\t{len}\t{inf}")?;
         }
     }
     let paths: usize = runs.iter().map(|(_, r)| r.walks.len()).sum();
     Ok(serde_json::json!({
-        "reference": reference, "samples": runs.len(), "skipped_without_this_organelle": skipped,
+        "reference": reference, "samples": runs.len(), "samples_in_frequencies": runs.iter().filter(|(s, _)| counted(s)).count(),
+        "skipped_without_this_organelle": skipped,
         "panel_segments": panel.names.len(), "new_segments": new.seqs.len(),
         "new_segment_bases": new.seqs.iter().map(|(_, s)| s.len()).sum::<usize>(),
         "links": links.len(), "read_links_not_in_panel": links.values().filter(|(p, _)| !p).count(),
         "paths": paths, "sites": sites.len(),
+        "samples_without_junctions_tsv": runs.iter().filter(|(_, r)| !r.has_junctions).map(|(s, _)| s.clone()).collect::<Vec<_>>(),
         "unmapped_unitigs_taken_as_new": runs.iter().filter(|(_, r)| r.unmapped_unitigs > 0).map(|(s, r)| serde_json::json!({"sample": s, "unitigs": r.unmapped_unitigs})).collect::<Vec<_>>(),
         "pieces_without_sequence": runs.iter().filter(|(_, r)| r.missing_pieces > 0).map(|(s, r)| serde_json::json!({"sample": s, "pieces": r.missing_pieces})).collect::<Vec<_>>(), "vcf_sites": vcf_sites, "junctions": jcount.len(),
         "outputs": ["cohort.gfa", "presence.tsv", "presence.calls.tsv", "genotypes.tsv", "genotypes.vcf", "junctions.tsv", "nearest.tsv"],
@@ -1045,13 +1141,15 @@ mod tests {
             let refn = if allele == "2+" { 1 } else { 2 };
             fs::write(o.join("individual.segments.tsv"), format!("sample\tsegment\tlength\tpieces\n{s}_reference_supported\tref.0.0.5\t5\t1+\n{s}_reference_supported\tref.{refn}.0.5\t5\t2+\n{s}_reference_supported\tref.3.0.5\t5\t3+\n{s}_denovo\t{s}_denovo.u1\t15\t1+,2+,3+\n{s}_denovo\t{s}_denovo.u2\t10\t4+\n")).unwrap();
             fs::write(o.join("junctions.tsv"), "molecule\tleft\trepeat\tright\tclass\tsource\nm1\tu1+\tu2+\tu1+\tundetermined_long_repeat\tpanel\n").unwrap();
-            fs::write(o.join("presence.tsv"), format!("segment\tlength\tkmers\tdepth\trelative\tcall\n1\t5\t1\t30\t1\tpresent\n2\t5\t1\t{}\t1\t{}\n3\t5\t1\t{}\t1\t{}\n4\t5\t1\t30\t1\tpresent\n", if refn == 1 { "30" } else { "0" }, if refn == 1 { "present" } else { "absent" }, if refn == 2 { "30" } else { "0" }, if refn == 2 { "present" } else { "absent" })).unwrap();
+            fs::write(o.join("presence.tsv"), format!("segment\tlength\tkmers\tdepth\trelative\tcall\n1\t5\t30\t30\t1\tpresent\n2\t5\t30\t{}\t1\t{}\n3\t5\t30\t{}\t1\t{}\n4\t5\t5\t30\t1\tpresent\n", if refn == 1 { "30" } else { "0" }, if refn == 1 { "present" } else { "absent" }, if refn == 2 { "30" } else { "0" }, if refn == 2 { "present" } else { "absent" })).unwrap();
             fs::write(o.join("genotypes.tsv"), format!("site\tleft\tright\tallele\tallele_bp\treference_runs\tkmers\tdepth\tshare\tcall\n0\t1+\t4+\t2+\t5\tR1\t1\t30\t1\t{}\n0\t1+\t4+\t3+\t5\tR2\t1\t30\t1\t{}\n", if refn == 1 { "major" } else { "absent" }, if refn == 2 { "major" } else { "absent" })).unwrap();
             fs::write(d.join("mitochondrion.fasta"), ">m1 circular=false path=u1+,u2+,u1+ configuration=1 of=2\nN\n>m2 circular=false path=u1+ configuration=2 of=2\nN\n").unwrap();
         }
         fs::write(dir.join("samples.tsv"), format!("s1\t{}\ns2\t{}\n", dir.join("s1").display(), dir.join("s2").display())).unwrap();
         let samples = read_samples(&dir.join("samples.tsv")).unwrap();
-        let rep = run(CohortArgs { samples, out: dir.join("out"), organelles: vec!["mitochondrion".into()], references: FxHashMap::default() }).unwrap();
+        fs::write(dir.join("s1/reconstruction.json"), r#"{"organelles":{"mitochondrion":{"final":{"pan_posterior":{"closest_relatives":[{"run":"R1","weight":0.9},{"run":"R2","weight":0.1}]}}}}}"#).unwrap();
+        let args = |out: &str, read_lengths: FxHashMap<String, (Option<f64>, bool)>| CohortArgs { samples: samples.clone(), out: dir.join(out), organelles: vec!["mitochondrion".into()], references: FxHashMap::default(), read_lengths, min_read_length: MIN_READ_LENGTH };
+        let rep = run(args("out", FxHashMap::default())).unwrap();
         let o = &rep["organelles"]["mitochondrion"];
         assert_eq!(o["samples"], 2);
         // the two samples' new segment is one sequence read from either strand
@@ -1072,6 +1170,24 @@ mod tests {
         let rec = vcf.lines().find(|l| !l.starts_with('#')).unwrap();
         assert!(rec.starts_with("R1#1#mt\t5\tsite0\tCCCCCG\tCGGGGT"), "{rec}");
         assert!(rec.ends_with("\t0:.\t1:."), "{rec}");
+        assert!(rec.contains(";AF=0.5000;NS=2;"), "{rec}");
+        // member names with their weights; segment 4 has too few own k-mers to call
+        assert!(nearest.contains("\tR1=9.000e-1,R2=1.000e-1\tNA\tyes"), "{nearest}");
+        let calls = fs::read_to_string(dir.join("out/mitochondrion/presence.calls.tsv")).unwrap();
+        assert!(calls.lines().any(|l| l.starts_with("4\t5\tpanel\tundetermined\tundetermined")), "{calls}");
+        assert!(calls.lines().any(|l| l.starts_with("2\t5\tpanel\tpresent\tabsent")), "{calls}");
+        // a short-read sample keeps its own columns but leaves every frequency
+        let mut lens = FxHashMap::default();
+        lens.insert("s2".to_string(), (Some(50.0), true));
+        let rep = run(args("short", lens)).unwrap();
+        assert_eq!(rep["organelles"]["mitochondrion"]["samples_in_frequencies"], 1);
+        assert_eq!(rep["excluded_from_frequencies"][0]["sample"], "s2");
+        let vcf = fs::read_to_string(dir.join("short/mitochondrion/genotypes.vcf")).unwrap();
+        let rec = vcf.lines().find(|l| !l.starts_with('#')).unwrap();
+        assert!(rec.contains(";AF=0.0000;NS=1;") && rec.ends_with("\t0:.\t1:."), "{rec}");
+        let j = fs::read_to_string(dir.join("short/mitochondrion/junctions.tsv")).unwrap();
+        assert_eq!(j.lines().skip(1).count(), 1, "{j}");
+        assert!(fs::read_to_string(dir.join("short/mitochondrion/nearest.tsv")).unwrap().contains("\t50\tno"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

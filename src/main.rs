@@ -363,6 +363,13 @@ struct PanCohortArgs {
     /// ORGANELLE=GFA: the panel graph, when the runs' reference.json does not name one.
     #[arg(long = "reference")]
     references: Vec<String>,
+    /// Table with sample, read_length_median and optionally data_limited (a runs directory's
+    /// summary.tsv): short-read samples are left out of the cohort's frequencies.
+    #[arg(long)]
+    sample_info: Option<PathBuf>,
+    /// Shortest median read length that counts in frequencies (with --sample-info).
+    #[arg(long, default_value_t = pan_cohort::MIN_READ_LENGTH)]
+    min_read_length: f64,
 }
 
 #[derive(clap::Args)]
@@ -2908,7 +2915,11 @@ fn dispatch(command: Command) -> Result<()> {
                 references.insert(o.to_string(), PathBuf::from(path));
             }
             let samples = pan_cohort::read_samples(&args.samples)?;
-            let report = pan_cohort::run(pan_cohort::CohortArgs { samples, out: args.out.clone(), organelles, references })?;
+            let read_lengths = match &args.sample_info {
+                Some(p) => pan_cohort::read_sample_info(p)?,
+                None => rustc_hash::FxHashMap::default(),
+            };
+            let report = pan_cohort::run(pan_cohort::CohortArgs { samples, out: args.out.clone(), organelles, references, read_lengths, min_read_length: args.min_read_length })?;
             eprintln!("[ovasm] pan cohort: {} -> {}", serde_json::to_string(&report["organelles"])?, args.out.display());
             Ok(())
         }
