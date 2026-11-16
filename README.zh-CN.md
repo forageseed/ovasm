@@ -14,15 +14,15 @@ OVASM 用测序读段组装植物线粒体和叶绿体基因组。输入 HiFi �
 
 ## 安装
 
-0.7.0 预编译版在[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.7.0)。
+0.9.0 预编译版在[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.9.0)。
 
 - **Windows x86_64：**下载
-  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.7.0/ovasm-v0.7.0-windows-x86_64.zip)，
+  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.9.0/ovasm-v0.9.0-windows-x86_64.zip)，
   解压后双击 `install.cmd`，然后重新打开终端。
 - **Linux x86_64（glibc 2.34 及以上）：**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.7.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.9.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -134,7 +134,7 @@ Oatk 报告的 307,026 bp 单环排列作为替代连接保留在图里。细节
 - 读段深度被误判的基因组不再漏招线粒体读段。异源四倍体胡枝子（*Lespedeza davurica*）不加任何参数就能得到
   完整的 378,667 bp 线粒体。也可以用 `--genome-size` 或 `--nuclear-depth` 手动给出深度。
 
-完整说明：[0.7.0 发布说明](docs/release-0.7.0.md)。
+完整说明：[0.9.0 发布说明](docs/release-0.9.0.md) · [0.7.0](docs/release-0.7.0.md)。
 
 ## 许可
 
