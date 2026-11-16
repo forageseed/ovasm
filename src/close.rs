@@ -234,6 +234,77 @@ pub fn close(molecule: &[u8], reads: &[PathBuf]) -> Result<Closure> {
     Ok(c)
 }
 
+/// Fewest homopolymer-compressed units of the molecule's end that its start must repeat for an
+/// overlap closure (`overlap_join`): 12 units are at least 12 bases with no two alike in a row,
+/// found by chance in a 600 bp window about once in 300 molecules, and the read pairs' distance
+/// must agree as well.
+const MIN_OVERLAP_UNITS: usize = 12;
+/// The bases an overlap closure removes may differ from the read pairs' (negative) end-to-start
+/// distance by at most this (rice: 45 against 53, 35 against 49, 75 against 80).
+const OVERLAP_GAP_TOLERANCE: f64 = 100.0;
+
+/// An overlap closure: the circle is `molecule[head..len - tail]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OverlapJoin {
+    pub head: usize,
+    pub tail: usize,
+    /// Homopolymer-compressed units the end and the start share.
+    pub units: usize,
+}
+
+/// Homopolymer runs of `s`: (base, first position).
+fn runs(s: &[u8]) -> Vec<(u8, usize)> {
+    let mut out: Vec<(u8, usize)> = Vec::new();
+    for (i, &b) in s.iter().enumerate() {
+        if out.last().map_or(true, |r| r.0 != b) {
+            out.push((b, i));
+        }
+    }
+    out
+}
+
+/// Close a linear molecule whose start repeats its end: the short-read graph stops on both sides
+/// of a homopolymer it cannot count, and the stretch beside it, assembled from both ends, comes
+/// out twice with the homopolymer at two lengths (rice plastids SAMEA115396711, 717 and 721 at
+/// one poly(A) tract: the read pairs put the start 49-80 bp before the end, and spelling forward
+/// stops at once where the reads differ on the next base). The longest run of the end's last
+/// homopolymer-compressed units that occurs once in the start's window (and not at its last
+/// unit) is the overlap, of at least `MIN_OVERLAP_UNITS` units. Each homopolymer is taken where
+/// both its sides are in the molecule: the overlap's last unit from the start, the others from
+/// the end. The bases removed must agree with `gap` (the pairs' end-to-start distance, negative
+/// for an overlap) within `OVERLAP_GAP_TOLERANCE`.
+pub fn overlap_join(molecule: &[u8], gap: f64) -> Option<OverlapJoin> {
+    let m = molecule.to_ascii_uppercase();
+    let n = m.len();
+    if n < 2 * WINDOW || gap >= 0.0 {
+        return None;
+    }
+    let tail_off = n - WINDOW;
+    let (hr, tr) = (runs(&m[..WINDOW]), runs(&m[tail_off..]));
+    let hb: Vec<u8> = hr.iter().map(|r| r.0).collect();
+    let tb: Vec<u8> = tr.iter().map(|r| r.0).collect();
+    // the end's first overlap unit must have a base before it in the window
+    for units in (MIN_OVERLAP_UNITS..tb.len()).rev() {
+        let suffix = &tb[tb.len() - units..];
+        // the start's last overlap unit must have a base after it
+        let mut at = (0..hb.len().saturating_sub(units)).filter(|&j| &hb[j..j + units] == suffix);
+        let (Some(j), None) = (at.next(), at.next()) else {
+            continue;
+        };
+        let head = hr[j + units - 1].1;
+        let t_last = tail_off + tr[tr.len() - 1].1;
+        if t_last <= head {
+            return None;
+        }
+        let removed = n - (t_last - head);
+        if (removed as f64 + gap).abs() > OVERLAP_GAP_TOLERANCE {
+            return None;
+        }
+        return Some(OverlapJoin { head, tail: n - t_last, units });
+    }
+    None
+}
+
 /// Most bases a molecule's end (or start) may be trimmed back to find an exact anchor in a
 /// reference walk; the walk must then spell those bases as the molecule does.
 const MAX_TRIM: usize = 200;
@@ -367,6 +438,39 @@ const SIMILARITY_STEP: usize = 16;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_end_repeated_at_the_start_with_its_homopolymer_at_another_length_closes() {
+        // circle: X + A(17) + U + Y, assembled from just after a poly(A) at the start (21 As,
+        // the run cut) to the end of U at the end (17 As, both sides there)
+        let mut x = 7u64;
+        let mut rnd = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    b"ACGT"[(x % 4) as usize]
+                })
+                .collect()
+        };
+        let u = b"GAATTACATTAAATATAGAATATA".to_vec();
+        let (body, gatt) = (rnd(5000), b"GATT".to_vec());
+        let start = [vec![b'A'; 21], u.clone()].concat();
+        let end = [gatt.clone(), vec![b'A'; 17], u.clone()].concat();
+        let molecule = [start.clone(), body.clone(), end.clone()].concat();
+        let j = overlap_join(&molecule, -53.0).expect("closes");
+        let circle = &molecule[j.head..molecule.len() - j.tail];
+        // one copy of U, the poly(A) at the end's length, U's last base once
+        assert_eq!(circle.len(), body.len() + gatt.len() + 17 + u.len());
+        assert_eq!(&circle[..1], &u[u.len() - 1..]);
+        assert!(circle.ends_with(&[gatt.as_slice(), &[b'A'; 17], &u[..u.len() - 1]].concat()));
+        // the pairs say the ends are far apart: no closure
+        assert!(overlap_join(&molecule, -400.0).is_none());
+        assert!(overlap_join(&molecule, 30.0).is_none());
+        // nothing repeated: no closure
+        assert!(overlap_join(&[rnd(700), rnd(5000)].concat(), -50.0).is_none());
+    }
+
     use super::*;
     use std::fmt::Write as _;
 

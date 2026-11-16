@@ -413,16 +413,19 @@ pub const MIN_PIECE: u64 = 1000;
 /// sequence that reads cover thinly or across a hairpin breaks there. ZM4's plastid (no inverted
 /// repeat, 125 kb) came out in four pieces at k 127 and at most 1,000x of reads, and as one
 /// molecule of 125.1 kb at 99, 77 and 55; its mitochondrion was one 305.6 kb piece at 127, 99 and
-/// 77. Every k of `SR_K_LADDER` below the first is tried until one gives a single molecule; the
-/// result is the accepted attempt with the fewest pieces, then the most molecule bases (a smaller
-/// k collapses repeats it no longer spans), then the larger k.
+/// 77. Every k of `SR_K_LADDER` below the first is tried until one gives a single molecule in a
+/// graph without open ends; the result is the accepted attempt with the fewest pieces, then the
+/// fewest open ends, then the most molecule bases (a smaller k collapses repeats it no longer
+/// spans), then the larger k.
 pub fn sr_ladder(a: &mut impl Attempts) -> Result<Ladder> {
-    sr_ladder_with_evidence_floor(a, None)
+    sr_ladder_with_evidence_floor(a, None, false)
 }
 
 /// The optional floor is a conservative retry guard from target-read-covered
 /// reference sequence, not an expected genome size or evidence of molecule origin.
-fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> Result<Ladder> {
+/// `closed`: the genome is one circle (a plastid): a single molecule ends the ladder only in a graph
+/// without open ends, and among attempts of as many pieces the one with fewer open ends comes first.
+fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>, closed: bool) -> Result<Ladder> {
     // `floor`: the reference bases complete target reads cover. An attempt qualifies when its
     // graph holds at least half of them (a retry guard, not a genome size); among qualifying
     // attempts more of them held comes before fewer pieces (rice SAMEA115396715's mitochondrion
@@ -437,8 +440,8 @@ fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> R
     // graphs held 99% of the mitochondrion.
     let held = |o: &Outcome| if o.accepted() { floor } else { o.molecule_bases.min(floor) };
     let better = |o: &Outcome, b: &Outcome| {
-        (qualifies(o), o.accepted(), o.total_length.min(floor), held(o), std::cmp::Reverse(o.pieces), o.molecule_bases, o.k)
-            > (qualifies(b), b.accepted(), b.total_length.min(floor), held(b), std::cmp::Reverse(b.pieces), b.molecule_bases, b.k)
+        (qualifies(o), o.accepted(), o.total_length.min(floor), held(o), std::cmp::Reverse(o.pieces), std::cmp::Reverse(if closed { o.open_ends } else { 0 }), o.molecule_bases, o.k)
+            > (qualifies(b), b.accepted(), b.total_length.min(floor), held(b), std::cmp::Reverse(b.pieces), std::cmp::Reverse(if closed { b.open_ends } else { 0 }), b.molecule_bases, b.k)
     };
     let mut tried: Vec<Outcome> = Vec::new();
     let mut best = 0usize;
@@ -446,7 +449,11 @@ fn sr_ladder_with_evidence_floor(a: &mut impl Attempts, floor: Option<u64>) -> R
     loop {
         let o = a.attempt(k)?;
         let i = tried.len();
-        let single = qualifies(&o) && o.molecules == 1;
+        // one molecule ends the ladder only where its graph has no open end: rice
+        // SAMEA115396710's plastid at k 127 (reads kept to 250x, k-mer depth 30-40) was one
+        // linear 113,758 bp molecule, its graph without the junction from the LSC into the
+        // inverted repeat, so the repeat ran on into the LSC and was laid down once
+        let single = qualifies(&o) && o.molecules == 1 && (!closed || o.open_ends == 0);
         if i == 0 || better(&o, &tried[best]) {
             best = i;
             a.stash()?;
@@ -1826,7 +1833,7 @@ fn assemble_organelle(
     };
     let mut ladder = match cfg.read_type {
         ReadType::Hifi => k_ladder(&mut attempts, true, start)?,
-        ReadType::Sr => sr_ladder_with_evidence_floor(&mut attempts, sr_min_graph_bases)?,
+        ReadType::Sr => sr_ladder_with_evidence_floor(&mut attempts, sr_min_graph_bases, organelle == "plastid")?,
     };
     // reads the open ends of the mitochondrion's graph left among the NUMT candidates
     // (`tip_rescue`): assembled again with them, kept when that closes open ends
@@ -2740,26 +2747,36 @@ mod tests {
         let o = |k, graph, molecules, bases| Outcome { k, total_length: graph, molecules, molecule_bases: bases, pieces: molecules, unitigs: 1, open_ends: 0 };
         let candidates = vec![o(127, 8931, 1, 5006), o(99, 220562, 3, 224833), o(77, 224785, 2, 230798), o(55, 226854, 1, 232196)];
         let mut a = Sized { outcomes: candidates.clone(), calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut a, Some(244954)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut a, Some(244954), false).unwrap();
         assert_eq!(a.calls, [127, 99, 77, 55]); assert_eq!(r.result().k, 55); assert!(r.accepted);
         let mut b = Sized { outcomes: candidates.clone(), calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut b, Some(600000)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut b, Some(600000), false).unwrap();
         assert_eq!(b.calls, [127, 99, 77, 55]); assert!(!r.accepted);
         let mut c = Sized { outcomes: candidates, calls: vec![] };
         let r = sr_ladder(&mut c).unwrap(); assert_eq!(c.calls, [127]); assert!(r.accepted);
         // neither accepted: the one whose molecules hold more, not the one with fewer pieces
         let rice = vec![o(127, 8_000, 0, 0), o(99, 400_000, 4, 20_000), o(77, 495_635, 9, 54_837), Outcome { pieces: 0, ..o(55, 729_616, 1, 1_717) }];
         let mut d = Sized { outcomes: rice, calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut d, Some(358_928)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut d, Some(358_928), false).unwrap();
         assert!(!r.accepted);
         assert_eq!(r.result().k, 77);
         // rice SAMEA115396715: every k qualifies; k 127 has the fewest pieces but holds half the
         // read-covered reference, so k 99 is kept
         let rice715 = vec![o(127, 212_904, 39, 195_347), o(99, 437_956, 42, 427_935), o(77, 440_727, 45, 426_827), o(55, 437_272, 59, 421_238)];
         let mut e = Sized { outcomes: rice715, calls: vec![] };
-        let r = sr_ladder_with_evidence_floor(&mut e, Some(357_616)).unwrap();
+        let r = sr_ladder_with_evidence_floor(&mut e, Some(357_616), false).unwrap();
         assert!(r.accepted);
         assert_eq!(r.result().k, 99);
+        // rice SAMEA115396710's plastid: k 127 one linear molecule in a graph with an open end
+        // (the junction from the LSC into the inverted repeat lost), k 99 one in a closed graph
+        let p710 = vec![Outcome { open_ends: 1, ..o(127, 113_758, 1, 113_758) }, o(99, 113_698, 1, 113_698), o(77, 113_700, 1, 113_700)];
+        let mut f = Sized { outcomes: p710.clone(), calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut f, None, true).unwrap();
+        assert_eq!((f.calls.as_slice(), r.result().k), ([127, 99].as_slice(), 99));
+        // not a single circle (a mitochondrion): the first single molecule ends the ladder as before
+        let mut g = Sized { outcomes: p710, calls: vec![] };
+        let r = sr_ladder_with_evidence_floor(&mut g, None, false).unwrap();
+        assert_eq!((g.calls.as_slice(), r.result().k), ([127].as_slice(), 127));
     }
 
     #[test]

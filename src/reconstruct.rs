@@ -872,12 +872,17 @@ fn read_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 /// The organelle GFA with `molecule` closed: the P walk that spells it gets `fill` (a new
 /// segment, unless empty, with `segment_tags`) and the link back to its first step, and is
 /// marked circular, with `cj:Z:<how>`. None when no P walk spells the molecule.
+///
+/// `overlap`: bases the molecule's end and start share (an overlap closure, `close::overlap_join`):
+/// the closing link carries them as its overlap. They agree around a homopolymer the two ends
+/// hold at different lengths, not base for base, so the link is tagged `ho:Z:homopolymer`.
 fn close_gfa(
     text: &str,
     molecule: &[u8],
     fill: &[u8],
     how: &str,
     segment_tags: &str,
+    overlap: usize,
 ) -> Result<Option<String>> {
     let mut seqs: BTreeMap<&str, &[u8]> = BTreeMap::new();
     for line in text.lines() {
@@ -914,7 +919,9 @@ fn close_gfa(
     }
     let mut new_steps: Vec<String> = steps.iter().map(|s| s.to_string()).collect();
     let mut added = String::new();
-    if fill.is_empty() {
+    if fill.is_empty() && overlap > 0 {
+        writeln!(added, "L\t{last}\t{lo}\t{first}\t{fo}\t{overlap}M\tho:Z:homopolymer")?;
+    } else if fill.is_empty() {
         writeln!(added, "L\t{last}\t{lo}\t{first}\t{fo}\t0M")?;
     } else {
         writeln!(
@@ -1825,7 +1832,8 @@ fn final_outputs(
     let mut reference_bp = 0usize;
     // a join made for the single linear molecule: (the molecule before it, the bases joined in,
     // the header's note, by read pairs?)
-    let mut applied_join: Option<(Vec<u8>, Vec<u8>, String, bool)> = None;
+    // and the bases cut from its start and its end, for an overlap closure)
+    let mut applied_join: Option<(Vec<u8>, Vec<u8>, String, bool, (usize, usize))> = None;
     if let [i] = pieces[..] {
         if !circular[i] {
             eprintln!("[ovasm] reconstruct {organelle}: closing the linear molecule with read pairs");
@@ -1833,12 +1841,34 @@ fn final_outputs(
             // the reads spell the join; else the pairs join the ends and a reference walk holds
             // sequence of their distance between them
             let mut join: Option<(Vec<u8>, &str, String, String)> = None;
+            let mut trim = (0usize, 0usize);
+            let mut overlap = None;
             if c.fill.is_some() {
                 join = Some((
                     c.sequence.clone(),
                     "read_pairs",
                     String::new(),
                     format!("closed_by=read_pairs join_bp={} joining_pairs={}", c.sequence.len(), c.joining_pairs),
+                ));
+            } else if let Some(o) = c
+                .gap_estimate
+                .filter(|_| c.joining_pairs >= close::MIN_JOINING_PAIRS)
+                .and_then(|gap| close::overlap_join(&molecules[i].1, gap))
+            {
+                // the start repeats the end around a homopolymer: cut, no bases added
+                trim = (o.head, o.tail);
+                overlap = Some(o);
+                join = Some((
+                    Vec::new(),
+                    "read_pairs",
+                    String::new(),
+                    format!(
+                        "closed_by=read_pairs_overlap overlap_bp={} overlap_units={} joining_pairs={} pair_gap_estimate={:.0}",
+                        o.head + o.tail,
+                        o.units,
+                        c.joining_pairs,
+                        c.gap_estimate.unwrap_or(0.0)
+                    ),
                 ));
             } else if let (true, Some(gap)) = (c.joining_pairs >= close::MIN_JOINING_PAIRS, c.gap_estimate) {
                 if let Some(f) = close::reference_fill(&molecules[i].1, walks, gap) {
@@ -1860,14 +1890,16 @@ fn final_outputs(
                 }
             }
             if let Some((fill, how, tags, note)) = join {
-                match close_gfa(&gfa_text, &molecules[i].1, &fill, how, &tags)? {
+                match close_gfa(&gfa_text, &molecules[i].1, &fill, how, &tags, trim.0 + trim.1)? {
                     Some(t) => {
                         gfa_text = t;
                         if how == "reference_fill" {
                             reference_bp = fill.len();
                         }
-                        applied_join = Some((molecules[i].1.clone(), fill.clone(), note.clone(), how == "read_pairs"));
+                        applied_join = Some((molecules[i].1.clone(), fill.clone(), note.clone(), how == "read_pairs", trim));
                         let (h, s) = &mut molecules[i];
+                        let end = s.len() - trim.1;
+                        *s = s[trim.0..end].to_vec();
                         s.extend_from_slice(&fill);
                         let renamed = h
                             .split(' ')
@@ -1893,6 +1925,9 @@ fn final_outputs(
                 }
             }
             closure = serde_json::to_value(&c)?;
+            if let Some(o) = overlap.filter(|_| circular[i]) {
+                closure["overlap"] = serde_json::to_value(o)?;
+            }
         }
     }
     fs::write(&gfa_out, &gfa_text)?;
@@ -1968,13 +2003,15 @@ fn final_outputs(
             let linear: Vec<usize> = major.iter().copied().filter(|&i| !r.molecules[i].2).collect();
             match (&applied_join, linear.as_slice()) {
                 (None, _) => Some(r),
-                (Some((before, fill, note, true)), [i]) if major.len() == 1 => {
-                    let k = 31.min(before.len());
+                (Some((before, fill, note, true, trim)), [i]) if major.len() == 1 => {
+                    // an overlap closure cuts bases at both ends: those must be the de novo molecule's too
+                    let k = (31 + trim.0.max(trim.1)).min(before.len());
                     let same = |s: &[u8]| s.len() >= k && s[..k] == before[..k] && s[s.len() - k..] == before[before.len() - k..];
                     let seq = r.molecules[*i].1.clone();
                     let turned = revcomp(&seq);
                     match if same(&seq) { Some(seq) } else if same(&turned) { Some(turned) } else { None } {
-                        Some(mut joined) => {
+                        Some(joined) => {
+                            let mut joined = joined[trim.0..joined.len() - trim.1].to_vec();
                             joined.extend_from_slice(fill);
                             r.molecules[*i].1 = joined;
                             r.molecules[*i].2 = true;
@@ -3294,7 +3331,7 @@ mod tests {
     fn a_closed_molecule_gets_its_join_segment_and_a_circular_walk() {
         let gfa = "H\tVN:Z:1.0\nS\ts.u0\tAAAACCCC\nS\ts.u1\tGGGTT\nL\ts.u0\t+\ts.u1\t-\t0M\nP\ts#1#pt.1\ts.u0+,s.u1-\t0M\tCH:i:1\n";
         let molecule = b"AAAACCCCAACCC";
-        let closed = close_gfa(gfa, molecule, b"TGT", "read_pairs", "").unwrap().unwrap();
+        let closed = close_gfa(gfa, molecule, b"TGT", "read_pairs", "", 0).unwrap().unwrap();
         assert!(closed.contains("S\ts.read_pairs_join\tTGT"));
         assert!(closed.contains("P\ts#1#pt.1\ts.u0+,s.u1-,s.read_pairs_join+\t0M,0M\tCH:i:1\tTP:Z:circular\tcj:Z:read_pairs"));
         let p = std::env::temp_dir().join(format!("ovasm-closed-{}.gfa", std::process::id()));
@@ -3302,7 +3339,7 @@ mod tests {
         assert_eq!(dead_ends(&parse_gfa(&p).unwrap()), 0);
         fs::remove_file(p).unwrap();
         // no walk spells another sequence
-        assert!(close_gfa(gfa, b"AAAACCCC", b"T", "read_pairs", "").unwrap().is_none());
+        assert!(close_gfa(gfa, b"AAAACCCC", b"T", "read_pairs", "", 0).unwrap().is_none());
     }
 
     #[test]
