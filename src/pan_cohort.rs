@@ -447,8 +447,16 @@ pub fn read_sample(
     let fasta = match fs::read_to_string(&reads_layer) {
         Ok(text) if text.lines().any(|l| l.starts_with('>'))
             && text.lines().filter(|l| l.starts_with('>')).all(|l| l.split_whitespace().any(|w| w.starts_with("path="))) => text,
-        _ => fs::read_to_string(dir.join(format!("{o}.fasta")))
-            .with_context(|| format!("{sample}: reading {o}.fasta"))?,
+        // a run that kept no molecule of this organelle writes no <o>.fasta: no paths, but its
+        // presence and genotypes still count
+        _ => {
+            let final_layer = dir.join(format!("{o}.fasta"));
+            if final_layer.exists() {
+                fs::read_to_string(&final_layer).with_context(|| format!("{sample}: reading {o}.fasta"))?
+            } else {
+                String::new()
+            }
+        }
     };
     let mut walks = Vec::new();
     let mut other_configuration: FxHashSet<String> = FxHashSet::default();
@@ -1051,6 +1059,7 @@ fn run_organelle(
         "new_segment_bases": new.seqs.iter().map(|(_, s)| s.len()).sum::<usize>(),
         "links": links.len(), "read_links_not_in_panel": links.values().filter(|(p, _)| !p).count(),
         "paths": paths, "sites": sites.len(),
+        "samples_without_molecules": runs.iter().filter(|(_, r)| r.walks.is_empty()).map(|(s, _)| s.clone()).collect::<Vec<_>>(),
         "samples_without_junctions_tsv": runs.iter().filter(|(_, r)| !r.has_junctions).map(|(s, _)| s.clone()).collect::<Vec<_>>(),
         "unmapped_unitigs_taken_as_new": runs.iter().filter(|(_, r)| r.unmapped_unitigs > 0).map(|(s, r)| serde_json::json!({"sample": s, "unitigs": r.unmapped_unitigs})).collect::<Vec<_>>(),
         "pieces_without_sequence": runs.iter().filter(|(_, r)| r.missing_pieces > 0).map(|(s, r)| serde_json::json!({"sample": s, "pieces": r.missing_pieces})).collect::<Vec<_>>(), "vcf_sites": vcf_sites, "junctions": jcount.len(),
@@ -1188,6 +1197,17 @@ mod tests {
         let j = fs::read_to_string(dir.join("short/mitochondrion/junctions.tsv")).unwrap();
         assert_eq!(j.lines().skip(1).count(), 1, "{j}");
         assert!(fs::read_to_string(dir.join("short/mitochondrion/nearest.tsv")).unwrap().contains("\t50\tno"));
+        // a run without molecules (no mitochondrion.fasta, no junctions.tsv) still counts by its
+        // presence and genotypes
+        fs::remove_file(dir.join("s2/mitochondrion.fasta")).unwrap();
+        fs::remove_file(dir.join("s2/mitochondrion/junctions.tsv")).unwrap();
+        let rep = run(args("bare", FxHashMap::default())).unwrap();
+        let o = &rep["organelles"]["mitochondrion"];
+        assert_eq!(o["samples"], 2);
+        assert_eq!(o["samples_without_molecules"][0], "s2");
+        assert_eq!(o["samples_without_junctions_tsv"][0], "s2");
+        let gfa = fs::read_to_string(dir.join("bare/mitochondrion/cohort.gfa")).unwrap();
+        assert!(!gfa.lines().any(|l| l.starts_with("P\ts2#")));
         let _ = fs::remove_dir_all(&dir);
     }
 }
