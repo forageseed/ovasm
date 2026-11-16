@@ -2809,6 +2809,11 @@ pub fn run(cfg: &Config) -> Result<Value> {
         } else {
             json!({"mode":"iterative","passes":20,"growth_bound":null})
         },
+        // the library the reads come from: read length (recruitment) and fragment span (pairs
+        // and reads within long unique steps of each organelle's molecules, `junction_support`)
+        "library":json!({"read_length":recruitment["read_length"],
+            "fragment_span_median":organelles.iter().map(|(o, s)| (o.to_string(), s["final"]["junctions"]["span_median"].clone())).collect::<serde_json::Map<_, _>>(),
+            "fragment_span_max":organelles.iter().map(|(o, s)| (o.to_string(), s["final"]["junctions"]["span_max"].clone())).collect::<serde_json::Map<_, _>>()}),
         "organelles":organelles,"plastid_layout":plastid_layout,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,

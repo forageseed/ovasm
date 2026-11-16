@@ -1354,6 +1354,9 @@ pub struct TargetOutput {
     pub converged: bool,
     /// The k-mer gate's depth of the target in reads (`kmer_read_depth`), with the k-mer gate.
     pub kmer_read_depth: Option<f64>,
+    /// Which bait k-mers the k-mer gate's depth was measured on: "all_bait_kmers", or
+    /// "own_bait_kmers" when it stood at another target's depth (`resolve_shared_depths`).
+    pub kmer_depth_from: Option<String>,
     /// The depth `max_read_depth` judged the target by (`cap_read_depth`): "sketch",
     /// "kmer_under_cap" (not downsampled), "kmer" (no sketch) or none (no cap asked).
     pub cap_depth_from: Option<&'static str>,
@@ -1413,6 +1416,9 @@ pub struct RecruitReport {
     /// What a caller should know about the result: a doubtful depth gate, a target stopped by
     /// `size_cap`, or one still growing when the passes ran out.
     pub warnings: Vec<String>,
+    /// Lengths of the reads recruited (the targets' sampled reads): median, shortest, longest
+    /// and how many were measured; null without reads.
+    pub read_length: serde_json::Value,
     pub elapsed_seconds: f64,
     pub peak_rss_mb: Option<f64>,
 }
@@ -2490,6 +2496,7 @@ pub(crate) fn run_with_options(
     // the k-mer gate's table and each target's k-mer depth, from after the first pass
     let mut kmer_table: Option<crate::frontier::KmerCounts> = None;
     let mut kmer_target_depth: Vec<Option<f64>> = vec![None; n_targets];
+    let mut kmer_depth_from: Vec<Option<String>> = vec![None; n_targets];
     // and each one's floor (`kmer_gate_floor`)
     let mut kmer_floor: Vec<Option<f64>> = vec![None; n_targets];
     // and the bait k-mers at its depth when the table was counted, the first pass's bound on its
@@ -2596,6 +2603,11 @@ pub(crate) fn run_with_options(
             let remeasured = resolve_shared_depths(&mut kmer_target_depth, |t| {
                 kmer_depth(&table, &bait, t, &res.all_sample[t].reads(), true)
             });
+            for t in 0..n_targets {
+                kmer_depth_from[t] = kmer_target_depth[t].map(|_| {
+                    if remeasured.contains(&t) { "own_bait_kmers" } else { "all_bait_kmers" }.to_string()
+                });
+            }
             if !remeasured.is_empty() {
                 let names: Vec<&str> = remeasured.iter().map(|&t| bait.targets[t].name.as_str()).collect();
                 eprintln!("[ovasm] k-mer gate: targets at one depth; {names:?} measured again on k-mers no other target holds");
@@ -3627,6 +3639,7 @@ pub(crate) fn run_with_options(
             recruitment_state,
             converged: recruitment_state == RecruitmentState::Converged,
             kmer_read_depth: kmer_depth,
+            kmer_depth_from: kmer_depth_from[t].clone(),
             cap_depth_from: judged.and_then(|j| j.1),
             sampling_fraction: fraction,
             sampled_by,
@@ -3642,6 +3655,16 @@ pub(crate) fn run_with_options(
         eprintln!("[ovasm] recruit warning: {w}");
     }
 
+    let read_length = {
+        let mut lengths: Vec<usize> =
+            (0..n_targets).flat_map(|t| res.all_sample[t].reads().iter().map(|r| r.len()).collect::<Vec<_>>()).collect();
+        lengths.sort_unstable();
+        match (lengths.first(), lengths.last()) {
+            (Some(&lo), Some(&hi)) => serde_json::json!({"median": lengths[lengths.len() / 2], "shortest": lo,
+                "longest": hi, "reads_measured": lengths.len()}),
+            _ => serde_json::Value::Null,
+        }
+    };
     let report = RecruitReport {
         tool: "ovasm find recruit",
         version: env!("CARGO_PKG_VERSION"),
@@ -3685,6 +3708,7 @@ pub(crate) fn run_with_options(
         core_depth,
         kmer_frontier: kmer_walks,
         warnings,
+        read_length,
         elapsed_seconds: start.elapsed().as_secs_f64(),
         peak_rss_mb: peak_rss_mb(),
     };
