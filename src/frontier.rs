@@ -194,24 +194,34 @@ impl KmerCounts {
         (line, slots)
     }
 
+    /// Conservative update: raise the k-mer's smallest counters by one. When another thread
+    /// moves one of them first (a failed CAS), read the four again and retry: dropping that
+    /// count lost most on the deepest k-mers, those many threads add at once.
     #[inline]
     pub(crate) fn add(&self, key: u64) {
         let (line, slots) = self.slots(key);
-        let values = slots.map(|s| line[s].load(Ordering::Relaxed));
-        let min = *values.iter().min().unwrap();
-        if min == u16::MAX {
-            return;
-        }
-        for (&s, &v) in slots.iter().zip(&values) {
-            if v == min {
-                // a lost race undercounts by one, beside thousands
-                let _ = line[s].compare_exchange(min, min + 1, Ordering::Relaxed, Ordering::Relaxed);
+        'attempt: loop {
+            let values = slots.map(|s| line[s].load(Ordering::SeqCst));
+            let min = *values.iter().min().unwrap();
+            if min == u16::MAX {
+                return;
             }
+            for (&s, &v) in slots.iter().zip(&values) {
+                if v == min
+                    && line[s]
+                        .compare_exchange(min, min + 1, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    continue 'attempt;
+                }
+            }
+            return;
         }
     }
 
-    /// Approximate count, capped at 65,535. Collisions can overcount; concurrent
-    /// conservative updates can lose increments, so this is not a strict lower bound.
+    /// Approximate count, capped at 65,535: at least the k-mer's occurrences. Collisions
+    /// overcount, and by how much depends on the order adds come in, so tables counted on
+    /// different thread counts can differ a little.
     #[inline]
     pub fn get(&self, key: u64) -> u32 {
         let (line, slots) = self.slots(key);
@@ -914,6 +924,56 @@ mod tests {
         let first = forward_kmers(&s)[0].1;
         assert_eq!(decode(first), s[..K].to_vec());
         assert_eq!(rc(first), forward_kmers(&revcomp(&s[..K]))[0].1);
+    }
+
+    /// Count `keys`, each `times` times, interleaved over a pool of `threads` threads.
+    fn count_in_pool(table: &KmerCounts, keys: &[u64], times: usize, threads: usize) {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        pool.install(|| {
+            (0..keys.len() * times)
+                .into_par_iter()
+                .with_min_len(1)
+                .for_each(|i| table.add(keys[i % keys.len()]));
+        });
+    }
+
+    #[test]
+    fn concurrent_adds_lose_no_count() {
+        // ZM4 counts 21 G k-mers on 16 threads: a CAS that lost a race to another thread adding
+        // the same k-mer dropped that count, most on the deepest k-mers, plastid repeats
+        let keys: Vec<u64> = (0..64u64).map(|i| canonical(forward_kmers(&random(40, 500 + i))[0].1)).collect();
+        for threads in [1, 8, 16] {
+            let table = KmerCounts::new(22);
+            count_in_pool(&table, &keys[..1], 40_000, threads);
+            assert_eq!(table.get(keys[0]), 40_000, "one k-mer, {threads} threads");
+            let table = KmerCounts::new(22);
+            count_in_pool(&table, &keys, 500, threads);
+            for &x in &keys {
+                assert_eq!(table.get(x), 500, "64 k-mers, {threads} threads");
+            }
+        }
+    }
+
+    #[test]
+    fn crowded_counts_stay_at_least_the_occurrences_on_any_thread_count() {
+        // 400 k-mers over 1,024 counters: most counts are shared. Conservative update
+        // depends on the order the adds come in, so the tables of 1, 8 and 16 threads differ
+        // a little, but none undercounts
+        let keys: Vec<u64> = (0..400u64).map(|i| canonical(forward_kmers(&random(40, 900 + i))[0].1)).collect();
+        let mut tables = Vec::new();
+        for threads in [1, 8, 16] {
+            let table = KmerCounts::new(10);
+            count_in_pool(&table, &keys, 50, threads);
+            let counts: Vec<u32> = keys.iter().map(|&x| table.get(x)).collect();
+            assert!(counts.iter().all(|&c| c >= 50), "{threads} threads: {counts:?}");
+            tables.push(counts);
+        }
+        let differ = |a: &[u32], b: &[u32]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "crowded table, k-mers whose count differs from 1 thread: 8 threads {}, 16 threads {}",
+            differ(&tables[0], &tables[1]),
+            differ(&tables[0], &tables[2])
+        );
     }
 
     #[test]
