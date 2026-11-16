@@ -77,7 +77,8 @@ if system == 'Windows':
     info['imported_windows_libraries'] = dependencies
 else:
     symbols = subprocess.check_output(['objdump', '-T', str(binary)], text=True)
-    required = max(tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+)', symbols))
+    strong = '\n'.join(l for l in symbols.splitlines() if not re.match(r'^[0-9a-fA-F]+\s+w\s+', l))
+    required = max(tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+)', strong))
     info['minimum_glibc'] = '.'.join(map(str, required))
     assert required <= (2, 34), 'README compatibility contract must match the built binary'
 (stage / 'BUILDINFO.json').write_text(json.dumps(info, indent=2), encoding='utf-8')
@@ -110,7 +111,7 @@ manifest = ''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.relativ
 (stage / 'FILES-SHA256.txt').write_text(manifest, encoding='utf-8')
 if system == 'Windows':
     archive = out / (name + '.zip')
-    with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
         for p in sorted(stage.rglob('*')):
             if p.is_file():
                 z.write(p, p.relative_to(out).as_posix())
