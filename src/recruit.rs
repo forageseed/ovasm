@@ -20,6 +20,10 @@ pub static PROF_CLASSIFY_NS: AtomicU64 = AtomicU64::new(0);
 pub static PROF_READER_WORK_NS: AtomicU64 = AtomicU64::new(0);
 pub static PROF_READER_SEND_NS: AtomicU64 = AtomicU64::new(0);
 pub static PROF_PARSE_NS: AtomicU64 = AtomicU64::new(0);
+/// Of the scan's serial part: read pairs offered (`MateReach`), and target reads counted,
+/// sampled and written.
+pub static PROF_MATE_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_TARGET_NS: AtomicU64 = AtomicU64::new(0);
 fn prof_take(a: &AtomicU64) -> f64 { a.swap(0, Relaxed) as f64 / 1e9 }
 /// `OVASM_PROFILE` set: each recruitment pass reports where its time went.
 pub fn profiling() -> bool {
@@ -809,8 +813,11 @@ struct MateReach<'a> {
 }
 
 impl MateReach<'_> {
-    fn offer(&self, rec: &Rec, bait: &BaitSet, out: &mut [Sample<MATE_READS>]) {
-        let mut key = None;
+    /// The targets (a bitmask) whose recruited reads hold `rec`'s mate and that `rec` would
+    /// extend (`mate_extends`). Run beside the classification, in parallel: probing every read
+    /// of the library on the scan's serial thread took ZM4 45-49 s of its 150-165 s passes.
+    fn matches(&self, rec: &Rec, bait: &BaitSet) -> u8 {
+        let (mut key, mut mask) = (None, 0u8);
         for t in 0..self.pairs.len() {
             let Some(d) = self.depth[t] else { continue };
             if self.pairs[t].is_empty() {
@@ -822,7 +829,21 @@ impl MateReach<'_> {
             }
             let floor = self.floor[t].unwrap_or(KMER_GATE_FLOOR * d);
             if mate_extends(self.table, bait, t, &rec.seq, d, floor) {
-                out[t].offer(name_key(&rec.id), &rec.seq);
+                mask |= 1 << t;
+            }
+        }
+        mask
+    }
+
+    /// Offer `rec`, a read left `Other`, to the targets of `mask` (`matches`), in scan order.
+    fn take(mask: u8, rec: &Rec, out: &mut [Sample<MATE_READS>]) {
+        if mask == 0 {
+            return;
+        }
+        let key = name_key(&rec.id);
+        for (t, sample) in out.iter_mut().enumerate() {
+            if mask & (1 << t) != 0 {
+                sample.offer(key, &rec.seq);
             }
         }
     }
@@ -928,7 +949,7 @@ fn scan(
     let (mut t_wait, mut t_par, mut t_serial, mut t_check, mut n_batches) = (0f64, 0f64, 0f64, 0f64, 0u64);
     let scan_start = Instant::now();
     let profile_reads = profiling();
-    let _ = (prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS), prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS));
+    let _ = (prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS), prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS), prof_take(&PROF_MATE_NS), prof_take(&PROF_TARGET_NS));
     let mut rx_iter = rx.into_iter();
     loop {
         let tw = Instant::now();
@@ -990,11 +1011,12 @@ fn scan(
         let storing = !replaying && replay.is_some();
         let (encoded, calls) = rayon::join(
             || storing.then(|| crate::replay::Replay::encode(&batch)),
-            || -> Vec<(Call, bool, bool, u16, Option<(usize, f32)>)> {
+            || -> Vec<((Call, bool, bool, u16, Option<(usize, f32)>), u8)> {
                 batch
                     .par_iter()
                     .enumerate()
                     .map(|(i, rec)| {
+                      let result = (|| {
                         let seq = &rec.rec.seq;
                         let classified = || {
                             let tcl = profile_reads.then(Instant::now);
@@ -1048,6 +1070,15 @@ fn scan(
                             Some(bound) => (call, false, false, bound, None),
                             None => classified(),
                         }
+                      })();
+                      // read pairs (`MateReach::matches`) for every read: the serial part may
+                      // still turn a call to `Other` (source exclusions), and takes the mask then
+                      let tm = profile_reads.then(Instant::now);
+                      let mates = w.mates.map_or(0, |m| m.matches(&rec.rec, bait));
+                      if let Some(tm) = tm {
+                          PROF_MATE_NS.fetch_add(tm.elapsed().as_nanos() as u64, Relaxed);
+                      }
+                      (result, mates)
                     })
                     .collect()
             },
@@ -1057,7 +1088,7 @@ fn scan(
         }
         t_par += tpar.elapsed().as_secs_f64();
         let tser = Instant::now();
-        for (i, ((call, changed, tandem, bound, judged), entry)) in calls.into_iter().zip(batch).enumerate() {
+        for (i, (((call, changed, tandem, bound, judged), mates), entry)) in calls.into_iter().zip(batch).enumerate() {
             out.reclassified += u64::from(changed);
             out.tandem += u64::from(tandem);
             if let Some((t, r)) = judged {
@@ -1099,8 +1130,8 @@ fn scan(
                 plan.observe(&entry.rec, call, original_input);
             }
             if call == Call::Other {
-                if let Some(m) = w.mates {
-                    m.offer(&entry.rec, bait, &mut out.mates);
+                if w.mates.is_some() {
+                    MateReach::take(mates, &entry.rec, &mut out.mates);
                 }
             }
             if matches!(call, Call::Other | Call::Tandem) {
@@ -1108,6 +1139,7 @@ fn scan(
             }
             let rec = entry.rec;
             let len = rec.seq.len() as u64;
+            let tt = profile_reads.then(Instant::now);
             match call {
                 Call::Organelle(mask) | Call::TandemArray(mask) => {
                     if mask.count_ones() > 1 {
@@ -1156,6 +1188,9 @@ fn scan(
                 }
                 Call::Other | Call::Tandem => {}
             }
+            if let Some(tt) = tt {
+                PROF_TARGET_NS.fetch_add(tt.elapsed().as_nanos() as u64, Relaxed);
+            }
         }
         t_serial += tser.elapsed().as_secs_f64();
     }
@@ -1191,11 +1226,12 @@ fn scan(
         plan.finish_scan()?;
     }
     if profiling() { eprintln!(
-        "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s gpu={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s",
+        "[ovasm] profile scan kind={} delta_kmers={} batches={} reads={} reclassified={} wall={:.1}s wait={:.1}s check={:.1}s gpu={:.1}s par={:.1}s serial={:.1}s | thread-summed delta={:.1}s classify={:.1}s | reader work={:.1}s send_blocked={:.1}s gz_parse={:.1}s | serial mates={:.1}s targets={:.1}s",
         if final_outputs { "final" } else if replaying { "replay" } else { "source" },
         delta.map_or(0, BaitSet::len), n_batches, out.reads, out.reclassified, scan_start.elapsed().as_secs_f64(), t_wait, t_check, t_gpu, t_par, t_serial,
         prof_take(&PROF_DELTA_NS), prof_take(&PROF_CLASSIFY_NS),
-        prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS)
+        prof_take(&PROF_READER_WORK_NS), prof_take(&PROF_READER_SEND_NS), prof_take(&PROF_PARSE_NS),
+        prof_take(&PROF_MATE_NS), prof_take(&PROF_TARGET_NS)
     ); }
     let _ = t_loop;
     Ok(out)
@@ -3962,9 +3998,9 @@ mod tests {
         let reach = MateReach { pairs: &pairs, table: &table, depth: &depth, floor: &fl };
         let mut out: Vec<Sample<MATE_READS>> = vec![Sample::default()];
         let rec = |id: &[u8], seq: &[u8]| Rec { id: id.to_vec(), seq: seq.to_vec(), qual: None };
-        reach.offer(&rec(b"SRR1.7 x", &organelle[1100..1250]), &bait, &mut out);
-        reach.offer(&rec(b"SRR1.8 x", &organelle[1300..1450]), &bait, &mut out);
-        reach.offer(&rec(b"SRR1.7 x", &nucleus[100..250]), &bait, &mut out);
+        { let r = rec(b"SRR1.7 x", &organelle[1100..1250]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
+        { let r = rec(b"SRR1.8 x", &organelle[1300..1450]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
+        { let r = rec(b"SRR1.7 x", &nucleus[100..250]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
         assert_eq!(out[0].reads(), vec![&organelle[1100..1250]]);
     }
 
