@@ -1698,13 +1698,15 @@ fn keep_at_target_depth(
 /// mitochondrion's plastid-derived stretches, the plastid's reads outnumber the mitochondrion's, and
 /// rice SAMEA115396710's mitochondrion stood at 1,707 (its plastid at 1,946, the reconstruction's
 /// own frontier walk at 220): its gate band let 1.9 M plastid reads in among 4.9 M.
-fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, reads: &[&[u8]]) -> Option<f64> {
+///
+/// `exclusive`: only the bait k-mers no other target holds (`resolve_shared_depths`).
+fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, reads: &[&[u8]], exclusive: bool) -> Option<f64> {
     let bit = 1u8 << t;
     let mut seen: Vec<u64> = reads
         .par_iter()
         .flat_map_iter(|s| {
             CanonicalKmers::new(s, bait.k)
-                .filter(|&(_, km)| bait.get(km) & bit != 0)
+                .filter(|&(_, km)| if exclusive { bait.get(km) == bit } else { bait.get(km) & bit != 0 })
                 .map(|(_, km)| km)
                 .collect::<Vec<_>>()
         })
@@ -1712,11 +1714,53 @@ fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, rea
     seen.sort_unstable();
     seen.dedup();
     let mut counts: Vec<u32> = seen.iter().map(|&km| table.get(km)).filter(|&c| c >= 3).collect();
-    if counts.is_empty() {
+    // on the exclusive k-mers alone, too few to stand for a target (an empty or noisy histogram):
+    // the caller keeps the shared estimate
+    if counts.is_empty() || (exclusive && counts.len() < MIN_EXCLUSIVE_KMERS) {
         return None;
     }
     counts.sort_unstable();
     Some(crate::assemble::sequence_depth(&counts)).filter(|&d| d > 0.0)
+}
+
+/// Two targets whose k-mer depths stand within this factor of each other are taken to be measured
+/// on the same sequence (`resolve_shared_depths`). A mitochondrion and its plastid differ by 3-30
+/// times in every library seen at full depth (rice 300-800x against 1,900-6,600x, Arabidopsis
+/// 365x against 5,000x and more, oat 21x against 1,300x).
+const SHARED_DEPTH_FOLD: f64 = 1.25;
+
+/// Fewest exclusive bait k-mers (counted at least three times) a target's depth is measured
+/// again on (`resolve_shared_depths`); with fewer it keeps its estimate.
+const MIN_EXCLUSIVE_KMERS: usize = 1000;
+
+/// Targets placed at one depth are measured again on the bait k-mers no other target holds.
+/// A pan reference's mitochondrion holds its plastid-derived stretches (MTPTs), whose k-mers are
+/// also the plastid's; where the mitochondrion is shallow its own k-mers are few and scattered
+/// while those stand together at the plastid's depth, and that peak became the mitochondrion's:
+/// rice SAMEA115396709 subsampled to 15x of mitochondrion had both targets at 52x, the gate band
+/// admitted the plastid's reads as the mitochondrion's, and the "mitochondrion" assembled was
+/// 98.7 kb of plastid and 14.5 kb of mitochondrion. `depths` are replaced only where the
+/// exclusive k-mers give a depth; a target with no such k-mers keeps its own.
+fn resolve_shared_depths(depths: &mut [Option<f64>], exclusive: impl Fn(usize) -> Option<f64>) -> Vec<usize> {
+    let n = depths.len();
+    let shared: Vec<usize> = (0..n)
+        .filter(|&a| {
+            (0..n).any(|b| {
+                b != a
+                    && matches!((depths[a], depths[b]), (Some(x), Some(y)) if x > 0.0 && y > 0.0 && x.max(y) <= SHARED_DEPTH_FOLD * x.min(y))
+            })
+        })
+        .collect();
+    let mut changed = Vec::new();
+    for &a in &shared {
+        if let Some(d) = exclusive(a).filter(|&d| d > 0.0) {
+            if depths[a] != Some(d) {
+                changed.push(a);
+            }
+            depths[a] = Some(d);
+        }
+    }
+    changed
 }
 
 /// The read depth of a target whose k-mers of length `k` stand at `kmer_depth` in the k-mer gate's
@@ -2547,7 +2591,17 @@ pub(crate) fn run_with_options(
             let mut library: Vec<u32> = table.sampled.iter().map(|&km| table.get(km)).collect();
             for t in 0..n_targets {
                 let reads = res.all_sample[t].reads();
-                kmer_target_depth[t] = kmer_depth(&table, &bait, t, &reads);
+                kmer_target_depth[t] = kmer_depth(&table, &bait, t, &reads, false);
+            }
+            let remeasured = resolve_shared_depths(&mut kmer_target_depth, |t| {
+                kmer_depth(&table, &bait, t, &res.all_sample[t].reads(), true)
+            });
+            if !remeasured.is_empty() {
+                let names: Vec<&str> = remeasured.iter().map(|&t| bait.targets[t].name.as_str()).collect();
+                eprintln!("[ovasm] k-mer gate: targets at one depth; {names:?} measured again on k-mers no other target holds");
+                warnings.push(format!("k-mer gate: {names:?} stood at another target's depth; measured on their own k-mers"));
+            }
+            for t in 0..n_targets {
                 kmer_floor[t] = kmer_target_depth[t].map(|d| kmer_gate_floor(&mut library, d));
                 kmer_present[t] = kmer_target_depth[t].map(|d| {
                     let floor = kmer_floor[t].unwrap_or(KMER_GATE_FLOOR * d);
@@ -3654,6 +3708,24 @@ pub fn peak_rss_mb() -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn targets_at_one_depth_are_measured_on_their_own_kmers() {
+        // rice SAMEA115396709 at 15x of mitochondrion: both at the plastid's 52x; the
+        // mitochondrion's own k-mers stand at 13x, the plastid's at 52x
+        let own = [Some(13.0), Some(52.0)];
+        let mut d = vec![Some(52.0), Some(52.0)];
+        assert_eq!(resolve_shared_depths(&mut d, |t| own[t]), vec![0]);
+        assert_eq!(d, vec![Some(13.0), Some(52.0)]);
+        // full depth: 3-30 times apart, nothing measured again
+        let mut d = vec![Some(700.0), Some(5000.0)];
+        assert!(resolve_shared_depths(&mut d, |_| panic!("not called")).is_empty());
+        assert_eq!(d, vec![Some(700.0), Some(5000.0)]);
+        // no own k-mers: the depth stays
+        let mut d = vec![Some(50.0), Some(52.0)];
+        assert!(resolve_shared_depths(&mut d, |_| None).is_empty());
+        assert_eq!(d, vec![Some(50.0), Some(52.0)]);
+    }
+
     use super::*;
 
     #[test]
@@ -4050,6 +4122,59 @@ mod tests {
     }
 
     #[test]
+    fn two_targets_sharing_half_their_bait_are_measured_on_their_own_kmers() {
+        // a mitochondrion at 20x whose bait is half plastid-derived (its own 3 kb and 3 kb of the
+        // plastid), the plastid at 200x: the shared k-mers stand at the plastid's depth
+        let own = pseudo_random(3000, 51);
+        let plastid = pseudo_random(6000, 52);
+        let table = crate::frontier::KmerCounts::with_k(20, 21);
+        for (seq, copies) in [(&own, 20), (&plastid, 200)] {
+            for _ in 0..copies {
+                for (_, km) in CanonicalKmers::new(seq, 21) {
+                    table.add(km);
+                }
+            }
+        }
+        let windows = |s: &'static [u8]| -> Vec<&'static [u8]> { (0..s.len() - 150).step_by(10).map(|a| &s[a..a + 150]).collect() };
+        let own: &'static [u8] = Box::leak(own.into_boxed_slice());
+        let plastid: &'static [u8] = Box::leak(plastid.into_boxed_slice());
+        let mut bait = BaitSet::new(21);
+        let (m, p) = (bait.target("mitochondrion").unwrap(), bait.target("plastid").unwrap());
+        bait.add_sequence(m, own);
+        bait.add_sequence(m, &plastid[..3000]);
+        bait.add_sequence(p, plastid);
+        bait.prepare_lookup();
+        let mut reads_m = windows(own);
+        reads_m.extend(windows(&plastid[..3000]));
+        let reads_p = windows(plastid);
+        let reads = |t: usize| if t == m { reads_m.clone() } else { reads_p.clone() };
+        // on its own k-mers each target stands at its own depth
+        let mine = kmer_depth(&table, &bait, m, &reads(m), true).unwrap();
+        assert!((mine - 20.0).abs() < 2.0, "{mine}");
+        let theirs = kmer_depth(&table, &bait, p, &reads(p), true).unwrap();
+        assert!((theirs - 200.0).abs() < 10.0, "{theirs}");
+        // both placed at the plastid's depth: the mitochondrion is measured again, the plastid
+        // keeps its depth
+        let mut d = vec![None; 2];
+        d[m] = Some(200.0);
+        d[p] = Some(200.0);
+        let again = resolve_shared_depths(&mut d, |t| kmer_depth(&table, &bait, t, &reads(t), true));
+        assert_eq!(again, vec![m]);
+        assert!((d[m].unwrap() - 20.0).abs() < 2.0, "{d:?}");
+        assert!((d[p].unwrap() - 200.0).abs() < 10.0, "{d:?}");
+        // fewer own k-mers than `MIN_EXCLUSIVE_KMERS`: no exclusive depth, the shared one stays
+        let mut small = BaitSet::new(21);
+        let (m2, p2) = (small.target("mitochondrion").unwrap(), small.target("plastid").unwrap());
+        small.add_sequence(m2, &own[..500]);
+        small.add_sequence(m2, &plastid[..3000]);
+        small.add_sequence(p2, plastid);
+        small.prepare_lookup();
+        let mut reads_small = windows(&own[..500]);
+        reads_small.extend(windows(&plastid[..3000]));
+        assert_eq!(kmer_depth(&table, &small, m2, &reads_small, true), None);
+    }
+
+    #[test]
     fn the_kmer_gate_lets_organelle_sequence_extend_and_keeps_the_nucleus_out() {
         // an organelle at 200x, its bait the first 1,000 bp; the nucleus at 5x, joined to the
         // organelle's 900-1,000 bp by a NUMT
@@ -4070,7 +4195,7 @@ mod tests {
         bait.add_sequence(t, &organelle[..1000]);
         bait.prepare_lookup();
         let reads: Vec<&[u8]> = (0..800).step_by(20).map(|a| &organelle[a..a + 150]).collect();
-        let depth = kmer_depth(&table, &bait, t, &reads).unwrap();
+        let depth = kmer_depth(&table, &bait, t, &reads, false).unwrap();
         assert!((depth - 200.0).abs() < 10.0, "{depth}");
         // 120 bp on the bait and 30 bp further into the organelle: extends
         assert!(kmer_extends(&table, &bait, t, &organelle[880..1030], depth, KMER_GATE_FLOOR * depth, false));

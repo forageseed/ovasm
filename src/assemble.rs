@@ -2665,6 +2665,12 @@ fn run_backbone_layout_guard(
     Ok(report)
 }
 
+/// Height, relative to the peak's, of the bins `depth_peak` takes as the peak's plateau.
+const PLATEAU: f64 = 0.9;
+
+/// Share of the nodes `sequence_depth`'s valley must leave above it (`depth_peak`).
+const MIN_PAST_VALLEY: f64 = 0.05;
+
 /// Width of a bin of `sequence_depth`'s histogram above `DEPTH_INTEGER_BINS`: 5% of the count.
 const DEPTH_BIN: f64 = 1.05;
 /// Below this count every count is a bin of its own: 5%-wide bins there are narrower than one
@@ -2718,15 +2724,43 @@ fn depth_peak(counts: &[u32], relative: bool) -> f64 {
     for &c in counts {
         hist[bin(c)] += 1;
     }
-    // per count, so integer and 5% bins are on one scale and the peak is the mode of the counts
+    // the first count of bin `i`: the counts are integers, and a 5% bin above `DEPTH_INTEGER_BINS`
+    // holds one or two of them by turns (21-22 in one, 23 alone), so its width in counts is
+    // the integers it holds, not its real width
+    let first_count = |i: usize| -> u64 {
+        if i <= n0 as usize {
+            return i as u64;
+        }
+        let mut c = lower(i).ceil() as u64;
+        while c > u64::from(n0) && bin((c - 1) as u32) >= i {
+            c -= 1;
+        }
+        while bin(c as u32) < i {
+            c += 1;
+        }
+        c
+    };
+    // per count, so integer and 5% bins are on one scale and the peak is the mode of the counts.
+    // By real width the bin of 21-22 stood at twice the density of its neighbours: a valley at 20
+    // and a peak at 21 wherever the sequence was shallower than ~25 (rice SAMEA115396709 at 15x
+    // of mitochondrion: the k-mer gate gave 21 for depths of 8 to 50 throughout)
     let density: Vec<f64> = hist
         .iter()
         .enumerate()
-        .map(|(i, &h)| h as f64 / (lower(i + 1) - lower(i)).max(1.0))
+        .map(|(i, &h)| h as f64 / (first_count(i + 1) - first_count(i)).max(1) as f64)
         .collect();
+    // nodes from bin `i` on: a valley must leave the peak `MIN_PAST_VALLEY` of them, not a
+    // few scattered high counts (an empty bin among them reads as a valley too)
+    let mut past = vec![0u64; hist.len() + 1];
+    for i in (0..hist.len()).rev() {
+        past[i] = past[i + 1] + hist[i];
+    }
     let first = bin(counts[0]);
-    let valley = (first + 1..density.len() - 1)
-        .find(|&i| density[i] <= density[i - 1] && density[i] < density[i + 1]);
+    let valley = (first + 1..density.len() - 1).find(|&i| {
+        density[i] <= density[i - 1]
+            && density[i] < density[i + 1]
+            && past[i] as f64 >= MIN_PAST_VALLEY * counts.len() as f64
+    });
     // nodes per relative width: h / ln(upper / lower), bin 0 (count 0) never holds a node
     let height = |i: usize| {
         if relative && i > 0 {
@@ -2740,7 +2774,17 @@ fn depth_peak(counts: &[u32], relative: bool) -> f64 {
     });
     match peak {
         Some(i) if hist[i] > 0 => {
-            let at: Vec<u32> = counts.iter().copied().filter(|&c| bin(c) == i).collect();
+            // the peak's plateau: the bins next to it within `PLATEAU` of its height, so a flat
+            // top (a spread sequence, bins of nearly equal density) stands at its middle, not at
+            // whichever bin sampling noise made the highest
+            let (mut a, mut b) = (i, i);
+            while a > valley.unwrap_or(0) && height(a - 1) >= PLATEAU * height(i) {
+                a -= 1;
+            }
+            while b + 1 < hist.len() && height(b + 1) >= PLATEAU * height(i) {
+                b += 1;
+            }
+            let at: Vec<u32> = counts.iter().copied().filter(|&c| (a..=b).contains(&bin(c))).collect();
             f64::from(at[at.len() / 2])
         }
         _ => {
@@ -2760,6 +2804,30 @@ fn depth_peak(counts: &[u32], relative: bool) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shallow_sequence_is_not_read_at_21() {
+        // k-mers of a sequence at mean depth 13, spread as a negative binomial (dispersion 8, as
+        // shallow subsampled libraries are), counts of 3 and more: the 5% bin of 21-22 holds two
+        // counts, and by its real width it made a valley at 20 and a peak at 21
+        let (mean, r) = (13.0f64, 8.0f64);
+        let q = r / (r + mean);
+        let mut pmf = q.powf(r);
+        let mut counts = Vec::new();
+        for c in 1..120u32 {
+            pmf *= (f64::from(c) - 1.0 + r) / f64::from(c) * (1.0 - q);
+            if c >= 3 {
+                counts.extend(std::iter::repeat(c).take((20_000.0 * pmf).round() as usize));
+            }
+        }
+        let d = super::sequence_depth(&counts);
+        assert!((9.0..=17.0).contains(&d), "{d}");
+        // a valley among a few scattered high counts is no valley: nothing past it to stand at
+        let mut tail = counts.clone();
+        tail.extend([60, 61, 90]);
+        let d = super::sequence_depth(&tail);
+        assert!((9.0..=17.0).contains(&d), "{d}");
+    }
+
     #[test]
     fn the_sequence_depth_is_where_most_of_the_sequence_stands() {
         fn poisson_like(n: usize, mean: f64, seed: u64) -> Vec<u32> {
