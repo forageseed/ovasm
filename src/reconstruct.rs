@@ -2192,14 +2192,14 @@ fn final_outputs(
             .map(|(h, _)| h.split(' ').next().unwrap_or("").to_string())
             .collect();
         let short = |s: &str| s.rsplit('.').next().unwrap_or(s).to_string();
-        let mut tsv = String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\n");
+        let mut tsv = String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\tanchor_gap_bp\n");
         let mut sources: BTreeMap<&str, usize> = BTreeMap::new();
         for j in &report.joins {
             let p = bridge_p.get(&(short(&j.left), short(&j.right))).copied();
             let source = js::join_source(j.class, p, adopted.contains(&j.molecule), mode);
             *sources.entry(source).or_default() += 1;
-            writeln!(tsv, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{}\t{}\t{}", j.molecule, j.left, j.repeat.join(","), j.right, j.x, j.y, j.repeat_bp, j.crossing_fragments, j.expected, j.p_at_most_observed, j.class,
-                p.map_or("NA".to_string(), |x| format!("{:.4}", x.0)), p.map_or("NA", |x| if x.2 { "yes" } else { "no" }), source)?;
+            writeln!(tsv, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{}\t{}\t{}\t{}", j.molecule, j.left, j.repeat.join(","), j.right, j.x, j.y, j.repeat_bp, j.crossing_fragments, j.expected, j.p_at_most_observed, j.class,
+                p.map_or("NA".to_string(), |x| format!("{:.4}", x.0)), p.map_or("NA", |x| if x.2 { "yes" } else { "no" }), source, j.anchor_gap_bp)?;
         }
         fs::write(dir.join("junctions.tsv"), tsv)?;
         // every pairing the graph allows at each anchor end with more than one (the panel
@@ -2231,10 +2231,10 @@ fn final_outputs(
             }
             let overlaps = js::read_overlaps(&assembly_gfa)?;
             let pairings = js::pairing_support(&bridges, &segs, &overlaps, reads, &report)?;
-            let mut t = String::from("left\trepeat\tright\trepeat_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\truns_holding\truns_informative\tpanel_takes\n");
+            let mut t = String::from("left\trepeat\tright\trepeat_bp\tanchor_gap_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\truns_holding\truns_informative\tpanel_takes\n");
             for x in &pairings {
                 let b = meta[x.bridge];
-                writeln!(t, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{:.4}\t{}\t{}\t{}", x.left, x.repeat.join(","), x.right, x.repeat_bp, x.reads_crossing, x.pairs_crossing, x.crossing_fragments, x.expected, x.p_at_most_observed, x.class,
+                writeln!(t, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{:.4}\t{}\t{}\t{}", x.left, x.repeat.join(","), x.right, x.repeat_bp, x.anchor_gap_bp, x.reads_crossing, x.pairs_crossing, x.crossing_fragments, x.expected, x.p_at_most_observed, x.class,
                     b["probability"].as_f64().unwrap_or(f64::NAN), b["runs_holding"], b["runs_informative"], if b["taken"] == true { "yes" } else { "no" })?;
             }
             fs::write(dir.join("pairings.tsv"), t)?;
@@ -2397,13 +2397,13 @@ fn final_outputs(
                 let mut jtext = if jt.exists() {
                     fs::read_to_string(&jt)?
                 } else {
-                    String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\n")
+                    String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\tanchor_gap_bp\n")
                 };
                 let mut st = String::from("gap\tleft_piece\tleft\tright_piece\tright\tscaffold_start\tbp\tfilled_with\twalk\twalk_start\n");
                 for (k, g) in sc.gaps.iter().enumerate() {
                     let (a, b) = (&sc.placements[g.after], &sc.placements[g.before]);
                     let (left, right) = (end_step(a.piece, a.reverse, true), end_step(b.piece, b.reverse, false));
-                    writeln!(jtext, "scaffold.1\t{left}\t-\t{right}\t{}\t{}\t{}\t0\tNA\tNA\tpanel_scaffold\tNA\tyes\tpanel", g.start, g.start + g.length, g.length)?;
+                    writeln!(jtext, "scaffold.1\t{left}\t-\t{right}\t{}\t{}\t{}\t0\tNA\tNA\tpanel_scaffold\tNA\tyes\tpanel\tNA", g.start, g.start + g.length, g.length)?;
                     writeln!(st, "{k}\t{}\t{left}\t{}\t{right}\t{}\t{}\t{}\t{walk_name}\t{}", name(a.piece), name(b.piece), g.start, g.length, if g.mirrored { "inverted_copy" } else { "panel_walk" }, g.walk_start)?;
                 }
                 fs::write(&jt, jtext)?;

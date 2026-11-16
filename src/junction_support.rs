@@ -85,6 +85,9 @@ pub struct Join {
     pub x: usize,
     pub y: usize,
     pub repeat_bp: usize,
+    /// Bases between the nearest anchors either side (the last graph-unique k-mer before the
+    /// repeat, the first after it): what a crossing fragment must span; the expectation's gap.
+    pub anchor_gap_bp: usize,
     pub crossing_fragments: u64,
     pub expected: f64,
     pub p_at_most_observed: f64,
@@ -146,6 +149,8 @@ pub struct Pairing {
     pub repeat: Vec<String>,
     pub right: String,
     pub repeat_bp: usize,
+    /// Bases between the nearest anchors of the two sides (as `Join::anchor_gap_bp`).
+    pub anchor_gap_bp: usize,
     /// Single reads holding anchors of both sides, and read pairs with one mate on each side
     /// at a span the library makes (a fragment counts once).
     pub reads_crossing: u64,
@@ -373,6 +378,18 @@ pub fn analyse(
         }
     }
     report.anchors = anchors.values().filter(|v| v.is_some()).count() / 2;
+    // anchor positions of each molecule, in order: a join's fragments must reach from the last
+    // one before its repeat to the first one after it
+    let mut anchor_pos: Vec<Vec<usize>> = vec![Vec::new(); molecules.len()];
+    for &(mi, fw, p) in anchors.values().flatten() {
+        if fw {
+            anchor_pos[mi as usize].push(p as usize);
+        }
+    }
+    for v in &mut anchor_pos {
+        v.sort_unstable();
+        v.dedup();
+    }
     drop(count);
 
     // place reads
@@ -546,13 +563,29 @@ pub fn analyse(
             let x = steps[ia].end;
             let y = steps[ib].start + if wrap { l } else { 0 };
             let g = y.saturating_sub(x);
+            // the gap the fragments must span: from the last anchor before x to the first one at
+            // or after y. A flank whose k-mers are not graph-unique near the repeat holds no
+            // anchor there, and the fragments must reach further (1001 Arabidopsis panel: 70 of
+            // the 74 joins cut as not crossed were in the held-out HiFi, 54 of them beside a
+            // flank under 300 bp whose nearest anchor lay ~100 bp from the repeat, or none)
+            let ap = &anchor_pos[mi];
+            let li = ap.partition_point(|&p| p + K <= x);
+            let left = if li > 0 { Some(ap[li - 1] as i64 + K as i64) } else if m.circular { ap.last().map(|&p| p as i64 + K as i64 - l as i64) } else { None };
+            let yy = y % l.max(1);
+            let ri = ap.partition_point(|&p| p < yy);
+            let base_y = (y - yy) as i64;
+            let right = if ri < ap.len() { Some(base_y + ap[ri] as i64) } else if m.circular { ap.first().map(|&p| base_y + (l + p) as i64) } else { None };
+            let anchor_gap = match (left, right) {
+                (Some(a), Some(b)) => ((b - a).max(0) as usize).max(g),
+                _ => usize::MAX / 4,
+            };
             let observed = fragments
                 .iter()
                 .filter(|&&(fm, a, b)| fm as usize == mi && a + (K as i64) <= x as i64 && b >= y as i64)
                 .count() as u64;
             let flank = segs[&steps[ia].segment].1.min(segs[&steps[ib].segment].1);
             let scale = base.map(|b| (flank / b).min(1.0)).unwrap_or(1.0);
-            let expected = expected_at(g) * scale;
+            let expected = expected_at(anchor_gap) * scale;
             let p = poisson_cdf(observed, expected);
             let below_controls = ratios.len() < 20 || (observed as f64) < ratio_floor * expected;
             let class = if p < ALPHA && below_controls {
@@ -570,6 +603,7 @@ pub fn analyse(
                 x,
                 y,
                 repeat_bp: g,
+                anchor_gap_bp: anchor_gap.min(usize::MAX / 4),
                 crossing_fragments: observed,
                 expected,
                 p_at_most_observed: p,
@@ -708,6 +742,15 @@ pub fn pairing_support(
         }
     }
     drop(count);
+    // first and last anchor offset of each anchor segment
+    let mut span_of: Vec<Option<(usize, usize)>> = vec![None; names.len()];
+    for &(ai, fw, p) in anchors.values().flatten() {
+        if fw {
+            let e = span_of[ai as usize].get_or_insert((p as usize, p as usize));
+            e.0 = e.0.min(p as usize);
+            e.1 = e.1.max(p as usize);
+        }
+    }
     // every placement of every read (a read across a junction lies on two anchors), by name
     let mut by_name: FxHashMap<Vec<u8>, Vec<Vec<Placed>>> = FxHashMap::default();
     for path in reads {
@@ -786,6 +829,12 @@ pub fn pairing_support(
         // where the last anchor starts, in bases from the first anchor's start
         let y = la + inner as i64 - ov as i64;
         let g = (y - la).max(0) as usize;
+        // bases from the first anchor's last anchor to its end, and from the last anchor's start
+        // to its first anchor, read the bridge's way
+        let (Some(sa), Some(sz)) = (span_of[ia as usize], span_of[iz as usize]) else { continue };
+        let tail_a = if a.1 { la as usize - (sa.1 + K) } else { sa.0 };
+        let head_z = if z.1 { sz.0 } else { lz as usize - K - sz.1 };
+        let anchor_gap = g + tail_a + head_z;
         let (mut reads_x, mut pairs_x) = (0u64, 0u64);
         for recs in by_anchors.get(&(ia.min(iz), ia.max(iz))).unwrap_or(&none) {
             let on_a = |ps: &Vec<Placed>| ps.iter().filter(|p| p.mol == ia).map(|p| orient(p, a.1, la)).collect::<Vec<_>>();
@@ -811,7 +860,7 @@ pub fn pairing_support(
         let observed = reads_x + pairs_x;
         let flank = segs[&a.0].1.min(segs[&z.0].1);
         let scale = report.single_copy_depth.map(|d| (flank / d).min(1.0)).unwrap_or(1.0);
-        let expected = expected_at(g) * scale;
+        let expected = expected_at(anchor_gap) * scale;
         let p = poisson_cdf(observed, expected);
         let below_controls = report.control_points < 20 || (observed as f64) < report.control_ratio_floor * expected;
         let class = if p < ALPHA && below_controls {
@@ -827,6 +876,7 @@ pub fn pairing_support(
             repeat: b[1..b.len() - 1].iter().map(label).collect(),
             right: label(z),
             repeat_bp: g,
+            anchor_gap_bp: anchor_gap,
             reads_crossing: reads_x,
             pairs_crossing: pairs_x,
             crossing_fragments: observed,
@@ -980,7 +1030,7 @@ mod path_tests {
         let steps = vec![st("a", 0, 4), st("r", 4, 6), st("b", 6, 10), st("c", 10, 16)];
         let m = Molecule { name: "m".into(), sequence: vec![b'A'; 16], circular: false, path: None };
         let j = |y| Join { molecule: "m".into(), left: String::new(), right: String::new(), repeat: vec![], x: 0, y,
-            repeat_bp: 0, crossing_fragments: 0, expected: 0.0, p_at_most_observed: 0.0, class: "unsupported" };
+            repeat_bp: 0, anchor_gap_bp: 0, crossing_fragments: 0, expected: 0.0, p_at_most_observed: 0.0, class: "unsupported" };
         assert_eq!(piece_paths(&m, &steps, &[j(6)]), vec!["a+,r+".to_string(), "b+,c+".to_string()]);
         assert_eq!(piece_paths(&m, &steps, &[]), vec!["a+,r+,b+,c+".to_string()]);
         let circle = Molecule { circular: true, ..m };
@@ -1129,6 +1179,31 @@ mod tests {
     }
 
     #[test]
+    fn a_join_beside_a_flank_without_anchors_is_expected_across_the_anchor_gap() {
+        // truth A R C B R D with a 150 bp stretch S that the graph also holds elsewhere (in D) at
+        // the end of A: no anchor within 150 bp before R, so pairs of 300 bp cross A-R-C less
+        // often than an 80 bp repeat alone would make them
+        let mut g = graph(17, 80);
+        let shared = g["D"].0[1000..1150].to_vec();
+        let a = g.get_mut("A").unwrap();
+        let n = a.0.len();
+        a.0.splice(n - 150..n, shared);
+        let (truth, path) = walk(&g, &["A", "R", "C", "B", "R", "D"]);
+        let dir = std::env::temp_dir().join(format!("ovasm-junction-gap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("r.fq");
+        write_pairs(&reads, &truth, 5);
+        let m = Molecule { name: "m".into(), sequence: truth, circular: true, path: Some(path) };
+        let (r, _) = analyse(&[m], &g, &[reads], &[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let j = r.joins.iter().find(|j| j.left == "A+").unwrap();
+        // the last anchor is the k-mer ending K - 1 bases into the shared stretch
+        assert_eq!(j.anchor_gap_bp, 80 + 150 - (K - 1), "{j:?}");
+        assert_eq!(j.class, "supported", "{j:?}");
+        assert!(j.crossing_fragments as f64 > 0.5 * j.expected, "{j:?}");
+    }
+
+    #[test]
     fn every_pairing_of_a_short_repeat_is_measured_taken_or_not() {
         let p = pairings(80, "short");
         assert_eq!(p.len(), 5);
@@ -1210,7 +1285,7 @@ mod tests {
         let m = Molecule { name: "m".into(), sequence: b"AAAACCCCGGGGTTTT".to_vec(), circular: true, path: None };
         let j = |y| Join {
             molecule: "m".into(), left: String::new(), right: String::new(), repeat: vec![], x: 0, y,
-            repeat_bp: 0, crossing_fragments: 0, expected: 20.0, p_at_most_observed: 0.0, class: "unsupported",
+            repeat_bp: 0, anchor_gap_bp: 0, crossing_fragments: 0, expected: 20.0, p_at_most_observed: 0.0, class: "unsupported",
         };
         let out = cut(&[m], &[j(4), j(12)]);
         assert_eq!(out.len(), 2);

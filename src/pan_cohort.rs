@@ -570,7 +570,7 @@ pub fn read_sample(
             }
             let (Some(l), Some(r)) = (parts[0].last().cloned(), parts[parts.len() - 1].first().cloned()) else { continue };
             let rep: Vec<Step> = merge_steps(parts[1..parts.len() - 1].concat());
-            let fields = ["repeat_bp", "reads_crossing", "pairs_crossing", "crossing_fragments", "expected", "p_at_most_observed", "class", "panel_takes"]
+            let fields = ["repeat_bp", "anchor_gap_bp", "reads_crossing", "pairs_crossing", "crossing_fragments", "expected", "p_at_most_observed", "class", "panel_takes"]
                 .iter()
                 .map(|c| pt.get(row, c).map(str::to_string))
                 .collect::<Result<Vec<_>>>()?;
@@ -1069,7 +1069,7 @@ fn run_organelle(
     // pairings: per sample, every pairing its graph allowed, in panel terms
     {
         let mut f = BufWriter::new(fs::File::create(out.join("pairings.tsv"))?);
-        writeln!(f, "left\trepeat\tright\tsample\tin_frequencies\trepeat_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_takes")?;
+        writeln!(f, "left\trepeat\tright\tsample\tin_frequencies\trepeat_bp\tanchor_gap_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_takes")?;
         let mut rows: Vec<(&String, &String, &String)> = runs.iter().flat_map(|(s, r)| r.pairings.iter().map(move |(k, v)| (k, s, v))).collect();
         rows.sort();
         for (key, s, v) in rows {
@@ -1208,7 +1208,7 @@ mod tests {
             fs::write(o.join("individual.segments.tsv"), format!("sample\tsegment\tlength\tpieces\n{s}_reference_supported\tref.0.0.5\t5\t1+\n{s}_reference_supported\tref.{refn}.0.5\t5\t2+\n{s}_reference_supported\tref.3.0.5\t5\t3+\n{s}_denovo\t{s}_denovo.u1\t15\t1+,2+,3+\n{s}_denovo\t{s}_denovo.u2\t10\t4+\n")).unwrap();
             fs::write(o.join("junctions.tsv"), "molecule\tleft\trepeat\tright\tclass\tsource\nm1\tu1+\tu2+\tu1+\tundetermined_long_repeat\tpanel\n").unwrap();
             // a bridge and its reverse: one pairing
-            fs::write(o.join("pairings.tsv"), "left\trepeat\tright\trepeat_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\truns_holding\truns_informative\tpanel_takes\nu1+\tu2+\tu1+\t10\t1\t2\t3\t4.00\t4.3e-1\tsupported\t0.5\t1\t2\tyes\nu1-\tu2-\tu1-\t10\t1\t2\t3\t4.00\t4.3e-1\tsupported\t0.5\t1\t2\tyes\n").unwrap();
+            fs::write(o.join("pairings.tsv"), "left\trepeat\tright\trepeat_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\truns_holding\truns_informative\tpanel_takes\tanchor_gap_bp\nu1+\tu2+\tu1+\t10\t1\t2\t3\t4.00\t4.3e-1\tsupported\t0.5\t1\t2\tyes\t12\nu1-\tu2-\tu1-\t10\t1\t2\t3\t4.00\t4.3e-1\tsupported\t0.5\t1\t2\tyes\t12\n").unwrap();
             fs::write(o.join("presence.tsv"), format!("segment\tlength\tkmers\tdepth\trelative\tcall\n1\t5\t30\t30\t1\tpresent\n2\t5\t30\t{}\t1\t{}\n3\t5\t30\t{}\t1\t{}\n4\t5\t5\t30\t1\tpresent\n", if refn == 1 { "30" } else { "0" }, if refn == 1 { "present" } else { "absent" }, if refn == 2 { "30" } else { "0" }, if refn == 2 { "present" } else { "absent" })).unwrap();
             fs::write(o.join("genotypes.tsv"), format!("site\tleft\tright\tallele\tallele_bp\treference_runs\tkmers\tdepth\tshare\tcall\n0\t1+\t4+\t2+\t5\tR1\t1\t30\t1\t{}\n0\t1+\t4+\t3+\t5\tR2\t1\t30\t1\t{}\n", if refn == 1 { "major" } else { "absent" }, if refn == 2 { "major" } else { "absent" })).unwrap();
             fs::write(d.join("mitochondrion.fasta"), ">m1 circular=false path=u1+,u2+,u1+ configuration=1 of=2\nN\n>m2 circular=false path=u1+ configuration=2 of=2\nN\n").unwrap();
@@ -1238,7 +1238,7 @@ mod tests {
         // one row per sample, in panel segments, with the run's counts
         let rows: Vec<&str> = pr.lines().skip(1).collect();
         assert_eq!(rows.len(), 2, "{pr}");
-        assert!(rows.iter().any(|r| r.contains("\ts1\tyes\t10\t1\t2\t3\t4.00\t4.3e-1\tsupported\tyes")), "{pr}");
+        assert!(rows.iter().any(|r| r.contains("\ts1\tyes\t10\t12\t1\t2\t3\t4.00\t4.3e-1\tsupported\tyes")), "{pr}");
         let vcf = fs::read_to_string(dir.join("out/mitochondrion/genotypes.vcf")).unwrap();
         let rec = vcf.lines().find(|l| !l.starts_with('#')).unwrap();
         assert!(rec.starts_with("R1#1#mt\t5\tsite0\tCCCCCG\tCGGGGT"), "{rec}");
