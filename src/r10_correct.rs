@@ -77,6 +77,8 @@ const AUTO_MIN_QUAL_FRAC: f64 = 0.90;
 const AUTO_MIN_EFFECTIVE_Q: f64 = 15.0;
 const AUTO_MIN_SOLID_PEAK: u32 = 5;
 const AUTO_MIN_SOLID_FRAC: f64 = 0.45;
+const AUTO_HIFI_MIN_EFFECTIVE_Q: f64 = 25.0;
+const AUTO_HIFI_MIN_SOLID_FRAC: f64 = 0.90;
 
 const K_HPC: usize = 15;
 const W_HPC: usize = 5;
@@ -221,6 +223,25 @@ fn forward_21mers(seq: &[u8]) -> Vec<u64> {
     out
 }
 
+fn looks_like_ccs_header(id: &[u8]) -> bool {
+    // PacBio CCS/HiFi headers (`m64011_.../123/ccs`, `ccs` token, or SAM tags `rq:f:` / `np:i:`).
+    let lower: Vec<u8> = id.iter().take(256).map(u8::to_ascii_lowercase).collect();
+    for i in 0..lower.len() {
+        if lower[i..].starts_with(b"/ccs")
+            && matches!(lower.get(i + 4), None | Some(b' ' | b'\t' | b'/'))
+        {
+            return true;
+        }
+        if (lower[i..].starts_with(b"rq:f:") || lower[i..].starts_with(b"np:i:")
+            || lower[i..].starts_with(b"rq=") || lower[i..].starts_with(b"np="))
+            && (i == 0 || matches!(lower[i - 1], b' ' | b'\t'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Inspect read Phred calibration and 21-mer solidity to decide between R10 phased overlap
 /// correction and the legacy solid-kmer dBG corrector.
 pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
@@ -228,9 +249,13 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
     let mut bases_examined = 0u64;
     let mut qual_bases = 0u64;
     let mut err_sum = 0.0f64;
+    let mut ccs_headers = 0usize;
 
     for r in reads {
         bases_examined += r.seq.len() as u64;
+        if looks_like_ccs_header(&r.id) {
+            ccs_headers += 1;
+        }
         if let Some(q) = r.qual.as_ref().filter(|q| q.len() == r.seq.len()) {
             qual_bases += q.len() as u64;
             err_sum += q
@@ -239,6 +264,11 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
                 .sum::<f64>();
         }
     }
+    let ccs_frac = if !reads.is_empty() {
+        ccs_headers as f64 / reads.len() as f64
+    } else {
+        0.0
+    };
     let qual_base_fraction = if bases_examined > 0 {
         qual_bases as f64 / bases_examined as f64
     } else {
@@ -331,6 +361,18 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
                         solid_21mer_fraction, AUTO_MIN_SOLID_FRAC
                     ),
                 )
+            } else if ccs_frac >= 0.50
+                || (effective_phred_q.unwrap_or(0.0) >= AUTO_HIFI_MIN_EFFECTIVE_Q
+                    && solid_21mer_fraction >= AUTO_HIFI_MIN_SOLID_FRAC)
+            {
+                let msg = format!(
+                    "reads look like PacBio HiFi (effective Q {:.2}, solid 21-mer fraction {:.3}{}); keeping legacy path — use `ovasm run hifi` for HiFi or `--chemistry r10` to force R10",
+                    effective_phred_q.unwrap_or(0.0),
+                    solid_21mer_fraction,
+                    if ccs_frac >= 0.50 { ", CCS headers" } else { "" }
+                );
+                eprintln!("[ovasm] warning: {msg}");
+                (false, format!("auto -> legacy: {msg}"))
             } else {
                 (
                     true,
@@ -2620,6 +2662,49 @@ mod tests {
             .collect();
         let p_r9 = detect_chemistry(&r9_reads, OntChemistry::Auto);
         assert!(!p_r9.use_r10, "R9 Dorado Q90 must stay legacy: {p_r9:?}");
+
+        // 4. PacBio HiFi profile (Q ~27-30, ~0.15% error => solid 21-mer ~0.97), even with SRA-renamed
+        // headers lacking `/ccs`, must NOT trigger R10 under Auto (`--chemistry r10` still forces it).
+        let hifi_reads: Vec<Rec> = (0..80)
+            .map(|i| {
+                let st = (i * 75) % 6_000;
+                let mut seq = Vec::with_capacity(2_200);
+                let mut qual = Vec::with_capacity(2_200);
+                for &b in &circ[st..st + 2_200] {
+                    if rng.unit() < 0.0015 {
+                        let alt = BASES[((base_code(b).unwrap() + 1) % 4) as usize];
+                        seq.push(alt);
+                        qual.push(33 + 18);
+                    } else {
+                        seq.push(b);
+                        qual.push(33 + 30);
+                    }
+                }
+                Rec {
+                    id: format!("ERR12779266.{}", i + 1).into_bytes(),
+                    seq,
+                    qual: Some(qual),
+                }
+            })
+            .collect();
+        let p_hifi = detect_chemistry(&hifi_reads, OntChemistry::Auto);
+        assert!(!p_hifi.use_r10, "HiFi reads passed to Auto must stay legacy: {p_hifi:?}");
+        assert!(p_hifi.effective_phred_q.unwrap() >= 25.0 && p_hifi.solid_21mer_fraction >= 0.95);
+        let p_hifi_forced = detect_chemistry(&hifi_reads, OntChemistry::R10);
+        assert!(p_hifi_forced.use_r10, "explicit --chemistry r10 must still force R10");
+
+        // 5. PacBio `/ccs` headers at lower Q22 also stay legacy under Auto.
+        let ccs_reads: Vec<Rec> = r10_reads
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Rec {
+                id: format!("m64011_220101_000000/{}/ccs", i + 1).into_bytes(),
+                seq: r.seq.clone(),
+                qual: r.qual.clone(),
+            })
+            .collect();
+        let p_ccs = detect_chemistry(&ccs_reads, OntChemistry::Auto);
+        assert!(!p_ccs.use_r10, "CCS-header reads must stay legacy under Auto: {p_ccs:?}");
     }
 
     #[test]
