@@ -2371,6 +2371,13 @@ pub struct Config {
     /// Walk the individual's sequence that no reference path holds before recruitment
     /// (`frontier`); WGS input only.
     pub frontier: Option<frontier::Params>,
+    /// Recruit once from the panel and only reach past its edges (`PAN_RECRUIT_PASSES` passes,
+    /// `PAN_GROWTH_BOUND`), not twenty passes of open-ended extension (`--iterative-recruitment`).
+    /// Leave-one-out on rice (six folds, a panel of five new assemblies) and Arabidopsis (eight):
+    /// rice from 30 to 13 minutes a sample, Arabidopsis from 15 to 8, memory the same (6.4 GB);
+    /// Arabidopsis unchanged, rice mitochondria no worse and SAMEA115396715 (recall 0.940 to
+    /// 0.970) and SAMEA115396717 (0.916 to 0.985) better.
+    pub one_shot_recruitment: bool,
 }
 
 
@@ -2536,7 +2543,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                     numt_min_block: usize::MAX,
                     block_gap: 40,
                 },
-                iterations: PAN_RECRUIT_PASSES,
+                iterations: if cfg.one_shot_recruitment { PAN_RECRUIT_PASSES } else { 20 },
                 extend_min_count: 3,
                 auto_shallow_edge_support: false,
                 extend_depth: 200.0,
@@ -2562,7 +2569,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 gate_fold: None,
                 nuclear_depth: None,
                 genome_size: None,
-                growth_bound: Some(PAN_GROWTH_BOUND),
+                growth_bound: cfg.one_shot_recruitment.then_some(PAN_GROWTH_BOUND),
             },
         )?)?
     };

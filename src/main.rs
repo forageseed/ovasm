@@ -571,6 +571,11 @@ struct ReconstructArgs {
     /// Memory of that walk's k-mer count table, in GiB (rounded down to a power of two).
     #[arg(long, default_value_t = 4.0)]
     frontier_memory_gib: f64,
+    /// Recruit as before the panel recruited once: twenty passes of open-ended extension instead
+    /// of a few passes that only reach past the panel's edges with a bound on what the bait may
+    /// grow by (about twice the time).
+    #[arg(long)]
+    iterative_recruitment: bool,
 }
 
 fn reconstruct(args: ReconstructArgs) -> Result<()> {
@@ -650,6 +655,7 @@ fn reconstruct(args: ReconstructArgs) -> Result<()> {
             slots_log2,
             ..Default::default()
         }),
+        one_shot_recruitment: !args.iterative_recruitment,
     })?;
     Ok(())
 }
