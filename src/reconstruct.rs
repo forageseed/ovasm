@@ -2697,7 +2697,17 @@ pub fn run(cfg: &Config) -> Result<Value> {
         "inputs":cfg.reads,"target_read_inputs":cfg.target_reads,
         "input_scope":if targeted {"explicit_target_reads"} else {"whole_genome_recruitment"},
         "experimental_deep_bubble_fraction":cfg.experimental_deep_bubble_fraction,
-        "reference_graphs":cfg.references,"frontier":frontier_info,"recruitment":recruitment,"organelles":organelles,
+        "reference_graphs":cfg.references,"frontier":frontier_info,"recruitment":recruitment,
+        // how recruitment ran (`Config::one_shot_recruitment`)
+        "recruitment_mode":if targeted {
+            json!({"mode":"not_run"})
+        } else if cfg.one_shot_recruitment {
+            json!({"mode":"panel_once","passes":PAN_RECRUIT_PASSES,"growth_bound":PAN_GROWTH_BOUND,
+                "anchor_share_of_read":2.0 / 3.0,"anchor_from_pass":2})
+        } else {
+            json!({"mode":"iterative","passes":20,"growth_bound":null})
+        },
+        "organelles":organelles,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,
         "physical_molecule_count":null,"physical_topology_identified":false});

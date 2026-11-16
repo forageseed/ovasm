@@ -42,6 +42,16 @@ The workflow proceeds as follows:
    walked into the nucleus (see the validation record).
 1. Seed recruitment with all reference P walks (including circular-boundary words) and
    all graph node sequences. Both targets compete in the same recruitment call.
+   By default the panel recruits once (`recruitment_mode.mode = "panel_once"` in
+   reconstruction.json): four passes over the reads, a read extending a target from the
+   second pass on only when the bait holds two thirds of it in one exact run, and a target
+   stopping once its bait has grown by a quarter of the panel k-mers it started with.
+   `--iterative-recruitment` runs the earlier twenty passes of open-ended extension
+   (`"iterative"`). Leave-one-out (evaluation v2 with `--no-long-join`), rice six folds on
+   a panel of five new assemblies and Arabidopsis eight: rice mitochondria no worse
+   (SAMEA115396715 recall 0.940 to 0.970, SAMEA115396717 0.916 to 0.985), Arabidopsis
+   identical, rice from 30 to 13 minutes a sample and Arabidopsis from 15 to 8, peak memory
+   unchanged (about 6.4 GB).
 2. Match complete retained reads, in either orientation, exactly against every source
    P walk. A sparse 21-mer index proposes positions; full sequence comparisons verify
    them. Reads span multiple graph nodes, including one-base variant nodes. Equivalent
