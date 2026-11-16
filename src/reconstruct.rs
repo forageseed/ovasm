@@ -2692,6 +2692,15 @@ pub fn run(cfg: &Config) -> Result<Value> {
             "de_novo":de_novo,"final":final_output,"genotypes":genotypes,"pan":pan}),
         );
     }
+    // circular plastid molecules of both layers in the conventional layout (`plastid_layout`)
+    let mut plastid_layout = serde_json::Map::new();
+    for name in ["plastid.fasta", "plastid.reads.fasta"] {
+        let f = cfg.out.join(name);
+        if f.exists() {
+            let panel = crate::panel::Panel::embedded(6, &[])?;
+            plastid_layout.insert(name.into(), json!(crate::plastid_layout::rewrite_fasta(&f, &panel)?));
+        }
+    }
     let workflow_completed = organelles
         .values()
         .all(|s| s["de_novo"].get("error").is_none());
@@ -2710,7 +2719,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
         } else {
             json!({"mode":"iterative","passes":20,"growth_bound":null})
         },
-        "organelles":organelles,
+        "organelles":organelles,"plastid_layout":plastid_layout,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"peak_rss_mb":recruit::peak_rss_mb(),
         "strict_score":null,"relaxed_score":null,"independent_truth_evaluated":false,
         "physical_molecule_count":null,"physical_topology_identified":false});

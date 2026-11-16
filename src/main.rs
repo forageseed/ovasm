@@ -30,6 +30,7 @@ mod pan_cohort;
 mod pan_posterior;
 mod panel;
 mod phase;
+mod plastid_layout;
 mod protein_seed;
 mod pipeline;
 mod primary;
@@ -267,10 +268,24 @@ fn assess(args: AssessArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(clap::Args)]
+struct PlastidLayoutArgs {
+    /// Plastid molecules (FASTA; records whose header says circular=true are laid out).
+    #[arg(long)]
+    fasta: PathBuf,
+    /// Output FASTA (may be the input: rewritten in place).
+    #[arg(long)]
+    out: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum SolveCommand {
     /// Representative linear (or circular) sequence through read-supported phased paths.
     Linearize(LinearizeArgs),
+    /// Circular plastid molecules of a FASTA in the conventional layout (LSC, IRb, SSC, IRa from
+    /// the LSC's first base; rbcL forward, psbA reverse; SSC with ndhF reverse), as `run` and
+    /// `pan reconstruct` write them; linear records are copied unchanged. Prints a JSON report.
+    PlastidLayout(PlastidLayoutArgs),
     /// Export a depth-constrained primary path and unplaced graph segments per component.
     /// These assembly records are not certificates of physical chromosome count.
     Primary(PrimaryArgs),
@@ -2922,6 +2937,15 @@ fn dispatch(command: Command) -> Result<()> {
             Ok(())
         }
         Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
+        Command::Solve(SolveCommand::PlastidLayout(args)) => {
+            if args.fasta != args.out {
+                std::fs::copy(&args.fasta, &args.out)?;
+            }
+            let panel = panel::Panel::embedded(6, &[])?;
+            let report = plastid_layout::rewrite_fasta(&args.out, &panel)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
         Command::Solve(SolveCommand::Primary(args)) => primary(args),
         Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),
         Command::Solve(SolveCommand::PanConfiguration(args)) => pan_configuration(args),

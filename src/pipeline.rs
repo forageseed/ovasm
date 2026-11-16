@@ -1979,6 +1979,15 @@ fn assemble_organelle(
         .opt("--out-json", dir.join("assessment.json"))
         .run()?;
     let assessment = assessment_summary(&read_json(&dir.join("assessment.json"))?);
+    // circular plastid molecules in the conventional layout (`plastid_layout`) before methylation
+    // coordinate projection so `methylation.bed` uses the final LSC-IRb-SSC-IRa coordinates.
+    let fasta = dir.join("molecules.fasta");
+    let plastid_layout_summary = if organelle == "plastid" && fasta.exists() {
+        let panel = Panel::embedded(6, &[])?;
+        Some(json!(crate::plastid_layout::rewrite_fasta(&fasta, &panel)?))
+    } else {
+        None
+    };
     let meth_bams: Vec<PathBuf> = if !cfg.methylation_bam.is_empty() {
         cfg.methylation_bam.clone()
     } else {
@@ -2135,6 +2144,9 @@ fn assemble_organelle(
         "elapsed_seconds": t0.elapsed().as_secs_f64(),
         "peak_rss_mb": peak_rss_mb(),
     });
+    if let Some(pl) = plastid_layout_summary {
+        report["plastid_layout"] = pl;
+    }
     if let Some(m) = methylation_summary {
         report["methylation"] = m;
     }

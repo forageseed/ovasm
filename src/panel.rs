@@ -566,12 +566,13 @@ fn ungapped_score(q: &[u8], s: &[u8], qi: usize, sj: usize) -> i32 {
 }
 
 /// Every stop-free stretch of at least `min_orf` residues in the six frames of `seq`, with the
-/// span it covers on `seq`'s forward strand: `f(residues, start, end)`.
+/// span it covers on `seq`'s forward strand and whether it reads on that strand:
+/// `f(residues, start, end, forward)`.
 fn for_each_stretch(
     seq: &[u8],
     code: &[u8; 64],
     min_orf: usize,
-    mut f: impl FnMut(&[u8], usize, usize),
+    mut f: impl FnMut(&[u8], usize, usize, bool),
 ) {
     let n = seq.len();
     for strand in 0..2 {
@@ -582,9 +583,9 @@ fn for_each_stretch(
         };
         let mut emit = |aa: &[u8], start: usize, end: usize| {
             if strand == 0 {
-                f(aa, start, end)
+                f(aa, start, end, true)
             } else {
-                f(aa, n - end, n - start)
+                f(aa, n - end, n - start, false)
             }
         };
         for frame in 0..3 {
@@ -617,7 +618,7 @@ fn for_each_stretch(
 fn scan_read(seq: &[u8], panel: &Panel, p: &PanelParams, hits: &mut [u32], tally: &mut Tally) {
     tally.reads += 1;
     tally.bases += seq.len() as u64;
-    for_each_stretch(seq, &panel.code, p.min_orf, |aa, _, _| {
+    for_each_stretch(seq, &panel.code, p.min_orf, |aa, _, _, _| {
         tally.orfs += 1;
         if let Some(g) = best_gene(aa, panel, p, hits) {
             tally.gene_segments[g as usize] += 1;
@@ -635,9 +636,21 @@ pub(crate) fn gene_stretches(
     hits: &mut [u32],
 ) -> Vec<(u16, usize, usize)> {
     let mut out = Vec::new();
-    for_each_stretch(seq, &panel.code, p.min_orf, |aa, start, end| {
+    for_each_stretch(seq, &panel.code, p.min_orf, |aa, start, end, _| {
         if let Some(g) = best_gene(aa, panel, p, hits) {
             out.push((g, start, end));
+        }
+    });
+    out
+}
+
+/// As `gene_stretches`, with the strand each gene reads on: (gene, start, end, forward).
+pub(crate) fn gene_strands(seq: &[u8], panel: &Panel, p: &PanelParams) -> Vec<(u16, usize, usize, bool)> {
+    let mut hits = vec![0u32; panel.genes.len()];
+    let mut out = Vec::new();
+    for_each_stretch(seq, &panel.code, p.min_orf, |aa, start, end, forward| {
+        if let Some(g) = best_gene(aa, panel, p, &mut hits) {
+            out.push((g, start, end, forward));
         }
     });
     out
