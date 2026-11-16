@@ -152,12 +152,13 @@ def score_v2(rows, truth_len, query_len, support=None):
     prec_bp = sum(union_len(v) for v in good_q.values())
     supported = 0
     if support:
+        # one median over the whole query: a short molecule of high copy (plastid-derived, say) has
+        # a median of its own far above the rest, and 150x of reads would fall under a fifth of it
+        alldepth = [x for q in query_len for x in support.get(q, [])]
+        med = statistics.median(alldepth) if alldepth else 0
         for q, L in query_len.items():
             depth = support.get(q)
-            if not depth:
-                continue
-            med = statistics.median(depth) or 0
-            if med <= 0:
+            if not depth or med <= 0:
                 continue
             covered = [0] * L
             for s, e in merge(good_q.get(q, [])):

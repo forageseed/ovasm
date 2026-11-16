@@ -51,6 +51,14 @@ class EvalTests(unittest.TestCase):
         self.assertAlmostEqual(s["v2_precision_supported"], 5000 / 6000)
         self.assertEqual(s["v2_query_unaligned_bp"], 2000)
 
+    def test_support_threshold_is_one_median_over_the_whole_query(self):
+        # a short high-copy molecule (median 1000x) beside the main one (median 100x): its 150x stretch
+        # absent from the truth is supported against the query's one median, not under a fifth of its own
+        rows = ev.parse_paf([paf("main", 0, 9000, "t", 18000, 0, 9000, 9000, 9000)])
+        depth = {"main": [100] * 9000, "short": [1000] * 1000 + [150] * 500}
+        s = ev.score_v2(rows, {"t": 9000}, {"main": 9000, "short": 1500}, depth)
+        self.assertEqual(s["v2_read_supported_absent_bp"], 1500)
+
     def test_fold(self):
         self.assertEqual(ev.fold(9000, 12000, 10000), [(9000, 10000), (0, 2000)])
         self.assertEqual(ev.fold(0, 25000, 10000), [(0, 10000)])
