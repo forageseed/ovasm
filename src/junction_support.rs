@@ -127,6 +127,33 @@ pub struct Report {
     pub under_traversed: usize,
     pub over_traversed: usize,
     pub uncertain_copy_calls: usize,
+    /// Anchor spans of the library's fragments (sorted) and the longest span a pair may have
+    /// to count as one fragment: what `pairing_support` measures other pairings against.
+    #[serde(skip)]
+    pub library_spans: Vec<i64>,
+    #[serde(skip)]
+    pub span_limit: i64,
+}
+
+/// One pairing the graph allows at an anchor end: leaving `left` through `repeat` into `right`
+/// (de novo segment names), whether or not a molecule takes it, and how many of the target's
+/// fragments cross it against how many its library would give.
+#[derive(Clone, Debug, Serialize)]
+pub struct Pairing {
+    /// Index of the bridge in the list given.
+    pub bridge: usize,
+    pub left: String,
+    pub repeat: Vec<String>,
+    pub right: String,
+    pub repeat_bp: usize,
+    /// Single reads holding anchors of both sides, and read pairs with one mate on each side
+    /// at a span the library makes (a fragment counts once).
+    pub reads_crossing: u64,
+    pub pairs_crossing: u64,
+    pub crossing_fragments: u64,
+    pub expected: f64,
+    pub p_at_most_observed: f64,
+    pub class: &'static str,
 }
 
 /// One molecule of the output: name, sequence, circular, walk of graph segments.
@@ -422,6 +449,7 @@ pub fn analyse(
     let mut local: Vec<i64> = pairs.iter().map(|p| p.0).chain(singles.iter().copied()).filter(|f| inside(f, MIN_COPY_STEP)).map(|f| f.2 - f.1).collect();
     local.sort_unstable();
     let span_limit = local.get(local.len().saturating_sub(1) * 99 / 100).map(|&s| s + s / 10).unwrap_or(i64::MAX);
+    report.span_limit = span_limit;
     let mut fragments = singles;
     for (whole, ends) in pairs {
         if whole.2 - whole.1 <= span_limit {
@@ -455,6 +483,7 @@ pub fn analyse(
     report.library_positions = positions;
     report.span_median = spans.get(spans.len() / 2).copied();
     report.span_max = spans.last().copied();
+    report.library_spans = spans.clone();
     let expected_at = |g: usize| -> f64 {
         if positions <= 0.0 {
             return 0.0;
@@ -602,6 +631,211 @@ pub fn analyse(
     report.over_traversed = report.copies.iter().filter(|c| c.class == "over_traversed").count();
     report.uncertain_copy_calls = report.copies.iter().filter(|c| c.class.ends_with("_uncertain")).count();
     Ok((report, all_steps))
+}
+
+/// Link overlaps of a GFA in both directions: ((from, forward), (to, forward)) -> bases.
+pub fn read_overlaps(gfa: &Path) -> Result<BTreeMap<((String, bool), (String, bool)), usize>> {
+    let text = std::fs::read_to_string(gfa).with_context(|| format!("cannot read {}", gfa.display()))?;
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.first() != Some(&"L") || f.len() < 6 {
+            continue;
+        }
+        let o: usize = f[5].trim_end_matches('M').parse().unwrap_or(0);
+        let (a, b) = ((f[1].to_string(), f[2] == "+"), (f[3].to_string(), f[4] == "+"));
+        out.insert(((b.0.clone(), !b.1), (a.0.clone(), !a.1)), o);
+        out.insert((a, b), o);
+    }
+    Ok(out)
+}
+
+/// Read support of every pairing in `bridges` (walks from an anchor segment through repeat
+/// segments to another anchor, as the configuration stage lists them at each anchor end),
+/// measured as `analyse` measures a molecule's joins but on the graph's segments, so pairings
+/// no molecule takes are measured too: a read holding graph-unique k-mers of both anchors at
+/// the offsets the bridge makes, or a pair with its forward mate on the first anchor and its
+/// reverse mate on the last at a span the library makes, crosses it. The expectation, Poisson
+/// tail and classes are `analyse`'s, from its library (`report`). A repeat that recombines in
+/// a population shows as more than one pairing of one anchor end crossed, sample by sample.
+pub fn pairing_support(
+    bridges: &[Vec<(String, bool)>],
+    segs: &BTreeMap<String, (Vec<u8>, f64)>,
+    overlaps: &BTreeMap<((String, bool), (String, bool)), usize>,
+    reads: &[PathBuf],
+    report: &Report,
+) -> Result<Vec<Pairing>> {
+    let usable = |b: &Vec<(String, bool)>| b.len() >= 3 && b.iter().all(|s| segs.contains_key(&s.0));
+    let names: Vec<&str> = bridges
+        .iter()
+        .filter(|b| usable(b))
+        .flat_map(|b| [b[0].0.as_str(), b[b.len() - 1].0.as_str()])
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index: BTreeMap<&str, u32> = names.iter().enumerate().map(|(i, n)| (*n, i as u32)).collect();
+    // graph-unique k-mers of the anchors, either strand -> (anchor, forward, position)
+    let mut count: FxHashMap<u64, u32> = FxHashMap::default();
+    for (seq, _) in segs.values() {
+        if seq.len() >= K {
+            for w in seq.windows(K) {
+                if let Some(c) = canonical(w) {
+                    *count.entry(c).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut anchors: FxHashMap<u64, Option<(u32, bool, u32)>> = FxHashMap::default();
+    for (ai, n) in names.iter().enumerate() {
+        let s = &segs[*n].0;
+        if s.len() < K {
+            continue;
+        }
+        for p in 0..=s.len() - K {
+            let w = &s[p..p + K];
+            let Some(c) = canonical(w) else { continue };
+            if count.get(&c) != Some(&1) {
+                continue;
+            }
+            for (word, fw) in [(pack(w), true), (pack(&revcomp(w)), false)] {
+                let Some(word) = word else { continue };
+                let v = Some((ai as u32, fw, p as u32));
+                anchors.entry(word).and_modify(|e| if *e != v { *e = None }).or_insert(v);
+            }
+        }
+    }
+    drop(count);
+    // every placement of every read (a read across a junction lies on two anchors), by name
+    let mut by_name: FxHashMap<Vec<u8>, Vec<Vec<Placed>>> = FxHashMap::default();
+    for path in reads {
+        for_each_rec(path, |r| {
+            let seq = r.seq.to_ascii_uppercase();
+            let n = seq.len() as i64;
+            if seq.len() < K {
+                return;
+            }
+            let mut placed: Vec<Placed> = Vec::new();
+            for (i, w) in seq.windows(K).enumerate() {
+                let Some(word) = pack(w) else { continue };
+                let Some(Some((mol, fw, at))) = anchors.get(&word).copied() else { continue };
+                let (i, at) = (i as i64, at as i64);
+                let left = if fw { at - i } else { at - (n - i - K as i64) };
+                match placed.iter_mut().find(|p| p.mol == mol && p.fw == fw && (p.left - left).abs() <= PLACE_TOLERANCE) {
+                    Some(p) => {
+                        p.amin = p.amin.min(at);
+                        p.amax = p.amax.max(at);
+                    }
+                    None => placed.push(Placed { mol, fw, left, right: left + n, amin: at, amax: at }),
+                }
+            }
+            if !placed.is_empty() {
+                by_name.entry(name_of(&r.id)).or_default().push(placed);
+            }
+        })?;
+    }
+    // names placed on two anchors (or twice on one), by the anchors they touch
+    let mut by_anchors: FxHashMap<(u32, u32), Vec<&Vec<Vec<Placed>>>> = FxHashMap::default();
+    for recs in by_name.values() {
+        let on: Vec<u32> = recs.iter().flatten().map(|p| p.mol).collect();
+        if on.len() < 2 {
+            continue;
+        }
+        let set: BTreeSet<u32> = on.iter().copied().collect();
+        let set: Vec<u32> = set.into_iter().collect();
+        for (i, &a) in set.iter().enumerate() {
+            if on.iter().filter(|&&m| m == a).count() >= 2 {
+                by_anchors.entry((a, a)).or_default().push(recs);
+            }
+            for &b in &set[i + 1..] {
+                by_anchors.entry((a, b)).or_default().push(recs);
+            }
+        }
+    }
+    let positions = report.library_positions;
+    let spans = &report.library_spans;
+    let span_limit = if report.span_limit > 0 { report.span_limit } else { i64::MAX };
+    let expected_at = |g: usize| -> f64 {
+        if positions <= 0.0 {
+            return 0.0;
+        }
+        spans.iter().map(|&s| (s - g as i64 - K as i64 + 1).max(0) as f64).sum::<f64>() / positions
+    };
+    let label = |s: &(String, bool)| format!("{}{}", s.0, if s.1 { '+' } else { '-' });
+    // a placement on an anchor read in the bridge's direction: (forward, leftmost, anchor span)
+    let orient = |p: &Placed, forward: bool, len: i64| -> (bool, i64, i64, i64) {
+        if forward {
+            (p.fw, p.left, p.amin, p.amax)
+        } else {
+            (!p.fw, len - p.right, len - K as i64 - p.amax, len - K as i64 - p.amin)
+        }
+    };
+    let none = Vec::new();
+    let mut out = Vec::new();
+    for (bi, b) in bridges.iter().enumerate() {
+        if !usable(b) {
+            continue;
+        }
+        let (a, z) = (&b[0], &b[b.len() - 1]);
+        let (ia, iz) = (index[a.0.as_str()], index[z.0.as_str()]);
+        let (la, lz) = (segs[&a.0].0.len() as i64, segs[&z.0].0.len() as i64);
+        let inner: usize = b[1..b.len() - 1].iter().map(|s| segs[&s.0].0.len()).sum();
+        let ov: usize = b.windows(2).map(|w| overlaps.get(&(w[0].clone(), w[1].clone())).copied().unwrap_or(0)).sum();
+        // where the last anchor starts, in bases from the first anchor's start
+        let y = la + inner as i64 - ov as i64;
+        let g = (y - la).max(0) as usize;
+        let (mut reads_x, mut pairs_x) = (0u64, 0u64);
+        for recs in by_anchors.get(&(ia.min(iz), ia.max(iz))).unwrap_or(&none) {
+            let on_a = |ps: &Vec<Placed>| ps.iter().filter(|p| p.mol == ia).map(|p| orient(p, a.1, la)).collect::<Vec<_>>();
+            let on_z = |ps: &Vec<Placed>| ps.iter().filter(|p| p.mol == iz).map(|p| orient(p, z.1, lz)).collect::<Vec<_>>();
+            let single = recs.iter().any(|ps| {
+                let (pa, pz) = (on_a(ps), on_z(ps));
+                pa.iter().any(|x| pz.iter().any(|q| x.0 == q.0 && (x.1 - (q.1 + y)).abs() <= PLACE_TOLERANCE))
+            });
+            if single {
+                reads_x += 1;
+                continue;
+            }
+            if recs.len() == 2 {
+                let pair = (0..2).any(|i| {
+                    let (pa, pz) = (on_a(&recs[i]), on_z(&recs[1 - i]));
+                    pa.iter().any(|x| x.0 && pz.iter().any(|q| !q.0 && q.3 + y - x.2 > 0 && q.3 + y - x.2 <= span_limit))
+                });
+                if pair {
+                    pairs_x += 1;
+                }
+            }
+        }
+        let observed = reads_x + pairs_x;
+        let flank = segs[&a.0].1.min(segs[&z.0].1);
+        let scale = report.single_copy_depth.map(|d| (flank / d).min(1.0)).unwrap_or(1.0);
+        let expected = expected_at(g) * scale;
+        let p = poisson_cdf(observed, expected);
+        let below_controls = report.control_points < 20 || (observed as f64) < report.control_ratio_floor * expected;
+        let class = if p < ALPHA && below_controls {
+            "unsupported"
+        } else if observed == 0 {
+            "undetermined_long_repeat"
+        } else {
+            "supported"
+        };
+        out.push(Pairing {
+            bridge: bi,
+            left: label(a),
+            repeat: b[1..b.len() - 1].iter().map(label).collect(),
+            right: label(z),
+            repeat_bp: g,
+            reads_crossing: reads_x,
+            pairs_crossing: pairs_x,
+            crossing_fragments: observed,
+            expected,
+            p_at_most_observed: p,
+            class,
+        });
+    }
+    Ok(out)
 }
 
 /// Cut molecules at their unsupported joins (at the start of the unique step after the
@@ -869,6 +1103,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(r.joins.len(), 2);
         assert!(r.joins.iter().all(|j| j.class == "supported"), "{:?}", r.joins);
+    }
+
+    fn pairings(repeat_len: usize, tag: &str) -> Vec<Pairing> {
+        let g = graph(13, repeat_len);
+        let (truth, path) = walk(&g, &["A", "R", "C", "B", "R", "D"]);
+        let dir = std::env::temp_dir().join(format!("ovasm-pairings-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reads = dir.join("r.fq");
+        write_pairs(&reads, &truth, 5);
+        let m = Molecule { name: "m".into(), sequence: truth, circular: true, path: Some(path) };
+        let (r, _) = analyse(&[m], &g, &[reads.clone()], &[]).unwrap();
+        // every pairing the graph allows at the repeat: two entries times two exits, either way
+        let s = |n: &str, f: bool| (n.to_string(), f);
+        let bridges: Vec<Vec<(String, bool)>> = vec![
+            vec![s("A", true), s("R", true), s("C", true)],
+            vec![s("A", true), s("R", true), s("D", true)],
+            vec![s("B", true), s("R", true), s("C", true)],
+            vec![s("B", true), s("R", true), s("D", true)],
+            vec![s("D", false), s("R", false), s("B", false)],
+        ];
+        let p = pairing_support(&bridges, &g, &BTreeMap::new(), &[reads], &r).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        p
+    }
+
+    #[test]
+    fn every_pairing_of_a_short_repeat_is_measured_taken_or_not() {
+        let p = pairings(80, "short");
+        assert_eq!(p.len(), 5);
+        let get = |l: &str, rt: &str| p.iter().find(|x| x.left == l && x.right == rt).unwrap();
+        // the truth's pairings are crossed by about what the library gives, read either way
+        for (l, rt) in [("A+", "C+"), ("B+", "D+"), ("D-", "B-")] {
+            let x = get(l, rt);
+            assert_eq!(x.class, "supported", "{x:?}");
+            assert!(x.crossing_fragments as f64 > 0.5 * x.expected && x.expected > 10.0, "{x:?}");
+            // 100 bp reads cannot hold 31 bases either side of 80: pairs cross it
+            assert!(x.pairs_crossing > 0 && x.reads_crossing == 0, "{x:?}");
+        }
+        assert_eq!(get("D-", "B-").crossing_fragments, get("B+", "D+").crossing_fragments);
+        // the other pairings of the same anchor ends are not crossed although they could be
+        for (l, rt) in [("A+", "D+"), ("B+", "C+")] {
+            let x = get(l, rt);
+            assert_eq!((x.crossing_fragments, x.class), (0, "unsupported"), "{x:?}");
+        }
+    }
+
+    #[test]
+    fn a_read_holding_both_anchors_crosses_a_repeat_shorter_than_it() {
+        let p = pairings(20, "tiny");
+        let x = p.iter().find(|x| x.left == "A+" && x.right == "C+").unwrap();
+        assert!(x.reads_crossing > 0 && x.class == "supported", "{x:?}");
+        let y = p.iter().find(|x| x.left == "A+" && x.right == "D+").unwrap();
+        assert_eq!(y.crossing_fragments, 0, "{y:?}");
+    }
+
+    #[test]
+    fn pairings_of_a_repeat_longer_than_the_fragments_are_undetermined() {
+        let p = pairings(600, "long");
+        assert!(p.iter().all(|x| x.class == "undetermined_long_repeat" && x.crossing_fragments == 0), "{p:?}");
     }
 
     #[test]

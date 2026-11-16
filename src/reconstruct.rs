@@ -2202,6 +2202,43 @@ fn final_outputs(
                 p.map_or("NA".to_string(), |x| format!("{:.4}", x.0)), p.map_or("NA", |x| if x.2 { "yes" } else { "no" }), source)?;
         }
         fs::write(dir.join("junctions.tsv"), tsv)?;
+        // every pairing the graph allows at each anchor end with more than one (the panel
+        // report's bridges, taken or not), crossed by the target's reads and pairs against what
+        // its library gives: which repeats rearrange shows across a population (`pan cohort`
+        // keys the rows by panel segments)
+        {
+            let mut bridges: Vec<Vec<(String, bool)>> = Vec::new();
+            let mut meta: Vec<&Value> = Vec::new();
+            for b in pan["junctions"].as_array().into_iter().flatten() {
+                let steps: Option<Vec<(String, bool)>> = b["bridge"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(|t| {
+                        let (n, o) = t.split_at(t.len().checked_sub(1)?);
+                        let n = if segs.contains_key(n) { n.to_string() } else { short(n) };
+                        match o {
+                            "+" => Some((n, true)),
+                            "-" => Some((n, false)),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                if let Some(s) = steps {
+                    bridges.push(s);
+                    meta.push(b);
+                }
+            }
+            let overlaps = js::read_overlaps(&assembly_gfa)?;
+            let pairings = js::pairing_support(&bridges, &segs, &overlaps, reads, &report)?;
+            let mut t = String::from("left\trepeat\tright\trepeat_bp\treads_crossing\tpairs_crossing\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\truns_holding\truns_informative\tpanel_takes\n");
+            for x in &pairings {
+                let b = meta[x.bridge];
+                writeln!(t, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{:.3e}\t{}\t{:.4}\t{}\t{}\t{}", x.left, x.repeat.join(","), x.right, x.repeat_bp, x.reads_crossing, x.pairs_crossing, x.crossing_fragments, x.expected, x.p_at_most_observed, x.class,
+                    b["probability"].as_f64().unwrap_or(f64::NAN), b["runs_holding"], b["runs_informative"], if b["taken"] == true { "yes" } else { "no" })?;
+            }
+            fs::write(dir.join("pairings.tsv"), t)?;
+        }
         // reads layer: the molecules cut at every join the target's reads do not decide
         let headers_all: BTreeMap<String, String> = records
             .iter()
