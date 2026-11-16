@@ -172,7 +172,7 @@ impl Gpu {
         let mut slot = vec![None; batch.len()];
         for (i, e) in batch.iter().enumerate() {
             let Some(p) = &e.packed else { continue };
-            let len = e.rec.seq.len() as u32;
+            let len = e.len as u32;
             if len < k {
                 slot[i] = Some(u32::MAX);
                 continue;
@@ -282,7 +282,8 @@ mod tests {
             }
             p
         });
-        Entry { rec: Rec { id: b"r".to_vec(), seq, qual: None }, packed }
+        let len = seq.len();
+        Entry { rec: Rec { id: b"r".to_vec(), seq, qual: None }, packed, len }
     }
 
     /// Runs only where a GPU is (`OVASM_GPU=1 cargo test -- --ignored gpu`).

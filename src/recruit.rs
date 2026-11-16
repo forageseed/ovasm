@@ -816,19 +816,19 @@ impl MateReach<'_> {
     /// The targets (a bitmask) whose recruited reads hold `rec`'s mate and that `rec` would
     /// extend (`mate_extends`). Run beside the classification, in parallel: probing every read
     /// of the library on the scan's serial thread took ZM4 45-49 s of its 150-165 s passes.
-    fn matches(&self, rec: &Rec, bait: &BaitSet) -> u8 {
+    fn matches<'s>(&self, id: &[u8], seq: impl Fn() -> &'s [u8], bait: &BaitSet) -> u8 {
         let (mut key, mut mask) = (None, 0u8);
         for t in 0..self.pairs.len() {
             let Some(d) = self.depth[t] else { continue };
             if self.pairs[t].is_empty() {
                 continue;
             }
-            let k = *key.get_or_insert_with(|| pair_key(&rec.id));
+            let k = *key.get_or_insert_with(|| pair_key(id));
             if !self.pairs[t].contains(&k) {
                 continue;
             }
             let floor = self.floor[t].unwrap_or(KMER_GATE_FLOOR * d);
-            if mate_extends(self.table, bait, t, &rec.seq, d, floor) {
+            if mate_extends(self.table, bait, t, seq(), d, floor) {
                 mask |= 1 << t;
             }
         }
@@ -907,7 +907,7 @@ fn scan(
         (s, tx, thread)
     });
     let (rx, reader) = if replaying && !final_outputs {
-        replay.as_ref().unwrap().batches()
+        replay.as_ref().unwrap().batches_lazy()
     } else {
         crate::replay::source_batches(inputs)
     };
@@ -986,13 +986,16 @@ fn scan(
             None
         };
         out.reads += batch.len() as u64;
-        let batch_bases = batch.iter().map(|r| r.rec.seq.len() as u64).sum::<u64>();
+        let batch_bases = batch.iter().map(|r| r.len as u64).sum::<u64>();
         out.bases += batch_bases;
         let tpar = Instant::now();
         if let (Some((k, threshold)), Some((_, tx, _))) = (sampling, sketcher.as_ref()) {
             let reads = batch
                 .par_iter()
-                .map(|r| crate::seedfree::GateSketch::sample(k, threshold, &r.rec.seq))
+                .map(|r| {
+                    let slot = std::cell::OnceCell::new();
+                    crate::seedfree::GateSketch::sample(k, threshold, r.seq_or(&slot))
+                })
                 .collect();
             tx.send((reads, batch_bases)).context("depth sketch thread stopped")?;
         }
@@ -1016,11 +1019,12 @@ fn scan(
                     .par_iter()
                     .enumerate()
                     .map(|(i, rec)| {
+                      let slot = std::cell::OnceCell::new();
                       let result = (|| {
-                        let seq = &rec.rec.seq;
+                        let seq = || rec.seq_or(&slot);
                         let classified = || {
                             let tcl = profile_reads.then(Instant::now);
-                            let (call, score) = classify_with(seq, bait, p, tandem);
+                            let (call, score) = classify_with(seq(), bait, p, tandem);
                             if let Some(tcl) = tcl {
                                 PROF_CLASSIFY_NS.fetch_add(tcl.elapsed().as_nanos() as u64, Relaxed);
                             }
@@ -1048,8 +1052,8 @@ fn scan(
                         // cached ACGT-only reads are scanned in their packed form
                         let changed = match (on_gpu.as_ref().and_then(|v| v[i]), &rec.packed) {
                             (Some(changed), _) => changed,
-                            (None, Some(packed)) => delta.any_key(PackedKmers::new(packed, seq.len(), bait.k)),
-                            (None, None) => delta.any_key(CanonicalKmers::new(seq, bait.k).map(|(_, key)| key)),
+                            (None, Some(packed)) => delta.any_key(PackedKmers::new(packed, rec.len, bait.k)),
+                            (None, None) => delta.any_key(CanonicalKmers::new(&rec.rec.seq, bait.k).map(|(_, key)| key)),
                         };
                         // unchanged: as it was; changed: kept with a new bound only when it
                         // cannot leave `Other` (the bound's full look, for such reads alone)
@@ -1058,8 +1062,8 @@ fn scan(
                         let kept = if !changed && !judged {
                             Some(bound)
                         } else if call == Call::Other && bound != u16::MAX {
-                            added_cover(seq, delta, p.block_gap)
-                                .and_then(|added| still_other(call, bound, added, seq.len(), p))
+                            added_cover(seq(), delta, p.block_gap)
+                                .and_then(|added| still_other(call, bound, added, rec.len, p))
                         } else {
                             None
                         };
@@ -1074,7 +1078,7 @@ fn scan(
                       // read pairs (`MateReach::matches`) for every read: the serial part may
                       // still turn a call to `Other` (source exclusions), and takes the mask then
                       let tm = profile_reads.then(Instant::now);
-                      let mates = w.mates.map_or(0, |m| m.matches(&rec.rec, bait));
+                      let mates = w.mates.map_or(0, |m| m.matches(&rec.rec.id, || rec.seq_or(&slot), bait));
                       if let Some(tm) = tm {
                           PROF_MATE_NS.fetch_add(tm.elapsed().as_nanos() as u64, Relaxed);
                       }
@@ -1088,12 +1092,12 @@ fn scan(
         }
         t_par += tpar.elapsed().as_secs_f64();
         let tser = Instant::now();
-        for (i, (((call, changed, tandem, bound, judged), mates), entry)) in calls.into_iter().zip(batch).enumerate() {
+        for (i, (((call, changed, tandem, bound, judged), mates), mut entry)) in calls.into_iter().zip(batch).enumerate() {
             out.reclassified += u64::from(changed);
             out.tandem += u64::from(tandem);
             if let Some((t, r)) = judged {
                 out.tandem_judged[t].reads += 1;
-                out.tandem_judged[t].bases += entry.rec.seq.len() as u64;
+                out.tandem_judged[t].bases += entry.len as u64;
                 out.tandem_ratios[t].push(r);
             }
             if let Some(cache) = replay.as_mut() {
@@ -1109,6 +1113,7 @@ fn scan(
             // before any target counts, samples, output or extension input.
             let original_input = !replaying || final_outputs;
             let excluded = if let Some(plan) = &mut policies.exclusions {
+                entry.ensure_seq();
                 plan.observe(&entry.rec, call, original_input, policies.pass)?
             } else {
                 0
@@ -1127,16 +1132,19 @@ fn scan(
                 call => call,
             };
             if let Some(plan) = &mut policies.admission {
+                entry.ensure_seq();
                 plan.observe(&entry.rec, call, original_input);
             }
             if call == Call::Other {
-                if w.mates.is_some() {
+                if w.mates.is_some() && mates != 0 {
+                    entry.ensure_seq();
                     MateReach::take(mates, &entry.rec, &mut out.mates);
                 }
             }
             if matches!(call, Call::Other | Call::Tandem) {
                 continue;
             }
+            entry.ensure_seq();
             let rec = entry.rec;
             let len = rec.seq.len() as u64;
             let tt = profile_reads.then(Instant::now);
@@ -4101,9 +4109,9 @@ mod tests {
         let reach = MateReach { pairs: &pairs, table: &table, depth: &depth, floor: &fl };
         let mut out: Vec<Sample<MATE_READS>> = vec![Sample::default()];
         let rec = |id: &[u8], seq: &[u8]| Rec { id: id.to_vec(), seq: seq.to_vec(), qual: None };
-        { let r = rec(b"SRR1.7 x", &organelle[1100..1250]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
-        { let r = rec(b"SRR1.8 x", &organelle[1300..1450]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
-        { let r = rec(b"SRR1.7 x", &nucleus[100..250]); MateReach::take(reach.matches(&r, &bait), &r, &mut out); }
+        { let r = rec(b"SRR1.7 x", &organelle[1100..1250]); MateReach::take(reach.matches(&r.id, || &r.seq[..], &bait), &r, &mut out); }
+        { let r = rec(b"SRR1.8 x", &organelle[1300..1450]); MateReach::take(reach.matches(&r.id, || &r.seq[..], &bait), &r, &mut out); }
+        { let r = rec(b"SRR1.7 x", &nucleus[100..250]); MateReach::take(reach.matches(&r.id, || &r.seq[..], &bait), &r, &mut out); }
         assert_eq!(out[0].reads(), vec![&organelle[1100..1250]]);
     }
 

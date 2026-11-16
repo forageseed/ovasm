@@ -19,6 +19,27 @@ pub struct Entry {
     /// A cached ACGT-only read's sequence as the cache stores it (`pack`), for replay passes to
     /// scan without decoding (`kmer::PackedKmers`).
     pub packed: Option<Vec<u8>>,
+    /// The read's length: `rec.seq` is empty for a packed read `batches_lazy` has not decoded.
+    pub len: usize,
+}
+
+impl Entry {
+    /// The read's sequence, decoded into `slot` when `batches_lazy` left it packed.
+    pub fn seq_or<'a>(&'a self, slot: &'a std::cell::OnceCell<Vec<u8>>) -> &'a [u8] {
+        match &self.packed {
+            Some(packed) if self.rec.seq.len() != self.len => slot.get_or_init(|| unpack(packed, self.len)),
+            _ => &self.rec.seq,
+        }
+    }
+
+    /// Decode the read's sequence into `rec.seq` when `batches_lazy` left it packed.
+    pub fn ensure_seq(&mut self) {
+        if self.rec.seq.len() != self.len {
+            if let Some(packed) = &self.packed {
+                self.rec.seq = unpack(packed, self.len);
+            }
+        }
+    }
 }
 
 pub struct Replay {
@@ -184,6 +205,29 @@ impl Replay {
         crossbeam_channel::Receiver<Vec<Entry>>,
         std::thread::JoinHandle<Result<()>>,
     ) {
+        self.batches_decoded(true)
+    }
+
+    /// `batches` leaving packed reads packed (`rec.seq` empty, `Entry::len` set): a scan pass
+    /// decodes only the reads it looks at again (`Entry::seq_or`, `Entry::ensure_seq`). Decoding
+    /// every read of the library each pass, and freeing it on the scan's serial thread, took
+    /// ZM4 (155.6 M reads) 80-90 s of reader work and much of the serial part's 60-80 s a pass.
+    pub fn batches_lazy(
+        &self,
+    ) -> (
+        crossbeam_channel::Receiver<Vec<Entry>>,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        self.batches_decoded(false)
+    }
+
+    fn batches_decoded(
+        &self,
+        decode: bool,
+    ) -> (
+        crossbeam_channel::Receiver<Vec<Entry>>,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
         let path = self.dir.join("sequence.bin");
         let (tx, rx) = crossbeam_channel::bounded(8);
         let thread = std::thread::spawn(move || -> Result<()> {
@@ -224,13 +268,16 @@ impl Replay {
                             qual: None,
                         },
                         packed,
+                        len,
                     });
                 }
-                batch.par_iter_mut().zip(lengths.par_iter()).for_each(|(entry, &len)| {
-                    if let Some(packed) = &entry.packed {
-                        entry.rec.seq = unpack(packed, len);
-                    }
-                });
+                if decode {
+                    batch.par_iter_mut().zip(lengths.par_iter()).for_each(|(entry, &len)| {
+                        if let Some(packed) = &entry.packed {
+                            entry.rec.seq = unpack(packed, len);
+                        }
+                    });
+                }
                 crate::recruit::PROF_READER_WORK_NS.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 let ts = std::time::Instant::now();
                 if tx.send(batch).is_err() {
@@ -289,7 +336,7 @@ pub fn source_batches(
     let (tx, rx) = crossbeam_channel::bounded(1);
     let thread = std::thread::spawn(move || -> Result<()> {
         for batch in original {
-            let batch = batch.into_iter().map(|rec| Entry { rec, packed: None }).collect();
+            let batch = batch.into_iter().map(|rec| { let len = rec.seq.len(); Entry { rec, packed: None, len } }).collect();
             if tx.send(batch).is_err() {
                 return Ok(());
             }
@@ -334,6 +381,7 @@ mod tests {
                     qual: (i != 2).then(|| vec![b'!' + i as u8; seq.len()]),
                 },
                 packed: None,
+                len: seq.len(),
             })
             .collect();
         cache.store(&entries[..2]).unwrap();
