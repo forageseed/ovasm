@@ -1306,7 +1306,14 @@ fn configurations(
         // the other components' molecules that go with the representative
         let extra: Vec<&Elsewhere> = if circular_candidate == Some(c) {
             let laid: BTreeSet<&str> = molecules.iter().flat_map(|m| m.1.iter().map(|s| s.0.as_str())).collect();
-            elsewhere.iter().filter(|e| e.4.as_deref().map_or(true, |repeat| !laid.contains(repeat))).collect()
+            // pieces of a genome only (`MIN_PIECE`): other components also hold unitigs of tens to
+            // hundreds of bases (bubbles the cleaning left, ends of reads), which came out as up to
+            // 14 extra plastid records of 30-1,300 bp in a held-out Arabidopsis fold
+            elsewhere
+                .iter()
+                .filter(|e| e.2.len() as u64 >= pipeline::MIN_PIECE)
+                .filter(|e| e.4.as_deref().map_or(true, |repeat| !laid.contains(repeat)))
+                .collect()
         } else {
             Vec::new()
         };
