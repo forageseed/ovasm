@@ -15,15 +15,15 @@ plant HiFi sample finishes in about 20 minutes on 8 threads with around 2 GB of 
 
 ## Install
 
-Precompiled builds of 0.7.0 are on the [release page](https://github.com/forageseed/ovasm/releases/tag/v0.7.0).
+Precompiled builds of 1.1.0 are on the [release page](https://github.com/forageseed/ovasm/releases/tag/v1.1.0).
 
 - **Windows x86_64:** download the
-  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.7.0/ovasm-v0.7.0-windows-x86_64.zip),
+  [ZIP](https://github.com/forageseed/ovasm/releases/download/v1.1.0/ovasm-v1.1.0-windows-x86_64.zip),
   extract it, double-click `install.cmd` and open a new terminal.
 - **Linux x86_64 (glibc 2.34 or newer):**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.7.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v1.1.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -84,9 +84,9 @@ circle in the graph is not proof of a single circular molecule.
 | `run` | `short`, `hifi`, `ont`, `hybrid` | reads to sequences in one step |
 | `find` | `recruit`, `discover`, `classify`, `label` | find the organelle reads |
 | `assemble` | `correct`, `graph`, `filter`, `unify` | build the assembly graph |
-| `check` | `evidence`, `unzip`, `assess` | check the graph against the reads |
+| `check` | `evidence`, `unzip`, `assess`, `methylation` | check the graph and base modifications against the reads |
 | `solve` | `linearize`, `primary`, `chromosomes` | turn the graph into sequences |
-| `pan` | `merge`, `reconstruct`, `identify`, `sharing` | work across many samples |
+| `pan` | `merge`, `reconstruct`, `cohort`, `identify`, `sharing` | work across many samples |
 
 How each step works and where every threshold comes from: [method](docs/method.md).
 More: [rebuilding an individual from a species graph](docs/reference-reconstruction.md) ·
@@ -151,15 +151,19 @@ Short reads are harder. On 20 existing alfalfa WGS samples an earlier build fini
 assembled well, but mitochondria usually came out in many pieces. Work on joining those pieces with
 read pairs is ongoing. See the [WGS panel](docs/existing-wgs-benchmark.md).
 
-## What's new in 0.7.0
+## What's new in 1.1.0
 
-- Recruiting reads is faster, with byte-identical output. An optional GPU path (`OVASM_GPU=1`) takes
-  the Potentilla test sample from 13 to 10 minutes.
-- Genomes whose read depth was misread no longer lose mitochondrial reads. *Lespedeza davurica*
-  (allotetraploid) now gives its complete 378,667 bp mitochondrion without any extra options.
-  `--genome-size` and `--nuclear-depth` let you set the depth by hand.
+- **Plant organelle methylation & NUMT/NUPT separation** (`ovasm check methylation`, `--methylation`,
+  `--max-read-methylation`): pure-Rust PacBio/ONT modBAM (`MM`/`ML`) profiling across `CG`, `CHG`,
+  `CHH` 5mC and `6mA`, preserving 100% of CpG sites across inverted and large repeats.
+- **Native ONT R10 Simplex phased overlap error correction** (`--chemistry auto|r10|legacy`, `--r10`):
+  4-stage HPC minimizer overlap, chimera clipping, strand-bias methylation pruning and four-gamete
+  repeat phasing, keeping R9/CLR/HiFi/FASTA paths unchanged.
+- **Species pan-genome v4 & thousand-sample cohorts** (`pan reconstruct`, `pan cohort`): two-layer
+  read-backed and panel-backed assemblies, canonical `LSC-IRb-SSC-IRa` plastid layout, and cohort
+  presence/junction/variant summaries.
 
-Full notes: [release 0.7.0](docs/release-0.7.0.md).
+Full notes: [1.1.0](docs/release-1.1.0.md) · [1.0.0](docs/release-1.0.0.md) · [0.9.0](docs/release-0.9.0.md) · [0.8.0](docs/release-0.8.0.md) · [0.7.0](docs/release-0.7.0.md).
 
 ## License
 

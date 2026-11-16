@@ -14,15 +14,15 @@ OVASM 用测序读段组装植物线粒体和叶绿体基因组。输入 HiFi �
 
 ## 安装
 
-0.7.0 预编译版在[下载页](https://github.com/forageseed/ovasm/releases/tag/v0.7.0)。
+1.1.0 预编译版在[下载页](https://github.com/forageseed/ovasm/releases/tag/v1.1.0)。
 
 - **Windows x86_64：**下载
-  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.7.0/ovasm-v0.7.0-windows-x86_64.zip)，
+  [ZIP](https://github.com/forageseed/ovasm/releases/download/v1.1.0/ovasm-v1.1.0-windows-x86_64.zip)，
   解压后双击 `install.cmd`，然后重新打开终端。
 - **Linux x86_64（glibc 2.34 及以上）：**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.7.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v1.1.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -69,9 +69,9 @@ ovasm run hybrid --long sample.ont.fastq.gz --short sample_R1.fq.gz --short samp
 | `run` | `short`、`hifi`、`ont`、`hybrid` | 从读段一步到序列 |
 | `find` | `recruit`、`discover`、`classify`、`label` | 找出细胞器读段 |
 | `assemble` | `correct`、`graph`、`filter`、`unify` | 构建组装图 |
-| `check` | `evidence`、`unzip`、`assess` | 用读段核对组装图 |
+| `check` | `evidence`、`unzip`、`assess`、`methylation` | 用读段与碱基修饰核对组装图 |
 | `solve` | `linearize`、`primary`、`chromosomes` | 把组装图理成序列 |
-| `pan` | `merge`、`reconstruct`、`identify`、`sharing` | 多样本分析 |
+| `pan` | `merge`、`reconstruct`、`cohort`、`identify`、`sharing` | 多样本与群体泛图分析 |
 
 更多：[用种内参考图重建个体](docs/reference-reconstruction.md) · [全部文档](docs/)。
 
@@ -128,13 +128,14 @@ Oatk 报告的 307,026 bp 单环排列作为替代连接保留在图里。细节
 短读长更难。早先的版本在 20 个已有苜蓿 WGS 样本上跑完了 14 个：叶绿体组装得不错，线粒体通常碎成很多段。
 用双端读段把这些片段连起来的工作还在进行。见 [WGS 批测](docs/existing-wgs-benchmark.md)。
 
-## 0.7.0 更新
+## 1.1.0 更新
 
-- 招募读段更快，输出逐字节不变。可选的 GPU 路径（`OVASM_GPU=1`）让 Potentilla 测试样本从 13 分钟降到 10 分钟。
-- 读段深度被误判的基因组不再漏招线粒体读段。异源四倍体胡枝子（*Lespedeza davurica*）不加任何参数就能得到
-  完整的 378,667 bp 线粒体。也可以用 `--genome-size` 或 `--nuclear-depth` 手动给出深度。
+- **植物细胞器甲基化分析与 NUMT/NUPT 分离**（`ovasm check methylation`、`--methylation`、`--max-read-methylation`）：
+  纯 Rust 直接解析 PacBio/ONT modBAM（`MM`/`ML` 标签），支持 `CG`、`CHG`、`CHH` 5mC 与 `6mA`，完整保留叶绿体反向重复与线粒体大重复区的甲基化位点。
+- **原生 ONT R10 Simplex 相位重叠自纠错**（`--chemistry auto|r10|legacy`、`--r10`）：四阶段同聚物压缩最小子重叠、嵌合体裁剪、链偏倚甲基化假位点剔除与四配子重复分相纠错，自动保持 R9/CLR/HiFi/FASTA 原路径逐字节不变。
+- **物种泛图重建 v4 与千样本群体汇总**（`pan reconstruct`、`pan cohort`）：读段层与面板层双层输出、叶绿体标准 `LSC-IRb-SSC-IRa` 定向，以及千样本存在/缺失、连接与变异汇总。
 
-完整说明：[0.7.0 发布说明](docs/release-0.7.0.md)。
+完整说明：[1.1.0](docs/release-1.1.0.md) · [1.0.0](docs/release-1.0.0.md) · [0.9.0](docs/release-0.9.0.md) · [0.8.0](docs/release-0.8.0.md) · [0.7.0](docs/release-0.7.0.md)。
 
 ## 许可
 
