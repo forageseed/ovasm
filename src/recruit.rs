@@ -1338,6 +1338,11 @@ pub struct TargetOutput {
     pub recruitment_state: RecruitmentState,
     /// True exactly when recruitment_state is converged.
     pub converged: bool,
+    /// The k-mer gate's depth of the target in reads (`kmer_read_depth`), with the k-mer gate.
+    pub kmer_read_depth: Option<f64>,
+    /// The depth `max_read_depth` judged the target by (`cap_read_depth`): "sketch",
+    /// "kmer_under_cap" (not downsampled), "kmer" (no sketch) or none (no cap asked).
+    pub cap_depth_from: Option<&'static str>,
     pub sampling_fraction: f64,
     /// The rule that set `sampling_fraction` below 1: target_depth, max_read_depth or max_bases.
     pub sampled_by: Option<&'static str>,
@@ -1661,6 +1666,28 @@ fn kmer_depth(table: &crate::frontier::KmerCounts, bait: &BaitSet, t: usize, rea
 /// 9,000x (k-mer depth 7,870 at k 21 in 150 bp reads, a billion bases kept), where an error
 /// recurring in one read in a few thousand is seen by several reads, passes as solid, and branches
 /// the graph (20 representative molecules for one circle).
+/// The read depth the final downsampling to `max_read_depth` judges a target by, and where it
+/// comes from: none ("kmer_under_cap", no downsampling) when the k-mer gate places the target
+/// under the cap, else the depth sketch of its reads ("sketch"), or the k-mer gate's when there
+/// is no sketch ("kmer"). A k-mer depth of zero or none counts as unknown. A mitochondrion whose
+/// recruited reads are mostly its plastid-derived stretches is sketched at the plastid's depth:
+/// oat SAMEA111508750's (2 x 251 bp, k-mer depth 21, about 23x in reads) at 1,271x beside its
+/// plastid's 1,307x; the cap kept a fifth of its reads and it assembled 7.6 kb. A target over the
+/// cap by its k-mers keeps the sketch: taking the k-mer depth there instead (rice
+/// SAMEA115396710/715/717 mitochondria, sketched at 4.5-5.8 times their k-mer depth of 299-793x)
+/// kept up to six times the reads, took 2-4 times as long and lowered SAMEA115396715's recall
+/// from 0.970 to 0.924. Of 854 targets across the Arabidopsis 1001 Genomes runs, the rice and
+/// Arabidopsis leave-one-out, oat, Nipponbare, ZM4 and JN-L, two change: oat SAMEA111508750's
+/// mitochondrion and a simulated half-depth oat one.
+fn cap_read_depth(sketch: Option<f64>, kmer: Option<f64>, max: f64) -> (Option<f64>, Option<&'static str>) {
+    match (sketch, kmer.filter(|&k| k > 0.0)) {
+        (_, Some(k)) if k <= max => (None, Some("kmer_under_cap")),
+        (Some(r), _) => (Some(r), Some("sketch")),
+        (None, Some(k)) => (Some(k), Some("kmer")),
+        (None, None) => (None, None),
+    }
+}
+
 fn kmer_read_depth(kmer_depth: f64, reads: u64, bases: u64, k: usize) -> Option<f64> {
     let len = bases as f64 / reads.max(1) as f64;
     (len > k as f64).then(|| kmer_depth * len / (len - k as f64 + 1.0))
@@ -3393,10 +3420,9 @@ pub(crate) fn run_with_options(
         if let Some(d) = cfg.target_depth.filter(|&d| depth > d) {
             cap(d / depth, "target_depth");
         }
-        let read_depth = final_depths.read[t].or_else(|| {
-            kmer_target_depth[t].and_then(|d| kmer_read_depth(d, counts.reads, counts.bases, bait.k))
-        });
-        if let (Some(max), Some(d)) = (cfg.max_read_depth, read_depth) {
+        let kmer_depth = kmer_target_depth[t].and_then(|d| kmer_read_depth(d, counts.reads, counts.bases, bait.k));
+        let judged = cfg.max_read_depth.map(|max| cap_read_depth(final_depths.read[t], kmer_depth, max));
+        if let (Some(max), Some((Some(d), _))) = (cfg.max_read_depth, judged) {
             if d > max {
                 cap(max / d, "max_read_depth");
             }
@@ -3458,6 +3484,8 @@ pub(crate) fn run_with_options(
             stop_reason,
             recruitment_state,
             converged: recruitment_state == RecruitmentState::Converged,
+            kmer_read_depth: kmer_depth,
+            cap_depth_from: judged.and_then(|j| j.1),
             sampling_fraction: fraction,
             sampled_by,
             kept_reads,
@@ -5732,6 +5760,22 @@ mod tests {
         keep_at_target_depth(None, Some(100.0), None, &mut all);
         keep_at_target_depth(Some(&table), None, None, &mut all);
         assert_eq!(all, new);
+    }
+
+    #[test]
+    fn a_target_the_kmer_gate_places_under_the_depth_cap_is_not_downsampled() {
+        // oat SAMEA111508750's mitochondrion: sketched at its plastid-derived reads' depth
+        assert_eq!(cap_read_depth(Some(1271.0), Some(22.8), 250.0), (None, Some("kmer_under_cap")));
+        // rice SAMEA115396710's: over the cap by its k-mers too, the sketch stays
+        assert_eq!(cap_read_depth(Some(1709.0), Some(298.8), 250.0), (Some(1709.0), Some("sketch")));
+        // Nipponbare, ZM4
+        assert_eq!(cap_read_depth(Some(844.0), Some(794.0), 250.0), (Some(844.0), Some("sketch")));
+        assert_eq!(cap_read_depth(Some(330.0), Some(363.0), 250.0), (Some(330.0), Some("sketch")));
+        // one estimate alone; a k-mer depth of zero is unknown
+        assert_eq!(cap_read_depth(None, Some(380.0), 250.0), (Some(380.0), Some("kmer")));
+        assert_eq!(cap_read_depth(Some(300.0), Some(0.0), 250.0), (Some(300.0), Some("sketch")));
+        assert_eq!(cap_read_depth(Some(83.0), None, 250.0), (Some(83.0), Some("sketch")));
+        assert_eq!(cap_read_depth(None, None, 250.0), (None, None));
     }
 
     #[test]
