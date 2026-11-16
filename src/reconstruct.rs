@@ -2342,6 +2342,87 @@ fn final_outputs(
     } else {
         Value::Null
     };
+    // A plastid the reads leave in pieces: laid onto the panel walk most like it, the walk's
+    // bases between them (`close::panel_scaffold`). The reads layer keeps the pieces; the joins
+    // across the walk's bases are the panel's (junctions.tsv source=panel, scaffold.tsv).
+    let mut scaffold = Value::Null;
+    if organelle == "plastid" && fasta_out.exists() && !status.starts_with("failed_") {
+        // the pieces the reads decided (the reads layer, cut at every join they do not
+        // decide), else the final molecules
+        let reads_layer = out.join(format!("{organelle}.reads.fasta"));
+        let records = read_fasta(if reads_layer.exists() { &reads_layer } else { &fasta_out })?;
+        let big: Vec<&(String, Vec<u8>)> = records.iter().filter(|(_, s)| s.len() as u64 >= pipeline::MIN_PIECE).collect();
+        if big.len() >= 2 && !big.iter().any(|(h, _)| h.split(' ').any(|w| w == "circular=true")) {
+            let seqs: Vec<Vec<u8>> = big.iter().map(|(_, s)| s.clone()).collect();
+            // the reference walks, and the panel runs' walks (a merged panel's P lines; the
+            // reference walks can be empty where they are)
+            let mut cand: Vec<(Vec<u8>, bool)> = walks.to_vec();
+            let mut cand_names: Vec<String> = walk_names.to_vec();
+            for w in panel {
+                cand.push((w.sequence.clone(), w.circular));
+                cand_names.push(w.run.clone());
+            }
+            eprintln!("[ovasm] reconstruct {organelle}: {} pieces the reads decided; laying them onto {} reference and panel walks", seqs.len(), cand.len());
+            if let Some(sc) = crate::close::panel_scaffold(&seqs, &cand) {
+                let name = |i: usize| big[i].0.split(' ').next().unwrap_or("").to_string();
+                // the path step a piece ends (or starts) with, read the way it was placed
+                let end_step = |i: usize, reverse: bool, last: bool| -> String {
+                    let steps: Vec<String> = crate::junction_support::header_path(&big[i].0)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(s, f)| format!("{s}{}", if f { '+' } else { '-' }))
+                        .collect();
+                    let flip = |s: &str| {
+                        let (n, o) = s.split_at(s.len().saturating_sub(1));
+                        format!("{n}{}", if o == "+" { '-' } else { '+' })
+                    };
+                    match (reverse, last) {
+                        (false, true) => steps.last().cloned(),
+                        (false, false) => steps.first().cloned(),
+                        (true, true) => steps.first().map(|s| flip(s)),
+                        (true, false) => steps.last().map(|s| flip(s)),
+                    }
+                    .unwrap_or_else(|| name(i))
+                };
+                let walk_name = cand_names.get(sc.walk).cloned().unwrap_or_default();
+                let mut fa = format!(
+                    ">scaffold.1 circular=true length={} closed_by=panel_scaffold panel_walk={walk_name} panel_similarity={:.4} pieces_placed={}/{} panel_fill_bp={} inverted_copy_bp={} panel_joins={}\n",
+                    sc.sequence.len(), sc.similarity, seqs.len() - sc.unplaced.len(), seqs.len(), sc.fill_bp, sc.mirrored_bp, sc.gaps.len()
+                );
+                for chunk in sc.sequence.chunks(80) {
+                    writeln!(fa, "{}", std::str::from_utf8(chunk)?)?;
+                }
+                fs::write(&fasta_out, fa)?;
+                let jt = dir.join("junctions.tsv");
+                let mut jtext = if jt.exists() {
+                    fs::read_to_string(&jt)?
+                } else {
+                    String::from("molecule\tleft\trepeat\tright\tx\ty\trepeat_bp\tcrossing_fragments\texpected\tp_at_most_observed\tclass\tpanel_probability\tpanel_takes\tsource\n")
+                };
+                let mut st = String::from("gap\tleft_piece\tleft\tright_piece\tright\tscaffold_start\tbp\tfilled_with\twalk\twalk_start\n");
+                for (k, g) in sc.gaps.iter().enumerate() {
+                    let (a, b) = (&sc.placements[g.after], &sc.placements[g.before]);
+                    let (left, right) = (end_step(a.piece, a.reverse, true), end_step(b.piece, b.reverse, false));
+                    writeln!(jtext, "scaffold.1\t{left}\t-\t{right}\t{}\t{}\t{}\t0\tNA\tNA\tpanel_scaffold\tNA\tyes\tpanel", g.start, g.start + g.length, g.length)?;
+                    writeln!(st, "{k}\t{}\t{left}\t{}\t{right}\t{}\t{}\t{}\t{walk_name}\t{}", name(a.piece), name(b.piece), g.start, g.length, if g.mirrored { "inverted_copy" } else { "panel_walk" }, g.walk_start)?;
+                }
+                fs::write(&jt, jtext)?;
+                fs::write(dir.join("scaffold.tsv"), st)?;
+                eprintln!(
+                    "[ovasm] reconstruct {organelle}: {} pieces laid onto panel walk {walk_name} (similarity {:.3}): one circle of {} bp; {} bp the walk's, {} bp the individual's inverted copy, in {} gap(s)",
+                    seqs.len() - sc.unplaced.len(), sc.similarity, sc.sequence.len(), sc.fill_bp, sc.mirrored_bp, sc.gaps.len()
+                );
+                reasons.push(format!("pieces laid onto the panel walk most like them: {} bp are the walk's, not the reads', and {} bp copy the individual's own inverted repeat, in {} gap(s)", sc.fill_bp, sc.mirrored_bp, sc.gaps.len()));
+                lengths = vec![sc.sequence.len()];
+                circular = vec![true];
+                reference_bp += sc.fill_bp;
+                status = "panel_scaffold".to_string();
+                scaffold = serde_json::to_value(&sc)?;
+                scaffold["walk_name"] = json!(walk_name);
+                scaffold["piece_names"] = json!((0..seqs.len()).map(name).collect::<Vec<_>>());
+            }
+        }
+    }
     // stretches whose length the reads do not fix (collapsed tandem arrays, microsatellites)
     let uncertain = if fasta_out.exists() {
         let final_molecules: Vec<(String, Vec<u8>, bool)> = read_fasta(&fasta_out)?
@@ -2402,7 +2483,7 @@ fn final_outputs(
         "withheld_fasta": withheld,
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
-        "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
+        "reference_fill": reference_fill, "reference_fill_bp": reference_bp, "panel_scaffold": scaffold,
         "configurations": configurations_found, "representative": representative,
         "uncertain_regions": uncertain,
         "junctions": junctions,

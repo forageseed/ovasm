@@ -436,6 +436,327 @@ fn similarity(molecule: &[u8], walks: &[(Vec<u8>, bool)]) -> Vec<f64> {
 /// One sampled k-mer in this many for `similarity`.
 const SIMILARITY_STEP: usize = 16;
 
+/// A piece placed on the walk: its span there differs from its length by at most this many
+/// bases, or this share of its length.
+const PLACE_TOLERANCE_BP: usize = 100;
+const PLACE_TOLERANCE_SHARE: f64 = 0.05;
+/// Share of the pieces' bases that must place, and of the walk they must cover, for a scaffold.
+const MIN_PLACED_SHARE: f64 = 0.9;
+/// How far into a piece its first (last) K-mer the walk holds is looked for: the ends of a
+/// piece are where the reads stopped, and can differ from every walk (a quarter of the piece at
+/// most).
+const SCAFFOLD_SEARCH: usize = 2000;
+const MIN_WALK_COVER: f64 = 0.5;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScaffoldPlacement {
+    pub piece: usize,
+    pub reverse: bool,
+    /// Span on the walk (end may pass the walk's length: across its origin).
+    pub walk_start: usize,
+    pub walk_end: usize,
+    /// Where its bases stand in the scaffold, and how many of its first bases were left out
+    /// because the placement before covered them; `contained`: none of it was used.
+    pub start: usize,
+    pub end: usize,
+    pub trimmed: usize,
+    pub contained: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScaffoldGap {
+    /// Placements (indices) on either side, the walk's bases taken, and where they stand.
+    pub after: usize,
+    pub before: usize,
+    pub walk_start: usize,
+    pub length: usize,
+    pub start: usize,
+    /// Filled with the individual's own bases: the reverse complement of the inverted copy the
+    /// scaffold holds from its pieces (the other inverted repeat), not the walk's.
+    pub mirrored: bool,
+    /// Of its bases, those the walk gave (all of them unless mirrored).
+    pub walk_bp: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Scaffold {
+    pub walk: usize,
+    pub similarity: f64,
+    pub walk_length: usize,
+    pub placements: Vec<ScaffoldPlacement>,
+    pub gaps: Vec<ScaffoldGap>,
+    pub unplaced: Vec<usize>,
+    /// Bases of the walk's own in the scaffold (gaps not mirrored), and of the individual's
+    /// inverted copies filled into gaps.
+    pub fill_bp: usize,
+    pub mirrored_bp: usize,
+    #[serde(skip)]
+    pub sequence: Vec<u8>,
+}
+
+/// A circular molecule's pieces laid onto the circular reference walk most like them (`walks`:
+/// sequence, circular), for a molecule as conserved in structure as a plastid, whose reads leave
+/// it in pieces (1001 Genomes Arabidopsis at 100 bp: nine linear pieces of 127 kb, one copy of
+/// the inverted repeat among them, for a 154 kb circle). Each piece is placed where the walk
+/// holds its first and last `K`-mers at a distance its length allows (moved inwards up to `SCAFFOLD_SEARCH` bases), on either strand and as often
+/// as the walk holds it: a collapsed inverted
+/// repeat places twice, once each way, so the circle has both. In walk order, a placement
+/// overlapping the one before loses the bases it repeats; the walk's own bases fill between
+/// them. Those bases are the reference's, not the reads': the gaps are reported. None when no
+/// walk holds the pieces, less than `MIN_PLACED_SHARE` of their bases place, or the
+/// placements cover less than `MIN_WALK_COVER` of the walk.
+pub fn panel_scaffold(pieces: &[Vec<u8>], walks: &[(Vec<u8>, bool)]) -> Option<Scaffold> {
+    let pieces: Vec<Vec<u8>> = pieces.iter().map(|p| p.to_ascii_uppercase()).collect();
+    let all: Vec<u8> = pieces.iter().flat_map(|p| p.iter().copied().chain(std::iter::once(b'N'))).collect();
+    let like = similarity(&all, walks);
+    // a panel run walk of a circular molecule spells the whole circle whether or not it is
+    // marked circular (GFA P lines of a merged panel are not)
+    let w = (0..walks.len()).filter(|&i| like[i] > 0.0).max_by(|&a, &b| like[a].total_cmp(&like[b]).then(b.cmp(&a)))?;
+    let walk = walks[w].0.to_ascii_uppercase();
+    let l = walk.len();
+    if l < 2 * K {
+        return None;
+    }
+    let doubled: Vec<u8> = [walk.as_slice(), walk.as_slice()].concat();
+    let mut at: FxHashMap<&[u8], Vec<usize>> = FxHashMap::default();
+    for (p, x) in doubled.windows(K).enumerate() {
+        at.entry(x).or_default().push(p);
+    }
+    let mut placed: Vec<(usize, bool, usize, usize)> = Vec::new();
+    let mut placed_bp = 0usize;
+    let mut unplaced = Vec::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        let n = piece.len();
+        let mut any = false;
+        if n >= 2 * (K + MAX_TRIM) {
+            let search = SCAFFOLD_SEARCH.min(n / 4 - K);
+            let tolerance = PLACE_TOLERANCE_BP.max((PLACE_TOLERANCE_SHARE * n as f64) as usize);
+            for reverse in [false, true] {
+                let s = if reverse { revcomp(piece) } else { piece.clone() };
+                // the first start K-mer the walk holds, and the first end K-mer
+                let start = (0..=search).find_map(|d| at.get(&s[d..d + K]).map(|v| (d, v)));
+                let end = (0..=search).find_map(|e| at.get(&s[n - K - e..n - e]).map(|v| (e, v)));
+                let (Some((d, starts)), Some((e, ends))) = (start, end) else { continue };
+                for &p in starts.iter().filter(|&&p| p >= d && p - d < l) {
+                    let ws = p - d;
+                    let best = ends
+                        .iter()
+                        .map(|&q| q + K + e)
+                        .filter(|&we| we > ws && we - ws <= 2 * l)
+                        .min_by_key(|&we| (we - ws).abs_diff(n));
+                    if let Some(we) = best.filter(|&we| (we - ws).abs_diff(n) <= tolerance) {
+                        placed.push((i, reverse, ws, we));
+                        any = true;
+                    }
+                }
+            }
+        }
+        if any {
+            placed_bp += n;
+        } else {
+            unplaced.push(i);
+        }
+    }
+    let total: usize = pieces.iter().map(Vec::len).sum();
+    if placed.is_empty() || (placed_bp as f64) < MIN_PLACED_SHARE * total as f64 {
+        return None;
+    }
+    placed.sort_by_key(|&(i, r, ws, we)| (ws, std::cmp::Reverse(we), i, r));
+    placed.dedup_by_key(|x| (x.2, x.3));
+    let origin = placed[0].2;
+    let mut sequence: Vec<u8> = Vec::new();
+    let mut placements: Vec<ScaffoldPlacement> = Vec::new();
+    let mut gaps: Vec<ScaffoldGap> = Vec::new();
+    let mut cursor = 0usize; // walk bases covered, from the origin
+    let mut last_used: Option<usize> = None;
+    for &(i, reverse, ws, we) in &placed {
+        let (rs, re) = (ws - origin, we - origin);
+        if re <= cursor {
+            placements.push(ScaffoldPlacement { piece: i, reverse, walk_start: ws, walk_end: we, start: sequence.len(), end: sequence.len(), trimmed: 0, contained: true });
+            continue;
+        }
+        if rs > cursor {
+            let from = (origin + cursor) % l;
+            let fill: Vec<u8> = doubled[from..from + (rs - cursor)].to_vec();
+            gaps.push(ScaffoldGap { after: last_used.unwrap_or(usize::MAX), before: placements.len(), walk_start: from, length: fill.len(), start: sequence.len(), mirrored: false, walk_bp: 0 });
+            sequence.extend_from_slice(&fill);
+        }
+        let trimmed = cursor.saturating_sub(rs).min(pieces[i].len());
+        let s = if reverse { revcomp(&pieces[i]) } else { pieces[i].clone() };
+        let start = sequence.len();
+        sequence.extend_from_slice(&s[trimmed..]);
+        placements.push(ScaffoldPlacement { piece: i, reverse, walk_start: ws, walk_end: we, start, end: sequence.len(), trimmed, contained: false });
+        last_used = Some(placements.len() - 1);
+        cursor = re;
+    }
+    let covered: usize = cursor.min(l);
+    // around the origin: the walk's bases up to the first placement, or the last placement's
+    // bases that the first already holds left out
+    if cursor < l {
+        let from = (origin + cursor) % l;
+        let fill: Vec<u8> = doubled[from..from + (l - cursor)].to_vec();
+        gaps.push(ScaffoldGap { after: last_used.unwrap_or(usize::MAX), before: 0, walk_start: from, length: fill.len(), start: sequence.len(), mirrored: false, walk_bp: 0 });
+        sequence.extend_from_slice(&fill);
+    } else if cursor > l {
+        let over = (cursor - l).min(sequence.len());
+        sequence.truncate(sequence.len() - over);
+    }
+    let fill_bp: usize = gaps.iter().map(|g| g.length).sum();
+    if ((covered.saturating_sub(fill_bp.min(covered))) as f64) < MIN_WALK_COVER * l as f64 {
+        return None;
+    }
+    gaps.iter_mut().for_each(|g| if g.after == usize::MAX { g.after = last_used.unwrap_or(0) });
+    let mirrored_bp = mirror_gaps(&mut sequence, &mut gaps);
+    let fill_bp = gaps.iter().map(|g| g.walk_bp).sum();
+    Some(Scaffold { walk: w, similarity: like[w], walk_length: l, placements, gaps, unplaced, fill_bp, mirrored_bp, sequence })
+}
+
+/// Gaps of a scaffold whose walk bases are the reverse complement of a stretch the individual's
+/// own pieces hold elsewhere in it (the other copy of an inverted repeat, which the reads gave
+/// once): filled with that stretch's reverse complement instead. The stretch is found by the
+/// reverse complements of the gap's last and first `K`-mers it holds (moved inwards up to `SCAFFOLD_SEARCH`
+/// bases), at the gap's length (within the placement tolerance), wholly outside every gap.
+/// Returns the bases so filled; gap starts are moved to the new coordinates.
+fn mirror_gaps(sequence: &mut Vec<u8>, gaps: &mut [ScaffoldGap]) -> usize {
+    let n = sequence.len();
+    let mut at: FxHashMap<&[u8], Vec<usize>> = FxHashMap::default();
+    for (p, x) in sequence.windows(K).enumerate() {
+        at.entry(x).or_default().push(p);
+    }
+    let in_gap = |a: usize, b: usize| gaps.iter().any(|g| a < g.start + g.length && g.start < b);
+    let mut fills: Vec<(usize, Vec<u8>, usize)> = Vec::new();
+    for (gi, g) in gaps.iter().enumerate() {
+        let len = g.length;
+        if len < 2 * (K + MAX_TRIM) || g.start + len > n {
+            continue;
+        }
+        let gap = &sequence[g.start..g.start + len];
+        let rcg = revcomp(gap);
+        let search = SCAFFOLD_SEARCH.min(len / 4 - K);
+        // the gap's ends can be single-copy sequence beside the inverted repeat: the copy is
+        // looked for from the first and last K-mers it holds, inwards
+        let first = (0..=search).find_map(|d| at.get(&rcg[d..d + K]).map(|v| (d, v.clone())));
+        let last = (0..=search).find_map(|e| at.get(&rcg[len - K - e..len - e]).map(|v| (e, v.clone())));
+        let (Some((d, firsts)), Some((e, lasts))) = (first, last) else { continue };
+        let core = len - d - e;
+        let tolerance = PLACE_TOLERANCE_BP.max((PLACE_TOLERANCE_SHARE * core as f64) as usize);
+        let found = firsts.iter().find_map(|&a| {
+            lasts
+                .iter()
+                .map(|&q| q + K)
+                .filter(|&b| b > a && b <= n && (b - a).abs_diff(core) <= tolerance && !in_gap(a, b))
+                .min_by_key(|&b| (b - a).abs_diff(core))
+                .map(|b| (a, b))
+        });
+        if let Some((a, b)) = found {
+            // rcg[d..len-e] is the reverse complement of gap[e..len-d]: that core takes the
+            // reverse complement of the copy, the walk's bases stay either side of it
+            let fill: Vec<u8> = gap[..e].iter().copied().chain(revcomp(&sequence[a..b])).chain(gap[len - d..].iter().copied()).collect();
+            fills.push((gi, fill, b - a));
+        }
+    }
+    drop(at);
+    let mut mirrored = 0usize;
+    // replace from the last gap back, so earlier starts stay; then move the starts
+    fills.sort_by_key(|f| std::cmp::Reverse(gaps[f.0].start));
+    for (gi, fill, copied) in &fills {
+        let g = &gaps[*gi];
+        sequence.splice(g.start..g.start + g.length, fill.iter().copied());
+        mirrored += copied;
+    }
+    let walk_left: FxHashMap<usize, usize> = fills.iter().map(|(gi, f, c)| (*gi, f.len() - c)).collect();
+    let mut delta: i64 = 0;
+    let mut order: Vec<usize> = (0..gaps.len()).collect();
+    order.sort_by_key(|&i| gaps[i].start);
+    let filled: FxHashMap<usize, usize> = fills.iter().map(|(gi, f, _)| (*gi, f.len())).collect();
+    for i in order {
+        let g = &mut gaps[i];
+        g.start = (g.start as i64 + delta) as usize;
+        g.walk_bp = g.length;
+        if let Some(&fl) = filled.get(&i) {
+            delta += fl as i64 - g.length as i64;
+            g.length = fl;
+            g.mirrored = true;
+            g.walk_bp = walk_left[&i];
+        }
+    }
+    mirrored
+}
+
+#[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+
+    fn random(n: usize, seed: &mut u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 7;
+                *seed ^= *seed << 17;
+                b"ACGT"[(*seed % 4) as usize]
+            })
+            .collect()
+    }
+
+    /// A plastid: LSC, IRb, SSC, IRa (IRa the reverse complement of IRb).
+    fn plastid(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut s = seed;
+        let (lsc, ir, ssc) = (random(6000, &mut s), random(1500, &mut s), random(1200, &mut s));
+        let circle = [lsc.clone(), ir.clone(), ssc.clone(), revcomp(&ir)].concat();
+        (circle, lsc, ir, ssc)
+    }
+
+    #[test]
+    fn pieces_with_one_copy_of_the_inverted_repeat_scaffold_into_the_whole_circle() {
+        let (relative, lsc, ir, ssc) = plastid(5);
+        // the individual: a few substitutions, its pieces short of their ends by 40-60 bases,
+        // the inverted repeat once
+        let mut ind_lsc = lsc.clone();
+        ind_lsc[3000] = if ind_lsc[3000] == b'A' { b'C' } else { b'A' };
+        let pieces = vec![ind_lsc[50..5950].to_vec(), revcomp(&ir[40..1460]), ssc[60..1140].to_vec()];
+        let walks = vec![(relative.clone(), true), (random(9000, &mut 9), true)];
+        let s = panel_scaffold(&pieces, &walks).expect("a scaffold");
+        assert_eq!(s.walk, 0);
+        assert!(s.unplaced.is_empty(), "{s:?}");
+        assert_eq!(s.sequence.len(), relative.len(), "{s:?}");
+        // the inverted repeat placed twice, once each way; the substitution kept
+        assert_eq!(s.placements.iter().filter(|p| p.piece == 1 && !p.contained).count(), 2, "{s:?}");
+        let doubled = [s.sequence.clone(), s.sequence.clone()].concat();
+        let probe = &ind_lsc[2980..3020];
+        assert!(doubled.windows(probe.len()).any(|w| w == probe) || doubled.windows(probe.len()).any(|w| w == revcomp(probe).as_slice()));
+        // the reference's bases: the trimmed ends only
+        assert_eq!(s.fill_bp, relative.len() - (5900 + 2 * 1420 + 1080), "{:?}", s.gaps);
+        assert_eq!(s.gaps.len(), 4);
+    }
+
+    #[test]
+    fn the_inverted_repeat_given_once_fills_its_other_copy_with_the_individuals_bases() {
+        let (relative, lsc, ir, ssc) = plastid(9);
+        // the individual differs from the relative inside the inverted repeat (both copies)
+        let mut ind_ir = ir.clone();
+        ind_ir[700] = if ind_ir[700] == b'G' { b'T' } else { b'G' };
+        // one piece IRb + SSC (so it places once), and the LSC
+        let pieces = vec![lsc[20..5980].to_vec(), [ind_ir.clone(), ssc[..1100].to_vec()].concat()];
+        let s = panel_scaffold(&pieces, &[(relative.clone(), true)]).expect("a scaffold");
+        assert_eq!(s.sequence.len(), relative.len(), "{s:?}");
+        assert!(s.gaps.iter().any(|g| g.mirrored && g.length > 1000), "{:?}", s.gaps);
+        // both copies carry the individual's base: IRb forward, IRa as its reverse complement
+        let probe = &ind_ir[680..720];
+        let doubled = [s.sequence.clone(), s.sequence.clone()].concat();
+        let count = |x: &[u8]| doubled[..s.sequence.len() + 40].windows(x.len()).filter(|w| *w == x).count();
+        assert_eq!(count(probe) + count(&revcomp(probe)), 2, "{:?}", s.gaps);
+        assert!(s.fill_bp < 300, "{s:?}");
+    }
+
+    #[test]
+    fn pieces_the_walks_do_not_hold_are_not_scaffolded() {
+        let (relative, _, _, _) = plastid(5);
+        let mut s = 77u64;
+        let pieces = vec![random(3000, &mut s), random(2000, &mut s)];
+        assert!(panel_scaffold(&pieces, &[(relative, true)]).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

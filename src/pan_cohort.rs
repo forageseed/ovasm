@@ -436,7 +436,8 @@ pub fn read_sample(
         let molecule = jt.get(row, "molecule")?.to_string();
         let molecule_of_row = molecule.clone();
         let left = jt.get(row, "left")?.to_string();
-        let repeat: Vec<String> = jt.get(row, "repeat")?.split(',').map(str::to_string).collect();
+        // "-": a join the panel scaffold made across the panel walk's bases (no repeat walked)
+        let repeat: Vec<String> = jt.get(row, "repeat")?.split(',').filter(|s| !s.is_empty() && *s != "-").map(str::to_string).collect();
         let right = jt.get(row, "right")?.to_string();
         let source = jt.get(row, "source").unwrap_or("reads").to_string();
         let class = jt.get(row, "class")?.to_string();
