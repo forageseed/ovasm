@@ -172,6 +172,13 @@ pub struct RunConfig {
     /// (`ComponentParams::reject_beside_closed_reference`): set by `run` for animal and fungal
     /// protein seeds, however many recruitment passes (`prune_gene_free` of `run`).
     pub prune_gene_free: bool,
+    /// Remove the graph components whose panel genes are the other organelle's (at least
+    /// `min_other_genes` and twice the target's), depth not judged (`pan reconstruct`): a
+    /// mitochondrion's recruited reads include the plastid's wherever the reference holds
+    /// plastid-derived stretches, and where the mitochondrion is shallow the plastid's component
+    /// is what assembles (rice SAMEA115396709 subsampled to 15x of mitochondrion: 96 kb of plastid
+    /// came out as its mitochondrion).
+    pub other_organelle_filter: bool,
     /// The protein seeds came from the whole-read scan and were recruited without the depth gate
     /// (`ProteinSeedReport::shallow`): the `prune_gene_free` filter then does not judge depth
     /// (`ComponentParams::judge_depth`).
@@ -514,6 +521,17 @@ impl ComponentFilter {
             organelle: organelle.to_string(),
             panel,
             params: ComponentParams::default(),
+        })
+    }
+
+    /// The filter of `RunConfig::other_organelle_filter`: the land-plant panel; a component goes
+    /// only when its genes are the other organelle's, whatever its depth.
+    fn other_organelle(organelle: &str) -> Result<Self> {
+        let k = ComponentParams::default().k;
+        Ok(Self {
+            organelle: organelle.to_string(),
+            panel: Panel::embedded(k, &[])?,
+            params: ComponentParams { judge_depth: false, reject_other_without_reference: true, ..ComponentParams::default() },
         })
     }
 
@@ -1805,6 +1823,9 @@ fn assemble_organelle(
             organelle,
             cfg.component_panel.as_deref(),
         )?)
+    } else if cfg.other_organelle_filter {
+        log(&format!("removing the graph components whose genes are not the {organelle}'s"));
+        Some(ComponentFilter::other_organelle(organelle)?)
     } else if cfg.prune_gene_free && organelle == "mitochondrion" {
         Some(ComponentFilter::gene_free(organelle, cfg.seed_lineage.name(), !cfg.shallow_seeds)?)
     } else {
@@ -2157,6 +2178,25 @@ fn assemble_organelle(
     if let Some(m) = methylation_summary {
         report["methylation"] = m;
     }
+    // whether this is the organelle's result: the k ladder's acceptance, and the panel genes on
+    // the molecules (`is_other_organelle`)
+    let (status, status_reason) = if molecules.is_empty() || !fasta.exists() {
+        ("no_molecules", String::new())
+    } else {
+        let seqs: Vec<Vec<u8>> = crate::reconstruct::read_fasta(&fasta)?.into_iter().map(|(_, s)| s).collect();
+        let (target_genes, other_genes) = organelle_genes(organelle, seqs.iter().map(Vec::as_slice))?;
+        if is_other_organelle(target_genes, other_genes) {
+            ("failed_other_organelle", format!(
+                "the molecules hold {other_genes} genes of the other organelle and {target_genes} of the {organelle}"))
+        } else if !ladder.accepted {
+            ("failed_untrustworthy", format!(
+                "no k gave molecules explaining {:.0}% of the graph", MIN_EXPLAINED * 100.0))
+        } else {
+            ("assembled", String::new())
+        }
+    };
+    report["status"] = json!(status);
+    report["status_reason"] = json!(status_reason);
     write_json(&dir.join("summary.json"), &report)?;
     let mut message = format!(
         "{organelle}: {} representative molecules; supported links {}/{n_links}; decisive={}",
@@ -2174,6 +2214,9 @@ fn assemble_organelle(
             ladder.result().k
         );
     }
+    if status == "failed_other_organelle" {
+        message += &format!("; FAILED: {status_reason}, not the {organelle}");
+    }
     if let Some(f) = &component_filter {
         if f["removed_components"].as_u64().unwrap_or(0) > 0 {
             message += &format!(
@@ -2184,6 +2227,56 @@ fn assemble_organelle(
     }
     log(&message);
     Ok(report)
+}
+
+/// Genes of the other organelle that, at twice the target's, make an assembly the other
+/// organelle's (`find classify`'s `min_genes` and margin).
+pub(crate) const OTHER_ORGANELLE_GENES: usize = 5;
+
+/// Whether molecules with these panel genes are the other organelle's (`OTHER_ORGANELLE_GENES`).
+pub(crate) fn is_other_organelle(target_genes: usize, other_genes: usize) -> bool {
+    other_genes >= OTHER_ORGANELLE_GENES && other_genes >= 2 * target_genes
+}
+
+/// Panel genes on `seqs`: (of `organelle`, of the other organelle), one stretch enough.
+pub(crate) fn organelle_genes<'a>(organelle: &str, seqs: impl IntoIterator<Item = &'a [u8]>) -> Result<(usize, usize)> {
+    let panel = Panel::embedded(6, &[])?;
+    let p = crate::panel::PanelParams { min_gene_segments: 1, ..crate::panel::PanelParams::default() };
+    let (mito, plastid) = crate::panel::sequence_genes(seqs, &panel, &p);
+    Ok(if organelle == "plastid" { (plastid.genes, mito.genes) } else { (mito.genes, plastid.genes) })
+}
+
+/// `ovasm run`'s delivery: an organelle whose run failed (`status` failed_*) keeps its molecules
+/// as `molecules.failed.fasta`, not as the organelle's `molecules.fasta`; summary.json says so.
+fn withhold_failed(out: &Path, report: &mut Value) -> Result<()> {
+    let mut changed = false;
+    let keys: Vec<Option<String>> = match report["organelles"].as_object() {
+        Some(m) => m.keys().cloned().map(Some).collect(),
+        None => vec![None],
+    };
+    for key in keys {
+        let dir = key.as_ref().map_or_else(|| out.to_path_buf(), |o| out.join(o));
+        let entry = match &key {
+            Some(o) => &mut report["organelles"][o.as_str()],
+            None => &mut *report,
+        };
+        if !entry["status"].as_str().is_some_and(|s| s.starts_with("failed_")) {
+            continue;
+        }
+        let (from, to) = (dir.join("molecules.fasta"), dir.join("molecules.failed.fasta"));
+        if from.exists() {
+            fs::rename(&from, &to)?;
+            entry["withheld_fasta"] = json!(to.to_string_lossy());
+            changed = true;
+            if key.is_some() {
+                write_json(&dir.join("summary.json"), entry)?;
+            }
+        }
+    }
+    if changed {
+        write_json(&out.join("summary.json"), report)?;
+    }
+    Ok(())
 }
 
 /// The filter's report as it goes into `summary.json`: the counts and, for each removed
@@ -2308,7 +2401,9 @@ fn validate(cfg: &RunConfig) -> Result<()> {
 /// that is `{"organelles": {name: summary or {"error": ...}}}` and each organelle's own
 /// summary is in its directory.
 pub fn run(cfg: &RunConfig) -> Result<Value> {
-    run_with_sr_evidence_floor(cfg, None)
+    let mut report = run_with_sr_evidence_floor(cfg, None)?;
+    withhold_failed(&cfg.out, &mut report)?;
+    Ok(report)
 }
 
 pub(crate) fn run_with_sr_evidence_floor(cfg: &RunConfig, sr_min_graph_bases: Option<u64>) -> Result<Value> {
@@ -2943,6 +3038,7 @@ mod tests {
             sample: "desktop".into(),
             component_panel: None,
             prune_gene_free: false,
+            other_organelle_filter: false,
             shallow_seeds: false,
             depth_reference: Default::default(),
             methylation: false,

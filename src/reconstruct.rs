@@ -857,7 +857,7 @@ fn dead_ends(g: &Graph) -> usize {
         .sum()
 }
 
-fn read_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+pub(crate) fn read_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     for line in fs::read_to_string(path)?.lines() {
         if let Some(h) = line.strip_prefix('>') {
@@ -950,6 +950,17 @@ fn close_gfa(
     Ok(Some(out))
 }
 
+/// The de novo assembly graph its evidence and molecules are about: the filtered one where the
+/// component filter ran (`RunConfig::other_organelle_filter`), else the whole graph.
+fn de_novo_graph(d: &Path) -> PathBuf {
+    let filtered = d.join("assembly.filtered.gfa");
+    if filtered.exists() {
+        filtered
+    } else {
+        d.join("assembly.gfa")
+    }
+}
+
 /// Most covers `linearize` reports per component when every configuration is wanted.
 const MAX_CONFIGURATIONS: usize = 10_000;
 /// Configurations spelled and written (FASTA, GFA walks, list), the best ranked first; the
@@ -1001,7 +1012,7 @@ fn configurations(
     // What the panel says of every bridge the reads leave open (`pan_posterior`): the
     // configuration it supports best is built by `linearize` beside the covers it searches.
     let (bridge_graph, bridge_repeat, bridge_views) =
-        crate::linearize::open_bridges(&d.join("assembly.gfa"), &d.join("evidence.json"), 2)?;
+        crate::linearize::open_bridges(&de_novo_graph(&d), &d.join("evidence.json"), 2)?;
     let bridge_walks: Vec<Vec<Oriented>> = bridge_views.iter().map(|b| b.walk.clone()).collect();
     let sites = if dir.join("genotypes.tsv").exists() {
         crate::pan_posterior::read_genotypes(&dir.join("genotypes.tsv"))?
@@ -1019,9 +1030,9 @@ fn configurations(
         let (fasta, partial, report) =
             (d.join("configurations.best.fasta"), d.join("configurations.partial.fasta"), d.join("configurations.json"));
         if posterior.is_some() {
-            crate::linearize::run_with_prior(&d.join("assembly.gfa"), &d.join("evidence.json"), params, &fasta, Some(&partial), &report, &bridge_prior)
+            crate::linearize::run_with_prior(&de_novo_graph(&d), &d.join("evidence.json"), params, &fasta, Some(&partial), &report, &bridge_prior)
         } else {
-            crate::linearize::run(&d.join("assembly.gfa"), &d.join("evidence.json"), params, &fasta, Some(&partial), &report)
+            crate::linearize::run(&de_novo_graph(&d), &d.join("evidence.json"), params, &fasta, Some(&partial), &report)
         }
     };
     let mut rep = solve(crate::linearize::LinearizeParams {
@@ -1068,7 +1079,7 @@ fn configurations(
     // organelle graph is blunt: a segment with an overlapping link loses those bases for every
     // walk, and ZM4's 360 bp repeat (126 bp overlaps to two short tips) came out 126 bp short in
     // walks that pass it without the tips (145,947 bp against the HiFi molecule's 146,073).
-    let asm = parse_gfa(&d.join("assembly.gfa"))?;
+    let asm = parse_gfa(&de_novo_graph(&d))?;
     let index: BTreeMap<&str, usize> = asm.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let mut overlap: BTreeMap<Edge, usize> = BTreeMap::new();
     for (&(a, b), &o) in asm.links.iter().zip(&asm.overlaps) {
@@ -1203,7 +1214,7 @@ fn configurations(
     for (sample, files) in prior_reads {
         let report_path = dir.join(format!("prior-read-evidence-{sample}.json"));
         let params = crate::evidence::EvidenceParams { short_read_adjacency: false, k: 21, flank: 2000, min_anchor: 500, diag_tol: 30, min_side_hits: 10, spacing_tol: 0.05, bootstrap: 0, seed: 0, max_repeat_len: 20_000 };
-        let report = crate::evidence::run(&d.join("assembly.gfa"), files.clone(), params, &report_path)?;
+        let report = crate::evidence::run(&de_novo_graph(&d), files.clone(), params, &report_path)?;
         add_prior_traversals(sample, &report.traversals, &repeats, &mut support);
         add_prior_joint_walks(sample, &report.observed_walks, &repeats, &mut joint_support);
         read_reports.push(json!({"sample":sample, "inputs":files, "report":report_path, "reads_scanned":report.reads_scanned, "reads_with_support":report.reads_with_support, "organelle_origin_certified":false, "origin_evidence":"Not assessed by this graph alignment; recruited reads can include nuclear organelle insertions or other homologous sequences."}));
@@ -1215,7 +1226,7 @@ fn configurations(
     let target_report = if target_hifi.is_empty() { None } else {
         let path = dir.join("target-hifi-evidence.json");
         let params = crate::evidence::EvidenceParams { short_read_adjacency: false, k: 21, flank: 2000, min_anchor: 500, diag_tol: 30, min_side_hits: 10, spacing_tol: 0.05, bootstrap: 0, seed: 0, max_repeat_len: 20_000 };
-        let report = crate::evidence::run(&d.join("assembly.gfa"), target_hifi.to_vec(), params, &path)?;
+        let report = crate::evidence::run(&de_novo_graph(&d), target_hifi.to_vec(), params, &path)?;
         add_prior_traversals("target", &report.traversals, &repeats, &mut target_support);
         add_prior_joint_walks("target", &report.observed_walks, &repeats, &mut target_joint_support);
         // Preserve the native single-record explanatory family separately from the
@@ -1224,7 +1235,7 @@ fn configurations(
         let native_fasta = dir.join("target-hifi-native.fasta");
         let native_partial = dir.join("target-hifi-native.partial.fasta");
         let native = crate::linearize::run(
-            &d.join("assembly.gfa"), &path,
+            &de_novo_graph(&d), &path,
             crate::linearize::LinearizeParams { min_reads: 2, max_steps: 5_000_000,
                 adaptive_steps: true, max_molecules: 0, max_alternatives: MAX_CONFIGURATIONS,
                 optional_below: 0.5 },
@@ -1969,7 +1980,24 @@ fn final_outputs(
     if loose > 0 {
         reasons.push(format!("{loose} loose segment ends in the organelle graph"));
     }
+    // The molecules must be the organelle's: where the target is too shallow to assemble, the
+    // reads it recruited through the reference's stretches of the other organelle (a
+    // mitochondrion's plastid-derived sequence) assemble the other organelle instead (rice
+    // SAMEA115396709 at 15x of mitochondrion: 96 kb of plastid). Genes of the land-plant panel
+    // on all molecules: at least `OTHER_ORGANELLE_GENES` of the other organelle and twice the
+    // target's fail the reconstruction.
+    let (target_genes, other_genes) = pipeline::organelle_genes(organelle, molecules.iter().map(|m| m.1.as_slice()))?;
+    let other_organelle = pipeline::is_other_organelle(target_genes, other_genes);
+    if other_organelle {
+        reasons.push(format!(
+            "the molecules hold {other_genes} genes of the other organelle and {target_genes} of the {organelle}: the {organelle} did not assemble"
+        ));
+    }
     let status = match (reasons.is_empty(), reference_bp) {
+        _ if other_organelle => "failed_other_organelle",
+        // no k gave molecules explaining half of their graph (the k ladder's acceptance): the
+        // run itself calls the assembly NOT TRUSTWORTHY, so it is not the organelle's result
+        _ if !k_accepted => "failed_untrustworthy",
         (false, _) => "incomplete",
         (true, 0) => "complete",
         // closed, but with bases a reference walk holds, not the reads
@@ -1981,7 +2009,7 @@ fn final_outputs(
     } else {
         (Value::Null, None)
     };
-    let was_incomplete = status == "incomplete";
+    let was_incomplete = status == "incomplete" || status.starts_with("failed_");
     let mut status = status.to_string();
     if !decisive && !was_incomplete {
         status = if reference_bp == 0 { "closed_configuration_uncertain" } else { "closed_reference_fill_configuration_uncertain" }.to_string();
@@ -2108,7 +2136,7 @@ fn final_outputs(
     // when its library could cross it (`junction_support`); a join they could cross and do not
     // is cut, one they cannot reach is reported as undetermined, and segments whose depth says
     // more (or fewer) copies than the walk visits are reported.
-    let assembly_gfa = dir.join("de-novo/assembly.gfa");
+    let assembly_gfa = de_novo_graph(&dir.join("de-novo"));
     let junctions = if fasta_out.exists() && assembly_gfa.exists() {
         use crate::junction_support as js;
         let records = read_fasta(&fasta_out)?;
@@ -2312,7 +2340,24 @@ fn final_outputs(
         let text = fs::read_to_string(&gfa_out)?;
         fs::write(&gfa_out, mark_paths_untrusted(&text))?;
     }
-    Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty()).then_some(fasta_out),
+    // A failed reconstruction delivers no sequence as the organelle's: its molecules (and the
+    // reads layer's) are kept beside, as `<organelle>.failed.fasta`, for inspection only.
+    let failed = status.starts_with("failed_");
+    let mut withheld = Vec::new();
+    if failed {
+        for (from, to) in [
+            (fasta_out.clone(), out.join(format!("{organelle}.failed.fasta"))),
+            (out.join(format!("{organelle}.reads.fasta")), out.join(format!("{organelle}.reads.failed.fasta"))),
+        ] {
+            if from.exists() {
+                fs::rename(&from, &to)?;
+                withheld.push(to);
+            }
+        }
+        eprintln!("[ovasm] reconstruct {organelle}: FAILED ({status}); its sequences are withheld as *.failed.fasta");
+    }
+    Ok(json!({"gfa": gfa_out, "fasta": (!molecules.is_empty() && !failed).then_some(fasta_out),
+        "withheld_fasta": withheld,
         "molecules": lengths.len(), "lengths": lengths, "circular": circular,
         "pieces_of_at_least_1kb": pieces.len(), "closure": closure,
         "reference_fill": reference_fill, "reference_fill_bp": reference_bp,
@@ -2679,6 +2724,7 @@ pub fn run(cfg: &Config) -> Result<Value> {
             sample: format!("{}_denovo", cfg.sample),
             component_panel: None,
             prune_gene_free: false,
+            other_organelle_filter: true,
             shallow_seeds: false,
             // the reference's own sequence sets the node depth: the target reads hold nuclear
             // reads beside the organelle's, which stand for more sequence at their own depth

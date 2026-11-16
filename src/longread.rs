@@ -1527,6 +1527,7 @@ fn assemble(
         sample: o.sample.clone(),
         component_panel: None,
         prune_gene_free: false,
+        other_organelle_filter: false,
         shallow_seeds: false,
         depth_reference: Default::default(),
         methylation: false,

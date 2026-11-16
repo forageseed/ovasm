@@ -66,6 +66,10 @@ pub struct ComponentParams {
     /// a few reads each, so a shallow part of it would go as "depth below the reference".
     #[serde(skip_serializing_if = "is_true")]
     pub judge_depth: bool,
+    /// Where no component is the target's (none holds more target genes than the other
+    /// organelle's), still remove those whose genes are the other organelle's
+    /// (`min_other_genes`, twice the target's), rather than keep every component.
+    pub reject_other_without_reference: bool,
     /// A component without genes is kept when its depth is within this factor of the
     /// reference's, either way. Components without genes that are in no published genome sat
     /// at 0.09-0.45 of the reference depth (0.45: a 14.5 kb circle beside the Climacium
@@ -98,6 +102,7 @@ impl Default for ComponentParams {
             reject_other_only: false,
             reject_beside_closed_reference: false,
             judge_depth: true,
+            reject_other_without_reference: false,
             depth_factor: 2.0,
             gene_depth_factor: 2.5,
             min_other_genes: 5,
@@ -206,7 +211,17 @@ pub fn decide(stats: &[Stat], p: &ComponentParams) -> (Option<usize>, Vec<(bool,
         })
         .map(|(i, _)| i);
     let Some(r) = reference else {
-        return (None, vec![(true, "no_reference"); stats.len()]);
+        let calls = stats
+            .iter()
+            .map(|s| {
+                if p.reject_other_without_reference && s.other_genes >= p.min_other_genes && s.other_genes >= 2 * s.target_genes {
+                    (false, "other_organelle_no_reference")
+                } else {
+                    (true, "no_reference")
+                }
+            })
+            .collect();
+        return (None, calls);
     };
     let ref_depth = stats[r].depth.unwrap_or(0.0);
     let calls = stats
