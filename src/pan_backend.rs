@@ -198,6 +198,15 @@ mod tests {
         let dir=std::env::temp_dir().join(format!("ovasm-backend-{label}-{}",std::process::id()));fs::create_dir_all(&dir).unwrap();
         let input=dir.join("sample.fa");fs::write(&input,">original name\nACGTACGTACGTACGTACGTACGTACGTACGT\n").unwrap();
         let exe=dir.join("backend");fs::write(&exe,format!("#!/bin/sh\nif [ \"$1\" = --version ] || [ \"$1\" = -v ]; then echo fake-test; exit 0; fi\n{body}\n")).unwrap();fs::set_permissions(&exe,fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may fork while this script is still open for writing; its child holds the
+        // write handle until it execs, and executing the script meanwhile fails with ETXTBSY (\"Text file
+        // busy\"). Wait until the script runs before the test uses it.
+        for attempt in 0.. {
+            match std::process::Command::new(&exe).arg("--version").output() {
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 200 => std::thread::sleep(std::time::Duration::from_millis(10)),
+                _ => break,
+            }
+        }
         let cfg=Config{backend:Backend::Minigraph,inputs:vec![("sample".into(),input)],out:dir.join("result"),threads:2,executable:Some(exe),sample:"panel".into()};(dir,cfg)
     }
     #[test] fn prepared_fasta_index_has_correct_offsets() {
