@@ -31,8 +31,13 @@ const MIN_SITE_SHARE: f64 = 0.2;
 /// A segment is present from this share of the organelle's depth, absent below `ABSENT_SHARE`.
 const PRESENT_SHARE: f64 = 0.25;
 const ABSENT_SHARE: f64 = 0.02;
-/// Segments with fewer own `K`-mers do not set the organelle's depth.
+/// Segments with fewer own `K`-mers do not set the organelle's depth, and are not called low
+/// (`uncallable`).
 const DEPTH_MIN_KMERS: usize = 10;
+/// Count a present segment's own `K`-mers must be expected to reach at `PRESENT_SHARE` of the
+/// organelle's depth for a low call to mean anything: below it a present segment's median falls
+/// under the share by chance.
+const MIN_PRESENT_COUNT: f64 = 3.0;
 
 /// One way through a site: a segment, or None straight from the left flank to the right.
 type Allele = Option<Oriented>;
@@ -249,8 +254,14 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
     fs::write(out.join("genotypes.tsv"), tsv)?;
     let mosaic_summary = write_mosaic(g, &sites, walks, &observed, &allele_runs, &site_calls, out)?;
     let mut presence = String::from("segment\tlength\tkmers\tdepth\trelative\tcall\n");
-    let (mut present, mut absent, mut low, mut unknown) = (0usize, 0usize, 0usize, 0usize);
+    let (mut present, mut absent, mut low, mut unknown, mut uncallable) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    // whether a segment's own K-mers can tell low from present: enough of them, and an organelle
+    // deep enough that a present segment stands clear of the low band (1001G at 100 bp: the low
+    // calls of 328 plastids followed the read-length batch, r = 0.66, all on segments of a few
+    // own K-mers in shallow libraries)
+    let can_call_low = |n: usize| n >= DEPTH_MIN_KMERS && PRESENT_SHARE * organelle >= MIN_PRESENT_COUNT;
     for (i, (d, ks)) in node_depth.iter().zip(&node_kmers).enumerate() {
+        let ks: &[u64] = ks;
         let rel = d.map(|d| d as f64 / organelle.max(1.0));
         let call = match rel {
             None => {
@@ -264,6 +275,10 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
             Some(r) if r < ABSENT_SHARE => {
                 absent += 1;
                 "absent"
+            }
+            Some(_) if !can_call_low(ks.len()) => {
+                uncallable += 1;
+                "uncallable"
             }
             Some(_) => {
                 low += 1;
@@ -286,7 +301,7 @@ pub fn run(g: &Graph, walks: &[(String, Vec<Oriented>)], reads: &[PathBuf], out:
         "sites_with_an_allele_without_own_kmers": ungenotyped,
         "heteroplasmic_sites": heteroplasmic, "heteroplasmic": minor_list,
         "major_alleles_in_no_reference_run": absent_from_runs, "mosaic": mosaic_summary,
-        "segments": {"present": present, "low": low, "absent": absent, "no_own_kmers": unknown},
+        "segments": {"present": present, "low": low, "absent": absent, "no_own_kmers": unknown, "uncallable": uncallable},
         "genotypes": out.join("genotypes.tsv"), "presence": out.join("presence.tsv"),
         "basis": "median read count of each allele's K-mers that occur once in the reference graph"}))
 }
