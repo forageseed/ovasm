@@ -158,15 +158,20 @@ pub fn dense_k(inputs: &[PathBuf]) -> Result<(usize, usize)> {
 /// check that its reads are long ones).
 pub fn median_read_length(inputs: &[PathBuf]) -> Result<usize> {
     let first = inputs.first().context("no read file")?;
-    let mut parser = needletail::parse_fastx_file(first)
-        .with_context(|| format!("cannot read {}", first.display()))?;
-    let mut lens = Vec::new();
-    while let Some(r) = parser.next() {
-        lens.push(r?.num_bases());
-        if lens.len() == 10_000 {
-            break;
+    let mut lens = if crate::methylation::is_bam_path(first) {
+        crate::methylation::first_bam_read_lengths(first, 10_000)?
+    } else {
+        let mut parser = needletail::parse_fastx_file(first)
+            .with_context(|| format!("cannot read {}", first.display()))?;
+        let mut v = Vec::new();
+        while let Some(r) = parser.next() {
+            v.push(r?.num_bases());
+            if v.len() == 10_000 {
+                break;
+            }
         }
-    }
+        v
+    };
     if lens.is_empty() {
         bail!("{} holds no reads", first.display());
     }

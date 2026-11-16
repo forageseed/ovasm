@@ -22,6 +22,7 @@ mod kmer;
 mod label;
 mod linearize;
 mod longread;
+mod methylation;
 mod pan;
 mod pan_external;
 mod pan_backend;
@@ -216,6 +217,8 @@ enum CheckCommand {
     /// number against the molecules' walks, shallow sequence, reads behind every junction used,
     /// graph and read-backed complexity, panel genes per molecule, plastid LSC/SSC/IR.
     Assess(AssessArgs),
+    /// Organelle base-modification profiling (`CG`/`CHG`/`CHH` 5mC and `6mA`) and NUMT/NUPT separation from modBAMs.
+    Methylation(methylation::MethylationArgs),
 }
 
 #[derive(clap::Args)]
@@ -887,6 +890,15 @@ struct RunArgs {
     /// built-in panel. See `ovasm assemble filter`.
     #[arg(long, hide_short_help = true)]
     component_panel: Option<PathBuf>,
+    /// Profile organelle base modifications (`CG`/`CHG`/`CHH` 5mC, `6mA`) and filter NUMTs/NUPTs from modBAM inputs.
+    #[arg(long, hide_short_help = true)]
+    methylation: bool,
+    /// Explicit modBAM file(s) with `MM`/`ML` tags for `--methylation` when `--reads` are FASTQ/FASTA.
+    #[arg(long = "methylation-bam", hide_short_help = true)]
+    methylation_bam: Vec<PathBuf>,
+    /// Maximum per-read CG 5mC fraction allowed during BAM read ingestion (e.g. 0.40 to drop hypermethylated NUMTs/NUPTs).
+    #[arg(long, hide_short_help = true)]
+    max_read_methylation: Option<f64>,
     /// Threads (default: all cores); -T as PMAT2.
     #[arg(short = 't', short_alias = 'T', long, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: Option<u16>,
@@ -1292,6 +1304,9 @@ fn run(mut args: RunArgs) -> Result<()> {
         prune_gene_free: prune_gene_free(args.lineage, protein_seeds_used),
         shallow_seeds: shallow,
         depth_reference,
+        methylation: args.methylation,
+        methylation_bam: args.methylation_bam,
+        max_read_methylation: args.max_read_methylation,
     });
     let result = result::write(&out, &report, run_started.elapsed().as_secs_f64())?;
     if json_out {
@@ -2634,6 +2649,9 @@ struct RecruitArgs {
     /// an autopolyploid; bases, or with k, m or g (1.26g).
     #[arg(long, value_parser = parse_genome_size)]
     genome_size: Option<u64>,
+    /// Maximum per-read CG 5mC fraction allowed when reading BAM inputs (e.g. 0.40).
+    #[arg(long)]
+    max_read_methylation: Option<f64>,
 }
 
 /// Bases, plain or with a k, m or g suffix (1.26g).
@@ -2728,6 +2746,10 @@ impl Preset {
 }
 
 fn recruit(args: RecruitArgs) -> Result<()> {
+    if let Some(m) = args.max_read_methylation {
+        anyhow::ensure!((0.0..=1.0).contains(&m), "--max-read-methylation must be in [0, 1]");
+    }
+    let _bam_meth_guard = methylation::activate_bam_ingest_filter(args.max_read_methylation, 5);
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -2861,6 +2883,10 @@ fn recruit(args: RecruitArgs) -> Result<()> {
             .peak_rss_mb
             .map_or("n/a".into(), |m| format!("{m:.0} MB"))
     );
+    let (filt_r, filt_b) = methylation::bam_ingest_filtered_counts();
+    if filt_r > 0 {
+        eprintln!("[ovasm] recruit: filtered {filt_r} hypermethylated BAM reads ({filt_b} bp)");
+    }
     Ok(())
 }
 
@@ -2891,6 +2917,10 @@ fn dispatch(command: Command) -> Result<()> {
         Command::Check(CheckCommand::Evidence(args)) => evidence(args),
         Command::Check(CheckCommand::Unzip(args)) => unzip(args),
         Command::Check(CheckCommand::Assess(args)) => assess(args),
+        Command::Check(CheckCommand::Methylation(args)) => {
+            methylation::run_methylation(&args)?;
+            Ok(())
+        }
         Command::Solve(SolveCommand::Linearize(args)) => linearize(args),
         Command::Solve(SolveCommand::Primary(args)) => primary(args),
         Command::Solve(SolveCommand::Chromosomes(args)) => chromosomes(args),

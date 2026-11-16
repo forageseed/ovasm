@@ -675,6 +675,9 @@ pub(crate) fn for_each_rec(path: &Path, mut f: impl FnMut(Rec)) -> Result<()> {
     {
         return Ok(());
     }
+    if crate::methylation::is_bam_path(path) {
+        return crate::methylation::for_each_bam_rec(path, f);
+    }
     let mut parser = needletail::parse_fastx_file(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     while let Some(record) = parser.next() {
@@ -742,6 +745,9 @@ pub fn read_batches(
 
 /// Read one FASTA/FASTQ(.gz) file into batches of about `BATCH_BASES` bases.
 fn read_file(path: &Path, tx: &crossbeam_channel::Sender<Vec<Rec>>) -> Result<()> {
+    if crate::methylation::is_bam_path(path) {
+        return crate::methylation::stream_bam_file(path, BATCH_BASES, tx);
+    }
     let mut parser = needletail::parse_fastx_file(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     let (mut batch, mut bases) = (Vec::new(), 0usize);

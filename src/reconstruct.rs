@@ -2644,6 +2644,9 @@ pub fn run(cfg: &Config) -> Result<Value> {
                 o.to_string(),
                 cfg.out.join("reference").join(format!("{o}.fasta")),
             )]),
+            methylation: false,
+            methylation_bam: Vec::new(),
+            max_read_methylation: None,
         }, retry_floor, cfg.experimental_deep_bubble_fraction.get(o).copied());
         let denovo_path = dir.join("de-novo/organelle.gfa");
         let integration = export_individual(

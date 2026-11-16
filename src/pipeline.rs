@@ -178,6 +178,12 @@ pub struct RunConfig {
     pub shallow_seeds: bool,
     /// Per organelle, sequence known to be its own (`assemble graph --depth-reference`).
     pub depth_reference: BTreeMap<String, PathBuf>,
+    /// Profile organelle base modifications (`CG`/`CHG`/`CHH` 5mC and `6mA`) and NUMT/NUPT separation from modBAM inputs.
+    pub methylation: bool,
+    /// Optional BAM files for `--methylation` when `--reads` are FASTQ/FASTA.
+    pub methylation_bam: Vec<PathBuf>,
+    /// Optional recruitment-time max per-read CG 5mC fraction for BAM inputs (`--max-read-methylation`).
+    pub max_read_methylation: Option<f64>,
 }
 
 fn log(message: &str) {
@@ -1157,6 +1163,9 @@ fn recruit_all(
         if let Some(d) = cfg.recruit_depth {
             argv = argv.opt("--target-depth", d.to_string());
         }
+        if let Some(m) = cfg.max_read_methylation {
+            argv = argv.opt("--max-read-methylation", m.to_string());
+        }
         // HiFi reads carry whole-read depth profiles: the gate keeps extension in the
         // organelle, and the read depth caps what goes on to assembly without a genome size
         // (Carex echinata, ungated: 686,022 "plastid" reads, 8.5 Gb, nine tenths nuclear, and
@@ -1970,6 +1979,27 @@ fn assemble_organelle(
         .opt("--out-json", dir.join("assessment.json"))
         .run()?;
     let assessment = assessment_summary(&read_json(&dir.join("assessment.json"))?);
+    let meth_bams: Vec<PathBuf> = if !cfg.methylation_bam.is_empty() {
+        cfg.methylation_bam.clone()
+    } else {
+        cfg.reads.iter().filter(|p| crate::methylation::is_bam_path(p)).cloned().collect()
+    };
+    let methylation_summary = if cfg.methylation && !meth_bams.is_empty() && dir.join("molecules.fasta").exists() {
+        log("profiling organelle base modifications and NUMT/NUPT separation");
+        let meth_dir = dir.join("methylation");
+        Argv::new("check methylation")
+            .opt("--target", dir.join("molecules.fasta"))
+            .opt("--gfa", dir.join("organelle.gfa"))
+            .each("--bam", &meth_bams)
+            .opt("--out", &meth_dir)
+            .run()?;
+        files.insert("methylation_bed".into(), path_str(&meth_dir.join("methylation.bed")));
+        files.insert("methylation_json".into(), path_str(&meth_dir.join("methylation.json")));
+        files.insert("methylation_gfa".into(), path_str(&meth_dir.join("organelle.methyl.gfa")));
+        Some(read_json(&meth_dir.join("methylation.json"))?)
+    } else {
+        None
+    };
     let replicates = match cfg.mode {
         Mode::Fast => Value::Null,
         Mode::Standard => {
@@ -2037,7 +2067,7 @@ fn assemble_organelle(
     if let Some(f) = linear["configurations_fasta"].as_str() {
         files.insert("configurations_fasta".into(), f.to_string());
     }
-    let report = json!({
+    let mut report = json!({
         "backend": "ovasm",
         "organelle": organelle,
         "read_set": match cfg.read_set {
@@ -2105,6 +2135,9 @@ fn assemble_organelle(
         "elapsed_seconds": t0.elapsed().as_secs_f64(),
         "peak_rss_mb": peak_rss_mb(),
     });
+    if let Some(m) = methylation_summary {
+        report["methylation"] = m;
+    }
     write_json(&dir.join("summary.json"), &report)?;
     let mut message = format!(
         "{organelle}: {} representative molecules; supported links {}/{n_links}; decisive={}",
@@ -2883,6 +2916,9 @@ mod tests {
             prune_gene_free: false,
             shallow_seeds: false,
             depth_reference: Default::default(),
+            methylation: false,
+            methylation_bam: Vec::new(),
+            max_read_methylation: None,
         }
     }
 

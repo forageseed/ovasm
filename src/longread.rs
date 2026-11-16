@@ -1529,6 +1529,9 @@ fn assemble(
         prune_gene_free: false,
         shallow_seeds: false,
         depth_reference: Default::default(),
+        methylation: false,
+        methylation_bam: Vec::new(),
+        max_read_methylation: None,
     })?;
     // homopolymer runs from the reads (see `hp_polish`): the molecules the stages wrote are kept
     // beside as molecules.unpolished.fasta. With short reads of the sample (`run hybrid`) those
