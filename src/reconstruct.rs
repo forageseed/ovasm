@@ -2341,13 +2341,18 @@ fn final_outputs(
         fs::write(&gfa_out, mark_paths_untrusted(&text))?;
     }
     // A failed reconstruction delivers no sequence as the organelle's: its molecules (and the
-    // reads layer's) are kept beside, as `<organelle>.failed.fasta`, for inspection only.
+    // reads layer's and the configurations') are kept beside, as `*.failed.fasta`, for
+    // inspection only (rice SAMEA115396709 at 15x: 21 kb of plastid among them).
     let failed = status.starts_with("failed_");
     let mut withheld = Vec::new();
     if failed {
         for (from, to) in [
             (fasta_out.clone(), out.join(format!("{organelle}.failed.fasta"))),
             (out.join(format!("{organelle}.reads.fasta")), out.join(format!("{organelle}.reads.failed.fasta"))),
+            (
+                out.join(format!("{organelle}.configurations.fasta")),
+                out.join(format!("{organelle}.configurations.failed.fasta")),
+            ),
         ] {
             if from.exists() {
                 fs::rename(&from, &to)?;
