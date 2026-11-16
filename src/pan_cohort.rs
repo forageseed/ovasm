@@ -385,9 +385,16 @@ pub fn read_sample(
         }
         junction_rows.push((molecule_of_row, left, repeat, right, source, class));
     }
-    // molecules (final layer, de novo unitig walks), cut at undecided joins
-    let fasta = fs::read_to_string(dir.join(format!("{o}.fasta")))
-        .with_context(|| format!("{sample}: reading {o}.fasta"))?;
+    // molecules as de novo unitig walks: the reads layer (<o>.reads.fasta, cut where the reads
+    // did not decide a join) where every one of its molecules names its walk, else the final
+    // layer, cut here at the same joins
+    let reads_layer = dir.join(format!("{o}.reads.fasta"));
+    let fasta = match fs::read_to_string(&reads_layer) {
+        Ok(text) if text.lines().any(|l| l.starts_with('>'))
+            && text.lines().filter(|l| l.starts_with('>')).all(|l| l.split_whitespace().any(|w| w.starts_with("path="))) => text,
+        _ => fs::read_to_string(dir.join(format!("{o}.fasta")))
+            .with_context(|| format!("{sample}: reading {o}.fasta"))?,
+    };
     let mut walks = Vec::new();
     let mut other_configuration: FxHashSet<String> = FxHashSet::default();
     for header in fasta.lines().filter(|l| l.starts_with('>')) {
@@ -395,6 +402,10 @@ pub fn read_sample(
         // the panel layer can list several configurations (configuration=i of=n): the cohort
         // takes the representative one, so a sample counts once
         if header.split_whitespace().any(|w| w.strip_prefix("configuration=").is_some_and(|c| c != "1")) {
+            // a piece names the molecule it was cut from, which junctions.tsv names
+            if let Some(from) = header.split_whitespace().find_map(|w| w.strip_prefix("cut_from=")) {
+                other_configuration.insert(from.to_string());
+            }
             other_configuration.insert(name);
             continue;
         }
@@ -403,7 +414,8 @@ pub fn read_sample(
         };
         let walk: Vec<String> = path.split(',').map(str::to_string).collect();
         let none = Vec::new();
-        let pieces_of_walk = cut_walk(&walk, undecided.get(&name).unwrap_or(&none));
+        let from = header.split_whitespace().find_map(|w| w.strip_prefix("cut_from=")).unwrap_or(&name);
+        let pieces_of_walk = cut_walk(&walk, undecided.get(from).unwrap_or(&none));
         for (i, w) in pieces_of_walk.iter().enumerate() {
             let mut steps = Vec::new();
             for u in w {
