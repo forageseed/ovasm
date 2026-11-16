@@ -15,15 +15,15 @@ plant HiFi sample finishes in about 20 minutes on 8 threads with around 2 GB of 
 
 ## Install
 
-Precompiled builds of 0.7.0 are on the [release page](https://github.com/forageseed/ovasm/releases/tag/v0.7.0).
+Precompiled builds of 0.8.0 are on the [release page](https://github.com/forageseed/ovasm/releases/tag/v0.8.0).
 
 - **Windows x86_64:** download the
-  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.7.0/ovasm-v0.7.0-windows-x86_64.zip),
+  [ZIP](https://github.com/forageseed/ovasm/releases/download/v0.8.0/ovasm-v0.8.0-windows-x86_64.zip),
   extract it, double-click `install.cmd` and open a new terminal.
 - **Linux x86_64 (glibc 2.34 or newer):**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.7.0/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/forageseed/ovasm/v0.8.0/scripts/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ovasm --version
 ```
@@ -159,7 +159,7 @@ read pairs is ongoing. See the [WGS panel](docs/existing-wgs-benchmark.md).
   (allotetraploid) now gives its complete 378,667 bp mitochondrion without any extra options.
   `--genome-size` and `--nuclear-depth` let you set the depth by hand.
 
-Full notes: [release 0.7.0](docs/release-0.7.0.md).
+Full notes: [release 0.8.0](docs/release-0.8.0.md) · [0.7.0](docs/release-0.7.0.md).
 
 ## License
 
