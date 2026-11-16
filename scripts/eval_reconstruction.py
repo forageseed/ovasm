@@ -7,7 +7,9 @@ v1 (as used before 2026-11-14): minimap2 -x asm5 --secondary=no, every alignment
   identity = matches / alignment columns over all alignments.
 v2:
   * circular truth molecules are doubled, so a query that starts elsewhere on the circle still
-    aligns in one piece (positions are taken modulo the molecule);
+    aligns in one piece (positions are taken modulo the molecule); alignments are not joined across
+    long gaps (--no-long-join), so a query that joins two truth molecules through a repeat is
+    scored piece by piece rather than as one low-identity chain;
   * only primary alignments (tp:A:P) count, and only blocks of >= MIN_BLOCK bp at >= MIN_ID
     identity are "good": recall = truth bases under good blocks, precision = query bases under
     good blocks, identity = matches / columns over primary blocks >= MIN_BLOCK (any identity);
@@ -204,7 +206,10 @@ def evaluate(truth, query, label, mm2="minimap2", threads=4, support=None):
     with tempfile.TemporaryDirectory() as d:
         t2 = Path(d) / "truth2.fa"
         t2.write_text("".join(f">{n}\n{s + s if circular(h) else s}\n" for n, h, s in trecs))
-        rows = parse_paf(minimap(mm2, threads, str(t2), query, ["-N", "50", "-p", "0.5"]))
+        # --no-long-join: asm5 otherwise chains across a gap of tens of kb, so a molecule that joins two
+        # subcircles of the truth through a repeat (a conformation the truth graph also lists) aligned as one
+        # chain at 0.6-0.8 identity and its bases were not counted (rice 710: recall 0.372 -> 0.946)
+        rows = parse_paf(minimap(mm2, threads, str(t2), query, ["-N", "50", "-p", "0.5", "--no-long-join"]))
     row.update(score_v2(rows, truth_len, query_len, read_depth(support) if support else None))
     return row
 
