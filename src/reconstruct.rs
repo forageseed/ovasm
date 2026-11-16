@@ -945,6 +945,11 @@ fn close_gfa(
 
 /// Most covers `linearize` reports per component when every configuration is wanted.
 const MAX_CONFIGURATIONS: usize = 10_000;
+/// Configurations spelled and written (FASTA, GFA walks, list), the best ranked first; the
+/// representative always. All of them are ranked and counted; spelling every one of 10,000
+/// Arabidopsis mitochondrial configurations held ~3.7 GB of sequence (peak 8.6-11.4 GB against
+/// ~5.5 GB) and wrote up to 3.7 GB of FASTA.
+const WRITE_CONFIGURATIONS: usize = 20;
 
 /// A walk of the assembly graph as a key equal for the same molecule however it is written: a
 /// linear walk or its reverse, a circular one from any step in either direction.
@@ -1131,11 +1136,12 @@ fn configurations(
                 .map(|&(p, f)| format!("{}{}", piece_name(p), if f { '+' } else { '-' }))
                 .collect();
             let gseq: usize = pw.iter().map(|&(p, _)| blunt.piece_len(p)).sum();
-            let Some(seq) = spell(&steps, m.circular) else {
+            // spelled now only to check that it can be; spelled again when written
+            if spell(&steps, m.circular).is_none() {
                 skipped += 1;
                 continue 'covers;
-            };
-            molecules.push((m, steps, gsteps, seq, gseq));
+            }
+            molecules.push((m, steps, gsteps, Vec::new(), gseq));
         }
         key.sort();
         if seen.insert(key) {
@@ -1278,7 +1284,7 @@ fn configurations(
     // rank ties the best candidate, regardless of the other candidates' topology.
     let all_major_circular: Vec<bool> = found.iter().map(|(_, _, _, molecules)| {
         let major: Vec<_> = molecules.iter()
-            .filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE)
+            .filter(|m| m.0.length as u64 >= pipeline::MIN_PIECE)
             .collect();
         !major.is_empty() && major.iter().all(|m| m.0.circular)
     }).collect();
@@ -1289,7 +1295,7 @@ fn configurations(
     for (rank, &c) in order.iter().enumerate() {
         let (score, target_rank_score, copy_deviation, molecules) = &found[c];
         let n = rank + 1;
-        let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
+        let big: Vec<_> = molecules.iter().filter(|m| m.0.length as u64 >= pipeline::MIN_PIECE).collect();
         // the other components' molecules that go with the representative
         let extra: Vec<&Elsewhere> = if circular_candidate == Some(c) {
             let laid: BTreeSet<&str> = molecules.iter().flat_map(|m| m.1.iter().map(|s| s.0.as_str())).collect();
@@ -1311,18 +1317,22 @@ fn configurations(
                 molecules: molecules
                     .iter()
                     .enumerate()
-                    .map(|(j, m)| (format!("{sample}_configuration{n}#1#{short}.{}", j + 1), m.3.clone(), m.0.circular))
+                    .map(|(j, m)| (format!("{sample}_configuration{n}#1#{short}.{}", j + 1), spell(&m.1, m.0.circular).unwrap_or_default(), m.0.circular))
                     .chain(extra.iter().enumerate().map(|(j, m)| {
                         (format!("{sample}_configuration{n}#1#{short}.{}", molecules.len() + j + 1), m.2.clone(), m.3)
                     }))
                     .collect(),
-                paths: molecules.iter().map(|m| m.0.path.replace(' ', ",")).collect(),
+                paths: molecules.iter().map(|m| m.0.path.replace(' ', ",")).chain(extra.iter().map(|e| e.0.clone())).collect(),
                 panel: panel_choice,
             });
         }
+        if rank >= WRITE_CONFIGURATIONS && circular_candidate != Some(c) {
+            continue;
+        }
         let runs = &prior.runs_with_all[c];
         let mut lengths = Vec::new();
-        for (j, (m, _, gsteps, seq, gseq)) in molecules.iter().enumerate() {
+        for (j, (m, steps, gsteps, _, gseq)) in molecules.iter().enumerate() {
+            let seq = spell(steps, m.circular).unwrap_or_default();
             let name = format!("{sample}_configuration{n}#1#{short}.{}", j + 1);
             writeln!(
                 fasta,
@@ -1400,7 +1410,7 @@ fn configurations(
         listed.len(), prior.runs, prior_reads.len()
     );
     Ok((
-        json!({"configurations": listed.len(), "as_well_ranked_by_target_evidence_as_the_best": tied, "as_well_supported_by_reads_as_the_best": raw_tied,
+        json!({"configurations": found.len(), "configurations_written": listed.len(), "as_well_ranked_by_target_evidence_as_the_best": tied, "as_well_supported_by_reads_as_the_best": raw_tied,
         "covers_searched": component.candidates, "search_truncated": component.search_truncated,
         "cover_size_limited": component.cover_size_limited, "candidate_list_limited": candidate_list_limited, "skipped_covers": skipped,
         "reference_runs": prior.runs, "fasta": path, "list": listed,
