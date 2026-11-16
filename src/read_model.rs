@@ -326,6 +326,14 @@ impl ReadModel {
         Ok(Some(Self{paths,links,min_reads:min_reads.max(1),index:OnceLock::new()}))
     }
 
+    /// The single-record threads that count (at least `min_reads` records each): the walk one
+    /// read takes through three or more segments, its records, and whether it passes two
+    /// repeats or more. For a caller that weighs covers it builds itself (`linearize::prior_cover`)
+    /// as `score` weighs the ones it is given.
+    pub(crate) fn threads(&self) -> impl Iterator<Item = (&[Oriented], u64, bool)> + '_ {
+        self.paths.iter().filter(move |(_, n, _)| *n >= self.min_reads).map(|(w, n, joint)| (w.as_slice(), *n, *joint))
+    }
+
     pub fn for_anchors(&self, anchors: &[usize], repeats: &[bool]) -> Self {
         let belongs:BTreeSet<_>=anchors.iter().copied().collect();
         let mut nodes=belongs.clone();

@@ -1808,7 +1808,9 @@ mod tests {
         assert_eq!(m["read_type"], "ont_hybrid");
         let corrections = m["long_read"]["corrections"].as_array().unwrap();
         assert_eq!(corrections.last().unwrap()["hybrid"], json!(true));
-        assert!(m["long_read"]["assembled_reads"].as_str().unwrap().ends_with("hybrid/mitochondrion.fasta"));
+        // by path components: the separator is the platform's
+        let assembled = Path::new(m["long_read"]["assembled_reads"].as_str().unwrap());
+        assert!(assembled.ends_with(Path::new("hybrid").join("mitochondrion.fasta")));
         assert!(m["long_read"]["short_reads"]["kept_reads"].as_u64().unwrap() >= 2 * 1400);
         assert!(out.join("evidence.short.json").is_file());
         assert!(m["short_read_evidence"]["links"].as_u64().is_some());

@@ -119,6 +119,10 @@ pub struct PriorCover {
     /// Covers the reads and the prior rank as well (the one with the fewest molecules is given).
     pub equally_good: u64,
     pub matchings_examined: u64,
+    /// The target's own single records (one read through three segments or more) the cover
+    /// explains: those through two repeats or more, and all. They were weighed before the prior.
+    pub joint_records_explained: u64,
+    pub thread_records_explained: u64,
 }
 
 fn rc_walk(w: &[Oriented]) -> Vec<Oriented> {
@@ -1634,6 +1638,7 @@ fn prior_cover(
     frac: &[f64],
     expected: &[Option<usize>],
     prior: &BridgePrior,
+    model: Option<&crate::read_model::ReadModel>,
 ) -> Option<(Vec<Found>, PriorCover)> {
     let local: FxHashMap<usize, usize> = comp.iter().enumerate().map(|(k, &a)| (a, k)).collect();
     // an anchor end, as the oriented anchor a walk leaves it by: anchor k has ends 2k and 2k + 1
@@ -1681,7 +1686,86 @@ fn prior_cover(
         edges.push(crate::pan_posterior::Edge { a: 2 * k, b: 2 * k + 1, read_ln: 0.0, incomplete: false, prior: 0.0, passes: Vec::new() });
         directions.push((LEFT_OUT, LEFT_OUT));
     }
-    let m = crate::pan_posterior::best_matching(2 * comp.len(), &edges, &|r| expected[r], COPY_PENALTY_LN, 2_000_000)?;
+    // The target's own single records (one read through three segments or more) come before
+    // the prior, as they come first where `cover_order` has them (`ReadFit::order`). The anchor
+    // ends a record crosses are weighed together, and a matching explains the record when its
+    // bridges, joined at the anchors they share, hold the record's walk.
+    let threads: Vec<(&[Oriented], u64, bool)> = model.map(|m| m.threads().collect()).unwrap_or_default();
+    let coupled: Vec<Vec<usize>> = threads
+        .iter()
+        .map(|(p, _, _)| {
+            let mut crossed = Vec::new();
+            for (i, &o) in p.iter().enumerate() {
+                if i + 1 < p.len() {
+                    crossed.extend(end(o));
+                }
+                if i > 0 {
+                    crossed.extend(end(flip(o)));
+                }
+            }
+            crossed.sort_unstable();
+            crossed.dedup();
+            crossed
+        })
+        .filter(|crossed| crossed.len() > 1)
+        .collect();
+    let records = |taken: &[usize]| -> (u64, u64) {
+        if threads.is_empty() {
+            return (0, 0);
+        }
+        // the bridges taken, each in both directions, by the oriented anchor they leave
+        let mut leaving_anchor: FxHashMap<Oriented, usize> = FxHashMap::default();
+        let mut taken_bridges: Vec<usize> = Vec::new();
+        for &e in taken {
+            let (i, j) = directions[e];
+            if i == LEFT_OUT {
+                continue;
+            }
+            for b in [i, j] {
+                leaving_anchor.insert(br[b].walk[0], b);
+                taken_bridges.push(b);
+            }
+        }
+        let holds = |p: &[Oriented]| -> bool {
+            taken_bridges.iter().any(|&start| {
+                (0..br[start].walk.len()).any(|from| {
+                    let (mut w, mut k) = (&br[start].walk, from);
+                    for (t, &node) in p.iter().enumerate() {
+                        if w[k] != node {
+                            return false;
+                        }
+                        if t + 1 == p.len() {
+                            return true;
+                        }
+                        if k + 1 < w.len() {
+                            k += 1;
+                        } else {
+                            // at the bridge's last anchor: on along the bridge taken at its other end
+                            match leaving_anchor.get(&w[k]) {
+                                Some(&next) => {
+                                    w = &br[next].walk;
+                                    k = 1;
+                                }
+                                None => return false,
+                            }
+                        }
+                    }
+                    false
+                })
+            })
+        };
+        let (mut joint, mut all) = (0u64, 0u64);
+        for &(p, n, through_two) in &threads {
+            if holds(p) {
+                all += n;
+                if through_two {
+                    joint += n;
+                }
+            }
+        }
+        (joint, all)
+    };
+    let m = crate::pan_posterior::best_matching(2 * comp.len(), &edges, &|r| expected[r], COPY_PENALTY_LN, &coupled, &records, 2_000_000)?;
     // the bridge leaving each end; none where the graph stops (the end of a linear molecule)
     let leave: Vec<usize> = m
         .edge_at
@@ -1750,6 +1834,8 @@ fn prior_cover(
         expected_correct_ends: m.expected,
         equally_good: m.equally_good,
         matchings_examined: m.examined,
+        joint_records_explained: m.records.0,
+        thread_records_explained: m.records.1,
     };
     Some((cover, stats))
 }
@@ -2946,7 +3032,7 @@ fn run_inner(
         }
         rep.alternatives = it.take(p.max_alternatives).map(|(_, c, _)| c).collect();
         if let Some(prior) = prior {
-            if let Some((cover, mut taken)) = prior_cover(&comp, &optional, &br, &frac, &expected, prior) {
+            if let Some((cover, mut taken)) = prior_cover(&comp, &optional, &br, &frac, &expected, prior, component_model.as_ref()) {
                 let (mut walks, mut report) = cover_report(&cover)?;
                 // tandem units as often as single reads cross them, as for `best`
                 for (walk, molecule) in walks.iter_mut().zip(report.molecules.iter_mut()) {
@@ -2956,6 +3042,12 @@ fn run_inner(
                         molecule.path = label(&laid);
                         *walk = laid;
                     }
+                }
+                // how the cover fits the target's records, as the searched covers are scored
+                if let Some(model) = &component_model {
+                    let circular: Vec<bool> = report.molecules.iter().map(|m| m.circular).collect();
+                    let mut budget = crate::read_model::WORK_BUDGET;
+                    report.read_support = model.score(&walks, &circular, &mut budget);
                 }
                 taken.cover = report;
                 rep.prior_cover = Some(taken);
@@ -4438,6 +4530,12 @@ mod tests {
     /// A and C enter repeat R, B and D leave it, B leads on to C and D back to A: one circle
     /// A R B C R D, or two, A R D and C R B. `phased`: reads across R.
     fn prior_run(phased: &[(&str, u64)], prior: &[(&str, f64)], dir_name: &str) -> LinearizeReport {
+        prior_run_with(phased, &[], prior, dir_name)
+    }
+
+    /// `threads`: single records of the target (one read through three segments or more), as
+    /// short reads give them: no phased path, so the bridges through R stay the graph's pairings.
+    fn prior_run_with(phased: &[(&str, u64)], threads: &[(&str, u64)], prior: &[(&str, f64)], dir_name: &str) -> LinearizeReport {
         let s = |n, seed| String::from_utf8(seq(n, seed)).unwrap();
         let gfa = format!(
             "H\tVN:Z:1.0\nS\tA\t{}\nS\tB\t{}\nS\tC\t{}\nS\tD\t{}\nS\tR\t{}\n\
@@ -4449,7 +4547,7 @@ mod tests {
             s(250, 4),
             s(120, 5)
         );
-        let ev = json!({
+        let mut ev = json!({
             "repeat_segments": ["R"],
             "segment_depths": {"A": 50.0, "B": 50.0, "C": 50.0, "D": 50.0, "R": 100.0},
             "median_depth": 50.0,
@@ -4459,8 +4557,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("g.gfa"), &gfa).unwrap();
-        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
         let g = parse_gfa(&dir.join("g.gfa")).unwrap();
+        if !threads.is_empty() {
+            let links = [("A+", "R+"), ("C+", "R+"), ("R+", "B+"), ("R+", "D+"), ("B+", "C+"), ("D+", "A+")];
+            ev["thread_evidence"] = json!({"schema": crate::thread_evidence::SCHEMA,
+                "graph_fingerprint": crate::unzip::graph_fingerprint(&g),
+                "accepted_records": threads.iter().map(|(_, n)| n).sum::<u64>(),
+                "links": links.iter().map(|(a, b)| json!({"from": a, "to": b, "records": 20})).collect::<Vec<_>>(),
+                "paths": threads.iter().map(|(p, n)| json!({"path": p, "reads": n})).collect::<Vec<_>>()});
+        }
+        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
         let index: FxHashMap<&str, usize> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
         let prior = BridgePrior {
             probability: prior
@@ -4513,6 +4619,23 @@ mod tests {
         let p = r.components[0].prior_cover.as_ref().unwrap();
         assert_eq!((p.cover.molecules.len(), p.open_ends, p.equally_good), (1, 0, 1));
         assert_eq!(p.cover.molecules[0].path, r.components[0].best.as_ref().unwrap().molecules[0].path);
+    }
+
+    #[test]
+    fn the_targets_single_records_come_before_a_prior() {
+        let two_circles = [("A+ R+ B+", 0.1), ("A+ R+ D+", 0.9), ("C+ R+ B+", 0.9), ("C+ R+ D+", 0.1)];
+        // five reads of the target run A-R-B in one piece: the pairing the prior likes less
+        let r = prior_run_with(&[], &[("A+ R+ B+", 5)], &two_circles, "ovasm-prior-thread");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!((p.cover.molecules.len(), p.thread_records_explained, p.joint_records_explained), (1, 5, 0));
+        assert_eq!(p.cover.molecules[0].length, 400 + 120 + 300 + 350 + 120 + 250);
+        // the prior still tells the bridges apart, and the cover's fit to the records is reported
+        assert_eq!((p.open_ends, p.decided_ends), (4, 2));
+        assert_eq!(p.cover.read_support.as_ref().map(|f| f.thread_records_explained), Some(5));
+        // one read is no record to go by (`min_reads` 2): the prior has its way
+        let r = prior_run_with(&[], &[("A+ R+ B+", 1)], &two_circles, "ovasm-prior-thread-one");
+        let p = r.components[0].prior_cover.as_ref().unwrap();
+        assert_eq!((p.cover.molecules.len(), p.thread_records_explained), (2, 0));
     }
 
     #[test]

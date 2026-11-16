@@ -1145,6 +1145,32 @@ fn configurations(
             found.push((cover.score, cover.ranked_score(), cover.copy_deviation, molecules));
         }
     }
+    // The graph's other components (further chromosomes, pieces no bridge joins to the largest):
+    // each as the panel has it where the panel tells its bridges apart, else as the search ranks
+    // it first. They are part of the representative whichever configuration of the largest
+    // component is taken; without them a graph of several components came out as its largest
+    // alone (a rice mitochondrion of 30 pieces, an Arabidopsis one with two lone segments).
+    // A repeat that `linearize` reports as a piece of its own because its first-ranked covers
+    // lay it down nowhere is left out where the configuration taken does lay it down.
+    // (path, organelle-graph steps, sequence, circular, the repeat if it is such a piece)
+    type Elsewhere = (String, Vec<String>, Vec<u8>, bool, Option<String>);
+    let mut elsewhere: Vec<Elsewhere> = Vec::new();
+    for other in rep.components.iter().filter(|c| !std::ptr::eq(*c, component)) {
+        let Some((cover, _)) = component_choice(other) else {
+            continue;
+        };
+        let unplaced = (other.ranking_model == "unplaced_repeat").then(|| other.anchors.first().cloned()).flatten();
+        for m in &cover.molecules {
+            let steps: Vec<(String, bool)> = m.path.split_whitespace().map(|t| (t[..t.len() - 1].to_string(), t.ends_with('+'))).collect();
+            let walk: Option<Vec<Oriented>> = steps.iter().map(|(n, o)| index.get(n.as_str()).map(|&i| (i, *o))).collect();
+            let (Some(pw), Some(seq)) = (walk.and_then(|w| crate::unify::piece_walk(&asm, &blunt, &w, m.circular).ok()), spell(&steps, m.circular)) else {
+                skipped += 1;
+                continue;
+            };
+            let gsteps = pw.iter().map(|&(p, f)| format!("{}{}", piece_name(p), if f { '+' } else { '-' })).collect();
+            elsewhere.push((m.path.replace(' ', ","), gsteps, seq, m.circular, unplaced.clone()));
+        }
+    }
     // The reads leave the pairings open; the reference runs' assemblies show which pairings
     // individuals of the species have. Each configuration is ranked by how often the runs hold
     // the pairings it makes (`reference_prior`), first the one most like them.
@@ -1264,6 +1290,13 @@ fn configurations(
         let (score, target_rank_score, copy_deviation, molecules) = &found[c];
         let n = rank + 1;
         let big: Vec<_> = molecules.iter().filter(|m| m.3.len() as u64 >= pipeline::MIN_PIECE).collect();
+        // the other components' molecules that go with the representative
+        let extra: Vec<&Elsewhere> = if circular_candidate == Some(c) {
+            let laid: BTreeSet<&str> = molecules.iter().flat_map(|m| m.1.iter().map(|s| s.0.as_str())).collect();
+            elsewhere.iter().filter(|e| e.4.as_deref().map_or(true, |repeat| !laid.contains(repeat))).collect()
+        } else {
+            Vec::new()
+        };
         if circular_candidate == Some(c) {
             let panel_choice = pan_cover.filter(|_| pan_found == Some(c)).map(|p| PanChoice {
                 expected_fraction: p.expected_correct_ends / p.ends.max(1) as f64,
@@ -1274,11 +1307,14 @@ fn configurations(
             circular = Some(Representative {
                 configuration: n,
                 equally_ranked: panel_choice.as_ref().map_or(tie_counts[&rank_keys[c]], |p| usize::try_from(p.equally_good).unwrap_or(usize::MAX)),
-                pieces: big.len(),
+                pieces: big.len() + extra.iter().filter(|m| m.2.len() as u64 >= pipeline::MIN_PIECE).count(),
                 molecules: molecules
                     .iter()
                     .enumerate()
                     .map(|(j, m)| (format!("{sample}_configuration{n}#1#{short}.{}", j + 1), m.3.clone(), m.0.circular))
+                    .chain(extra.iter().enumerate().map(|(j, m)| {
+                        (format!("{sample}_configuration{n}#1#{short}.{}", molecules.len() + j + 1), m.2.clone(), m.3)
+                    }))
                     .collect(),
                 panel: panel_choice,
             });
@@ -1309,6 +1345,26 @@ fn configurations(
             // the GFA walk spells the blunt segments: shorter where a segment lost bases to an
             // overlapping link this molecule does not use
             lengths.push(json!({"length": seq.len(), "circular": m.circular, "gfa_walk_bp": gseq}));
+        }
+        // the representative's molecules of the other components, once, with their walks
+        {
+            for (j, (path, gsteps, seq, circ, _)) in extra.iter().copied().enumerate() {
+                let name = format!("{sample}_configuration{n}#1#{short}.{}", molecules.len() + j + 1);
+                writeln!(
+                    fasta,
+                    ">{name} configuration={n} circular={circ} length={} path={path} reads_decide=false other_component=true",
+                    seq.len()
+                )?;
+                for chunk in seq.chunks(80) {
+                    writeln!(fasta, "{}", std::str::from_utf8(chunk)?)?;
+                }
+                writeln!(
+                    walks,
+                    "P\t{name}\t{}\t*{}\tcf:i:{n}\tst:Z:unresolved_configuration",
+                    gsteps.join(","),
+                    if *circ { "\tTP:Z:circular" } else { "" }
+                )?;
+            }
         }
         let detail: Vec<Value> = pairings[c]
             .iter()
@@ -1478,6 +1534,16 @@ struct PanChoice {
     decided_ends: usize,
     /// Configurations the reads and the panel rank as well.
     equally_good: u64,
+}
+
+/// The cover of a component that goes into the representative: the panel's where the panel
+/// tells its bridges apart, else the one the search ranks first.
+fn component_choice(c: &crate::linearize::ComponentReport) -> Option<(&crate::linearize::CoverReport, &'static str)> {
+    match (&c.prior_cover, &c.best) {
+        (Some(p), _) if p.decided_ends > 0 => Some((&p.cover, "pan_posterior")),
+        (_, Some(best)) => Some((best, "reads_then_search_order")),
+        _ => None,
+    }
 }
 
 /// The panel's posterior as reported: the model's quantities, the closest relatives, the cover
@@ -2486,12 +2552,21 @@ pub fn choose_configuration(cfg: &ChooseConfig) -> Result<Value> {
     )?;
     let names: BTreeMap<&str, usize> = g.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let (mut fasta, mut components, mut n) = (String::new(), Vec::new(), 0usize);
+    // segments the covers taken lay down: a repeat reported as a piece of its own because the
+    // first-ranked covers lay it down nowhere is left out where these do
+    let laid: BTreeSet<&str> = rep
+        .components
+        .iter()
+        .filter(|c| c.ranking_model != "unplaced_repeat")
+        .filter_map(component_choice)
+        .flat_map(|(cover, _)| cover.molecules.iter())
+        .flat_map(|m| m.path.split_whitespace().map(|t| &t[..t.len() - 1]))
+        .collect();
     for c in &rep.components {
-        let (cover, by) = match (&c.prior_cover, &c.best) {
-            (Some(p), _) if p.decided_ends > 0 => (&p.cover, "pan_posterior"),
-            (_, Some(b)) => (b, "reads_then_search_order"),
-            _ => continue,
-        };
+        let Some((cover, by)) = component_choice(c) else { continue };
+        if c.ranking_model == "unplaced_repeat" && c.anchors.first().is_some_and(|a| laid.contains(a.as_str())) {
+            continue;
+        }
         for m in &cover.molecules {
             n += 1;
             let walk: Vec<Oriented> = m

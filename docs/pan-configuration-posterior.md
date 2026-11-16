@@ -79,10 +79,17 @@ Nothing below is fitted to results.
    so).
 
 The individual's reads come first throughout. A matching is ranked as `linearize` ranks a
-cover on reads: bridges that reads measured before the graph's pairings, then the shares of
-reads less the penalty per repeat copy laid down beyond or short of its depth. The panel
-orders only what those leave tied, and among matchings the panel ranks alike the one with the
-fewest molecules is given.
+cover on reads: bridges that reads measured before the graph's pairings; then the individual's
+own single records it explains (one read through three segments or more: those through two
+repeats or more, then all, as `ReadFit::order`), with the anchor ends one record crosses
+weighed in one component, so that the bridges it needs are chosen together and it is counted
+once; then the shares of reads less the penalty per repeat copy laid down beyond or short of
+its depth. The panel orders only what those leave tied, and among matchings the panel ranks
+alike the one with the fewest molecules is given.
+
+An optional (shallow) anchor may be left out, as in every cover. Where the bridged ends of a
+component cannot all be joined (a graph that lacks a link), the fewest are left open, two at
+most; each ends a linear molecule.
 
 ## What comes out
 
@@ -92,6 +99,11 @@ fewest molecules is given.
   `pan_configuration_chosen` (`..._length_uncertain` with stretches of uncertain length). Where
   the graph stops at two ends the molecule is linear between them, and the join that read
   pairs gave the de novo molecule closes it. A reference-filled closure is kept as it was.
+* The graph's other components (further chromosomes, pieces no bridge joins to the largest)
+  go with the representative, each as the panel has it where the panel tells its bridges
+  apart, else as the search ranks it first (`other_component=true` in the configurations
+  FASTA). A repeat that `linearize` reports as a piece of its own, because its first-ranked
+  covers lay it down nowhere, is left out where the configuration taken lays it down.
 * `reconstruction.json`, `final.configurations.pan_posterior`: panel runs, variant sites, the
   five closest relatives with their weights, rho and the junctions it rests on, the cover's
   expected share of correct ends, how many configurations rank as well, and every bridge of
@@ -146,9 +158,37 @@ differently (run ERR11437347 for four accessions, 4 ends each); a closest relati
 change of its own; and, in the graphs that lack a link, the place where the molecule is left
 open.
 
-Not covered by this validation: other species, panels of fewer runs, and panels whose runs
-are short-read assemblies (they hold no junction across a repeat their own reads did not
-span, so they add nothing and take nothing away).
+Only one of the 48 folds has single records of the target at all (SAMEA113427120: 20 walks,
+378 records); the configuration taken explains 373 of them, and the remaining walk (5
+records) pairs an exit that another walk (11 records) pairs otherwise.
+
+### Six rice hold-outs
+
+Each of six *Oryza sativa* samples against the panel of the other nine (some *O. rufipogon*),
+on the graph, evidence and genotypes its earlier reconstruction left; scored against the
+held-out HiFi assembly with `ovasm-paper-pan/scripts/recon_accuracy.py` (share of the
+assembly covered, share of the output that aligns to it, identity). These graphs fall into
+many pieces, so the choice is mostly about which pieces are joined.
+
+| sample | records | assembly covered | output aligned | identity |
+| --- | ---: | ---: | ---: | ---: |
+| SAMEA115396709 | 30 -> 10 | 97.3% -> 98.9% | 85.9% -> 85.2% | 99.9993% -> 99.9993% |
+| SAMEA115396710 | 44 -> 15 | 95.1% -> 98.2% | 84.5% -> 85.4% | 99.925% -> 99.799% |
+| SAMEA115396711 | 3 -> 4 | 96.5% -> 100.0% | 86.5% -> 90.8% | unchanged |
+| SAMEA115396715 | 39 -> 39 | 27.1% (unchanged: the panel tells no bridge apart) | | |
+| SAMEA115396717 | 34 -> 11 | 95.9% -> 99.1% | 95.5% -> 95.2% | 99.961% -> 99.963% |
+| SAMEA115396721 | 1 -> 1 | 83.7% -> 95.5% | 78.3% -> 92.7% | 99.994% -> 99.995% |
+
+More of the assembly is covered in five of six and the pieces are fewer in three. In
+SAMEA115396710 identity over the aligned blocks fell by 0.13 points, which is what a wrong
+join inside an aligned block looks like; in SAMEA115396711 one 361 kb molecule became
+pieces of at most 136 kb that together cover all of the assembly. The held-out HiFi reads
+were not laid on these graphs, so no junction of the rice choices has been checked one by
+one.
+
+Not covered by this validation: panels whose runs are short-read assemblies (they hold no
+junction across a repeat their own reads did not span, so they add nothing and take nothing
+away), and any species beyond these two.
 
 ## Limits
 

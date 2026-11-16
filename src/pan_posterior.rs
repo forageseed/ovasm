@@ -492,6 +492,9 @@ pub struct Matching {
     pub equally_good: u64,
     pub examined: u64,
     pub uses_incomplete: bool,
+    /// The target's single records the matching explains: those through two repeats or more,
+    /// and all.
+    pub records: (u64, u64),
 }
 
 fn bucket(x: f64) -> i128 {
@@ -541,15 +544,27 @@ fn molecules(partner: &[usize]) -> usize {
 
 /// The matching of the `ends` anchor ends (anchor k: ends 2k and 2k + 1) by `edges` that
 /// `linearize::cover_order` ranks first on what reads measured (no incomplete bridge if one
-/// such matching exists; then the shares of reads less `copy_penalty` per repeat copy laid down
-/// beyond or short of `expected`), then with the greatest prior, then with the fewest
-/// molecules. An end no edge reaches is where the graph stops and ends a linear molecule
+/// such matching exists; then the target's single records it explains, `records` of the edges
+/// taken: those through two repeats or more, then all, as `ReadFit::order`; then the shares of
+/// reads less `copy_penalty` per repeat copy laid down beyond or short of `expected`), then
+/// with the greatest prior, then with the fewest molecules. `coupled`: ends one record ties
+/// together, so that the edges it needs are weighed in one component and it is counted once.
+/// An end no edge reaches is where the graph stops and ends a linear molecule
 /// (`edge_at`: `usize::MAX`). The ends that edges reach are all matched where that can be;
 /// a component where it cannot (bridges through one repeat and the ends they join) leaves the
 /// fewest open, as `cover_order` takes the fewest linear molecules first. None when a
 /// component would need more than two such ends or has more matchings than `budget` steps
 /// enumerate.
-pub fn best_matching(ends: usize, edges: &[Edge], expected: &dyn Fn(usize) -> Option<usize>, copy_penalty: f64, budget: u64) -> Option<Matching> {
+#[allow(clippy::too_many_arguments)]
+pub fn best_matching(
+    ends: usize,
+    edges: &[Edge],
+    expected: &dyn Fn(usize) -> Option<usize>,
+    copy_penalty: f64,
+    coupled: &[Vec<usize>],
+    records: &dyn Fn(&[usize]) -> (u64, u64),
+    budget: u64,
+) -> Option<Matching> {
     if ends == 0 || ends % 2 == 1 {
         return None;
     }
@@ -586,13 +601,26 @@ pub fn best_matching(ends: usize, edges: &[Edge], expected: &dyn Fn(usize) -> Op
             }
         }
     }
+    // ends one of the target's records ties together are weighed together
+    for group in coupled {
+        for pair in group.windows(2) {
+            if pair[0] < ends && pair[1] < ends {
+                let (x, y) = (find(&mut root, pair[0]), find(&mut root, pair[1]));
+                root[x.max(y)] = x.min(y);
+            }
+        }
+    }
     let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for x in 0..ends {
+        // an end no edge reaches is in no component: the graph stops there
+        if at[x].is_empty() {
+            continue;
+        }
         let r = find(&mut root, x);
         comps.entry(r).or_default().push(x);
     }
     // per component: the best matchings among those without an incomplete edge, and among all
-    type Key = (i128, i128);
+    type Key = (u64, u64, i128, i128);
     struct Best {
         key: Option<Key>,
         ties: Vec<Vec<usize>>, // the edges of each
@@ -660,10 +688,6 @@ pub fn best_matching(ends: usize, edges: &[Edge], expected: &dyn Fn(usize) -> Op
     let mut examined = 0u64;
     let mut options: Vec<[Best; 2]> = Vec::new();
     for members in comps.values() {
-        // an end no edge reaches: the graph stops there
-        if members.len() == 1 && at[members[0]].is_empty() {
-            continue;
-        }
         let mut best = [Best { key: None, ties: Vec::new(), count: 0 }, Best { key: None, ties: Vec::new(), count: 0 }];
         // Every end joined if that can be; else the fewest left open, two more at a time: each
         // open end ends a linear molecule, and `cover_order` takes the fewest of those first. A
@@ -689,7 +713,8 @@ pub fn best_matching(ends: usize, edges: &[Edge], expected: &dyn Fn(usize) -> Op
                         }
                     }
                     let deviation: usize = passes.iter().map(|(&r, &got)| expected(r).map_or(0, |want| got.abs_diff(want))).sum();
-                    let key = (bucket(read - copy_penalty * deviation as f64), bucket(prior));
+                    let (joint, threads) = records(taken);
+                    let key = (joint, threads, bucket(read - copy_penalty * deviation as f64), bucket(prior));
                     for (class, b) in best.iter_mut().enumerate() {
                         if class == 0 && incomplete {
                             continue;
@@ -791,7 +816,9 @@ pub fn best_matching(ends: usize, edges: &[Edge], expected: &dyn Fn(usize) -> Op
     let mut distinct: Vec<usize> = edge_at.iter().copied().filter(|&i| i != usize::MAX).collect();
     distinct.sort_unstable();
     distinct.dedup();
+    let explained = lists.iter().zip(&choice).map(|(list, &c)| records(&list[c])).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     Some(Matching {
+        records: explained,
         molecules: fewest,
         expected: distinct.iter().map(|&i| edges[i].prior).sum(),
         uses_incomplete: distinct.iter().any(|&i| edges[i].incomplete),
@@ -988,7 +1015,7 @@ mod tests {
                 }
             }
             // None only where one component would need more than two open ends (or no edge at all)
-            let Some(m) = best_matching(ends, &edges, &|_| None, 2.0, 1_000_000) else { continue };
+            let Some(m) = best_matching(ends, &edges, &|_| None, 2.0, &[], &|_| (0, 0), 1_000_000) else { continue };
             solved += 1;
             let mut taken: Vec<usize> = m.edge_at.iter().copied().filter(|&i| i != usize::MAX).collect();
             taken.sort_unstable();
@@ -1006,38 +1033,65 @@ mod tests {
         // anchors 0 and 1 (ends 0,1 and 2,3): one circle through both (1-2, 3-0) or two circles (0-1, 2-3)
         let edge = |a, b, read_ln, incomplete, prior| Edge { a, b, read_ln, incomplete, prior, passes: Vec::new() };
         let tied = vec![edge(1, 2, 0.0, true, 1.0), edge(3, 0, 0.0, true, 1.0), edge(0, 1, 0.0, true, 1.0), edge(2, 3, 0.0, true, 1.0)];
-        let m = best_matching(4, &tied, &|_| None, 2.0, 1000).unwrap();
+        let m = best_matching(4, &tied, &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((m.molecules, m.equally_good), (1, 2));
         // the prior prefers the two circles
         let mut prior = tied.clone();
         prior[2].prior = 1.6;
         prior[3].prior = 1.6;
-        let m = best_matching(4, &prior, &|_| None, 2.0, 1000).unwrap();
+        let m = best_matching(4, &prior, &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((m.molecules, m.equally_good), (2, 1));
         assert!((m.expected - 3.2).abs() < 1e-12);
         // but bridges that reads measured come first
         let mut reads = prior.clone();
         reads[0].incomplete = false;
         reads[1].incomplete = false;
-        let m = best_matching(4, &reads, &|_| None, 2.0, 1000).unwrap();
+        let m = best_matching(4, &reads, &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((m.molecules, m.uses_incomplete), (1, false));
         // and so does a copy number: the two circles lay repeat 9 down once where depth says twice
         let mut copies = prior.clone();
         copies[0].passes = vec![9];
         copies[1].passes = vec![9];
         copies[2].passes = vec![9];
-        let m = best_matching(4, &copies, &|r| (r == 9).then_some(2), 2.0, 1000).unwrap();
+        let m = best_matching(4, &copies, &|r| (r == 9).then_some(2), 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!(m.molecules, 1);
         // ends no bridge reaches end a linear molecule: 0 - (1-2) - 3
-        let open = best_matching(4, &tied[..1], &|_| None, 2.0, 1000).unwrap();
+        let open = best_matching(4, &tied[..1], &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((open.molecules, open.edge_at.clone()), (1, vec![usize::MAX, 0, 0, usize::MAX]));
         // three ends that bridges reach cannot all be joined: one stays open, the one the prior misses least
         let odd = vec![edge(1, 2, 0.0, true, 1.0), edge(1, 3, 0.0, true, 1.5)];
-        let m = best_matching(4, &odd, &|_| None, 2.0, 1000).unwrap();
+        let m = best_matching(4, &odd, &|_| None, 2.0, &[], &|_| (0, 0), 1000).unwrap();
         assert_eq!((m.molecules, m.equally_good, m.edge_at.clone()), (1, 1, vec![usize::MAX, 1, usize::MAX, 1]));
         // no bridge at all, or too small a budget: no matching
-        assert!(best_matching(4, &[], &|_| None, 2.0, 1000).is_none());
-        assert!(best_matching(4, &tied, &|_| None, 2.0, 1).is_none());
+        assert!(best_matching(4, &[], &|_| None, 2.0, &[], &|_| (0, 0), 1000).is_none());
+        assert!(best_matching(4, &tied, &|_| None, 2.0, &[], &|_| (0, 0), 1).is_none());
+    }
+
+    #[test]
+    fn the_targets_own_records_come_before_the_prior_and_tie_ends_together() {
+        // four anchors (ends 0-7), two choices that share nothing: ends 0-3 pair as (0-2, 1-3) or
+        // (0-3, 1-2), ends 4-7 as (4-6, 5-7) or (4-7, 5-6); the prior wants the first of each
+        let edge = |a, b, prior| Edge { a, b, read_ln: 0.0, incomplete: true, prior, passes: Vec::new() };
+        let edges = vec![
+            edge(0, 2, 1.0), edge(1, 3, 1.0), edge(0, 3, 0.5), edge(1, 2, 0.5),
+            edge(4, 6, 1.0), edge(5, 7, 1.0), edge(4, 7, 0.5), edge(5, 6, 0.5),
+        ];
+        // one record of the target runs through the bridges 0-3 and 4-7: seven reads
+        let across = |taken: &[usize]| if taken.contains(&2) && taken.contains(&6) { (0, 7) } else { (0, 0) };
+        // weighed apart, neither half can show it holds the record, and the prior has its way
+        let apart = best_matching(8, &edges, &|_| None, 2.0, &[], &across, 1000).unwrap();
+        assert_eq!((apart.edge_at[0], apart.edge_at[4], apart.records), (0, 4, (0, 0)));
+        // tied together by the record, the bridges it runs through are taken against the prior
+        let tied = best_matching(8, &edges, &|_| None, 2.0, &[vec![0, 4]], &across, 1000).unwrap();
+        assert_eq!((tied.edge_at[0], tied.edge_at[4], tied.records), (2, 6, (0, 7)));
+        assert!((tied.expected - 2.0).abs() < 1e-12 && (apart.expected - 4.0).abs() < 1e-12);
+        // a record through two repeats counts before any number of the others
+        let joint = |taken: &[usize]| if taken.contains(&0) { (1, 1) } else if taken.contains(&2) { (0, 9) } else { (0, 0) };
+        let m = best_matching(8, &edges, &|_| None, 2.0, &[], &joint, 1000).unwrap();
+        assert_eq!((m.edge_at[0], m.records), (0, (1, 1)));
+        // an end no edge reaches may be named by a record: it stays open and blocks nothing
+        let open = best_matching(8, &edges[..5], &|_| None, 2.0, &[vec![0, 5]], &|_| (0, 0), 1000).unwrap();
+        assert_eq!((open.edge_at[4], open.edge_at[5], open.edge_at[7]), (4, usize::MAX, usize::MAX));
     }
 
     #[test]
