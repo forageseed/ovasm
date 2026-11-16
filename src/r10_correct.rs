@@ -250,6 +250,7 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
     let mut qual_bases = 0u64;
     let mut err_sum = 0.0f64;
     let mut ccs_headers = 0usize;
+    let mut q_hist = [0u64; 128];
 
     for r in reads {
         bases_examined += r.seq.len() as u64;
@@ -258,12 +259,19 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
         }
         if let Some(q) = r.qual.as_ref().filter(|q| q.len() == r.seq.len()) {
             qual_bases += q.len() as u64;
-            err_sum += q
-                .iter()
-                .map(|&b| lut[decode_phred(b) as usize])
-                .sum::<f64>();
+            for &b in q {
+                err_sum += lut[decode_phred(b) as usize];
+                q_hist[(b & 0x7F) as usize] += 1;
+            }
         }
     }
+    let (dom_q_byte, dom_q_count) = q_hist
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, &c)| c)
+        .map(|(i, &c)| (i as u8, c))
+        .unwrap_or((b'!', 0));
+    let uniform_synthetic_qual = qual_bases > 0 && dom_q_count.saturating_mul(1000) >= qual_bases.saturating_mul(999);
     let ccs_frac = if !reads.is_empty() {
         ccs_headers as f64 / reads.len() as f64
     } else {
@@ -334,6 +342,20 @@ pub fn detect_chemistry(reads: &[Rec], mode: OntChemistry) -> ChemistryProfile {
                         "auto -> legacy: input lacks per-base FASTQ qualities ({:.1}% < {:.0}%)",
                         100.0 * qual_base_fraction,
                         100.0 * AUTO_MIN_QUAL_FRAC
+                    ),
+                )
+            } else if uniform_synthetic_qual
+                || (effective_phred_q.unwrap_or(0.0) >= 30.0
+                    && solid_21mer_fraction < AUTO_HIFI_MIN_SOLID_FRAC)
+            {
+                (
+                    false,
+                    format!(
+                        "auto -> legacy: synthetic/uncalibrated FASTQ qualities ({:.1}% '{}', effective Q {:.2}, solid 21-mer {:.3}; FASTA origin)",
+                        if qual_bases > 0 { 100.0 * dom_q_count as f64 / qual_bases as f64 } else { 0.0 },
+                        char::from(dom_q_byte.clamp(33, 126)),
+                        effective_phred_q.unwrap_or(0.0),
+                        solid_21mer_fraction
                     ),
                 )
             } else if effective_phred_q.unwrap_or(0.0) < AUTO_MIN_EFFECTIVE_Q {
@@ -2705,6 +2727,22 @@ mod tests {
             .collect();
         let p_ccs = detect_chemistry(&ccs_reads, OntChemistry::Auto);
         assert!(!p_ccs.use_r10, "CCS-header reads must stay legacy under Auto: {p_ccs:?}");
+
+        // 6. FASTA input recruited through `recruit.rs` (which emits neutral `b'I'` Q40 FASTQ
+        // qualities on noisy ONT reads, e.g. `zm4ont` `ont622.prefix130k.fa`) must stay legacy!
+        let fasta_recruited: Vec<Rec> = r10_reads
+            .iter()
+            .map(|r| Rec {
+                id: r.id.clone(),
+                seq: r.seq.clone(),
+                qual: Some(vec![b'I'; r.seq.len()]),
+            })
+            .collect();
+        let p_fa_rec = detect_chemistry(&fasta_recruited, OntChemistry::Auto);
+        assert!(
+            !p_fa_rec.use_r10,
+            "FASTA-recruited uniform Q40 ('I') reads must stay legacy under Auto: {p_fa_rec:?}"
+        );
     }
 
     #[test]
