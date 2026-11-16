@@ -149,7 +149,7 @@ const HIST_MAX: usize = 1 << 22;
 /// k-mers at ~1,877x, the plastid's far above) piled up there: the solid peak came out as 10,000,
 /// the minimum count about 3,000, and the mitochondrion's own k-mers were all left out (code
 /// audit 11-15; hybrid mitochondrion 66% of the gold, 276 substitutions).
-fn valley_and_peak(counts: &FxHashMap<u64, u32>) -> (u32, u32) {
+pub(crate) fn valley_and_peak(counts: &FxHashMap<u64, u32>) -> (u32, u32) {
     let top = counts.values().copied().max().unwrap_or(0) as usize;
     let len = top.min(HIST_MAX) + 2;
     let mut hist = vec![0u64; len];
@@ -436,6 +436,9 @@ pub struct RoundReport {
 
 #[derive(Serialize)]
 pub struct CorrectReport {
+    pub chemistry: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r10: Option<crate::r10_correct::R10Report>,
     pub rounds: Vec<RoundReport>,
     pub output: String,
     pub elapsed_seconds: f64,
@@ -541,40 +544,89 @@ pub fn run(
     out_fasta: &Path,
     out_json: &Path,
 ) -> Result<CorrectReport> {
+    run_with_chemistry(
+        inputs,
+        short_inputs,
+        ks,
+        self_ks,
+        base,
+        crate::r10_correct::OntChemistry::Auto,
+        out_fasta,
+        out_json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_chemistry(
+    inputs: Vec<PathBuf>,
+    short_inputs: Vec<PathBuf>,
+    ks: &[usize],
+    self_ks: &[usize],
+    base: CorrectParams,
+    chemistry: crate::r10_correct::OntChemistry,
+    out_fasta: &Path,
+    out_json: &Path,
+) -> Result<CorrectReport> {
     if ks.is_empty() || ks.iter().chain(self_ks).any(|&k| !(11..=31).contains(&k)) {
         bail!("each --k and --self-k must be in 11..=31");
     }
     let t0 = Instant::now();
     let mut reads = load(&inputs)?;
-    let short = if short_inputs.is_empty() {
-        None
+    let (chemistry_used, r10_report, rounds) = if short_inputs.is_empty() {
+        let profile = crate::r10_correct::detect_chemistry(&reads, chemistry);
+        if profile.use_r10 {
+            eprintln!("[ovasm] correct: {}", profile.reason);
+            let (out_reads, compat_rounds, r10_rep) = crate::r10_correct::run_r10(reads, profile)?;
+            reads = out_reads;
+            ("r10", Some(r10_rep), compat_rounds)
+        } else {
+            if chemistry == crate::r10_correct::OntChemistry::Auto && !reads.is_empty() {
+                eprintln!("[ovasm] correct: {}", profile.reason);
+            }
+            let mut rounds = Vec::new();
+            for &k in ks {
+                let (next, rep) = round(reads, None, &CorrectParams { k, ..base })?;
+                eprintln!(
+                    "[ovasm] correct k={}: solid >= {} ({} k-mers, peak {}); {} -> {} reads; {:.1}% anchored, {}/{} gaps bridged, {:.1}% trimmed; {:.1}s",
+                    k, rep.min_count, rep.solid_kmers, rep.solid_peak, rep.reads_in, rep.reads_out,
+                    100.0 * rep.stats.anchored_bases as f64 / rep.stats.bases_in.max(1) as f64,
+                    rep.stats.gaps_bridged, rep.stats.gaps,
+                    100.0 * rep.stats.trimmed_bases as f64 / rep.stats.bases_in.max(1) as f64,
+                    rep.seconds
+                );
+                rounds.push(rep);
+                reads = next;
+            }
+            ("legacy", None, rounds)
+        }
     } else {
-        Some(load(&short_inputs)?)
+        let short = Some(load(&short_inputs)?);
+        let mut rounds = Vec::new();
+        let plan: Vec<(usize, Option<&[Rec]>)> = ks
+            .iter()
+            .map(|&k| (k, short.as_deref()))
+            .chain(
+                self_ks
+                    .iter()
+                    .filter(|_| short.is_some())
+                    .map(|&k| (k, None)),
+            )
+            .collect();
+        for (k, solid_from) in plan {
+            let (next, rep) = round(reads, solid_from, &CorrectParams { k, ..base })?;
+            eprintln!(
+                "[ovasm] correct k={}{}: solid >= {} ({} k-mers, peak {}); {} -> {} reads; {:.1}% anchored, {}/{} gaps bridged, {:.1}% trimmed; {:.1}s",
+                k, if rep.hybrid { " (hybrid)" } else { "" }, rep.min_count, rep.solid_kmers, rep.solid_peak, rep.reads_in, rep.reads_out,
+                100.0 * rep.stats.anchored_bases as f64 / rep.stats.bases_in.max(1) as f64,
+                rep.stats.gaps_bridged, rep.stats.gaps,
+                100.0 * rep.stats.trimmed_bases as f64 / rep.stats.bases_in.max(1) as f64,
+                rep.seconds
+            );
+            rounds.push(rep);
+            reads = next;
+        }
+        ("legacy", None, rounds)
     };
-    let mut rounds = Vec::new();
-    let plan: Vec<(usize, Option<&[Rec]>)> = ks
-        .iter()
-        .map(|&k| (k, short.as_deref()))
-        .chain(
-            self_ks
-                .iter()
-                .filter(|_| short.is_some())
-                .map(|&k| (k, None)),
-        )
-        .collect();
-    for (k, solid_from) in plan {
-        let (next, rep) = round(reads, solid_from, &CorrectParams { k, ..base })?;
-        eprintln!(
-            "[ovasm] correct k={}{}: solid >= {} ({} k-mers, peak {}); {} -> {} reads; {:.1}% anchored, {}/{} gaps bridged, {:.1}% trimmed; {:.1}s",
-            k, if rep.hybrid { " (hybrid)" } else { "" }, rep.min_count, rep.solid_kmers, rep.solid_peak, rep.reads_in, rep.reads_out,
-            100.0 * rep.stats.anchored_bases as f64 / rep.stats.bases_in.max(1) as f64,
-            rep.stats.gaps_bridged, rep.stats.gaps,
-            100.0 * rep.stats.trimmed_bases as f64 / rep.stats.bases_in.max(1) as f64,
-            rep.seconds
-        );
-        rounds.push(rep);
-        reads = next;
-    }
     if let Some(dir) = out_fasta.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -588,6 +640,8 @@ pub fn run(
     }
     w.flush()?;
     let report = CorrectReport {
+        chemistry: chemistry_used,
+        r10: r10_report,
         rounds,
         output: out_fasta.display().to_string(),
         elapsed_seconds: t0.elapsed().as_secs_f64(),

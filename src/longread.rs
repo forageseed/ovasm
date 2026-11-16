@@ -58,6 +58,7 @@ pub const RECRUIT_K: usize = 21;
 /// holds `ASSEMBLE_K_GROWTH` times its sequence or more, which means the higher k lost sequence to
 /// errors the correction left (Nipponbare ONT: 273 kb at 201, 405 kb at 101, of 376 kb; ZM4 ONT:
 /// 299.7 kb at 201, 300.2 kb at 101).
+pub const ASSEMBLE_K_R10: usize = 501;
 pub const ASSEMBLE_K_HIGH: usize = 201;
 pub const ASSEMBLE_K_LOW: usize = 101;
 pub const ASSEMBLE_K_GROWTH: f64 = 1.10;
@@ -135,6 +136,10 @@ pub struct LongOptions {
     sample: String,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: Option<u16>,
+    /// Set by `run_ont` / `run_hybrid`: `run ont` defaults to `Auto` (`R10` phased overlap EC on
+    /// R10 FASTQ, `Legacy` otherwise); `run hybrid` always uses `Legacy`.
+    #[arg(skip = crate::r10_correct::OntChemistry::Auto)]
+    chemistry: crate::r10_correct::OntChemistry,
 }
 
 #[derive(clap::Args)]
@@ -142,6 +147,18 @@ pub struct OntArgs {
     /// Long read files (ONT or PacBio CLR; FASTQ/FASTA, optionally .gz); repeat for several.
     #[arg(long = "reads", required = true)]
     reads: Vec<PathBuf>,
+    /// ONT error-correction chemistry: `auto` selects hifiasm-style phased overlap correction on
+    /// R10 FASTQ reads and preserves the `k = 17, 25` solid-kmer dBG scheme for R9, CLR, and FASTA.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = crate::r10_correct::OntChemistry::Auto,
+        conflicts_with = "r10"
+    )]
+    chemistry: crate::r10_correct::OntChemistry,
+    /// Shorthand for `--chemistry r10` (ONT R10.4 / Simplex phased overlap error correction).
+    #[arg(long)]
+    r10: bool,
     #[command(flatten)]
     options: LongOptions,
 }
@@ -173,11 +190,13 @@ fn log(message: &str) {
     eprintln!("[ovasm] run: {message}");
 }
 
-pub fn run_ont(args: OntArgs) -> Result<()> {
+pub fn run_ont(mut args: OntArgs) -> Result<()> {
+    args.options.chemistry = crate::r10_correct::OntChemistry::resolve(args.chemistry, args.r10);
     finish(run(&args.reads, None, &args.options)?, &args.options)
 }
 
-pub fn run_hybrid(args: HybridArgs) -> Result<()> {
+pub fn run_hybrid(mut args: HybridArgs) -> Result<()> {
+    args.options.chemistry = crate::r10_correct::OntChemistry::Legacy;
     let short = Short {
         reads: &args.short,
         max_bases: args.short_max_bases,
@@ -607,8 +626,32 @@ fn read_share(id: &[u8], salt: u64) -> f64 {
 /// `reads` down to `CORRECT_MAX_DEPTH`: when their median depth (see `read_depths`) is above it,
 /// the reads whose id hashes below the share are written to `out` and it is returned in their
 /// place. Also the record of it: depth, kept share, reads and bases kept.
+fn write_fastx_record(
+    w: &mut BufWriter<fs::File>,
+    id: &[u8],
+    seq: &[u8],
+    qual: Option<&[u8]>,
+) -> Result<()> {
+    if let Some(q) = qual.filter(|q| q.len() == seq.len()) {
+        w.write_all(b"@")?;
+        w.write_all(id)?;
+        w.write_all(b"\n")?;
+        w.write_all(seq)?;
+        w.write_all(b"\n+\n")?;
+        w.write_all(q)?;
+        w.write_all(b"\n")?;
+    } else {
+        w.write_all(b">")?;
+        w.write_all(id)?;
+        w.write_all(b"\n")?;
+        w.write_all(seq)?;
+        w.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, Value)> {
-    let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut records: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     for path in reads {
         if !path.is_file() || fs::metadata(path)?.len() == 0 {
             continue;
@@ -618,7 +661,11 @@ fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, 
         while let Some(record) = reader.next() {
             let record =
                 record.with_context(|| format!("malformed record in {}", path.display()))?;
-            records.push((record.id().to_vec(), record.seq().into_owned()));
+            records.push((
+                record.id().to_vec(),
+                record.seq().into_owned(),
+                record.qual().map(|q| q.to_vec()),
+            ));
         }
     }
     let depths = read_depths(&records.iter().map(|r| r.1.as_slice()).collect::<Vec<_>>());
@@ -633,12 +680,8 @@ fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, 
     }
     let mut w = BufWriter::new(fs::File::create(out)?);
     let (mut n, mut b) = (0u64, 0u64);
-    for (id, seq) in records.iter().filter(|r| read_share(&r.0, salt) < fraction) {
-        w.write_all(b">")?;
-        w.write_all(id)?;
-        w.write_all(b"\n")?;
-        w.write_all(seq)?;
-        w.write_all(b"\n")?;
+    for (id, seq, qual) in records.iter().filter(|r| read_share(&r.0, salt) < fraction) {
+        write_fastx_record(&mut w, id, seq, qual.as_deref())?;
         n += 1;
         b += seq.len() as u64;
     }
@@ -698,7 +741,7 @@ fn split_partial(
     bait.prepare_lookup();
     let params = ont_params();
     let path = dir.join("numt_candidates.fastq");
-    let mut calls: Vec<(Vec<u8>, Vec<u8>, usize)> = Vec::new();
+    let mut calls: Vec<(Vec<u8>, Vec<u8>, Option<Vec<u8>>, usize)> = Vec::new();
     let mut bases = vec![0u64; bait.targets.len()];
     let meta = fs::metadata(&path).with_context(|| format!("cannot access {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "not a regular file: {}", path.display());
@@ -710,7 +753,12 @@ fn split_partial(
                 record.with_context(|| format!("malformed record in {}", path.display()))?;
             let seq = record.seq();
             if let (Call::NumtCandidate(t), _) = classify(&seq, &bait, &params) {
-                calls.push((record.id().to_vec(), seq.into_owned(), t));
+                calls.push((
+                    record.id().to_vec(),
+                    seq.into_owned(),
+                    record.qual().map(|q| q.to_vec()),
+                    t,
+                ));
             }
         }
     }
@@ -718,7 +766,7 @@ fn split_partial(
     let mut recruited_all: Vec<Vec<Vec<u8>>> = Vec::with_capacity(bait.targets.len());
     for (t, target) in bait.targets.iter().enumerate() {
         let recruited = read_seqs(&dir.join(format!("{}.fastq", target.name)))?;
-        let idx: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].2 == t).collect();
+        let idx: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].3 == t).collect();
         let keep = at_target_depth(
             &recruited,
             &idx.iter().map(|&i| calls[i].1.as_slice()).collect::<Vec<_>>(),
@@ -734,7 +782,7 @@ fn split_partial(
         }
         for (&i, k) in idx.iter().zip(keep) {
             if !k {
-                calls[i].2 = usize::MAX;
+                calls[i].3 = usize::MAX;
             }
         }
         recruited_all.push(recruited);
@@ -753,10 +801,10 @@ fn split_partial(
                     .unwrap_or(1.0)
             })
             .collect();
-        let active: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].2 != usize::MAX).collect();
+        let active: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].3 != usize::MAX).collect();
         let active_refs: Vec<(&[u8], usize)> = active
             .iter()
-            .map(|&i| (calls[i].1.as_slice(), calls[i].2))
+            .map(|&i| (calls[i].1.as_slice(), calls[i].3))
             .collect();
         let keep_cross = filter_cross_organelle_partials(
             &recruited_all,
@@ -767,11 +815,11 @@ fn split_partial(
         let mut dropped_by_target = vec![0usize; bait.targets.len()];
         let mut before_by_target = vec![0usize; bait.targets.len()];
         for (&i, keep) in active.iter().zip(keep_cross) {
-            let t = calls[i].2;
+            let t = calls[i].3;
             before_by_target[t] += 1;
             if !keep {
                 dropped_by_target[t] += 1;
-                calls[i].2 = usize::MAX;
+                calls[i].3 = usize::MAX;
             }
         }
         for (t, target) in bait.targets.iter().enumerate() {
@@ -789,8 +837,8 @@ fn split_partial(
         }
     }
     for c in &calls {
-        if c.2 != usize::MAX {
-            bases[c.2] += c.1.len() as u64;
+        if c.3 != usize::MAX {
+            bases[c.3] += c.1.len() as u64;
         }
     }
     let mut out = BTreeMap::new();
@@ -803,15 +851,11 @@ fn split_partial(
         let fasta = dir.join(format!("{}.partial.fasta", target.name));
         let mut w = BufWriter::new(fs::File::create(&fasta)?);
         let (mut n, mut b) = (0u64, 0u64);
-        for (id, seq, _) in calls.iter().filter(|c| c.2 == t) {
+        for (id, seq, qual, _) in calls.iter().filter(|c| c.3 == t) {
             if fraction < 1.0 && read_share(id, salt) >= fraction {
                 continue;
             }
-            w.write_all(b">")?;
-            w.write_all(id)?;
-            w.write_all(b"\n")?;
-            w.write_all(seq)?;
-            w.write_all(b"\n")?;
+            write_fastx_record(&mut w, id, seq, qual.as_deref())?;
             n += 1;
             b += seq.len() as u64;
         }
@@ -851,7 +895,13 @@ fn seed_spec(name: &str, path: &Path) -> OsString {
 /// `assemble correct` of `reads` into `fasta` (and its report beside it): self-correction, or
 /// hybrid with `short` (then the self rounds of `assemble correct`'s default); the reads down to
 /// `CORRECT_MAX_DEPTH` first (see `cap_depth`).
-fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> Result<Value> {
+fn correct(
+    reads: &[PathBuf],
+    short: Option<&Path>,
+    chemistry: crate::r10_correct::OntChemistry,
+    fasta: &Path,
+    salt: u64,
+) -> Result<Value> {
     let json = fasta.with_extension("json");
     let (reads, depth_cap) = cap_depth(reads, &fasta.with_extension("capped.fasta"), salt)?;
     let mut argv = Argv::new("assemble correct")
@@ -860,6 +910,8 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
         .opt("--out-json", &json);
     if let Some(s) = short {
         argv = argv.opt("--short-reads", s);
+    } else {
+        argv = argv.opt("--chemistry", chemistry.as_arg());
     }
     argv.run()?;
     let report = read_json(&json)?;
@@ -867,9 +919,10 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
     let count = last.as_ref().and_then(|l| l["reads_out"].as_u64())
         .ok_or_else(|| anyhow::anyhow!("correction report has no valid final reads_out: {}", json.display()))?;
     if short.is_none() { require_self_correction(count, fasta)?; }
-    Ok(json!({
+    let mut out = json!({
         "reads": path_str(fasta),
         "report": path_str(&json),
+        "chemistry": report["chemistry"],
         "hybrid": short.is_some(),
         "depth_cap": depth_cap,
         "rounds": report["rounds"].as_array().map(|r| r.iter().map(|x| json!({
@@ -881,7 +934,11 @@ fn correct(reads: &[PathBuf], short: Option<&Path>, fasta: &Path, salt: u64) -> 
         "reads_out": last.as_ref().map(|l| l["reads_out"].clone()),
         "bases_out": last.as_ref().map(|l| l["stats"]["bases_out"].clone()),
         "seconds": report["elapsed_seconds"],
-    }))
+    });
+    if !report["r10"].is_null() {
+        out["r10"] = report["r10"].clone();
+    }
+    Ok(out)
 }
 
 fn correction_output_usable(count: u64, fasta: &Path) -> Result<bool> {
@@ -933,6 +990,11 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
             .build_global()?;
     }
     let pipeline_name = if short.is_some() { "hybrid" } else { "ont" };
+    let self_chemistry = if short.is_some() {
+        crate::r10_correct::OntChemistry::Legacy
+    } else {
+        o.chemistry
+    };
     let organelles: &[&'static str] = match o.organelle {
         OrganelleChoice::Mitochondrion => &["mitochondrion"],
         OrganelleChoice::Plastid => &["plastid"],
@@ -970,7 +1032,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
             let organelle = organelles[0];
             log(&format!("correcting the supplied {organelle} long reads"));
             let fasta = o.out.join(format!("correct/{organelle}.fasta"));
-            let mut c = correct(long, None, &fasta, o.salt)?;
+            let mut c = correct(long, None, self_chemistry, &fasta, o.salt)?;
             c["purpose"] = "assembly".into();
             reads.insert(
                 organelle,
@@ -1136,7 +1198,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                     }
                     let fasta = o.out.join(format!("correct/round{round}/{organelle}.bait.fasta"));
                     let result = (|| -> Result<(Value, PathBuf)> {
-                        let mut c = correct(&inputs, None, &fasta, o.salt)?;
+                        let mut c = correct(&inputs, None, self_chemistry, &fasta, o.salt)?;
                         c["purpose"] = "bait".into();
                         c["partial_reads"] = partial.get(organelle).map(|x| x.1).into();
                         let masked = fasta.with_extension("masked.fasta");
@@ -1164,7 +1226,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                     ));
                     let fasta = o.out.join(format!("correct/{organelle}.fasta"));
                     let result = (|| -> Result<(Value, PathBuf)> {
-                        let mut c = correct(&r.raw, None, &fasta, o.salt)?;
+                        let mut c = correct(&r.raw, None, self_chemistry, &fasta, o.salt)?;
                         c["purpose"] = "assembly".into();
                         let masked = fasta.with_extension("masked.fasta");
                         c["tandem_masked_bases"] = mask_tandem_fasta(&fasta, &masked)?.into();
@@ -1199,7 +1261,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 }
                 log(&format!("self-correcting the {organelle} long reads to assemble"));
                 let fasta = o.out.join(format!("correct/{organelle}.fasta"));
-                match correct(&r.raw, None, &fasta, o.salt) {
+                match correct(&r.raw, None, self_chemistry, &fasta, o.salt) {
                     Ok(mut c) => { c["purpose"] = "assembly".into(); r.corrected = fasta; r.corrections.push(c); }
                     Err(e) => { *entry = Err(e.context("self correction for assembly")); }
                 }
@@ -1264,7 +1326,13 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 log(&format!("correcting the {organelle} long reads with its short reads"));
                 let fasta = o.out.join("correct/hybrid").join(format!("{organelle}.fasta"));
                 let result = (|| -> Result<(Value, bool)> {
-                    let mut c = correct(&r.raw, Some(&dir.join(format!("{organelle}.fastq"))), &fasta, o.salt)?;
+                    let mut c = correct(
+                        &r.raw,
+                        Some(&dir.join(format!("{organelle}.fastq"))),
+                        crate::r10_correct::OntChemistry::Legacy,
+                        &fasta,
+                        o.salt,
+                    )?;
                     c["purpose"] = "assembly".into();
                     let n = c["reads_out"].as_u64().ok_or_else(|| anyhow::anyhow!("invalid hybrid reads_out"))?;
                     let use_corrected = use_hybrid_correction(n, &fasta, &r.corrected, &mut c)?;
@@ -1327,7 +1395,12 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
 /// k of the graph of corrected `reads`: `ASSEMBLE_K_HIGH`, or `ASSEMBLE_K_LOW` when its graph holds
 /// `ASSEMBLE_K_GROWTH` times the sequence of the higher k's (see there). Each probe is one
 /// `assemble graph` pass over the reads, written beside the graph and removed.
-fn choose_assemble_k(reads: &Path, dir: &Path, depth_reference: Option<&Path>) -> Result<usize> {
+fn choose_assemble_k(
+    reads: &Path,
+    dir: &Path,
+    depth_reference: Option<&Path>,
+    is_r10: bool,
+) -> Result<usize> {
     let length = |k: usize| -> Result<f64> {
         let (gfa, json) = (
             dir.join(format!("probe-k{k}.gfa")),
@@ -1352,11 +1425,22 @@ fn choose_assemble_k(reads: &Path, dir: &Path, depth_reference: Option<&Path>) -
         Ok(total)
     };
     let (high, low) = (length(ASSEMBLE_K_HIGH)?, length(ASSEMBLE_K_LOW)?);
-    let k = pick_assemble_k(high, low);
-    log(&format!(
-        "graph of {} bp at k {ASSEMBLE_K_HIGH}, {} bp at k {ASSEMBLE_K_LOW}: starting at k {k}",
-        high as u64, low as u64
-    ));
+    let mut k = pick_assemble_k(high, low);
+    if is_r10 && k == ASSEMBLE_K_HIGH {
+        let r10_len = length(ASSEMBLE_K_R10)?;
+        if r10_len > 0.0 && high < ASSEMBLE_K_GROWTH * r10_len {
+            k = ASSEMBLE_K_R10;
+        }
+        log(&format!(
+            "graph of {} bp at k {ASSEMBLE_K_R10}, {} bp at k {ASSEMBLE_K_HIGH}, {} bp at k {ASSEMBLE_K_LOW}: starting at k {k}",
+            r10_len as u64, high as u64, low as u64
+        ));
+    } else {
+        log(&format!(
+            "graph of {} bp at k {ASSEMBLE_K_HIGH}, {} bp at k {ASSEMBLE_K_LOW}: starting at k {k}",
+            high as u64, low as u64
+        ));
+    }
     Ok(k)
 }
 
@@ -1393,9 +1477,20 @@ fn assemble(
         .map(|s| (organelle.to_string(), s.clone()))
         .into_iter()
         .collect();
+    let used_r10 = pipeline_name == "ont"
+        && r.corrections
+            .iter()
+            .rev()
+            .find(|c| c["purpose"] == "assembly")
+            .is_some_and(|c| c["chemistry"] == "r10");
     let assemble_k = match o.assemble_k {
         Some(k) => k,
-        None => choose_assemble_k(&r.corrected, dir, own_seeds.get(organelle).and_then(|v| v.first()).map(PathBuf::as_path))?,
+        None => choose_assemble_k(
+            &r.corrected,
+            dir,
+            own_seeds.get(organelle).and_then(|v| v.first()).map(PathBuf::as_path),
+            used_r10,
+        )?,
     };
     log(&format!("assembling the corrected {organelle} reads from k {assemble_k}"));
     let mut summary = pipeline::run(&pipeline::RunConfig {
@@ -1450,7 +1545,12 @@ fn assemble(
         Some(sr) => (vec![sr], "short reads"),
         None => (r.raw.clone(), "uncorrected reads"),
     };
-    let polish = if molecules.exists() {
+    let polish = if molecules.exists() && used_r10 {
+        json!({
+            "reads_used": "r10 phased consensus",
+            "skipped": true,
+        })
+    } else if molecules.exists() {
         log(&format!("polishing the homopolymer runs of the {organelle} molecules with the {polish_with}"));
         let unpolished = dir.join("molecules.unpolished.fasta");
         fs::rename(&molecules, &unpolished)?;
@@ -2167,5 +2267,145 @@ mod tests {
             2_000,
         );
         assert_eq!(keep, vec![false, true, true, false], "keep={keep:?}");
+    }
+
+    #[test]
+    fn ont_r10_fastq_auto_runs_phased_overlap_ec_while_hybrid_keeps_legacy() {
+        let dir = tmpdir("ont_r10_e2e");
+        // 24 kb circular mitochondrion carrying two 1.8 kb diverged repeat copies (6 SNPs apart)
+        // and 3 forward-strand CpG methylation hotspots, sequenced as R10.4.1 FASTQ (~1.2% noise).
+        let mut mito = seq(24_000, 3_101);
+        let copy1 = seq(1_800, 3_102);
+        let mut copy2 = copy1.clone();
+        for &p in &[200usize, 500, 800, 1_100, 1_400, 1_650] {
+            copy2[p] = if copy2[p] == b'A' { b'G' } else { b'A' };
+        }
+        mito[2_000..3_800].copy_from_slice(&copy1);
+        mito[13_000..14_800].copy_from_slice(&copy2);
+        for &mp in &[6_000usize, 10_000, 19_000] {
+            mito[mp] = b'C';
+            mito[mp + 1] = b'G';
+        }
+
+        let plastid = seq(16_000, 3_103);
+        let mut rng = Rng(3_104);
+        let sim_fastq = |genome: &[u8], len: usize, step: usize, tag: &str, meth: &[usize], rng: &mut Rng| -> String {
+            let circ = [genome, &genome[..len]].concat();
+            let mut buf = String::new();
+            for (i, st) in (0..genome.len()).step_by(step).enumerate() {
+                let is_fwd = i % 3 != 0;
+                let mut truth = circ[st..st + len].to_vec();
+                if is_fwd {
+                    for &mp in meth {
+                        for off in [mp, mp + genome.len()] {
+                            if off >= st && off < st + len && rng.unit() < 0.70 {
+                                truth[off - st] = b'T';
+                            }
+                        }
+                    }
+                }
+                let (mut s, mut q) = (Vec::with_capacity(len + 32), Vec::with_capacity(len + 32));
+                for &b in &truth {
+                    let u = rng.unit();
+                    if u < 0.006 {
+                        let alt = if b == b'A' { b'C' } else { b'A' };
+                        s.push(alt);
+                        q.push(b'+'); // Q10
+                    } else if u < 0.010 {
+                        s.push(b);
+                        q.push(b'9'); // Q24
+                        s.push(b);
+                        q.push(b','); // Q11
+                    } else if u < 0.012 {
+                        continue;
+                    } else {
+                        s.push(b);
+                        q.push(b'9'); // Q24
+                    }
+                }
+                if !is_fwd {
+                    s = crate::evidence::revcomp(&s);
+                    q.reverse();
+                }
+                buf.push_str(&format!(
+                    "@{tag}{i}\n{}\n+\n{}\n",
+                    std::str::from_utf8(&s).unwrap(),
+                    std::str::from_utf8(&q).unwrap()
+                ));
+            }
+            buf
+        };
+
+        let fq_path = dir.join("r10.fastq");
+        let mut fq = sim_fastq(&mito, 6_000, 100, "m", &[6_000, 10_000, 19_000], &mut rng);
+        fq.push_str(&sim_fastq(&plastid, 6_000, 120, "p", &[], &mut rng));
+        fs::write(&fq_path, fq).unwrap();
+
+        let (mt_seed, pt_seed) = (dir.join("mt_seed.fa"), dir.join("pt_seed.fa"));
+        fasta(
+            &mt_seed,
+            &[
+                ("mt_a".into(), mito[..8_000].to_vec()),
+                ("mt_b".into(), mito[11_000..].to_vec()),
+            ],
+        );
+        fasta(&pt_seed, &[("pt".into(), plastid.clone())]);
+
+        let out_ont = dir.join("out_ont");
+        let mt_arg = format!("mitochondrion={}", mt_seed.display());
+        let pt_arg = format!("plastid={}", pt_seed.display());
+        let o = options(&[
+            "--organelle",
+            "mitochondrion",
+            "--out",
+            out_ont.to_str().unwrap(),
+            "--seeds",
+            &mt_arg,
+            "--seeds",
+            &pt_arg,
+        ]);
+        run(&[fq_path.clone()], None, &o).unwrap();
+        assert_genome(&out_ont, &mito, "R10 mitochondrion");
+        let m = read_json(&out_ont.join("summary.json")).unwrap();
+        let corrs = m["long_read"]["corrections"].as_array().unwrap();
+        assert!(corrs.iter().all(|c| c["chemistry"] == "r10"), "{corrs:?}");
+        assert_eq!(m["k"], json!(ASSEMBLE_K_R10));
+        assert_eq!(m["homopolymer_polish"]["reads_used"], "r10 phased consensus");
+        let mol = &molecules(&out_ont)[0];
+        assert_eq!(mol.len(), mito.len());
+        assert_eq!(contained(&mito, mol), 1.0, "exact 24 kb circular reconstruction");
+        assert_eq!(contained(&copy1, mol), 1.0, "copy1 homogenized");
+        assert_eq!(contained(&copy2, mol), 1.0, "copy2 homogenized");
+
+        // Verify `run hybrid` on the exact same R10 FASTQ preserves `legacy` EC!
+        let (s1, s2) = (dir.join("sr_1.fa"), dir.join("sr_2.fa"));
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let circ = [mito.as_slice(), &mito[..400]].concat();
+        for (i, st) in (0..mito.len()).step_by(20).enumerate() {
+            let f = &circ[st..st + 400];
+            a.push((format!("s{i}"), f[..150].to_vec()));
+            b.push((format!("s{i}"), crate::evidence::revcomp(&f[250..])));
+        }
+        fasta(&s1, &a);
+        fasta(&s2, &b);
+        let out_hyb = dir.join("out_hyb");
+        let o_hyb = options(&[
+            "--organelle",
+            "mitochondrion",
+            "--out",
+            out_hyb.to_str().unwrap(),
+            "--seeds",
+            &mt_arg,
+            "--seeds",
+            &pt_arg,
+        ]);
+        let short_arr = [s1, s2];
+        run(&[fq_path], Some(Short { reads: &short_arr, max_bases: 0 }), &o_hyb).unwrap();
+        let mh = read_json(&out_hyb.join("summary.json")).unwrap();
+        let hyb_corrs = mh["long_read"]["corrections"].as_array().unwrap();
+        assert!(hyb_corrs.iter().all(|c| c["chemistry"] == "legacy"), "{hyb_corrs:?}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

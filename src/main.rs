@@ -32,6 +32,7 @@ mod phase;
 mod protein_seed;
 mod pipeline;
 mod primary;
+mod r10_correct;
 mod read_admission;
 mod read_context;
 mod read_model;
@@ -1342,6 +1343,19 @@ struct CorrectArgs {
     /// With --short-reads: hybrid rounds only.
     #[arg(long)]
     no_self_rounds: bool,
+    /// ONT error-correction chemistry: `auto` selects hifiasm-style phased overlap correction on
+    /// R10 FASTQ reads and keeps the `k = 17, 25` solid-kmer dBG scheme for R9, CLR, FASTA, and
+    /// `--short-reads`.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = r10_correct::OntChemistry::Auto,
+        conflicts_with = "r10"
+    )]
+    chemistry: r10_correct::OntChemistry,
+    /// Shorthand for `--chemistry r10` (ONT R10.4 / Simplex phased overlap error correction).
+    #[arg(long)]
+    r10: bool,
     #[arg(long)]
     threads: Option<usize>,
     /// Output FASTA of corrected reads.
@@ -1357,7 +1371,16 @@ fn correct(args: CorrectArgs) -> Result<()> {
             .num_threads(n)
             .build_global()?;
     }
-    let r = correct::run(
+    let explicit_legacy_tuning =
+        args.min_count.is_some() || args.relative > 0.0 || args.k != vec![17, 25];
+    let chemistry = if args.r10 {
+        r10_correct::OntChemistry::R10
+    } else if args.chemistry == r10_correct::OntChemistry::Auto && explicit_legacy_tuning {
+        r10_correct::OntChemistry::Legacy
+    } else {
+        args.chemistry
+    };
+    let r = correct::run_with_chemistry(
         args.reads,
         args.short_reads,
         &args.k,
@@ -1378,12 +1401,13 @@ fn correct(args: CorrectArgs) -> Result<()> {
             relative: args.relative,
             peak_fraction: args.peak_fraction,
         },
+        chemistry,
         &args.out,
         &args.out_json,
     )?;
     eprintln!(
-        "[ovasm] corrected reads -> {}; {:.1}s",
-        r.output, r.elapsed_seconds
+        "[ovasm] corrected reads ({}) -> {}; {:.1}s",
+        r.chemistry, r.output, r.elapsed_seconds
     );
     Ok(())
 }
