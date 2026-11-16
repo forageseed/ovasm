@@ -131,7 +131,7 @@ pub struct MethylationArgs {
 }
 
 // =============================================================================================
-// Pure-Rust BGZF & BAM Streaming Decode
+// Pure-Rust BGZF & BAM Streaming Decoder
 // =============================================================================================
 
 #[inline]
@@ -644,7 +644,7 @@ pub fn stream_bam_file(
 }
 
 // =============================================================================================
-// SAMtags 搂1.7 MM/ML Decoder & Plant Context Classifier (CG / CHG / CHH / 6mA)
+// SAMtags §1.7 MM/ML Decoder & Plant Context Classifier (CG / CHG / CHH / 6mA)
 // =============================================================================================
 
 #[repr(u8)]
@@ -1120,51 +1120,98 @@ fn scan_canonical_kmers(seq: &[u8], k: usize, step: usize, mut f: impl FnMut(usi
     }
 }
 
+#[inline]
+fn contig_c_context(seq: &[u8], circular: bool, pos: usize, plus_strand: bool) -> Option<ModContext> {
+    let n = seq.len();
+    if pos >= n {
+        return None;
+    }
+    if plus_strand {
+        if seq[pos] != b'C' {
+            return None;
+        }
+        let b1 = if pos + 1 < n {
+            seq[pos + 1]
+        } else if circular {
+            seq[(pos + 1) % n]
+        } else {
+            return None;
+        };
+        if b1 == b'G' {
+            return Some(ModContext::Cg);
+        }
+        if is_h_base(b1) {
+            let b2 = if pos + 2 < n {
+                seq[pos + 2]
+            } else if circular {
+                seq[(pos + 2) % n]
+            } else {
+                return None;
+            };
+            if b2 == b'G' {
+                return Some(ModContext::Chg);
+            }
+            if is_h_base(b2) {
+                return Some(ModContext::Chh);
+            }
+        }
+        None
+    } else {
+        if seq[pos] != b'G' {
+            return None;
+        }
+        let p1 = if pos >= 1 {
+            pos - 1
+        } else if circular {
+            n - 1
+        } else {
+            return None;
+        };
+        let b1 = comp_base(seq[p1]);
+        if b1 == b'G' {
+            return Some(ModContext::Cg);
+        }
+        if is_h_base(b1) {
+            let p2 = if pos >= 2 {
+                pos - 2
+            } else if circular && n >= 2 {
+                (pos + n) - 2
+            } else {
+                return None;
+            };
+            let b2 = comp_base(seq[p2]);
+            if b2 == b'G' {
+                return Some(ModContext::Chg);
+            }
+            if is_h_base(b2) {
+                return Some(ModContext::Chh);
+            }
+        }
+        None
+    }
+}
+
 fn count_contig_motifs(seq: &[u8], circular: bool) -> (usize, usize, usize, usize) {
     let n = seq.len();
     if n == 0 {
         return (0, 0, 0, 0);
     }
-    let at = |idx: usize| -> Option<u8> {
-        if idx < n {
-            Some(seq[idx])
-        } else if circular {
-            Some(seq[idx % n])
-        } else {
-            None
-        }
-    };
     let (mut cpg, mut chg, mut chh, mut a_sites) = (0usize, 0usize, 0usize, 0usize);
     for i in 0..n {
         let b0 = seq[i];
         if b0 == b'A' || b0 == b'T' {
             a_sites += 1;
         }
-        if b0 == b'C' {
-            if let Some(b1) = at(i + 1) {
-                if b1 == b'G' {
-                    cpg += 1;
-                } else if is_h_base(b1) {
-                    if let Some(b2) = at(i + 2) {
-                        if b2 == b'G' {
-                            chg += 1;
-                        } else if is_h_base(b2) {
-                            chh += 1;
-                        }
-                    }
-                }
-            }
+        match contig_c_context(seq, circular, i, true) {
+            Some(ModContext::Cg) => cpg += 1,
+            Some(ModContext::Chg) => chg += 1,
+            Some(ModContext::Chh) => chh += 1,
+            _ => {}
         }
-        if b0 == b'G' && i >= 1 {
-            let b1 = comp_base(seq[i - 1]);
-            if is_h_base(b1) && i >= 2 {
-                let b2 = comp_base(seq[i - 2]);
-                if b2 == b'G' {
-                    chg += 1;
-                } else if is_h_base(b2) {
-                    chh += 1;
-                }
-            }
+        match contig_c_context(seq, circular, i, false) {
+            Some(ModContext::Chg) => chg += 1,
+            Some(ModContext::Chh) => chh += 1,
+            _ => {}
         }
     }
     (cpg, chg, chh, a_sites)
@@ -1723,24 +1770,22 @@ fn process_candidate_read(
         let true_len = contig.seq.len();
         let plus_on_target = read_plus_on_target == call.on_orig_strand;
         match call.context {
-            ModContext::Cg => {
-                let dyad_pos = if plus_on_target {
-                    t_pos as usize
-                } else if t_pos > 0 {
-                    (t_pos - 1) as usize
-                } else if contig.circular {
-                    true_len - 1
-                } else {
+            ModContext::Cg | ModContext::Chg | ModContext::Chh => {
+                let Some(ref_ctx) =
+                    contig_c_context(&contig.seq, contig.circular, t_pos as usize, plus_on_target)
+                else {
                     continue;
                 };
-                let next_pos = if dyad_pos + 1 < true_len {
-                    dyad_pos + 1
-                } else if contig.circular {
-                    0
-                } else {
-                    continue;
-                };
-                if contig.seq[dyad_pos] == b'C' && contig.seq[next_pos] == b'G' {
+                if ref_ctx == ModContext::Cg {
+                    let dyad_pos = if plus_on_target {
+                        t_pos as usize
+                    } else if t_pos > 0 {
+                        (t_pos - 1) as usize
+                    } else if contig.circular {
+                        true_len - 1
+                    } else {
+                        continue;
+                    };
                     sites.push(ProjectedSite {
                         contig: cid,
                         pos: dyad_pos as u32,
@@ -1748,16 +1793,12 @@ fn process_candidate_read(
                         context: ModContext::Cg,
                         qual: call.qual,
                     });
-                }
-            }
-            ModContext::Chg | ModContext::Chh => {
-                let expect = if plus_on_target { b'C' } else { b'G' };
-                if contig.seq[t_pos as usize] == expect {
+                } else {
                     sites.push(ProjectedSite {
                         contig: cid,
                         pos: t_pos,
                         plus_strand: plus_on_target,
-                        context: call.context,
+                        context: ref_ctx,
                         qual: call.qual,
                     });
                 }
@@ -2506,4 +2547,3 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
-

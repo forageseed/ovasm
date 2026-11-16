@@ -134,6 +134,15 @@ pub struct LongOptions {
     /// Sample name in the unified graph (segment names, PanSN paths).
     #[arg(long, default_value = "sample")]
     sample: String,
+    /// Profile organelle base modifications (`CG`/`CHG`/`CHH` 5mC and `6mA`) and NUMT/NUPT separation from modBAM inputs.
+    #[arg(long)]
+    methylation: bool,
+    /// Explicit modBAM file(s) with `MM`/`ML` tags for `--methylation` when `--reads` are FASTQ/FASTA.
+    #[arg(long = "methylation-bam")]
+    methylation_bam: Vec<PathBuf>,
+    /// Maximum per-read CG 5mC fraction allowed during BAM read ingestion (e.g. 0.40 to drop hypermethylated NUMTs/NUPTs).
+    #[arg(long)]
+    max_read_methylation: Option<f64>,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: Option<u16>,
     /// Set by `run_ont` / `run_hybrid`: `run ont` defaults to `Auto` (`R10` phased overlap EC on
@@ -656,17 +665,9 @@ fn cap_depth(reads: &[PathBuf], out: &Path, salt: u64) -> Result<(Vec<PathBuf>, 
         if !path.is_file() || fs::metadata(path)?.len() == 0 {
             continue;
         }
-        let mut reader = needletail::parse_fastx_file(path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        while let Some(record) = reader.next() {
-            let record =
-                record.with_context(|| format!("malformed record in {}", path.display()))?;
-            records.push((
-                record.id().to_vec(),
-                record.seq().into_owned(),
-                record.qual().map(|q| q.to_vec()),
-            ));
-        }
+        crate::recruit::for_each_rec(path, |rec| {
+            records.push((rec.id, rec.seq, rec.qual));
+        })?;
     }
     let depths = read_depths(&records.iter().map(|r| r.1.as_slice()).collect::<Vec<_>>());
     let depth = depth_quantile(&depths, 0.5);
@@ -1076,6 +1077,9 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 if o.recruit_max_bases > 0 {
                     argv = argv.opt("--max-bases", o.recruit_max_bases.to_string());
                 }
+                if let Some(m) = o.max_read_methylation {
+                    argv = argv.opt("--max-read-methylation", m.to_string());
+                }
                 for (name, paths) in &seeds {
                     for p in paths {
                         argv = argv.opt("--seed", seed_spec(name, p));
@@ -1354,7 +1358,7 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
             .remove(organelle)
             .unwrap_or_else(|| Err(anyhow::anyhow!("no reads of the {organelle}")))
             .and_then(|r| {
-                assemble(o, organelle, &r, &dir, &seeds, &builtin, files.clone(), pipeline_name, t0)
+                assemble(o, long, organelle, &r, &dir, &seeds, &builtin, files.clone(), pipeline_name, t0)
             });
         match result {
             Ok(report) => {
@@ -1459,6 +1463,7 @@ fn pick_assemble_k(high: f64, low: f64) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     o: &LongOptions,
+    long: &[PathBuf],
     organelle: &str,
     r: &Reads,
     dir: &Path,
@@ -1530,8 +1535,12 @@ fn assemble(
         other_organelle_filter: false,
         shallow_seeds: false,
         depth_reference: Default::default(),
-        methylation: false,
-        methylation_bam: Vec::new(),
+        methylation: o.methylation,
+        methylation_bam: if !o.methylation_bam.is_empty() {
+            o.methylation_bam.clone()
+        } else {
+            long.iter().filter(|p| crate::methylation::is_bam_path(p)).cloned().collect()
+        },
         max_read_methylation: None,
     })?;
     // homopolymer runs from the reads (see `hp_polish`): the molecules the stages wrote are kept
