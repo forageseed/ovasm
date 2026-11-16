@@ -2756,11 +2756,19 @@ fn depth_peak(counts: &[u32], relative: bool) -> f64 {
         past[i] = past[i + 1] + hist[i];
     }
     let first = bin(counts[0]);
-    let valley = (first + 1..density.len() - 1).find(|&i| {
-        density[i] <= density[i - 1]
-            && density[i] < density[i + 1]
-            && past[i] as f64 >= MIN_PAST_VALLEY * counts.len() as f64
-    });
+    // the lowest count is a valley when the counts rise from it: a sequence shallow enough to
+    // peak a few counts above the floor has no valley before its peak, and the first one lay in
+    // its tail (rice SAMEA115396709 subsampled, 21-mers of the mitochondrion's own bait k-mers:
+    // counts of 3 rising to a peak at 6-7, read as 25 from a bump of the tail)
+    let valley = if first + 1 < density.len() && density[first] < density[first + 1] {
+        Some(first)
+    } else {
+        (first + 1..density.len() - 1).find(|&i| {
+            density[i] <= density[i - 1]
+                && density[i] < density[i + 1]
+                && past[i] as f64 >= MIN_PAST_VALLEY * counts.len() as f64
+        })
+    };
     // nodes per relative width: h / ln(upper / lower), bin 0 (count 0) never holds a node
     let height = |i: usize| {
         if relative && i > 0 {
@@ -2826,6 +2834,27 @@ mod tests {
         tail.extend([60, 61, 90]);
         let d = super::sequence_depth(&tail);
         assert!((9.0..=17.0).contains(&d), "{d}");
+    }
+
+    #[test]
+    fn a_sequence_peaking_just_above_the_floor_is_read_at_its_peak_not_in_its_tail() {
+        // k-mers at mean depth 7 (negative binomial, dispersion 8), counts of 3 and more: they
+        // rise from 3 to the peak, with no valley before it; a bump of other k-mers at 24-26
+        // (a few kb at another depth) lies past the first valley of the tail
+        let (mean, r) = (7.0f64, 8.0f64);
+        let q = r / (r + mean);
+        let mut pmf = q.powf(r);
+        let mut counts = Vec::new();
+        for c in 1..80u32 {
+            pmf *= (f64::from(c) - 1.0 + r) / f64::from(c) * (1.0 - q);
+            if c >= 3 {
+                counts.extend(std::iter::repeat(c).take((40_000.0 * pmf).round() as usize));
+            }
+        }
+        counts.extend(std::iter::repeat(24).take(400).chain(std::iter::repeat(25).take(600)).chain(std::iter::repeat(26).take(400)));
+        counts.sort_unstable();
+        let d = super::sequence_depth(&counts);
+        assert!((5.0..=8.0).contains(&d), "{d}");
     }
 
     #[test]
