@@ -1,5 +1,5 @@
-*.sh text eol=lf
-scripts/** linguist-documentation
-docs/** linguist-documentation
-tests/*.py linguist-documentation
-tests/**/*.py linguist-documentation
+*.sh text eol=lf linguist-documentation=true
+*.py linguist-documentation=true
+*.cpp linguist-documentation=true
+*.ps1 linguist-documentation=true
+*.cmd linguist-documentation=true
