@@ -1188,7 +1188,20 @@ fn recruit_all(
         if let Some(d) = cfg.recruit_depth {
             argv = argv.opt("--target-depth", d.to_string());
         }
-        if let Some(m) = cfg.max_read_methylation {
+        let effective_max_meth = cfg.max_read_methylation.or_else(|| {
+            if !cfg.methylation {
+                return None;
+            }
+            crate::methylation::auto_ingest_max_cg_methylation(&cfg.reads, cfg.seed_lineage).map(
+                |(cutoff, regime)| {
+                    log(&format!(
+                        "methylation pre-recruitment filter: regime={regime}, auto max-read-methylation={cutoff:.2}"
+                    ));
+                    cutoff
+                },
+            )
+        });
+        if let Some(m) = effective_max_meth {
             argv = argv.opt("--max-read-methylation", m.to_string());
         }
         // HiFi reads carry whole-read depth profiles: the gate keeps extension in the

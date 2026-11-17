@@ -1077,7 +1077,22 @@ fn run(long: &[PathBuf], short: Option<Short>, o: &LongOptions) -> Result<Value>
                 if o.recruit_max_bases > 0 {
                     argv = argv.opt("--max-bases", o.recruit_max_bases.to_string());
                 }
-                if let Some(m) = o.max_read_methylation {
+                let effective_max_meth = o.max_read_methylation.or_else(|| {
+                    if !o.methylation {
+                        return None;
+                    }
+                    crate::methylation::auto_ingest_max_cg_methylation(long, o.lineage).map(
+                        |(cutoff, regime)| {
+                            if round == 1 {
+                                log(&format!(
+                                    "methylation pre-recruitment filter: regime={regime}, auto max-read-methylation={cutoff:.2}"
+                                ));
+                            }
+                            cutoff
+                        },
+                    )
+                });
+                if let Some(m) = effective_max_meth {
                     argv = argv.opt("--max-read-methylation", m.to_string());
                 }
                 for (name, paths) in &seeds {

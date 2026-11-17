@@ -584,6 +584,73 @@ pub fn first_bam_read_lengths(path: &Path, limit: usize) -> Result<Vec<usize>> {
     Ok(lens)
 }
 
+/// Pre-scan up to `sample_limit` primary BAM records carrying `MM`/`ML` CpG calls to infer
+/// a lineage-aware pre-recruitment `--max-read-methylation` cutoff when `--methylation` is
+/// enabled without an explicit `--max-read-methylation` value.
+///
+/// Returns `Some((max_cg, regime_name))` when hypermethylated nuclear reads are detected so
+/// nuclear NUMTs/NUPTs are filtered before recruitment and graph construction, or `None` when
+/// BAMs lack `MM`/`ML` tags or belong to an unmethylated clade (e.g. Diptera, Nematoda) where
+/// pre-recruitment CpG pruning should stay off to avoid false read loss.
+pub fn auto_ingest_max_cg_methylation(
+    paths: &[PathBuf],
+    lineage: crate::seeddb::Lineage,
+) -> Option<(f64, &'static str)> {
+    const SAMPLE_LIMIT: usize = 2000;
+    const MIN_CPGS: usize = 5;
+    let mut cgs: Vec<f64> = Vec::new();
+    for path in paths.iter().filter(|p| is_bam_path(p)) {
+        if cgs.len() >= SAMPLE_LIMIT {
+            break;
+        }
+        let _ = for_each_bam_read(path, true, |r| {
+            if let (Some(mm), Some(ml)) = (r.mm.as_deref(), r.ml.as_deref()) {
+                let s = summarize_read_mods(&r.seq, mm, ml, 0.5);
+                if s.cg_calls >= MIN_CPGS {
+                    cgs.push(s.cg_frac());
+                }
+            }
+            Ok(cgs.len() < SAMPLE_LIMIT)
+        });
+    }
+    if cgs.len() < 16 {
+        return None;
+    }
+    cgs.sort_by(|a, b| a.total_cmp(b));
+    let med = quantile_sorted(&cgs, 0.50);
+    let p90 = quantile_sorted(&cgs, 0.90);
+    let high: Vec<f64> = cgs.iter().copied().filter(|&x| x >= 0.40).collect();
+    let high_share = high.len() as f64 / cgs.len() as f64;
+    let high_med = quantile_sorted(&high, 0.50);
+    match lineage {
+        crate::seeddb::Lineage::Landplants => {
+            if high_share >= 0.02 || p90 >= 0.35 {
+                Some((0.40, EpigeneticRegime::PlantCgChgRddm.as_str()))
+            } else {
+                None
+            }
+        }
+        crate::seeddb::Lineage::Metazoa => {
+            if med >= 0.40 || (high_share >= 0.04 && high_med >= 0.50) {
+                Some((0.30, EpigeneticRegime::VertebrateGlobalCpg.as_str()))
+            } else if high_share >= 0.01 || p90 >= 0.25 {
+                Some((0.38, EpigeneticRegime::InvertebrateMosaicCpg.as_str()))
+            } else {
+                // DNMT-deficient / unmethylated animal clade (e.g. Diptera, Nematoda):
+                // keep all reads during recruitment and let `check methylation` profile cleanly.
+                None
+            }
+        }
+        crate::seeddb::Lineage::Fungi => {
+            if high_share >= 0.02 || p90 >= 0.35 {
+                Some((0.40, EpigeneticRegime::FungiVariable5mC.as_str()))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Convert BAM primary records into `recruit::Rec` records, applying any active BAM methylation filter.
 pub fn for_each_bam_rec(path: &Path, mut f: impl FnMut(Rec)) -> Result<()> {
     let filt = current_bam_filter();
