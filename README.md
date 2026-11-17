@@ -99,17 +99,22 @@ ovasm check methylation --target result/mitochondrion/molecules.fasta --gfa resu
 ### 4. Species pan-organelle graph & population short-read cohort
 
 ```sh
-# Merge HiFi organelle graphs across accessions into a species pan-graph
-ovasm pan merge --graphs acc1/mitochondrion/organelle.gfa --graphs acc2/mitochondrion/organelle.gfa -o pan.mitochondrion.gfa
-ovasm pan merge --graphs acc1/plastid/organelle.gfa --graphs acc2/plastid/organelle.gfa -o pan.plastid.gfa
+# Prepare a 2-column TSV/TXT: sample<TAB>path (either run directory or organelle.gfa path)
+#   ACC_001	assemblies/ACC_001
+#   ACC_002	assemblies/ACC_002
+
+# Batch-merge both organelles at once (writes pan/pan.mitochondrion.gfa & pan/pan.plastid.gfa)
+ovasm pan merge -s panel_samples.tsv -G all -o pan
+# Or merge a single organelle from run directories (-G mt / -G pt) or a direct GFA table:
+ovasm pan merge -s mt_gfas.tsv -o pan/pan.mitochondrion.gfa
 
 # Reconstruct an individual from Illumina WGS reads against both organelle pan-graphs
 ovasm pan reconstruct --reads wgs_R1.fq.gz --reads wgs_R2.fq.gz \
-  --reference mitochondrion=pan.mitochondrion.gfa --reference plastid=pan.plastid.gfa \
+  --reference mitochondrion=pan/pan.mitochondrion.gfa --reference plastid=pan/pan.plastid.gfa \
   --sample ACC_001 --threads 8 --out recon/ACC_001
 
-# Summarize hundreds or thousands of reconstructed individuals into a cohort graph & VCF
-ovasm pan cohort --runs recon/ACC_001 --runs recon/ACC_002 --panel-mt pan.mitochondrion.gfa --panel-pt pan.plastid.gfa -o cohort_out
+# Summarize hundreds or thousands of reconstructed individuals (sample<TAB>recon_dir TSV)
+ovasm pan cohort --samples cohort_samples.tsv --out cohort_out
 ```
 
 ### Output layout & agent-ready schema

@@ -99,17 +99,22 @@ ovasm check methylation --target result/mitochondrion/molecules.fasta --gfa resu
 ### 4. 物种泛细胞器图谱构建与千样本短读段群体重建
 
 ```sh
-# 合并多份品系的 HiFi 细胞器组装图为物种泛图
-ovasm pan merge --graphs acc1/mitochondrion/organelle.gfa --graphs acc2/mitochondrion/organelle.gfa -o pan.mitochondrion.gfa
-ovasm pan merge --graphs acc1/plastid/organelle.gfa --graphs acc2/plastid/organelle.gfa -o pan.plastid.gfa
+# 准备两列 TSV 或 TXT（一列样本名，一列组装目录或 organelle.gfa 路径）：
+#   ACC_001	assemblies/ACC_001
+#   ACC_002	assemblies/ACC_002
+
+# 一条命令同时合并线粒体与叶绿体泛图（输出 pan/pan.mitochondrion.gfa 与 pan/pan.plastid.gfa）
+ovasm pan merge -s panel_samples.tsv -G all -o pan
+# 也可按单个细胞器合并（目录加 -G mt / -G pt，或直接给 GFA 文件路径表）：
+ovasm pan merge -s mt_gfas.tsv -o pan/pan.mitochondrion.gfa
 
 # 基于物种泛图从单个样本的 Illumina WGS 短读段重建双细胞器
 ovasm pan reconstruct --reads wgs_R1.fq.gz --reads wgs_R2.fq.gz \
-  --reference mitochondrion=pan.mitochondrion.gfa --reference plastid=pan.plastid.gfa \
+  --reference mitochondrion=pan/pan.mitochondrion.gfa --reference plastid=pan/pan.plastid.gfa \
   --sample ACC_001 --threads 8 --out recon/ACC_001
 
-# 汇总成百上千个重建样本，输出群体泛图、PAV 表、VCF 与重组连接频率
-ovasm pan cohort --runs recon/ACC_001 --runs recon/ACC_002 --panel-mt pan.mitochondrion.gfa --panel-pt pan.plastid.gfa -o cohort_out
+# 批量汇总成百上千个重建样本（sample<TAB>recon_dir 表），输出群体泛图、PAV 表、VCF 与重组连接频率
+ovasm pan cohort --samples cohort_samples.tsv --out cohort_out
 ```
 
 ### 输出目录结构

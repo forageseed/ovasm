@@ -71,6 +71,137 @@ pub struct PanReport {
 /// A sample path over pieces: (name, steps, circular, sample index).
 type PanPath = (String, Vec<(usize, bool)>, bool, usize);
 
+/// One input entry for `ovasm pan merge`: optional explicit sample name + GFA file or run directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanInput {
+    pub sample: Option<String>,
+    pub path: PathBuf,
+}
+
+/// Parse a `.tsv` or `.txt` batch sample list (`sample<TAB>path`, `sample path`, or `path` per line).
+pub fn parse_sample_list(list_path: &Path) -> Result<Vec<PanInput>> {
+    let raw_text = fs::read_to_string(list_path)
+        .with_context(|| format!("cannot read {}", list_path.display()))?;
+    let text = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
+    let base_dir = list_path.parent().filter(|p| !p.as_os_str().is_empty());
+
+    let resolve_rel = |raw: &str| -> PathBuf {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() || p.exists() {
+            p
+        } else if let Some(b) = base_dir {
+            let cand = b.join(raw);
+            if cand.exists() { cand } else { p }
+        } else {
+            p
+        }
+    };
+    let is_two_col_header = |c0: &str, c1: &str| -> bool {
+        matches!(
+            c0.to_ascii_lowercase().as_str(),
+            "sample" | "sample_id" | "accession" | "id" | "name"
+        ) && !resolve_rel(c1).exists()
+    };
+    let is_one_col_header = |c0: &str| -> bool {
+        matches!(
+            c0.to_ascii_lowercase().as_str(),
+            "path" | "gfa" | "file" | "dir" | "directory"
+        ) && !resolve_rel(c0).exists()
+    };
+
+    let mut out = Vec::new();
+    let mut first_data_line = true;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.contains('\t') {
+            let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+            if cols.len() == 1 || cols.get(1).is_none_or(|c| c.is_empty()) {
+                if first_data_line && is_one_col_header(cols[0]) {
+                    first_data_line = false;
+                    continue;
+                }
+                out.push(PanInput { sample: None, path: resolve_rel(cols[0]) });
+            } else {
+                if first_data_line && is_two_col_header(cols[0], cols[1]) {
+                    first_data_line = false;
+                    continue;
+                }
+                if cols[0].is_empty() {
+                    bail!("{}: empty sample name in line {raw_line:?}", list_path.display());
+                }
+                out.push(PanInput {
+                    sample: Some(cols[0].to_string()),
+                    path: resolve_rel(cols[1]),
+                });
+            }
+        } else if resolve_rel(line).exists() {
+            out.push(PanInput { sample: None, path: resolve_rel(line) });
+        } else {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 1 {
+                if first_data_line && is_one_col_header(parts[0]) {
+                    first_data_line = false;
+                    continue;
+                }
+                out.push(PanInput { sample: None, path: resolve_rel(parts[0]) });
+            } else {
+                let rest = line[parts[0].len()..].trim();
+                let raw_path = if resolve_rel(rest).exists() { rest } else { parts[1] };
+                if first_data_line && is_two_col_header(parts[0], raw_path) {
+                    first_data_line = false;
+                    continue;
+                }
+                out.push(PanInput {
+                    sample: Some(parts[0].to_string()),
+                    path: resolve_rel(raw_path),
+                });
+            }
+        }
+        first_data_line = false;
+    }
+    if out.is_empty() {
+        bail!("{}: no sample graphs listed", list_path.display());
+    }
+    Ok(out)
+}
+
+/// Resolve either a `.gfa` file or an `ovasm run` output directory to its `organelle.gfa`.
+pub fn resolve_input_gfa(raw_path: &Path, organelle: Option<&str>) -> Result<PathBuf> {
+    if raw_path.is_file() {
+        return Ok(raw_path.to_path_buf());
+    }
+    if raw_path.is_dir() {
+        if let Some(org) = organelle {
+            let sub = raw_path.join(org).join("organelle.gfa");
+            if sub.is_file() {
+                return Ok(sub);
+            }
+            let direct = raw_path.join("organelle.gfa");
+            if raw_path.file_name().and_then(|s| s.to_str()) == Some(org) && direct.is_file() {
+                return Ok(direct);
+            }
+            bail!("{}: directory has no {org}/organelle.gfa", raw_path.display());
+        }
+        let direct = raw_path.join("organelle.gfa");
+        if direct.is_file() {
+            return Ok(direct);
+        }
+        if raw_path.join("mitochondrion/organelle.gfa").is_file()
+            || raw_path.join("plastid/organelle.gfa").is_file()
+        {
+            bail!(
+                "{}: run directory contains organelle subfolders; pass -G mt, -G pt or -G all (or point directly to organelle.gfa)",
+                raw_path.display()
+            );
+        }
+        bail!("{}: directory has no organelle.gfa", raw_path.display());
+    }
+    bail!("{}: no such GFA file or directory", raw_path.display())
+}
+
 /// One sample graph as read: its graph, P lines (name, step labels, circular) and name.
 struct SampleGraph {
     sample: String,
@@ -80,7 +211,76 @@ struct SampleGraph {
     path_tags: BTreeMap<String, Vec<String>>,
 }
 
-fn read_sample(path: &Path) -> Result<SampleGraph> {
+fn rename_sample(sg: &mut SampleGraph, new_sample: &str) -> Result<()> {
+    if !valid_pansn_field(new_sample) {
+        bail!(
+            "{}: sample {new_sample:?} must use only letters, digits, '_', '.' and '-'",
+            sg.path.display()
+        );
+    }
+    let old_sample = sg.sample.clone();
+    let old_seg_prefix = format!("{old_sample}.");
+    let new_seg_prefix = format!("{new_sample}.");
+    if old_sample == new_sample
+        && sg.graph.names.iter().all(|n| n.starts_with(&new_seg_prefix))
+    {
+        return Ok(());
+    }
+    let mut seg_map: FxHashMap<String, String> = FxHashMap::default();
+    let mut seen_segs: FxHashSet<String> = FxHashSet::default();
+    for name in &mut sg.graph.names {
+        let old_name = name.clone();
+        let new_name = if let Some(rest) = old_name.strip_prefix(&old_seg_prefix) {
+            format!("{new_sample}.{rest}")
+        } else if old_name.starts_with(&new_seg_prefix) {
+            old_name.clone()
+        } else {
+            format!("{new_sample}.{old_name}")
+        };
+        if !seen_segs.insert(new_name.clone()) {
+            bail!("{}: duplicate segment name {new_name} after renaming to {new_sample}", sg.path.display());
+        }
+        *name = new_name.clone();
+        seg_map.insert(old_name, new_name);
+    }
+
+    let old_path_prefix = format!("{old_sample}#");
+    let new_path_prefix = format!("{new_sample}#");
+    let mut new_path_tags = BTreeMap::new();
+    let mut seen_paths = FxHashSet::default();
+    for (pname, labels, _) in &mut sg.paths {
+        let old_pname = pname.clone();
+        let new_pname = if let Some(rest) = old_pname.strip_prefix(&old_path_prefix) {
+            format!("{new_sample}#{rest}")
+        } else if old_pname.starts_with(&new_path_prefix) {
+            old_pname.clone()
+        } else {
+            format!("{new_sample}#{old_pname}")
+        };
+        if !seen_paths.insert(new_pname.clone()) {
+            bail!("{}: duplicate path name {new_pname} after renaming to {new_sample}", sg.path.display());
+        }
+        let new_labels = labels
+            .split(' ')
+            .map(|step| {
+                let (seg, orient) = step.split_at(step.len() - 1);
+                let mapped = seg_map.get(seg).map(String::as_str).unwrap_or(seg);
+                format!("{mapped}{orient}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        *pname = new_pname.clone();
+        *labels = new_labels;
+        if let Some(tags) = sg.path_tags.remove(&old_pname) {
+            new_path_tags.insert(new_pname, tags);
+        }
+    }
+    sg.path_tags = new_path_tags;
+    sg.sample = new_sample.to_string();
+    Ok(())
+}
+
+fn read_sample(path: &Path, sample_override: Option<&str>) -> Result<SampleGraph> {
     let text =
         fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let graph = parse_gfa(path)?;
@@ -143,7 +343,7 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
             .context("no sample name (H sn:Z:) and no usable file name")?
             .to_string(),
     };
-    if !valid_pansn_field(&sample) {
+    if sample_override.is_none() && !valid_pansn_field(&sample) {
         bail!(
             "{}: sample {sample:?} must use only letters, digits, '_', '.' and '-'",
             path.display()
@@ -207,13 +407,17 @@ fn read_sample(path: &Path) -> Result<SampleGraph> {
             });
         }
     }
-    Ok(SampleGraph {
+    let mut sg = SampleGraph {
         sample,
         path: path.to_path_buf(),
         graph,
         paths,
         path_tags,
-    })
+    };
+    if let Some(new_sample) = sample_override {
+        rename_sample(&mut sg, new_sample)?;
+    }
+    Ok(sg)
 }
 
 #[inline]
@@ -300,13 +504,30 @@ fn join_shared(g: &Graph, k: usize, uf: &mut StrandUf, base0: &[usize]) -> (u64,
 }
 
 pub fn run(inputs: &[PathBuf], p: &PanParams, out: &Path, out_json: &Path) -> Result<PanReport> {
+    let named: Vec<PanInput> = inputs
+        .iter()
+        .map(|path| PanInput { sample: None, path: path.clone() })
+        .collect();
+    run_named(&named, None, p, out, out_json)
+}
+
+pub fn run_named(
+    inputs: &[PanInput],
+    organelle: Option<&str>,
+    p: &PanParams,
+    out: &Path,
+    out_json: &Path,
+) -> Result<PanReport> {
     let t0 = Instant::now();
     if p.k % 2 == 0 || !(15..=63).contains(&p.k) {
         bail!("k must be odd and in 15..=63 (got {})", p.k);
     }
     let samples = inputs
         .iter()
-        .map(|f| read_sample(f))
+        .map(|entry| {
+            let gfa = resolve_input_gfa(&entry.path, organelle)?;
+            read_sample(&gfa, entry.sample.as_deref())
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut seen_samples = FxHashSet::default();
     for sg in &samples {
@@ -743,5 +964,70 @@ mod tests {
         )
         .is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sample_table_tsv_and_txt_rename_default_sample_graphs_and_resolve_run_dirs() {
+        let dir = std::env::temp_dir().join(format!("ovasm-pan-tsv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let d1 = dir.join("acc1").join("mitochondrion");
+        let d2 = dir.join("acc2").join("mitochondrion");
+        fs::create_dir_all(&d1).unwrap();
+        fs::create_dir_all(&d2).unwrap();
+        let (a, b, r) = (seq(1200, 11), seq(1100, 12), seq(300, 13));
+        // Both runs used the default `--sample sample`, which would collide without column 1.
+        let g1_tmp = sample_gfa(&d1, "sample", &a, &b, &r, false);
+        let g2_tmp = sample_gfa(&d2, "sample", &a, &b, &r, true);
+        let g1 = d1.join("organelle.gfa");
+        let g2 = d2.join("organelle.gfa");
+        let t1 = fs::read_to_string(&g1_tmp)
+            .unwrap()
+            .replace("TP:Z:circular", "TP:Z:circular\tst:Z:unresolved_configuration");
+        fs::write(&g1, t1).unwrap();
+        fs::rename(&g2_tmp, &g2).unwrap();
+        fs::remove_file(&g1_tmp).unwrap();
+
+        // 1) Two-column TSV with header and comment, pointing directly to GFA files (relative to TSV).
+        let tsv = dir.join("samples.tsv");
+        fs::write(
+            &tsv,
+            "# batch merge table\nsample\tpath\nACC_001\tacc1/mitochondrion/organelle.gfa\nACC_002\tacc2/mitochondrion/organelle.gfa\n",
+        )
+        .unwrap();
+        let parsed = parse_sample_list(&tsv).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].sample.as_deref(), Some("ACC_001"));
+        assert_eq!(parsed[1].sample.as_deref(), Some("ACC_002"));
+
+        let out_gfa = dir.join("pan.mt.gfa");
+        let out_json = dir.join("pan.mt.json");
+        let rep = run_named(&parsed, None, &PanParams { k: 31 }, &out_gfa, &out_json).unwrap();
+        assert_eq!(rep.samples.len(), 2);
+        assert_eq!(rep.samples[0].sample, "ACC_001");
+        assert_eq!(rep.samples[1].sample, "ACC_002");
+        assert_eq!(rep.verified_paths, 4);
+        let merged = fs::read_to_string(&out_gfa).unwrap();
+        assert!(merged.lines().any(|l| l.starts_with("P\tACC_001#1#mt\t") && l.contains("uj:Z:")));
+        assert!(merged.lines().any(|l| l.starts_with("P\tACC_002#1#mt\t")));
+        let segs = fs::read_to_string(out_gfa.with_extension("segments.tsv")).unwrap();
+        assert!(segs.contains("ACC_001\tACC_001.u0\t"));
+        assert!(segs.contains("ACC_002\tACC_002.u0\t"));
+
+        // 2) Space-separated TXT pointing to parent run directories (`acc1`, `acc2`) + organelle = mitochondrion.
+        let txt = dir.join("samples.txt");
+        fs::write(&txt, "sample dir\nACC_001 acc1\nACC_002 acc2\n").unwrap();
+        let parsed_txt = parse_sample_list(&txt).unwrap();
+        let out_gfa2 = dir.join("pan2.mt.gfa");
+        let rep2 = run_named(
+            &parsed_txt,
+            Some("mitochondrion"),
+            &PanParams { k: 31 },
+            &out_gfa2,
+            &dir.join("pan2.mt.json"),
+        )
+        .unwrap();
+        assert_eq!(rep2.pan_bases, rep.pan_bases);
+        assert_eq!(rep2.verified_paths, 4);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1823,59 +1823,102 @@ fn panel(args: PanelArgs) -> Result<()> {
 
 #[derive(clap::Args)]
 struct PanArgs {
-    /// Sample OV-GFA (repeatable).
-    #[arg(long)]
-    gfa: Vec<PathBuf>,
-    /// File listing sample OV-GFAs, one path per line (with or instead of --gfa).
-    #[arg(long)]
-    gfa_list: Option<PathBuf>,
+    /// Sample OV-GFA or `SAMPLE=PATH` (repeatable; `--graphs` alias).
+    #[arg(long, visible_alias = "graphs")]
+    gfa: Vec<String>,
+    /// Batch `.tsv` or `.txt` list: `sample<TAB>path` (or `sample path`), or one path per line;
+    /// `path` may be an `organelle.gfa` file or an `ovasm run` directory (with `-G`).
+    #[arg(short = 's', long = "samples", visible_alias = "gfa-list")]
+    samples: Vec<PathBuf>,
+    /// Organelle when entries are `ovasm run` directories: `mt`, `pt`, or `all`
+    /// (`all`/`both` writes `<out>/pan.mitochondrion.gfa` and `<out>/pan.plastid.gfa`).
+    #[arg(short = 'G', long, value_enum)]
+    organelle: Option<pipeline::OrganelleChoice>,
     /// Shared k-mer length that joins samples' bases (odd, at most 63).
     #[arg(long, default_value_t = 63)]
     k: usize,
-    /// Output pangenome GFA.
-    #[arg(long)]
+    /// Output pangenome GFA (or output directory when `-G all`).
+    #[arg(short = 'o', long)]
     out: PathBuf,
-    /// Output JSON report.
+    /// Output JSON report (default: `<out>.json`).
     #[arg(long)]
-    out_json: PathBuf,
+    out_json: Option<PathBuf>,
 }
 
 fn pan(args: PanArgs) -> Result<()> {
-    let mut inputs = args.gfa.clone();
-    if let Some(list) = &args.gfa_list {
-        let text = std::fs::read_to_string(list)
-            .with_context(|| format!("cannot read {}", list.display()))?;
-        inputs.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(PathBuf::from),
-        );
+    let mut inputs: Vec<pan::PanInput> = Vec::new();
+    for raw in &args.gfa {
+        if !Path::new(raw).exists() {
+            if let Some((sample, path)) = raw.split_once('=') {
+                if !sample.trim().is_empty() && !path.trim().is_empty() {
+                    inputs.push(pan::PanInput {
+                        sample: Some(sample.trim().to_string()),
+                        path: PathBuf::from(path.trim()),
+                    });
+                    continue;
+                }
+            }
+        }
+        inputs.push(pan::PanInput {
+            sample: None,
+            path: PathBuf::from(raw),
+        });
+    }
+    for list in &args.samples {
+        inputs.extend(pan::parse_sample_list(list)?);
     }
     if inputs.is_empty() {
-        bail!("give sample graphs with --gfa or --gfa-list");
+        bail!("give sample graphs with --samples (-s), --gfa-list, or --gfa");
     }
-    let report = pan::run(
-        &inputs,
-        &pan::PanParams { k: args.k },
-        &args.out,
-        &args.out_json,
-    )?;
-    eprintln!(
-        "[ovasm] {} samples, {} bp -> {} pieces, {} bp ({} links); in every sample: {} pieces, {} bp; \
-         verified {} segments, {} links, {} paths; {:.1}s",
-        report.samples.len(),
-        report.sample_bases,
-        report.pieces,
-        report.pan_bases,
-        report.links,
-        report.core_pieces,
-        report.core_bases,
-        report.verified_segments,
-        report.verified_links,
-        report.verified_paths,
-        report.elapsed_seconds
-    );
+
+    let print_summary = |label: Option<&str>, report: &pan::PanReport| {
+        let prefix = label.map(|o| format!("{o}: ")).unwrap_or_default();
+        eprintln!(
+            "[ovasm] {prefix}{} samples, {} bp -> {} pieces, {} bp ({} links); in every sample: {} pieces, {} bp; \
+             verified {} segments, {} links, {} paths; {:.1}s",
+            report.samples.len(),
+            report.sample_bases,
+            report.pieces,
+            report.pan_bases,
+            report.links,
+            report.core_pieces,
+            report.core_bases,
+            report.verified_segments,
+            report.verified_links,
+            report.verified_paths,
+            report.elapsed_seconds
+        );
+    };
+
+    let params = pan::PanParams { k: args.k };
+    match args.organelle {
+        Some(pipeline::OrganelleChoice::Both) => {
+            if args.out_json.is_some() {
+                bail!("--out-json cannot be combined with -G all (writes <out>/pan.<organelle>.json)");
+            }
+            std::fs::create_dir_all(&args.out)?;
+            for org in ["mitochondrion", "plastid"] {
+                let out_gfa = args.out.join(format!("pan.{org}.gfa"));
+                let out_json = args.out.join(format!("pan.{org}.json"));
+                let report = pan::run_named(&inputs, Some(org), &params, &out_gfa, &out_json)?;
+                print_summary(Some(org), &report);
+            }
+        }
+        choice => {
+            let org = match choice {
+                Some(pipeline::OrganelleChoice::Mitochondrion) => Some("mitochondrion"),
+                Some(pipeline::OrganelleChoice::Plastid) => Some("plastid"),
+                Some(pipeline::OrganelleChoice::Both) => unreachable!(),
+                None => None,
+            };
+            let out_json = args
+                .out_json
+                .clone()
+                .unwrap_or_else(|| args.out.with_extension("json"));
+            let report = pan::run_named(&inputs, org, &params, &args.out, &out_json)?;
+            print_summary(org, &report);
+        }
+    }
     Ok(())
 }
 
