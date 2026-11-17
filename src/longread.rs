@@ -98,7 +98,7 @@ pub struct LongOptions {
     seeds: Vec<String>,
     /// Built-in seed library: landplants (mitochondrion and plastid), metazoa or fungi
     /// (mitochondrion only).
-    #[arg(long, value_enum, default_value_t = crate::seeddb::Lineage::Landplants)]
+    #[arg(short = 'x', long, value_enum, default_value_t = crate::seeddb::Lineage::Landplants)]
     lineage: crate::seeddb::Lineage,
     /// Recruit one organelle without seeding the other (not advised).
     #[arg(long)]
@@ -143,7 +143,7 @@ pub struct LongOptions {
     /// Maximum per-read CG 5mC fraction allowed during BAM read ingestion (e.g. 0.40 to drop hypermethylated NUMTs/NUPTs).
     #[arg(long)]
     max_read_methylation: Option<f64>,
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    #[arg(short = 't', long, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: Option<u16>,
     /// Set by `run_ont` / `run_hybrid`: `run ont` defaults to `Auto` (`R10` phased overlap EC on
     /// R10 FASTQ, `Legacy` otherwise); `run hybrid` always uses `Legacy`.
@@ -1541,7 +1541,7 @@ fn assemble(
         } else {
             long.iter().filter(|p| crate::methylation::is_bam_path(p)).cloned().collect()
         },
-        max_read_methylation: None,
+        max_read_methylation: o.max_read_methylation,
     })?;
     // homopolymer runs from the reads (see `hp_polish`): the molecules the stages wrote are kept
     // beside as molecules.unpolished.fasta. With short reads of the sample (`run hybrid`) those

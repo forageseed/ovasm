@@ -1230,14 +1230,18 @@ fn single_copy_crossroads(g: &Graph, depth: &RepeatDepth<'_>) -> Vec<bool> {
         .collect()
 }
 
+/// Shallow minority stub threshold (fraction of median depth) and length ceiling below which a
+/// minor nuclear/variant bubble or dead-end tip does not turn its flanking unique segment into a
+/// multi-copy repeat when a non-stub neighbour already leaves that end.
+const STUB_DEPTH_FOLD: f64 = 0.25;
+const STUB_MAX_LEN: usize = 1_000;
+
 fn repeat_segments(
     g: &Graph,
     max_len: usize,
     supported: &[bool],
     depth: &RepeatDepth<'_>,
 ) -> Vec<bool> {
-    // (segment, right end?) -> distinct links touching that end
-    let mut degree: FxHashMap<(usize, bool), usize> = FxHashMap::default();
     let mut keys: Vec<(Oriented, Oriented)> = g
         .links
         .iter()
@@ -1247,14 +1251,38 @@ fn repeat_segments(
         .collect();
     keys.sort();
     keys.dedup();
-    for (a, b) in keys {
-        *degree.entry((a.0, a.1)).or_default() += 1; // leaves a's right end if a is forward
-        *degree.entry((b.0, !b.1)).or_default() += 1; // enters b's left end if b is forward
+    let mut raw_degree: FxHashMap<(usize, bool), usize> = FxHashMap::default();
+    let mut end_nbrs: FxHashMap<(usize, bool), Vec<usize>> = FxHashMap::default();
+    for &(a, b) in &keys {
+        *raw_degree.entry((a.0, a.1)).or_default() += 1; // leaves a's right end if a is forward
+        *raw_degree.entry((b.0, !b.1)).or_default() += 1; // enters b's left end if b is forward
+        end_nbrs.entry((a.0, a.1)).or_default().push(b.0);
+        end_nbrs.entry((b.0, !b.1)).or_default().push(a.0);
     }
+    let shallow_stub: Vec<bool> = (0..g.seqs.len())
+        .map(|s| {
+            depth.median > 0.0
+                && depth
+                    .values
+                    .is_some_and(|d| d[s] < STUB_DEPTH_FOLD * depth.median)
+                && (g.seqs[s].len() < STUB_MAX_LEN
+                    || raw_degree.get(&(s, false)).copied().unwrap_or(0) == 0
+                    || raw_degree.get(&(s, true)).copied().unwrap_or(0) == 0)
+        })
+        .collect();
+    let eff_degree = |s: usize, end: bool| -> usize {
+        let Some(nbrs) = end_nbrs.get(&(s, end)) else {
+            return 0;
+        };
+        if !shallow_stub[s] && nbrs.iter().any(|&n| !shallow_stub[n]) {
+            nbrs.iter().filter(|&&n| !shallow_stub[n]).count()
+        } else {
+            nbrs.len()
+        }
+    };
     let mut repeat: Vec<bool> = (0..g.seqs.len())
         .map(|s| {
-            let branching = degree.get(&(s, true)).copied().unwrap_or(0) >= 2
-                || degree.get(&(s, false)).copied().unwrap_or(0) >= 2;
+            let branching = eff_degree(s, true) >= 2 || eff_degree(s, false) >= 2;
             branching && depth.at_least_or(s, REPEAT_FOLD, g.seqs[s].len() <= max_len)
         })
         .collect();
@@ -1271,11 +1299,18 @@ fn repeat_segments(
         }
         loop {
             let add: Vec<usize> = (0..g.seqs.len())
-                .filter(|&s| !repeat[s] && depth.at_least(s, REPEAT_FOLD))
+                .filter(|&s| !repeat[s] && !shallow_stub[s] && depth.at_least(s, REPEAT_FOLD))
                 .filter(|&s| {
                     [true, false].iter().all(|&end| {
-                        side.get(&(s, end))
-                            .is_some_and(|v| v.iter().all(|&n| n != s && repeat[n]))
+                        side.get(&(s, end)).is_some_and(|v| {
+                            let has_non_stub = v.iter().any(|&n| !shallow_stub[n]);
+                            let mut kept = v
+                                .iter()
+                                .copied()
+                                .filter(|&n| !has_non_stub || !shallow_stub[n])
+                                .peekable();
+                            kept.peek().is_some() && kept.all(|n| n != s && repeat[n])
+                        })
                     })
                 })
                 .collect();
@@ -2840,6 +2875,37 @@ mod tests {
         let depth = [110.0, 101.0, 95.0, 151.0];
         assert_eq!(single_copy_crossroads(&g, &RepeatDepth::legacy(&g, Some(&depth))), vec![true, true, false, false]);
         assert_eq!(single_copy_crossroads(&g, &RepeatDepth::legacy(&g, None)), vec![false; 4]);
+    }
+
+    #[test]
+    fn shallow_numt_stubs_do_not_turn_flanking_unique_segments_into_repeats() {
+        // Main backbone A (24 kb, 160x from 100x mt + 60x NUMT) -> B (70 kb, 100x) -> R -> A,
+        // plus a 400 bp 18x nuclear NUMT rearrangement stub S branching off A+ -> S+ -> B+,
+        // while R (1,400 bp, 190x) genuinely branches to an 85 kb 38x sub-circle U0 and to A.
+        let g = Graph {
+            names: ["U0", "R", "A", "B", "S"].map(String::from).to_vec(),
+            seqs: vec![
+                vec![b'A'; 85_000],
+                vec![b'C'; 1_400],
+                vec![b'G'; 24_000],
+                vec![b'T'; 70_000],
+                vec![b'A'; 400],
+            ],
+            links: vec![
+                ((0, true), (1, true)),
+                ((1, true), (0, true)),
+                ((1, true), (2, true)),
+                ((2, true), (3, true)),
+                ((3, true), (1, true)),
+                ((2, true), (4, true)),
+                ((4, true), (3, true)),
+            ],
+            overlaps: vec![0; 7],
+        };
+        let depth = [38.0, 190.0, 160.0, 100.0, 18.0];
+        let rep = repeat_segments(&g, 20_000, &[true; 7], &RepeatDepth::legacy(&g, Some(&depth)));
+        // Only R (index 1) is a genuine repeat; A (index 2) is not promoted by stub S (index 4).
+        assert_eq!(rep, vec![false, true, false, false, false]);
     }
 }
 

@@ -2976,6 +2976,229 @@ fn run_inner(
                 rep.ranking_model="legacy_after_read_budget_exhaustion";
             }
         }
+        // When nuclear NUMT/NUPT rearrangement breakpoints inject many short (<1 kb) or dead-end
+        // ultra-shallow (<0.5 * optional_below * median) optional shortcut bubbles into an
+        // unmethylated graph, enumerating all 2^k detour subsets can truncate DFS or exhaust the
+        // read-model budget and drop a genuine multi-kilobase sub-stoichiometric sub-circle.
+        // Retry once without redundant shallow stubs whose removal preserves required-anchor
+        // connectivity, keeping substantial sub-stoichiometric anchors (e.g. an 85 kb sub-circle).
+        if rep.search_truncated || rep.read_model_budget_exhausted {
+            if let (Some(depths), Some(md)) = (
+                report["segment_depths"].as_object(),
+                report["median_depth"].as_f64().filter(|&x| x > 0.0),
+            ) {
+                let stub_cutoff = 0.5 * p.optional_below * md;
+                let stubs: FxHashSet<usize> = comp
+                    .iter()
+                    .copied()
+                    .filter(|&a| {
+                        let d = depths.get(&g.names[a]).and_then(Value::as_f64).unwrap_or(md);
+                        optional[a]
+                            && d < stub_cutoff
+                            && (g.seqs[a].len() < MIN_UNBRIDGED_BP
+                                || bridged_at((a, true)) != bridged_at((a, false)))
+                    })
+                    .collect();
+                if !stubs.is_empty() {
+                    let pruned_comp: Vec<usize> = comp
+                        .iter()
+                        .copied()
+                        .filter(|a| !stubs.contains(a))
+                        .collect();
+                    let pruned_br_check: Vec<Bridge> = br
+                        .iter()
+                        .filter(|b| {
+                            !stubs.contains(&b.walk[0].0)
+                                && !stubs.contains(&b.walk[b.walk.len() - 1].0)
+                        })
+                        .cloned()
+                        .collect();
+                    let req: FxHashSet<usize> = comp
+                        .iter()
+                        .copied()
+                        .filter(|&a| !optional[a])
+                        .collect();
+                    let sub_comps = components(g.names.len(), &pruned_br_check);
+                    let connected = req.len() <= 1
+                        || sub_comps
+                            .iter()
+                            .any(|sc| req.iter().all(|r| sc.contains(r)));
+                    if connected && !pruned_comp.is_empty() {
+                        let mut pruned_out_of: FxHashMap<Oriented, Vec<usize>> = FxHashMap::default();
+                        let mut pruned_starts: FxHashSet<Oriented> = FxHashSet::default();
+                        for (i, b) in br.iter().enumerate() {
+                            if !stubs.contains(&b.walk[0].0)
+                                && !stubs.contains(&b.walk[b.walk.len() - 1].0)
+                            {
+                                pruned_starts.insert(b.walk[0]);
+                                pruned_out_of.entry(b.walk[0]).or_default().push(i);
+                            }
+                        }
+                        let pruned_ends: Vec<usize> = pruned_comp
+                            .iter()
+                            .copied()
+                            .filter(|&a| {
+                                !optional[a]
+                                    && pruned_starts.contains(&(a, true))
+                                        != pruned_starts.contains(&(a, false))
+                            })
+                            .collect();
+                        if pruned_ends.len() <= ends.len() {
+                            let pruned_threads = component_model
+                                .as_ref()
+                                .map(|m| m.thread_ends(&pruned_comp, &optional));
+                            let p_min = pruned_ends.len().div_ceil(2).max(1);
+                            let p_env = if p.max_molecules == 0 {
+                                if read_model.is_some() && pruned_comp.len() <= 12 {
+                                    pruned_comp.len()
+                                } else {
+                                    4.max(p_min)
+                                }
+                            } else {
+                                p.max_molecules
+                            };
+                            let mut p_last = p_env.min(pruned_comp.len());
+                            let mut p_m = p_min;
+                            let mut p_trunc = false;
+                            let mut p_ranked: Vec<(Vec<Vec<Oriented>>, CoverReport, Vec<Found>)> =
+                                Vec::new();
+                            let mut p_seen = BTreeSet::new();
+                            while p_m <= p_last {
+                                let (found, tr, t_tr) = search_phased_indexed(
+                                    g.names.len(),
+                                    &pruned_comp,
+                                    &optional,
+                                    &br,
+                                    p_m,
+                                    p.max_steps,
+                                    &phases,
+                                    &pruned_out_of,
+                                    pruned_threads.as_ref(),
+                                );
+                                p_trunc |= tr || t_tr;
+                                for cover in found {
+                                    let mut key: Vec<(bool, Vec<Oriented>)> = cover
+                                        .iter()
+                                        .map(|f| {
+                                            (
+                                                f.circular,
+                                                canonical_key(&candidate_walk(&br, f), f.circular),
+                                            )
+                                        })
+                                        .collect();
+                                    key.sort();
+                                    if p_seen.insert(key) {
+                                        let (walks, rpt) = cover_report(&cover)?;
+                                        p_ranked.push((walks, rpt, cover));
+                                    }
+                                }
+                                if tr {
+                                    p_last = p_m;
+                                    break;
+                                }
+                                if p_m == p_last
+                                    && p_ranked.is_empty()
+                                    && p.max_molecules == 0
+                                    && p_last < pruned_comp.len()
+                                {
+                                    p_last += 1;
+                                }
+                                p_m += 1;
+                            }
+                            let mut p_exhausted = false;
+                            if let Some(model) = &component_model {
+                                let mut budget =
+                                    scoring_work_budget(pruned_comp.len(), p_ranked.len());
+                                for (walks, cover, _) in &mut p_ranked {
+                                    let circular: Vec<_> =
+                                        cover.molecules.iter().map(|m| m.circular).collect();
+                                    cover.read_support = model.score(walks, &circular, &mut budget);
+                                    if cover.read_support.is_none() {
+                                        p_exhausted = true;
+                                        break;
+                                    }
+                                }
+                                if p_exhausted {
+                                    for (_, cover, _) in &mut p_ranked {
+                                        cover.read_support = None;
+                                    }
+                                }
+                            }
+                            if !p_ranked.is_empty()
+                                && (!p_exhausted || (!p_trunc && rep.search_truncated))
+                            {
+                                if !p_exhausted && pruned_ends.is_empty() {
+                                    let has_strong_out = |u: Oriented| {
+                                        pruned_out_of.get(&u).is_some_and(|ixs| {
+                                            ixs.iter().any(|&i| !br[i].weak && !br[i].topological)
+                                        })
+                                    };
+                                    let best_closed_unexplained_adj = p_ranked
+                                        .iter()
+                                        .filter(|(_, c, _)| {
+                                            c.molecules.iter().all(|m| m.circular)
+                                                && c.weak_bridges == 0
+                                                && c.topological_bridges == 0
+                                                && c.read_support.as_ref().is_some_and(|rs| {
+                                                    rs.unobserved_junctions == 0
+                                                        && rs.weak_junctions == 0
+                                                        && rs.unphased_branch_visits == 0
+                                                })
+                                        })
+                                        .filter_map(|(_, c, _)| {
+                                            c.read_support
+                                                .as_ref()
+                                                .map(|rs| rs.unexplained_adjacency_record_occurrences)
+                                        })
+                                        .min();
+                                    if let Some(closed_adj) = best_closed_unexplained_adj {
+                                        let filtered: Vec<_> = p_ranked
+                                            .iter()
+                                            .filter(|(walks, c, _)| {
+                                                let self_trapped_open = walks
+                                                    .iter()
+                                                    .zip(&c.molecules)
+                                                    .any(|(w, m)| {
+                                                        !m.circular
+                                                            && !w.is_empty()
+                                                            && has_strong_out(flip(w[0]))
+                                                            && has_strong_out(w[w.len() - 1])
+                                                    });
+                                                let worse_adj = c
+                                                    .read_support
+                                                    .as_ref()
+                                                    .is_some_and(|rs| {
+                                                        rs.unexplained_adjacency_record_occurrences
+                                                            > closed_adj
+                                                    });
+                                                !(self_trapped_open && worse_adj)
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        if !filtered.is_empty() {
+                                            p_ranked = filtered;
+                                        }
+                                    }
+                                }
+                                ranked = p_ranked;
+                                rep.search_truncated = p_trunc;
+                                rep.searched_max_molecules = p_last;
+                                rep.cover_size_limited = p_last < pruned_comp.len();
+                                rep.read_model_budget_exhausted = p_exhausted;
+                                rep.ranking_model = if p_exhausted {
+                                    "legacy_after_read_budget_exhaustion"
+                                } else if read_model.is_some() {
+                                    crate::read_model::MODEL
+                                } else {
+                                    "legacy_bridge_copy"
+                                };
+                                rep.read_join_cover = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ranked.sort_by(|(wa, a, _), (wb, b, _)| cover_order(a, b).then_with(|| wa.cmp(wb)));
         rep.candidates = ranked.len();
         rep.margin_ln = ranked.first().and_then(|(_, best, _)| {
@@ -5315,5 +5538,74 @@ mod tests {
         let r=run_on(&g,&ev,"ovasm-native-model-components");
         assert_eq!(r.components.len(),2);
         for c in &r.components {assert_eq!(c.best.as_ref().unwrap().read_support.as_ref().unwrap().unexplained_thread_records,0);}
+    }
+
+    #[test]
+    fn shallow_numt_stubs_retry_keeps_substoichiometric_subcircle() {
+        // Required circle A (5 kb, 100x) <-> B (5 kb, 100x) via repeat R (1.4 kb, 180x),
+        // plus a 10 kb sub-stoichiometric sub-circle U0 (38x, 0.38x median) bridged across R,
+        // and a 300 bp ultra-shallow (15x, 0.15x median) nuclear NUMT shortcut S between A and B.
+        // With a tiny step budget that truncates when exploring S detours, the stub-pruned retry
+        // drops S while preserving U0 so single_record_linkage_v1 selects the full master circle.
+        let g = gfa_text(
+            &[("U0", 10_000), ("R", 1_400), ("A", 5_000), ("B", 5_000), ("S", 300)],
+            &[
+                ("U0+", "R+"),
+                ("R+", "A+"),
+                ("A+", "B+"),
+                ("B+", "R+"),
+                ("R+", "U0+"),
+                ("A+", "S+"),
+                ("S+", "B+"),
+            ],
+        );
+        let mut ev = model_evidence(
+            &g,
+            &["R"],
+            &[
+                ("U0+", "R+", 20),
+                ("R+", "A+", 40),
+                ("A+", "B+", 80),
+                ("B+", "R+", 40),
+                ("R+", "U0+", 20),
+                ("A+", "S+", 5),
+                ("S+", "B+", 5),
+            ],
+            &[
+                ("U0+ R+ A+", 15),
+                ("B+ R+ U0+", 15),
+                ("B+ R+ A+", 10),
+                ("A+ B+ R+", 30),
+                ("A+ S+ B+", 3),
+            ],
+        );
+        ev["segment_depths"] = json!({"U0": 38.0, "R": 180.0, "A": 100.0, "B": 100.0, "S": 15.0});
+        ev["median_depth"] = json!(100.0);
+        let dir = std::env::temp_dir().join(format!("ovasm-stub-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("g.gfa"), &g).unwrap();
+        std::fs::write(dir.join("e.json"), ev.to_string()).unwrap();
+        let params = LinearizeParams {
+            min_reads: 2,
+            max_steps: 12,
+            adaptive_steps: false,
+            max_molecules: 1,
+            max_alternatives: 5,
+            optional_below: 0.5,
+        };
+        let r = run(
+            &dir.join("g.gfa"),
+            &dir.join("e.json"),
+            params,
+            &dir.join("m.fa"),
+            None,
+            &dir.join("l.json"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let best = r.best.as_ref().unwrap();
+        assert!(best.circular && best.length == 22_800, "got: {} ({})", best.length, best.path);
+        assert!(r.skipped_anchors.contains(&"S".to_string()));
+        assert!(!r.skipped_anchors.contains(&"U0".to_string()));
     }
 }

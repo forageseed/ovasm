@@ -2024,12 +2024,16 @@ fn assemble_organelle(
     let methylation_summary = if cfg.methylation && !meth_bams.is_empty() && dir.join("molecules.fasta").exists() {
         log("profiling organelle base modifications and NUMT/NUPT separation");
         let meth_dir = dir.join("methylation");
-        Argv::new("check methylation")
+        let mut cmd = Argv::new("check methylation")
             .opt("--target", dir.join("molecules.fasta"))
             .opt("--gfa", dir.join("organelle.gfa"))
+            .opt("--lineage", cfg.seed_lineage.name())
             .each("--bam", &meth_bams)
-            .opt("--out", &meth_dir)
-            .run()?;
+            .opt("--out", &meth_dir);
+        if let Some(m) = cfg.max_read_methylation {
+            cmd = cmd.opt("--max-cg-methylation", m.to_string());
+        }
+        cmd.run()?;
         files.insert("methylation_bed".into(), path_str(&meth_dir.join("methylation.bed")));
         files.insert("methylation_json".into(), path_str(&meth_dir.join("methylation.json")));
         files.insert("methylation_gfa".into(), path_str(&meth_dir.join("organelle.methyl.gfa")));

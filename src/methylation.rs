@@ -125,6 +125,11 @@ pub struct MethylationArgs {
     /// Circular boundary wrap mode for target sequences.
     #[arg(long, value_enum, default_value_t = CircularMode::Auto)]
     pub circular: CircularMode,
+    /// Lineage epigenetic model: `landplants` (`CG`/`CHG`/`CHH` + `6mA`), `metazoa` (`animal`:
+    /// `CG`-only NUMT separation with vertebrate global-CpG vs invertebrate mosaic/unmethylated
+    /// regime auto-detection and multi-lap ~16 kb circular chaining), or `fungi`.
+    #[arg(short = 'x', long, value_enum, default_value_t = crate::seeddb::Lineage::Landplants)]
+    pub lineage: crate::seeddb::Lineage,
     /// Worker threads for parallel BGZF decompression and read placement.
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
@@ -1217,6 +1222,25 @@ fn count_contig_motifs(seq: &[u8], circular: bool) -> (usize, usize, usize, usiz
     (cpg, chg, chh, a_sites)
 }
 
+fn build_circular_ext_seq(seq: &[u8], circular: bool) -> Vec<u8> {
+    if !circular || seq.len() <= 64 {
+        return seq.to_vec();
+    }
+    // Large plant organelles (120-2,000 kb) only need one 25 kb wrap across the origin, whereas
+    // compact animal/fungal mitogenomes (~14-20 kb) are frequently spanned >1x by single 20-50 kb
+    // ONT/HiFi rolling-circle or origin-crossing reads. Wrapping up to `seq.len() + 2 * 25 kb`
+    // (capped at 6 laps, well below MAX_KMER_OCC = 32) prevents multi-lap animal mtDNA reads from
+    // hitting the end of `ext_seq` and being misclassified as chimeric NUMTs.
+    let target_len = (seq.len() + 2 * CIRCULAR_WRAP_MAX).min(seq.len() * 6);
+    let mut ext = Vec::with_capacity(target_len);
+    ext.extend_from_slice(seq);
+    while ext.len() < target_len {
+        let take = (target_len - ext.len()).min(seq.len());
+        ext.extend_from_slice(&seq[..take]);
+    }
+    ext
+}
+
 fn load_targets_from_fasta(path: &Path, mode: CircularMode) -> Result<Vec<TargetContig>> {
     let mut reader = needletail::parse_fastx_file(path)
         .with_context(|| format!("cannot read target FASTA {}", path.display()))?;
@@ -1241,11 +1265,7 @@ fn load_targets_from_fasta(path: &Path, mode: CircularMode) -> Result<Vec<Target
         if seq.is_empty() {
             continue;
         }
-        let mut ext_seq = seq.clone();
-        if circular && seq.len() > 64 {
-            let wrap = seq.len().min(CIRCULAR_WRAP_MAX);
-            ext_seq.extend_from_slice(&seq[..wrap]);
-        }
+        let ext_seq = build_circular_ext_seq(&seq, circular);
         let (true_cpg_dyads, true_chg_sites, true_chh_sites, true_a_sites) =
             count_contig_motifs(&seq, circular);
         out.push(TargetContig {
@@ -1288,11 +1308,7 @@ fn load_targets_from_gfa(path: &Path) -> Result<Vec<TargetContig>> {
     let mut out = Vec::with_capacity(segs.len());
     for (name, seq) in segs {
         let circular = self_loops.contains(&name);
-        let mut ext_seq = seq.clone();
-        if circular && seq.len() > 64 {
-            let wrap = seq.len().min(CIRCULAR_WRAP_MAX);
-            ext_seq.extend_from_slice(&seq[..wrap]);
-        }
+        let ext_seq = build_circular_ext_seq(&seq, circular);
         let (true_cpg_dyads, true_chg_sites, true_chh_sites, true_a_sites) =
             count_contig_motifs(&seq, circular);
         out.push(TargetContig {
@@ -1867,7 +1883,91 @@ fn roc_auc(neg_organelle: &[f64], pos_nuclear: &[f64]) -> Option<f64> {
     Some((u / (n_pos * n_neg)).clamp(0.0, 1.0))
 }
 
-fn parse_cg_threshold_policy(spec: &str, organelle_full_cgs: &[f64]) -> Result<Option<(f64, &'static str)>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpigeneticRegime {
+    PlantCgChgRddm,
+    VertebrateGlobalCpg,
+    InvertebrateMosaicCpg,
+    InvertebrateUnmethylated,
+    FungiVariable5mC,
+}
+
+impl EpigeneticRegime {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PlantCgChgRddm => "plant_cg_chg_rddm",
+            Self::VertebrateGlobalCpg => "vertebrate_global_cpg",
+            Self::InvertebrateMosaicCpg => "invertebrate_mosaic_cpg",
+            Self::InvertebrateUnmethylated => "invertebrate_unmethylated",
+            Self::FungiVariable5mC => "fungi_variable_5mc",
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Self::PlantCgChgRddm => {
+                "Land-plant MET1/CMT3/RdDM regime: nuclear DNA carries heavy CG + CHG (+ CHH) 5mC while mtDNA/ptDNA stay unmethylated."
+            }
+            Self::VertebrateGlobalCpg => {
+                "Vertebrate global DNMT1/DNMT3 CpG regime: nuclear NUMTs are heavily CpG-methylated (~65-85%) while mtDNA stays unmethylated (~0.5-2.5%); CHG rescue disabled."
+            }
+            Self::InvertebrateMosaicCpg => {
+                "Invertebrate mosaic CpG regime: gene-body-integrated hypermethylated NUMTs are purged; unmethylated intergenic NUMTs require overhang/depth/graph evidence."
+            }
+            Self::InvertebrateUnmethylated => {
+                "DNMT-deficient / unmethylated animal regime (e.g. Diptera, Nematoda): nuclear DNA lacks 5mC; conservative guard prevents false pruning of AT-rich mtDNA reads."
+            }
+            Self::FungiVariable5mC => {
+                "Fungal regime: repeat-targeted 5mC varies across clades (present in Neurospora/Basidiomycota, absent in Saccharomycotina); CG-only filter applied."
+            }
+        }
+    }
+}
+
+fn infer_epigenetic_regime(
+    lineage: crate::seeddb::Lineage,
+    nuclear_cgs: &[f64],
+    placed_full_cgs: &[f64],
+) -> EpigeneticRegime {
+    match lineage {
+        crate::seeddb::Lineage::Landplants => EpigeneticRegime::PlantCgChgRddm,
+        crate::seeddb::Lineage::Fungi => EpigeneticRegime::FungiVariable5mC,
+        crate::seeddb::Lineage::Metazoa => {
+            let mut nuc = nuclear_cgs.to_vec();
+            nuc.sort_by(|a, b| a.total_cmp(b));
+            let mut plc = placed_full_cgs.to_vec();
+            plc.sort_by(|a, b| a.total_cmp(b));
+            let high_placed_frac = if plc.is_empty() {
+                0.0
+            } else {
+                plc.iter().filter(|&&x| x >= 0.45).count() as f64 / plc.len() as f64
+            };
+            if nuc.len() >= 10 {
+                let med = quantile_sorted(&nuc, 0.50);
+                let p90 = quantile_sorted(&nuc, 0.90);
+                if med >= 0.45 {
+                    EpigeneticRegime::VertebrateGlobalCpg
+                } else if p90 >= 0.25 || med >= 0.06 || high_placed_frac >= 0.02 {
+                    EpigeneticRegime::InvertebrateMosaicCpg
+                } else {
+                    EpigeneticRegime::InvertebrateUnmethylated
+                }
+            } else if high_placed_frac >= 0.03 {
+                EpigeneticRegime::VertebrateGlobalCpg
+            } else if high_placed_frac >= 0.01 || quantile_sorted(&plc, 0.90) >= 0.15 {
+                EpigeneticRegime::InvertebrateMosaicCpg
+            } else {
+                EpigeneticRegime::InvertebrateUnmethylated
+            }
+        }
+    }
+}
+
+fn parse_cg_threshold_policy(
+    spec: &str,
+    organelle_full_cgs: &[f64],
+    regime: EpigeneticRegime,
+) -> Result<Option<(f64, &'static str)>> {
     let s = spec.trim();
     if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") {
         return Ok(None);
@@ -1876,12 +1976,31 @@ fn parse_cg_threshold_policy(spec: &str, organelle_full_cgs: &[f64]) -> Result<O
         let mut v = organelle_full_cgs.to_vec();
         v.sort_by(|a, b| a.total_cmp(b));
         let baseline = if v.is_empty() {
-            0.12
+            match regime {
+                EpigeneticRegime::VertebrateGlobalCpg
+                | EpigeneticRegime::InvertebrateMosaicCpg
+                | EpigeneticRegime::InvertebrateUnmethylated => 0.03,
+                _ => 0.12,
+            }
         } else {
             quantile_sorted(&v, 0.35)
         };
-        let thr = (baseline + 0.28).clamp(0.38, 0.55);
-        return Ok(Some((thr, "auto")));
+        let (thr, tag) = match regime {
+            EpigeneticRegime::PlantCgChgRddm => ((baseline + 0.28).clamp(0.38, 0.55), "auto"),
+            EpigeneticRegime::VertebrateGlobalCpg => {
+                ((baseline + 0.22).clamp(0.25, 0.45), "auto_vertebrate_cpg")
+            }
+            EpigeneticRegime::InvertebrateMosaicCpg => {
+                ((baseline + 0.26).clamp(0.32, 0.50), "auto_invertebrate_mosaic")
+            }
+            EpigeneticRegime::InvertebrateUnmethylated => {
+                // Unmethylated nuclear genome (e.g. Drosophila, C. elegans): avoid discarding
+                // AT-rich mtDNA reads with 5-8 CpGs that have 1-2 noisy basecaller calls.
+                (0.55, "auto_unmethylated_clade_guard")
+            }
+            EpigeneticRegime::FungiVariable5mC => ((baseline + 0.28).clamp(0.35, 0.55), "auto_fungi"),
+        };
+        return Ok(Some((thr, tag)));
     }
     let val: f64 = s
         .parse()
@@ -1969,7 +2088,9 @@ pub fn run_methylation(args: &MethylationArgs) -> Result<Value> {
         .filter(|p| p.nuclear_overhang < 100 && p.summary.cg_calls >= args.min_read_cpgs)
         .map(|p| p.summary.cg_frac())
         .collect();
-    let thr_policy = parse_cg_threshold_policy(&args.max_cg_methylation, &full_len_cgs)?;
+    let regime = infer_epigenetic_regime(args.lineage, &nuclear_baseline_cgs, &full_len_cgs);
+    let thr_policy = parse_cg_threshold_policy(&args.max_cg_methylation, &full_len_cgs, regime)?;
+    let allow_plant_chg_rescue = args.lineage == crate::seeddb::Lineage::Landplants;
 
     let prob_u8 = (args.prob_threshold.clamp(0.0, 1.0) * 255.0).round() as u8;
 
@@ -1994,7 +2115,10 @@ pub fn run_methylation(args: &MethylationArgs) -> Result<Value> {
         let is_hyper = match thr_policy {
             Some((thr, _)) => {
                 (p.summary.cg_calls >= args.min_read_cpgs && p.summary.cg_frac() > thr)
-                    || (p.summary.cg_calls == 0 && p.summary.chg_calls >= 10 && p.summary.chg_frac() > 0.35)
+                    || (allow_plant_chg_rescue
+                        && p.summary.cg_calls == 0
+                        && p.summary.chg_calls >= 10
+                        && p.summary.chg_frac() > 0.35)
             }
             None => false,
         };
@@ -2166,12 +2290,23 @@ pub fn run_methylation(args: &MethylationArgs) -> Result<Value> {
     let auc_vs_nuclear = roc_auc(&clean_read_cgs, &nuclear_baseline_cgs);
     let auc_vs_numts = roc_auc(&clean_read_cgs, &numt_read_cgs);
 
+    let primary_contexts = match args.lineage {
+        crate::seeddb::Lineage::Landplants => json!(["CG", "CHG", "CHH", "6mA"]),
+        crate::seeddb::Lineage::Metazoa | crate::seeddb::Lineage::Fungi => json!(["CG", "6mA"]),
+    };
+
     let report = json!({
         "schema": SCHEMA,
+        "lineage": args.lineage.name(),
+        "epigenetic_regime": regime.as_str(),
+        "regime_note": regime.note(),
+        "primary_contexts": primary_contexts,
         "parameters": {
+            "lineage": args.lineage.name(),
             "prob_threshold": args.prob_threshold,
             "cg_threshold_policy": thr_policy.map_or("none", |(_, m)| m),
             "effective_max_cg_methylation": thr_policy.map(|(v, _)| v),
+            "chg_rescue_enabled": allow_plant_chg_rescue,
             "min_read_cpgs": args.min_read_cpgs,
             "max_overhang_bp": args.max_overhang,
             "kmer": args.kmer,
@@ -2527,6 +2662,7 @@ mod tests {
             max_overhang: 300,
             kmer: 31,
             circular: CircularMode::Auto,
+            lineage: crate::seeddb::Lineage::Landplants,
             threads: Some(2),
         })
         .unwrap();
@@ -2544,6 +2680,164 @@ mod tests {
             report["contigs"][0]["unfiltered_cg"]["sites_ge_0_20"].as_u64().unwrap() > 50,
             "unfiltered pileup should show the NUPT spike before filtering"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn animal_mitogenome_adapts_to_vertebrate_rolling_circle_mega_numts_and_unmethylated_insects() {
+        let mut rng: u64 = 0xfeed_face_cafe_beef;
+        let mut rand_seq = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    rng = hash64(rng.wrapping_add(1));
+                    b"ACGT"[(rng & 3) as usize]
+                })
+                .collect()
+        };
+        // 16.5 kb circular animal mitogenome (~human/vertebrate scale)
+        let mito = rand_seq(16_569);
+        let dir = std::env::temp_dir().join(format!("ovasm_meth_animal_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target_fa = dir.join("animal_mt.fasta");
+        fs::write(
+            &target_fa,
+            format!(">mt circular=true\n{}\n", String::from_utf8(mito.clone()).unwrap()),
+        )
+        .unwrap();
+
+        let make_cpg_mm_ml = |seq: &[u8], ml_val: u8| -> (String, Vec<u8>) {
+            let mut deltas = Vec::new();
+            let mut skip = 0usize;
+            let mut mls = Vec::new();
+            for i in 0..seq.len() {
+                if seq[i] == b'C' {
+                    if i + 1 < seq.len() && seq[i + 1] == b'G' {
+                        deltas.push(skip.to_string());
+                        mls.push(ml_val);
+                        skip = 0;
+                    } else {
+                        skip += 1;
+                    }
+                }
+            }
+            let mm = if deltas.is_empty() {
+                String::new()
+            } else {
+                format!("C+m?,{};", deltas.join(","))
+            };
+            (mm, mls)
+        };
+
+        // Case 1: Vertebrate global-CpG regime with 38 kb (>2x full 16.5 kb circle!) rolling-circle
+        // mtDNA reads + full-length 16.5 kb hypermethylated polymorphic mega-NUMT reads (~80% CG).
+        let mut vert_records: Vec<(String, u16, Vec<u8>, String, Vec<u8>)> = Vec::new();
+        for i in 0..24 {
+            let start = (i * 1_100) % mito.len();
+            let len = if i < 6 { 38_000 } else { 14_000 }; // 6 multi-lap rolling-circle ONT reads!
+            let rseq: Vec<u8> = (0..len).map(|k| mito[(start + k) % mito.len()]).collect();
+            let (mm, ml) = make_cpg_mm_ml(&rseq, 10);
+            vert_records.push((format!("vert_mt_{i}"), 4, rseq, mm, ml));
+        }
+        for i in 0..8 {
+            // Full-circle 16.5 kb concatenated mega-NUMT (zero nuclear overhang; only CpG catches it!)
+            let rseq = mito.clone();
+            let (mm, ml) = make_cpg_mm_ml(&rseq, 235);
+            vert_records.push((format!("vert_meganumt_{i}"), 4, rseq, mm, ml));
+        }
+        let vert_bam = dir.join("vert.bam");
+        let vert_refs: Vec<_> = vert_records
+            .iter()
+            .map(|(n, fl, sq, mm, ml)| (n.as_str(), *fl, sq.as_slice(), Some(mm.as_str()), Some(ml.as_slice())))
+            .collect();
+        write_synthetic_bam(&vert_bam, &vert_refs);
+
+        let vert_rep = run_methylation(&MethylationArgs {
+            target: Some(target_fa.clone()),
+            gfa: None,
+            bam: vec![vert_bam],
+            out: dir.join("vert_out"),
+            prob_threshold: 0.5,
+            max_cg_methylation: "auto".into(),
+            min_read_cpgs: 5,
+            max_overhang: 300,
+            kmer: 31,
+            circular: CircularMode::Auto,
+            lineage: crate::seeddb::Lineage::Metazoa,
+            threads: Some(2),
+        })
+        .unwrap();
+        assert_eq!(vert_rep["lineage"], json!("metazoa"));
+        assert_eq!(vert_rep["epigenetic_regime"], json!("vertebrate_global_cpg"));
+        assert_eq!(vert_rep["parameters"]["chg_rescue_enabled"], json!(false));
+        assert_eq!(
+            vert_rep["reads"]["clean_organelle_reads"],
+            json!(24),
+            "all 24 vertebrate mtDNA reads (including 38 kb >2-lap rolling-circle reads) must be kept"
+        );
+        assert_eq!(vert_rep["reads"]["numt_nupt_chimeric_reads"], json!(0));
+        assert_eq!(vert_rep["reads"]["numt_nupt_hypermethylated_reads"], json!(8));
+
+        // Case 2: DNMT-deficient unmethylated insect regime (e.g. Drosophila): an AT-rich read with
+        // zero CG calls and noisy CHG calls must NOT be discarded by plant CHG rescue, and a sparse
+        // 5-CpG read with 2 noisy calls (40% CG) must NOT be falsely pruned under unmethylated guard.
+        let mut ins_records: Vec<(String, u16, Vec<u8>, String, Vec<u8>)> = Vec::new();
+        for i in 0..20 {
+            let start = (i * 800) % mito.len();
+            let rseq: Vec<u8> = (0..6_000).map(|k| mito[(start + k) % mito.len()]).collect();
+            let (mm, ml) = make_cpg_mm_ml(&rseq, 8);
+            ins_records.push((format!("ins_mt_{i}"), 4, rseq, mm, ml));
+        }
+        // Read with 5 called CpGs where 2/5 (0.40) happen to have noisy basecaller prob > 0.5
+        let sparse_seq = mito[0..1_200].to_vec();
+        let mut deltas = Vec::new();
+        let mut mls = Vec::new();
+        let mut skip = 0usize;
+        for i in 0..sparse_seq.len() {
+            if sparse_seq[i] == b'C' {
+                if i + 1 < sparse_seq.len() && sparse_seq[i + 1] == b'G' && mls.len() < 5 {
+                    deltas.push(skip.to_string());
+                    mls.push(if mls.len() < 2 { 200u8 } else { 10u8 }); // 2/5 = 0.40
+                    skip = 0;
+                } else {
+                    skip += 1;
+                }
+            }
+        }
+        ins_records.push((
+            "ins_noisy_sparse".into(),
+            4,
+            sparse_seq,
+            format!("C+m?,{};", deltas.join(",")),
+            mls,
+        ));
+
+        let ins_bam = dir.join("ins.bam");
+        let ins_refs: Vec<_> = ins_records
+            .iter()
+            .map(|(n, fl, sq, mm, ml)| (n.as_str(), *fl, sq.as_slice(), Some(mm.as_str()), Some(ml.as_slice())))
+            .collect();
+        write_synthetic_bam(&ins_bam, &ins_refs);
+
+        let ins_rep = run_methylation(&MethylationArgs {
+            target: Some(target_fa),
+            gfa: None,
+            bam: vec![ins_bam],
+            out: dir.join("ins_out"),
+            prob_threshold: 0.5,
+            max_cg_methylation: "auto".into(),
+            min_read_cpgs: 5,
+            max_overhang: 300,
+            kmer: 31,
+            circular: CircularMode::Auto,
+            lineage: crate::seeddb::Lineage::Metazoa,
+            threads: Some(2),
+        })
+        .unwrap();
+        assert_eq!(ins_rep["epigenetic_regime"], json!("invertebrate_unmethylated"));
+        assert_eq!(ins_rep["reads"]["clean_organelle_reads"], json!(21));
+        assert_eq!(ins_rep["reads"]["numt_nupt_hypermethylated_reads"], json!(0));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
