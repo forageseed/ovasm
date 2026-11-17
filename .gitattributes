@@ -1,1 +1,5 @@
 *.sh text eol=lf
+scripts/** linguist-documentation
+docs/** linguist-documentation
+tests/*.py linguist-documentation
+tests/**/*.py linguist-documentation

@@ -2,7 +2,9 @@
 name = "ovasm"
 version = "1.1.0"
 edition = "2021"
+authors = ["zhicheng jia"]
 description = "OrganelleVerse organelle assembler: read recruitment, evidence graphs, assembly"
+repository = "https://github.com/forageseed/ovasm"
 license = "MIT"
 rust-version = "1.80"
 
